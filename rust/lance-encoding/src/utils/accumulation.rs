@@ -36,17 +36,27 @@ impl AccumulationQueue {
 
     /// Adds an array to the queue, if there is enough data then the queue is flushed
     /// and returned
+    ///
+    /// 向 queue 中添加 array，满足阈值时返回Some()，并触发一次flush；否则返回None
     pub fn insert(
         &mut self,
         array: ArrayRef,
         row_number: u64,
         num_rows: u64,
     ) -> Option<(Vec<ArrayRef>, u64, u64)> {
+
+        // 填充 self.row_number 值（当前Page的start row offset）
         if self.row_number == u64::MAX {
+            // 对于初始值为 u64::MAX 的row_number，设置为给定值 row_number
             self.row_number = row_number;
         }
+        // 累加 num_rows
         self.num_rows += num_rows;
+        // 累加 current_bytes（内存值）
         self.current_bytes += array.get_array_memory_size() as u64;
+
+        // 若当前值大于cache_bytes设置的值，则返回Some()，并触发一次flush
+        // 注意这里的各种重置操作
         if self.current_bytes > self.cache_bytes {
             debug!(
                 "Flushing column {} page of size {} bytes (unencoded)",
@@ -65,6 +75,9 @@ impl AccumulationQueue {
                 num_rows,
             ))
         } else {
+
+            // 若不满足flush条件，则触发一次deep copy，然后将数据缓存至buffered_arrays中。
+            // TODO zhangyue.1010 这里先编码再缓存会不会更好？节省内存，且省去一次Copy操作
             trace!(
                 "Accumulating data for column {}.  Now at {} bytes",
                 self.column_index,

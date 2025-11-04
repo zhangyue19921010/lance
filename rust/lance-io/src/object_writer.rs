@@ -76,7 +76,7 @@ fn initial_upload_size() -> usize {
 pub struct ObjectWriter {
     state: UploadState,
     path: Arc<Path>,
-    cursor: usize,
+    cursor: usize, // 记录写入的数据后的字节偏移量
     connection_resets: u16,
     buffer: Vec<u8>,
     // TODO: use constant size to support R2

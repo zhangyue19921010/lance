@@ -159,6 +159,8 @@ impl CoreFieldEncodingStrategy {
 }
 
 impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
+    
+    // 基于给定的 field 以及 FieldEncodingStrategy 构建当前列的 encoder
     fn create_field_encoder(
         &self,
         encoding_strategy_root: &dyn FieldEncodingStrategy,
@@ -166,9 +168,15 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
         column_index: &mut ColumnIndexSequence,
         options: &EncodingOptions,
     ) -> Result<Box<dyn FieldEncoder>> {
+        
+        // 获取当前列的类型
         let data_type = field.data_type();
+        // 如果类型为基础类型 primitive（这里代码解析指以基础类型为例）
         if Self::is_primitive_type(&data_type) {
+            
+            // 缓存 field id与物理存储（实际处理顺序） column_index 的映射关系
             let column_index = column_index.next_column_index(field.id as u32);
+            
             if field.metadata.contains_key(BLOB_META_KEY) {
                 let mut packed_meta = HashMap::new();
                 packed_meta.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
@@ -182,6 +190,8 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                 )?);
                 Ok(Box::new(BlobFieldEncoder::new(desc_encoder)))
             } else {
+                
+                // 创建 基础类型的 field encoder
                 Ok(Box::new(PrimitiveFieldEncoder::try_new(
                     options,
                     self.array_encoding_strategy.clone(),
@@ -340,6 +350,8 @@ impl CoreArrayEncodingStrategy {
         }
     }
 
+    /// 对于给定的arrays，data type等信息，选择对应的encoder类型，这里还会传入field metadata，作为判断依据
+    /// 这里简单点直接使用功能u64
     fn choose_array_encoder(
         arrays: &[ArrayRef],
         data_type: &DataType,
@@ -447,6 +459,8 @@ impl CoreArrayEncodingStrategy {
 
                 Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
             }
+
+            // 对于 UInt8，UInt16以及UInt64等，使用bitpacking进行编码
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
                 if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
                     #[cfg(feature = "bitpacking")]
@@ -613,21 +627,29 @@ fn check_fixed_size_encoding(arrays: &[ArrayRef], version: LanceFileVersion) -> 
     }
 }
 
+/// 根据 给定 arrays以及field，确定对应的编码器，这里还会传入field metadata，作为判断依据
+///
+///
 impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
     fn create_array_encoder(
         &self,
         arrays: &[ArrayRef],
         field: &Field,
     ) -> Result<Box<dyn ArrayEncoder>> {
+        // 获取arrays的总共需要的内存大小合，即 total data size
         let data_size = arrays
             .iter()
             .map(|arr| arr.get_buffer_memory_size() as u64)
             .sum::<u64>();
+
+        // 数据类型
         let data_type = arrays[0].data_type();
 
+        // 尝试对Utf8直接使用 use_dict_encoding
         let use_dict_encoding = data_type == &DataType::Utf8
             && check_dict_encoding(arrays, get_dict_encoding_threshold());
 
+        // 选择一个对应的encoder
         Self::choose_array_encoder(
             arrays,
             data_type,

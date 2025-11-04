@@ -128,6 +128,7 @@ impl FromStr for CompressionScheme {
     }
 }
 
+// TODO zhangyue.1010 支持其他压缩算法
 pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
@@ -210,16 +211,23 @@ mod zstd {
         }
     }
 
+    /// ZSTD 压缩器
     impl BufferCompressor for ZstdBufferCompressor {
+        // 开始压缩数据
         fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+            // 初始化 output_buf
             output_buf.write_all(&(input_buf.len() as u64).to_le_bytes())?;
+            // 创建zstd encoder
             let mut encoder = ::zstd::stream::Encoder::new(output_buf, self.compression_level)?;
 
+            // 压缩数据，并填充至 output_buf 中
             encoder.write_all(input_buf)?;
+            // 完成压缩
             match encoder.finish() {
                 Ok(_) => Ok(()),
                 Err(e) => Err(e.into()),
             }
+            // ------ 至此完成数据压缩 -----
         }
 
         fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {

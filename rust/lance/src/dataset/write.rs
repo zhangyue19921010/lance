@@ -383,6 +383,8 @@ pub async fn do_write_fragments(
     // FIXME: this is bad, really bad, we need to find a way to remove this.
     let data = wrap_json_stream_for_writing(data);
 
+    // 将data按条件split stream
+    // V2 版本下只关注max_rows_per_file，而不再关注max_rows_per_group
     let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
         // In v1 we split the stream into row group sized batches
         chunk_stream(data, params.max_rows_per_group)
@@ -404,24 +406,44 @@ pub async fn do_write_fragments(
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
+
+    // 迭代 buffered_reader 开始写入数据  ****** IMPORTANT ******
     while let Some(batch_chunk) = buffered_reader.next().await {
+        // 解构batch_chunk
         let batch_chunk = batch_chunk?;
 
+        // 若writer不存在，则先初始化writer
         if writer.is_none() {
+            // 初始化 new writer 以及初始化当前的 fragment
             let (new_writer, new_fragment) = writer_generator.new_writer().await?;
+            // 标记当前 fragment in progress
             params.progress.begin(&new_fragment).await?;
+            // 赋值 writer
             writer = Some(new_writer);
+            // 缓存当前 fragment
             fragments.push(new_fragment);
         }
 
+        // ********************** IMPORTANT **********************
+        // 对于给定 Writer，开始写入当前batch_chunk中的数据
         writer.as_mut().unwrap().write(&batch_chunk).await?;
+
+        // ------------- 至此当前Page完成了所有编码、压缩、写入以及元数据组装等工作 -------------
+
+        // 统计当前文件中一共写入了多少条数据
         for batch in batch_chunk {
             num_rows_in_current_file += batch.num_rows() as u32;
         }
 
+        // 如果当前文件 1. 写入的条数超过阈值 2. 或者写入的bytes大小超过阈值
+        // 则 finish当前 writer，并更新相应的元数据信息
         if num_rows_in_current_file >= params.max_rows_per_file as u32
             || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
         {
+            // 调用 take 取出（remove）writer，并完成当前data file的写入
+            // ************************************ finish() function is VERY IMPORTANT *********************************
+            // 涉及到元数据组装，而这里的元数据组装是 TODO zhangyue.1010 binary copy的核心逻辑之一
+            // 返回 num_rows 以及 data file对象
             let (num_rows, data_file) = writer.take().unwrap().finish().await?;
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
             debug_assert_eq!(num_rows, num_rows_in_current_file);
@@ -596,9 +618,11 @@ pub async fn write_fragments_internal(
         (data, schema)
     };
 
+    // TODO zhangyue.1010 这里可以改
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
 
+    // 修正Schema以及获取storage_version[default v2_0]
     let (schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
@@ -647,12 +671,14 @@ pub async fn write_fragments_internal(
         (converted_schema, params.storage_version_or_default())
     };
 
+    // TODO zhangyue.1010 这里可以改
     let data_schema = schema.project_by_schema(
         data.schema().as_ref(),
         OnMissing::Error,
         OnTypeMismatch::Error,
     )?;
 
+    // 处理Blob Stream，目前只对Binary Stream生效
     let (data, blob_data) = data.extract_blob_stream(&data_schema);
 
     // Some params we borrow from the normal write, some we override
@@ -676,6 +702,9 @@ pub async fn write_fragments_internal(
     }
 
     let frag_schema = schema.retain_storage_class(StorageClass::Default);
+
+    // 前置Schema以及参数渲染已经完成
+    // 开始写入fragments data file
     let fragments_fut = do_write_fragments(
         object_store.clone(),
         base_dir,
@@ -685,6 +714,8 @@ pub async fn write_fragments_internal(
         storage_version,
         target_bases_info,
     );
+
+    // --------------------------------- 到这里了---------------------------------
 
     let (default, blob) = if let Some(blob_data) = blob_data {
         let blob_schema = schema.retain_storage_class(StorageClass::Blob);
@@ -720,6 +751,7 @@ pub trait GenericWriter: Send {
     /// a new file
     async fn tell(&mut self) -> Result<u64>;
     /// Finish writing the file (flush the remaining data and write footer)
+    /// ******************** VERY IMPORTANT ********************
     async fn finish(&mut self) -> Result<(u32, DataFile)>;
 }
 
@@ -765,7 +797,11 @@ struct V2WriterAdapter {
 
 #[async_trait::async_trait]
 impl GenericWriter for V2WriterAdapter {
+
+    // 对于当前writer，给定数据batches，开始写入数据
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
+
+        // 遍历每一个batch，开始写入数据，调用writer的write_batch API
         for batch in batches {
             self.writer.write_batch(batch).await?;
         }
@@ -774,21 +810,34 @@ impl GenericWriter for V2WriterAdapter {
     async fn tell(&mut self) -> Result<u64> {
         Ok(self.writer.tell().await?)
     }
+
+    /// Finish writing the file (flush the remaining data and write footer)
+    /// ******************** VERY IMPORTANT ********************
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        // 收集当前Writer的field_ids
         let field_ids = self
             .writer
             .field_id_to_column_indices()
             .iter()
             .map(|(field_id, _)| *field_id as i32)
             .collect::<Vec<_>>();
+
+        // 收集当前Writer的column_indices
         let column_indices = self
             .writer
             .field_id_to_column_indices()
             .iter()
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
+
+        // 获取当前Writer的 major version 以及 minor version
         let (major, minor) = self.writer.version().to_numbers();
+
+        // 调用writer的finish方法，并等待其完成
+        // --------------------------------------- 看到这里了 -----------------------------------
         let num_rows = self.writer.finish().await? as u32;
+
+        //
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
@@ -798,6 +847,8 @@ impl GenericWriter for V2WriterAdapter {
             NonZero::new(self.writer.tell().await?),
             self.base_id,
         );
+
+        //
         Ok((num_rows, data_file))
     }
 }
@@ -819,14 +870,17 @@ pub async fn open_writer_with_options(
     add_data_dir: bool,
     base_id: Option<u32>,
 ) -> Result<Box<dyn GenericWriter>> {
+    // 提前生成 lance file name
     let filename = format!("{}.lance", generate_random_filename());
 
+    // 构建完整的 file path
     let full_path = if add_data_dir {
         base_dir.child(DATA_DIR).child(filename.as_str())
     } else {
         base_dir.child(filename.as_str())
     };
 
+    // 构建 writer
     let writer = if storage_version == LanceFileVersion::Legacy {
         Box::new(V1WriterAdapter {
             writer: FileWriter::<ManifestDescribing>::try_new(
@@ -840,7 +894,9 @@ pub async fn open_writer_with_options(
             base_id,
         })
     } else {
+        // 构建 object writer（与 OSS 交互）
         let writer = object_store.create(&full_path).await?;
+        // 创建 file writer
         let file_writer = v2::writer::FileWriter::try_new(
             writer,
             schema.clone(),
@@ -849,6 +905,7 @@ pub async fn open_writer_with_options(
                 ..Default::default()
             },
         )?;
+        // 装配为 writer_adapter
         let writer_adapter = V2WriterAdapter {
             writer: file_writer,
             path: filename,
@@ -916,8 +973,10 @@ impl WriterGenerator {
 
     pub async fn new_writer(&self) -> Result<(Box<dyn GenericWriter>, Fragment)> {
         // Use temporary ID 0; will assign ID later.
+        // 初始化fragment 并暂时将 fragment id 赋值为 0
         let fragment = Fragment::new(0);
 
+        // 初始化新的writer
         let writer = if let Some(base_info) = self.select_target_base() {
             open_writer_with_options(
                 base_info.object_store.as_ref(),

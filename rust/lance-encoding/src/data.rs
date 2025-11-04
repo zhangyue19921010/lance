@@ -1227,13 +1227,22 @@ fn arrow_binary_to_data_block(
     })
 }
 
+/// 编码扁平的的数据
+///
+///
 fn encode_flat_data(arrays: &[ArrayRef], num_values: u64) -> LanceBuffer {
+    // 获取当前类型的byte宽度
     let bytes_per_value = arrays[0].data_type().byte_width();
+    // 获取总共需要多大buffer空间 条数 * 单条大小
     let mut buffer = Vec::with_capacity(num_values as usize * bytes_per_value);
+    // 遍历所有array
     for arr in arrays {
+        // 对于给定 array，先获取其底层具体数据
         let data = arr.to_data();
+        // 提取buffer中的数据，并合并到一个连续的内存区域中
         buffer.extend_from_slice(data.buffers()[0].as_slice());
     }
+    // 将buffer封装为LanceBuffer
     LanceBuffer::from(buffer)
 }
 
@@ -1451,6 +1460,9 @@ fn extract_nulls(arrays: &[ArrayRef], num_values: u64) -> Nullability {
     }
 }
 
+/// 将给定的 arrays 转换为 DataBlock，这里以int64为例，进行源码阅读展开
+///
+///
 impl DataBlock {
     pub fn from_arrays(arrays: &[ArrayRef], num_values: u64) -> Self {
         if arrays.is_empty() || num_values == 0 {
@@ -1481,6 +1493,7 @@ impl DataBlock {
                     block_info: BlockInfo::new(),
                 })
             }
+            // -------------- 直接跳转到这里 --------------
             DataType::Date32
             | DataType::Date64
             | DataType::Decimal32(_, _)
@@ -1504,6 +1517,7 @@ impl DataBlock {
             | DataType::UInt32
             | DataType::UInt64
             | DataType::UInt8 => {
+                // 对于上述数据类型的arrays数据，进行编码
                 let data = encode_flat_data(arrays, num_values);
                 Self::FixedWidth(FixedWidthDataBlock {
                     data,

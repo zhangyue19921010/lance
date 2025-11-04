@@ -160,15 +160,21 @@ pub trait FieldEncoder: Send {
     /// page.
     ///
     /// The `num_rows` is the number of top level rows.  It is initially the same as `array.len()`
+    /// TODO zhangyue.1010 typo
     /// however it is passed seprately because array will become flattened over time (if there is
     /// repetition) and we need to know the original number of rows for various purposes.
+    ///
+    ///
+    /// 对于给定ArrayRef，self，row_number，以及num_rows 创建该列对应的Encode Task
+    /// 此处以 PrimitiveFieldEncoder(传统模式) 为例展开源码阅读
+    /// Structural Encoder使用的是PrimitiveStructuralEncoder
     fn maybe_encode(
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
         repdef: RepDefBuilder,
-        row_number: u64,
-        num_rows: u64,
+        row_number: u64, // 当前批次 第一行数据的行号（writer级别的全局变量）
+        num_rows: u64, // 当前批次一共有多少条数据
     ) -> Result<Vec<EncodeTask>>;
     /// Flush any remaining data from the buffers into encoding tasks
     ///
@@ -503,21 +509,28 @@ pub struct BatchEncoder {
 }
 
 impl BatchEncoder {
+    // 基于给定Schema以及FieldEncodingStrategy，初始化 Batch Encoder
     pub fn try_new(
         schema: &Schema,
         strategy: &dyn FieldEncodingStrategy,
         options: &EncodingOptions,
     ) -> Result<Self> {
+        // col_index 初始值为0
         let mut col_idx = 0;
+        // 初始化 ColumnIndexSequence
         let mut col_idx_sequence = ColumnIndexSequence::default();
+
+        // 遍历 schema中的每一个字段
         let field_encoders = schema
             .fields
             .iter()
             .map(|field| {
+
+                // 对于某个字段，创建该列对应的 field encoder
                 let encoder = strategy.create_field_encoder(
                     strategy,
                     field,
-                    &mut col_idx_sequence,
+                    &mut col_idx_sequence, // 传入 col_idx_sequence
                     options,
                 )?;
                 col_idx += encoder.as_ref().num_columns();

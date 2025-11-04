@@ -402,6 +402,8 @@ pub struct PrimitiveFieldEncoder {
 }
 
 impl PrimitiveFieldEncoder {
+    
+    // 基于 field，column index以及array_encoding_strategy 创建 基础字段类型的Encoder
     pub fn try_new(
         options: &EncodingOptions,
         array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
@@ -409,7 +411,7 @@ impl PrimitiveFieldEncoder {
         field: Field,
     ) -> Result<Self> {
         Ok(Self {
-            accumulation_queue: AccumulationQueue::new(
+            accumulation_queue: AccumulationQueue::new( // 累积队列来缓存数据（按列级别）直到缓存到足够的数据，触发Flush操作
                 options.cache_bytes_per_column,
                 column_index,
                 options.keep_original_array,
@@ -421,19 +423,47 @@ impl PrimitiveFieldEncoder {
         })
     }
 
+    /// 基于给定切分好的 arrays，创建独立的 Encode Task，并完成编码
+    ///
     fn create_encode_task(&mut self, arrays: Vec<ArrayRef>) -> Result<EncodeTask> {
+
+        // 根据给定arrays以及当前field，构建对应的encoder
+        // 例如，这里使用basic encoder
         let encoder = self
             .array_encoding_strategy
             .create_array_encoder(&arrays, &self.field)?;
+
+        // 获取column index
         let column_idx = self.column_index;
+
+        // 获取 data type
         let data_type = self.field.data_type();
 
+        // ******* 异步触发对arrays的编码操作 *******
+        // 将编码结果封装为 EncodedPage 并返回，其中包含几个关键的信息
+        // 1. data: DataBlock
+        // 2. description ==> pb message
         Ok(tokio::task::spawn(async move {
+
+            // 获取总的num_values值
             let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+
+            // 将arrays转换为DataBlock，将多个array底层数据聚集到一个buffer中（可能涉及转换）
             let data = DataBlock::from_arrays(&arrays, num_values);
+
+            // 初始化buffer index
             let mut buffer_index = 0;
+
+            // 将Data block编码至 array（Encoded Array）
+            // 这里以CompressedBufferEncoder为例，进行源码阅读，这里涉及到编码以及压缩
+            // 返回值 array 包含压缩后的数据 data以及当前压缩编码对应的元数据信息
             let array = encoder.encode(data, &data_type, &mut buffer_index)?;
+
+            // 展开，并进行模式匹配
             let (data, description) = array.into_buffers();
+            
+            // 组装为 EncodedPage，包含压缩后的数据，压缩编码元数据，num_rows，column_index 等信息
+            // Encode Task的输出结果为 EncodedPage，包含压缩后的数据，压缩编码元数据，num_rows，column_index 等信息
             Ok(EncodedPage {
                 data,
                 description: PageEncoding::Legacy(description),
@@ -453,16 +483,29 @@ impl PrimitiveFieldEncoder {
         .boxed())
     }
 
+    /// 触发 flush 操作
+    /// 根据array占用内存的大小，按32KiB切分为不同的独立的 encode task
     // Creates an encode task, consuming all buffered data
     fn do_flush(&mut self, arrays: Vec<ArrayRef>) -> Result<Vec<EncodeTask>> {
         if arrays.len() == 1 {
+            // flush 当前 array数据
+
+            // 取出 array数据
             let array = arrays.into_iter().next().unwrap();
+            // 获取 buffer size in bytes
             let size_bytes = array.get_buffer_memory_size();
-            let num_parts = bit_util::ceil(size_bytes, self.max_page_bytes as usize);
+            // 按32KiB切分当前buffer，看看总共需要多个page
+            let num_parts = bit_util::ceil(size_bytes, self.max_page_bytes as usize); // max_page_bytes默认32MiB
             // Can't slice it finer than 1 page per row
+            // 当个Page至少一行数据
             let num_parts = num_parts.min(array.len());
+
+            // num_parts <= 1，则使用一个Page，即创建一个单一的Encode Task
+            // 否则 按32KiB 切分为多个 Page，即当前Column 需要创建多个 Encode Task
+            // 这里以 num_parts <= 1 继续展开源码阅读
             if num_parts <= 1 {
                 // One part and it fits in a page
+                // 创建独立的encode task
                 Ok(vec![self.create_encode_task(vec![array])?])
             } else {
                 // One part and it needs to be sliced into multiple pages
@@ -504,7 +547,10 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
+
+        // 向累积队列accumulation_queue中添加要写入的数据
         if let Some(arrays) = self.accumulation_queue.insert(array, row_number, num_rows) {
+            // ************ 满足阈值，触发一次Flush! ************
             Ok(self.do_flush(arrays.0)?)
         } else {
             Ok(vec![])

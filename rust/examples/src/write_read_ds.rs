@@ -37,6 +37,7 @@ async fn write_dataset(data_path: &str) -> Result<(), Box<dyn std::error::Error>
         ..Default::default()
     };
 
+    // 调用 Dataset 的 write API开始写入数据
     Dataset::write(batches, data_path, Some(write_params)).await?;
     Ok(())
 } // End write dataset
@@ -70,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_path = tempdir.as_str();
 
     let result = async {
+        // 写数据
         write_dataset(data_path).await?;
         read_dataset(data_path).await?;
         Ok(())

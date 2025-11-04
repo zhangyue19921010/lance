@@ -12,6 +12,9 @@ use crate::{
 
 use lance_core::Result;
 
+/// 触发实际的数据压缩
+/// 
+/// 
 impl ArrayEncoder for CompressedBufferEncoder {
     fn encode(
         &self,
@@ -19,27 +22,38 @@ impl ArrayEncoder for CompressedBufferEncoder {
         _data_type: &DataType,
         buffer_index: &mut u32,
     ) -> Result<EncodedArray> {
+        
+        // 获取未压缩的原始数据
         let uncompressed_data = data.as_fixed_width().unwrap();
 
+        // 构建compressed buf，用于压缩数据
         let mut compressed_buf = Vec::with_capacity(uncompressed_data.data.len());
+        
+        // 基于compressor，压缩数据，这里以zstd为例，展开源码阅读
+        // compress 方法会将data数据压缩，并写入到 compressed_buf 数据结构中
         self.compressor
             .compress(&uncompressed_data.data, &mut compressed_buf)?;
 
+        // 构建 compressed_data ，此处为DataBlock::Opaque
+        // 该对象，持有压缩后的数据，当前buffer中的条数，以及blockInfo初始对象
         let compressed_data = DataBlock::Opaque(OpaqueBlock {
             buffers: vec![compressed_buf.into()],
             num_values: uncompressed_data.num_values,
             block_info: BlockInfo::new(),
         });
 
+        // 获取 comp_buf_index
         let comp_buf_index = *buffer_index;
         *buffer_index += 1;
 
+        // 构建扁平编码后的 array encoding 元数据信息
         let encoding = ProtobufUtils::flat_encoding(
             uncompressed_data.bits_per_value,
             comp_buf_index,
             Some(CompressionConfig::new(CompressionScheme::Zstd, None)),
         );
 
+        // 组装为 EncodedArray 并返回，该对象持有压缩后的数据 data，以及当前压缩编码的元数据信息 encoding
         Ok(EncodedArray {
             data: compressed_data,
             encoding,

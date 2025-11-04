@@ -98,6 +98,8 @@ impl ProtobufUtils {
         }
     }
 
+    /// 组装元数据信息，并进行flat压缩
+    /// 
     pub fn flat_encoding(
         bits_per_value: u64,
         buffer_index: u32,
@@ -105,11 +107,12 @@ impl ProtobufUtils {
     ) -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::Flat(Flat {
-                bits_per_value,
-                buffer: Some(pb::Buffer {
+                bits_per_value, // 每个值的bits大小
+                buffer: Some(pb::Buffer { // buffer 信息
                     buffer_index,
                     buffer_type: BufferType::Page as i32,
                 }),
+                // 压缩信息
                 compression: compression.map(|compression_config| pb::Compression {
                     scheme: compression_config.scheme.to_string(),
                     level: compression_config.level,

@@ -132,6 +132,9 @@ impl FileWriter {
         options: FileWriterOptions,
     ) -> Result<Self> {
         let mut writer = Self::new_lazy(object_writer, options);
+
+        // ********** IMPORTANT **********
+        // 初始化 Writer，基于 schema 提前初始化Column writer，包括序列化等逻辑
         writer.initialize(schema)?;
         Ok(writer)
     }
@@ -187,9 +190,16 @@ impl FileWriter {
         Ok(writer.finish().await? as usize)
     }
 
+    /// 将buf数据写入到文件系统中，这里还会涉及到pad对齐与填充
+    ///
+    ///
+    ///
     async fn do_write_buffer(writer: &mut ObjectWriter, buf: &[u8]) -> Result<()> {
+        // 基于writer，将buf中的数据全部写入至文件系统中
         writer.write_all(buf).await?;
+        // 64 bytes 填充对其
         let pad_bytes = pad_bytes::<PAGE_BUFFER_ALIGNMENT>(buf.len());
+        // 将对其的pad也写入到文件系统中
         writer.write_all(&PAD_BUFFER[..pad_bytes]).await?;
         Ok(())
     }
@@ -199,19 +209,49 @@ impl FileWriter {
         self.options.format_version.unwrap_or_default()
     }
 
+    /// 将给定的 Encoded Page写入到文件系统中
+    /// 一个Page中可能会包含多个Buffer，这里遍历所有Buffer，并写入到文件系统中
+    /// TODO zhangyue.1010 binary copy 应该调用到这个级别的API
+    /// 先从文件系统中读取为EncodedPage，然后直接处理EncodedPage
     async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
+        // 获取 page data
         let buffers = encoded_page.data;
+
+        // 基于buffer个数 初始化 buffer offsets vec，用于记录每个buffer的offset
         let mut buffer_offsets = Vec::with_capacity(buffers.len());
+
+        // 基于buffer个数 初始化 buffer sizes vec，用于记录每个buffer的size
         let mut buffer_sizes = Vec::with_capacity(buffers.len());
+
+        // 遍历 buffers中的每一个buffer
         for buffer in buffers {
+
+            // 填充当前 writer 的 游标（当前writer写入的字节偏移量）
             buffer_offsets.push(self.writer.tell().await? as u64);
+
+            // 填充当前buffer的大小
             buffer_sizes.push(buffer.len() as u64);
+
+            // 真正触发buffer的写入到文件系统中，这里涉及到pad 64 对齐和填充
             Self::do_write_buffer(&mut self.writer, &buffer).await?;
         }
+
+        // ----------- 至此，当前page的所有buffer数据已经全部写入到文件系统中了
+
+        // 获取 encoded page的元数据描述信息，并转换为Vec<u8>
         let encoded_encoding = match encoded_page.description {
             PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
             PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
         };
+
+        // 构建Page的元数据信息 以 pb message的形式
+        // TODO zhangyue.1010 注意这里的Page元数据构建，Binary Copy的时候是否涉及这里的改动
+        // page pb message中包含如下信息：
+        // 1. buffer_offsets（每一个buffer起始offset偏移量）
+        // 2. buffer_sizes（每一个buffer的buffer size）
+        // 3. 编码信息 Encoding元数据信息（序列化存储）
+        // 4. num rows
+        // 5. row number
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
@@ -223,14 +263,40 @@ impl FileWriter {
             length: encoded_page.num_rows,
             priority: encoded_page.row_number,
         };
+
+        // 从 column_metadata 取出当前 column对应的pages列表，并将当前page元数据存储到pages中
         self.column_metadata[encoded_page.column_idx as usize]
             .pages
             .push(page);
+
+        // ---------------------------------------------------------------------------
+        // 至此当前Page完成了所有编码、压缩、写入以及元数据组装等工作
+
         Ok(())
     }
 
+    /// 等待encoding_tasks完成，并将对应生成的Page数据（已完成编码和压缩，且持有对应的元数据信息）持久化，即写入到文件系统
+    ///
+    /// pub struct EncodedPage {
+    //     // The encoded page buffers
+    //     pub data: Vec<LanceBuffer>,
+    //     // A description of the encoding used to encode the page
+    //     pub description: PageEncoding,
+    //     /// The number of rows in the encoded page
+    //     pub num_rows: u64,
+    //     /// The top-level row number of the first row in the page
+    //     ///
+    //     /// Generally the number of "top-level" rows and the number of rows are the same.  However,
+    //     /// when there is repetition (list/fixed-size-list) there will be more or less items than rows.
+    //     ///
+    //     /// A top-level row can never be split across a page boundary.
+    //     pub row_number: u64,
+    //     /// The index of the column
+    //     pub column_idx: u32,
+    // }
     #[instrument(skip_all, level = "debug")]
     async fn write_pages(&mut self, mut encoding_tasks: FuturesOrdered<EncodeTask>) -> Result<()> {
+
         // As soon as an encoding task is done we write it.  There is no parallelism
         // needed here because "writing" is really just submitting the buffer to the
         // underlying write scheduler (either the OS or object_store's scheduler for
@@ -239,14 +305,25 @@ impl FileWriter {
         //
         // Also, there is no point in trying to make write_page parallel anyways
         // because we wouldn't want buffers getting mixed up across pages.
+
+        // 循环等待encoding_tasks 完成
+        // TODO zhangyue.1010 可以考虑在这里引入 Disruptor，解决压缩编码快，但写入慢的场景？意义不大，这里本身就是异步的了
         while let Some(encoding_task) = encoding_tasks.next().await {
+
+            // 当前 encoding task完成
+            // 取出其 encoded page 数据结构
             let encoded_page = encoding_task?;
+
+            // 调用 writer.rs 中的 write_page 方法，将 encoded page 写入到文件系统中
             self.write_page(encoded_page).await?;
         }
+
         // It's important to flush here, we don't know when the next batch will arrive
         // and the underlying cloud store could have writes in progress that won't advance
         // until we interact with the writer again.  These in-progress writes will time out
         // if we don't flush.
+
+        // 再触发一次 flush，将剩余的数据刷出去
         self.writer.flush().await?;
         Ok(())
     }
@@ -285,6 +362,15 @@ impl FileWriter {
         Ok(())
     }
 
+    /**
+    初始化 Self 中的下述关键组件：
+    1. self.num_columns
+    2. self.column_writers
+    3. self.column_metadata
+    4. self.field_id_to_column_indices
+    5. self.schema_metadata
+    6. self.schema
+    **/
     fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
         let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
             data_cache_bytes / schema.fields.len() as u64
@@ -309,6 +395,8 @@ impl FileWriter {
         schema.validate()?;
 
         let keep_original_array = self.options.keep_original_array.unwrap_or(false);
+
+        // 解析并获取 encoding_strategy
         let encoding_strategy = self.options.encoding_strategy.clone().unwrap_or_else(|| {
             let version = self.version();
             default_encoding_strategy(version).into()
@@ -320,12 +408,19 @@ impl FileWriter {
             keep_original_array,
             buffer_alignment: PAGE_BUFFER_ALIGNMENT as u64,
         };
+
+        // ******* 初始化 Column Encoder *******
+        // Batch Encoder == field encoders + mapping
         let encoder =
             BatchEncoder::try_new(&schema, encoding_strategy.as_ref(), &encoding_options)?;
+
         self.num_columns = encoder.num_columns();
 
         self.column_writers = encoder.field_encoders;
         self.column_metadata = vec![initial_column_metadata(); self.num_columns as usize];
+
+        // 初始化field_id_to_column_index
+        // 存储字段ID与列的位置索引的对应关系，Field ID --> Column Index
         self.field_id_to_column_indices = encoder.field_id_to_column_index;
         self.schema_metadata
             .extend(std::mem::take(&mut schema.metadata));
@@ -341,12 +436,15 @@ impl FileWriter {
         Ok(self.schema.as_ref().unwrap())
     }
 
+    /// 对于给定的batch数据，以及self，构建多个Encode Task
+    /// Encode Task的输出结果为 EncodedPage，包含压缩后的数据，压缩编码元数据，num_rows，column_index 等信息
     #[instrument(skip_all, level = "debug")]
     fn encode_batch(
         &mut self,
         batch: &RecordBatch,
         external_buffers: &mut OutOfLineBuffers,
     ) -> Result<Vec<Vec<EncodeTask>>> {
+        // 遍历schema中的每一列 field
         self.schema
             .as_ref()
             .unwrap()
@@ -354,7 +452,10 @@ impl FileWriter {
             .iter()
             .zip(self.column_writers.iter_mut())
             .map(|(field, column_writer)| {
+
+                // 对于特定列field，找到对应的 column_writer
                 let array = batch
+                    // 基于 field name，获取batch中，当前列的数据集 array
                     .column_by_name(&field.name)
                     .ok_or(Error::InvalidInput {
                         source: format!(
@@ -364,14 +465,24 @@ impl FileWriter {
                         .into(),
                         location: location!(),
                     })?;
+
+                // 提前构建好 rep/def 定义器
                 let repdef = RepDefBuilder::default();
+                // 获取当前array中包含的rows的个数
                 let num_rows = array.len() as u64;
+
+                // 基于当前column writer，尝试进行编码，并创建对应的Encode Task
+                // 此处 单个Column调用 maybe_encode，可能会返回多个Encode Task
+                // 1. 对于嵌套 Column，每一个leaf column对应一个 encode task
+                // 2. 对于大的 Column，可能要切分为存储在多个Page中
+                // 3. 一个Encode Task对应一个Page的写入
+                // Encode Task的输出结果为 EncodedPage，包含压缩后的数据，压缩编码元数据，num_rows，column_index 等信息
                 column_writer.maybe_encode(
                     array.clone(),
                     external_buffers,
                     repdef,
-                    self.rows_written,
-                    num_rows,
+                    self.rows_written, // 当前批次写入的起始条数（全局变量）
+                    num_rows, // 当前批次的总条数
                 )
             })
             .collect::<Result<Vec<_>>>()
@@ -381,6 +492,11 @@ impl FileWriter {
     ///
     /// Note: the future returned by this method may complete before the data has been fully
     /// flushed to the file (some data may be in the data cache or the I/O cache)
+    ///
+    /// ************ IMPORTANT ************
+    /// Writer 将Batch数据写入到文件中的核心逻辑 V2
+    ///
+    ///
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         debug!(
             "write_batch called with {} rows, {} columns, and {} bytes of data",
@@ -388,8 +504,12 @@ impl FileWriter {
             batch.num_columns(),
             batch.get_array_memory_size()
         );
+
+        // 确保 self 中 Schema 以及对应 writer/encoder 已经初始化完成
         self.ensure_initialized(batch)?;
+        // 校验Batch数据是否满足Schema nullable的要求
         self.verify_nullability_constraints(batch)?;
+        // 获取当前Batch一共包含多少条数据
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
@@ -400,21 +520,32 @@ impl FileWriter {
                 location: location!(),
             });
         }
+
+        // 按需提前构建 external buffers
+        // 目前只支持 large binary encoding
         // First we push each array into its column writer.  This may or may not generate enough
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
         let mut external_buffers =
             OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
+
+
+        // *************************** IMPORTANT ***************************
+        // 基于self，batch数据集构建 encoding task
+        // 每一个encoding tasks 负责构建 Encode Task（输出结果为 EncodedPage，包含压缩后的数据，压缩编码元数据，num_rows，column_index 等信息）
+        //
         let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
         // Next, write external buffers
         for external_buffer in external_buffers.take_buffers() {
             Self::do_write_buffer(&mut self.writer, &external_buffer).await?;
         }
 
+        // 展开 encoding_tasks
         let encoding_tasks = encoding_tasks
             .into_iter()
             .flatten()
             .collect::<FuturesOrdered<_>>();
 
+        // 更新 self.rows_written
         self.rows_written = match self.rows_written.checked_add(batch.num_rows() as u64) {
             Some(rows_written) => rows_written,
             None => {
@@ -422,6 +553,7 @@ impl FileWriter {
             }
         };
 
+        // 传入encoding_tasks，并等待task完成后，写入Page至存储系统
         self.write_pages(encoding_tasks).await?;
 
         Ok(())
@@ -567,7 +699,19 @@ impl FileWriter {
     /// data has been flushed and the file has been closed.
     ///
     /// Returns the total number of rows written
+    ///
+    ///
+    ///
+    /// 完成当前文件的写入：
+    ///
+    /// 这个方法会持续等待，直到全部数据写入到文件中。接下来会将metadata以及footer写入到文件中，Lance会持续等待
+    /// 直到元数据文件也完成写入，且文件句柄关闭
+    ///
+    /// 最后 返回当前writer一共写入了多少条数据
+    ///
+    ///
     pub async fn finish(&mut self) -> Result<u64> {
+        
         // 1. flush any remaining data and write out those pages
         let mut external_buffers =
             OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);

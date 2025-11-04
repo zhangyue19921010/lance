@@ -187,6 +187,11 @@ impl BasicEncoder {
     }
 }
 
+/// 开始编码
+/// 对于给定的Data Block编码为 EncodedArray
+/// 
+/// 
+/// 
 impl ArrayEncoder for BasicEncoder {
     fn encode(
         &self,

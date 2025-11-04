@@ -89,7 +89,10 @@ impl<'a> InsertBuilder<'a> {
         stream: SendableRecordBatchStream,
         schema: Schema,
     ) -> Result<Dataset> {
+        // 写数据问题
         let (transaction, context) = self.write_uncommitted_stream_impl(stream, schema).await?;
+
+        // 提交commit，写元数据文件
         Self::do_commit(&context, transaction).await
     }
 
@@ -193,12 +196,16 @@ impl<'a> InsertBuilder<'a> {
             mode=?context.params.mode
         );
 
+        // 校验写入“环境”，包括Schema以及feature flag
         self.validate_write(&mut context, &schema)?;
 
         let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
+
+        // 确定Target Base，即写入的目标目录
         let target_base_info =
             validate_and_resolve_target_bases(&mut context.params, existing_base_paths).await?;
 
+        // 开始写入fragments
         let written_frags = write_fragments_internal(
             context.dest.dataset(),
             context.object_store.clone(),
