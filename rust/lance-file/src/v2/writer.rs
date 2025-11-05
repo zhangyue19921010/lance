@@ -100,10 +100,16 @@ pub struct FileWriterOptions {
     pub format_version: Option<LanceFileVersion>,
 }
 
+
 pub struct FileWriter {
     writer: ObjectWriter,
     schema: Option<LanceSchema>,
     column_writers: Vec<Box<dyn FieldEncoder>>,
+    // Column metadata 包含
+    // 1. encoding
+    // 2. pages
+    // 3. buffer_offsets
+    // 4. buffer_sizes
     column_metadata: Vec<pbfile::ColumnMetadata>,
     field_id_to_column_indices: Vec<(u32, u32)>,
     num_columns: u32,
@@ -192,8 +198,6 @@ impl FileWriter {
 
     /// 将buf数据写入到文件系统中，这里还会涉及到pad对齐与填充
     ///
-    ///
-    ///
     async fn do_write_buffer(writer: &mut ObjectWriter, buf: &[u8]) -> Result<()> {
         // 基于writer，将buf中的数据全部写入至文件系统中
         writer.write_all(buf).await?;
@@ -276,7 +280,7 @@ impl FileWriter {
     }
 
     /// 等待encoding_tasks完成，并将对应生成的Page数据（已完成编码和压缩，且持有对应的元数据信息）持久化，即写入到文件系统
-    ///
+    /// 并将Pages元数据信息缓存在 self 的 column_metadata中的pages字段中
     /// pub struct EncodedPage {
     //     // The encoded page buffers
     //     pub data: Vec<LanceBuffer>,
@@ -559,6 +563,7 @@ impl FileWriter {
         Ok(())
     }
 
+    /// 写入所有的column metadata至文件系统中
     async fn write_column_metadata(
         &mut self,
         metadata: pbfile::ColumnMetadata,
@@ -570,6 +575,8 @@ impl FileWriter {
         Ok((position, len))
     }
 
+    ///
+    /// 写入column metadata信息，并返位置
     async fn write_column_metadatas(&mut self) -> Result<Vec<(u64, u64)>> {
         let mut metadatas = Vec::new();
         std::mem::swap(&mut self.column_metadata, &mut metadatas);
@@ -594,6 +601,11 @@ impl FileWriter {
         })
     }
 
+    ///
+    /// 写入Global buffer至文件系统中
+    ///
+    /// 1. schema信息等元数据信息
+    /// 2. 返回gbo_table（Vec）
     async fn write_global_buffers(&mut self) -> Result<Vec<(u64, u64)>> {
         let schema = self.schema.as_mut().ok_or(Error::invalid_input("No schema provided on writer open and no data provided.  Schema is unknown and file cannot be created", location!()))?;
         schema.metadata = std::mem::take(&mut self.schema_metadata);
@@ -630,12 +642,33 @@ impl FileWriter {
         Ok(self.global_buffers.len() as u32)
     }
 
+    ///
+    /// finish 所有的 column writer，包括数据写入、元数据写入（column buffer）以及元数据组装
+    ///
+    /// 1. finish writer  --> olumn元数据
+    /// 2. 完成external buffers的写入
+    /// 3. column中的final pages的写入
+    /// 4. 将 column buffer 写入到文件系统中
+    /// 5. 组装 column_metadata 元数据 --> buffer_offsets，buffer_sizes，encoding
+    ///
+    ///
     async fn finish_writers(&mut self) -> Result<()> {
+
+        // 记录当前处理到了哪个位置的index
         let mut col_idx = 0;
+
+        // 遍历所有的column writers
         for mut writer in std::mem::take(&mut self.column_writers) {
+
+            // 对于每一个 column writer
+            // 基于当前writer写入的偏移量，初始化一个新的external buffers
             let mut external_buffers =
                 OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
+
+            // 调用writer的finish方法，并获取Column元数据
             let columns = writer.finish(&mut external_buffers).await?;
+
+            // 完成所有external buffers的写入
             for buffer in external_buffers.take_buffers() {
                 self.writer.write_all(&buffer).await?;
             }
@@ -647,26 +680,46 @@ impl FileWriter {
                 col_idx,
                 columns.len()
             );
+
+            // 遍历所有的Columns: EncodedColumn
             for column in columns {
+
+                // 遍历column中的所有pages，并完成final pages的写入
                 for page in column.final_pages {
                     self.write_page(page).await?;
                 }
+
+                // 开始构建当前Column的元数据信息
                 let column_metadata = &mut self.column_metadata[col_idx];
+
+                // 获取当前writer的游标
                 let mut buffer_pos = self.writer.tell().await? as u64;
+                // 遍历所有column_buffers
                 for buffer in column.column_buffers {
+                    // 填充 column_metadata.buffer_offsets
                     column_metadata.buffer_offsets.push(buffer_pos);
                     let mut size = 0;
+
+                    // 将当前buffer写入到文件系统中
                     Self::do_write_buffer(&mut self.writer, &buffer).await?;
+                    // 记录写入的 buffer size
                     size += buffer.len() as u64;
+                    // 推进 buffer_pos
                     buffer_pos += size;
+                    // 填充 column_metadata.buffer_sizes
                     column_metadata.buffer_sizes.push(size);
                 }
+
+                // 将column的encoding元数据信息编码
                 let encoded_encoding = Any::from_msg(&column.encoding)?.encode_to_vec();
+
+                // 将当前列的编码信息填充至column_metadata.encoding
                 column_metadata.encoding = Some(pbfile::Encoding {
                     location: Some(pbfile::encoding::Location::Direct(pbfile::DirectEncoding {
                         encoding: encoded_encoding,
                     })),
                 });
+                // 推进 col_idx
                 col_idx += 1;
             }
         }
@@ -704,41 +757,71 @@ impl FileWriter {
     ///
     /// 完成当前文件的写入：
     ///
-    /// 这个方法会持续等待，直到全部数据写入到文件中。接下来会将metadata以及footer写入到文件中，Lance会持续等待
-    /// 直到元数据文件也完成写入，且文件句柄关闭
+    /// 这个方法会持续等待，直到全部数据写入到文件中。接下来会将metadata以及footer写入到文件中
+    /// Lance会继续等待，直到元数据文件也完成写入，且文件句柄关闭
     ///
     /// 最后 返回当前writer一共写入了多少条数据
     ///
     ///
+    /// 1. finish page write
+    /// 2. finish Global buffer write
+    /// 3. finish column metadata write
+    /// 4. finish CMO写入
+    /// 5. finish GBO写入
+    /// 6. 完成Footer写入
+    /// 7. close writer
+    ///
+    /// ==> 返回最终写入了多少条数据
+    ///
     pub async fn finish(&mut self) -> Result<u64> {
-        
+
+        // 基于当前Writer的游标（当前Writer写到了哪个offset，位点偏移量）
+        // 构建 external buffers
         // 1. flush any remaining data and write out those pages
         let mut external_buffers =
             OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
+
+        // 基于当前的column writers，构建 encoding tasks
+        // 遍历所有的column writers
         let encoding_tasks = self
             .column_writers
             .iter_mut()
+            // 对于特定的column writer，调用writer的flush方法，生成encode tasks
             .map(|writer| writer.flush(&mut external_buffers))
             .collect::<Result<Vec<_>>>()?;
+
+        // 遍历external buffers
+        // 对每一个external buffer，调用一次write buffer操作
         for external_buffer in external_buffers.take_buffers() {
             Self::do_write_buffer(&mut self.writer, &external_buffer).await?;
         }
+
+        // 将encoding_tasks排序
         let encoding_tasks = encoding_tasks
             .into_iter()
             .flatten()
             .collect::<FuturesOrdered<_>>();
+
+        // 调用write pages 方法，并等待所有pages写入完成
+        // 并将Pages元数据信息缓存在 self 的 column_metadata中的pages字段中
         self.write_pages(encoding_tasks).await?;
 
+        // 调用finish_writers 方法，确保所有writers都完成写入
+        // 这里的writers是column writer
+        // --------------------------- 至此，所有列相关的操作包括（page写入，page元数据组装，column元数据写入，column buffers）都已经完成 --------------------------
         self.finish_writers().await?;
 
+        // 开始写入global buffers，并返回位置信息
         // 3. write global buffers (we write the schema here)
         let global_buffer_offsets = self.write_global_buffers().await?;
         let num_global_buffers = global_buffer_offsets.len() as u32;
 
+        // 开始写入Column metadata，并返回位置信息
         // 4. write the column metadatas
         let column_metadata_start = self.writer.tell().await? as u64;
         let metadata_positions = self.write_column_metadatas().await?;
 
+        // 写入CMO
         // 5. write the column metadata offset table
         let cmo_table_start = self.writer.tell().await? as u64;
         for (meta_pos, meta_len) in metadata_positions {
@@ -746,6 +829,7 @@ impl FileWriter {
             self.writer.write_u64_le(meta_len).await?;
         }
 
+        // 写入GBO
         // 6. write global buffers offset table
         let gbo_table_start = self.writer.tell().await? as u64;
         for (gbo_pos, gbo_len) in global_buffer_offsets {
@@ -754,6 +838,7 @@ impl FileWriter {
         }
 
         let (major, minor) = self.version_to_numbers();
+        // 完成footer写入
         // 7. write the footer
         self.writer.write_u64_le(column_metadata_start).await?;
         self.writer.write_u64_le(cmo_table_start).await?;

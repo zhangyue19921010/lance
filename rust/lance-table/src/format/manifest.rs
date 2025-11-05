@@ -113,6 +113,15 @@ pub fn is_detached_version(version: u64) -> bool {
     version & DETACHED_VERSION_MASK != 0
 }
 
+//假设有三个片段，行数分别为100、150和80
+// let fragments = vec![
+//     Fragment { /* 包含100行数据 */ },
+//     Fragment { /* 包含150行数据 */ },
+//     Fragment { /* 包含80行数据 */ }, ];
+
+// 调用函数后的结果
+// let offsets = compute_fragment_offsets(&fragments);
+// offsets = [0, 100, 250, 330]
 fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
     fragments
         .iter()
@@ -205,12 +214,16 @@ impl Manifest {
         }
     }
 
+    /// 基于previous manifest以及最新的 fragments 构建最新的manifest
+    /// 
+    /// 
     pub fn new_from_previous(
         previous: &Self,
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
         new_blob_version: Option<u64>,
     ) -> Self {
+        // 计算fragment_offsets（Fragment行数）
         let fragment_offsets = compute_fragment_offsets(&fragments);
         let local_schema = schema.retain_storage_class(StorageClass::Default);
 

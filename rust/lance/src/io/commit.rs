@@ -111,6 +111,8 @@ async fn do_commit_new_dataset(
     metadata_cache: &DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    // 写transaction文件
+    // TODO zhangyue.1010 这里可能会有冲突的问题吧？？？多个任务同时创建新的dataset
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
     let (mut manifest, indices) = if let Operation::Clone {
@@ -252,6 +254,7 @@ pub(crate) async fn commit_new_dataset(
         None
     };
 
+    // 对于新的dataset 开始commit元数据
     do_commit_new_dataset(
         object_store,
         commit_handler,
@@ -779,6 +782,9 @@ async fn load_and_sort_new_transactions(
 }
 
 /// Attempt to commit a transaction, with retries and conflict resolution.
+///
+/// 尝试基于 transaction 提交元数据，这里会进行retry来解决冲突提交
+///
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
@@ -811,15 +817,21 @@ pub(crate) async fn commit_transaction(
 
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.
+    // 获取历史version
     let read_version = transaction.read_version;
+    // 计算当前version
     let mut target_version = read_version + 1;
+    // 备份dataset
     let original_dataset = dataset.clone();
 
     // read_version sometimes defaults to zero for overwrite.
     // If num_retries is zero, we are in "strict overwrite" mode.
     // Strict overwrites are not subject to any sort of automatic conflict resolution.
+    // 判断当前是否为“严格模式”
     let strict_overwrite = matches!(transaction.operation, Operation::Overwrite { .. })
         && commit_config.num_retries == 0;
+
+    // 校正dataset中的version
     let mut dataset =
         if dataset.manifest.version != read_version && (read_version != 0 || strict_overwrite) {
             // If the dataset version is not the same as the read version, we need to
@@ -840,6 +852,12 @@ pub(crate) async fn commit_transaction(
     // We keep pair of (version, transaction). No other transactions to check initially
     let mut other_transactions: Vec<(u64, Arc<Transaction>)>;
 
+    //
+    //
+    // 开始在while中进行 commit，当然这里有attempts次数的限制
+    // Lance 对与冲突写入始终是悲观的，即每次都会检测并rebase尝试解决冲突，这样能够获取可预测的并发写入性能
+    // 乐观的场景下，会使得顺序写入快但并发写入慢
+    //
     while backoff.attempt() < num_attempts {
         // We are pessimistic here and assume there may be other transactions
         // we need to check for. We could be optimistic here and blindly
@@ -848,7 +866,10 @@ pub(crate) async fn commit_transaction(
         // faster and the slow path slower, which makes performance less predictable
         // for users. So we always check for other transactions.
         // We skip this for strict overwrites, because strict overwrites can't be rebased.
+        // TODO zhangyue.1010 能否开启乐观模式，因为串行写入时无需额外的list行为
+        // TODO zhangyue.1010 transactions 的脏文件
         if !strict_overwrite {
+            // 在非严格的模式下
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
             // See if we can retry the commit. Try to account for all
@@ -863,12 +884,16 @@ pub(crate) async fn commit_transaction(
                 rebase.check_txn(other_transaction, *other_version)?;
             }
 
+            // 修正 dataset
+            // 重置 transaction
             transaction = rebase.finish(&dataset).await?;
         }
 
+        // 创建 transaction file
         let transaction_file =
             write_transaction_file(object_store, &dataset.base, &transaction).await?;
 
+        // target version +1
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
             return Err(Error::Internal { message: "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.".into(), location: location!() });
@@ -886,6 +911,11 @@ pub(crate) async fn commit_transaction(
                 )
                 .await?
             }
+            // 基于当前的manifest以及transaction中的信息，构建新的manifest
+            // 这块儿挺复杂的。。。 慢慢再看吧------
+            // TODO zhangyue.1010 manifest文件的创建再看看。。。。
+            // 先看看 append 相关的以及Core逻辑
+            // compaction 应该是 rewrite相关的逻辑
             _ => transaction.build_manifest(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
@@ -913,6 +943,7 @@ pub(crate) async fn commit_transaction(
         migrate_indices(&dataset, &mut indices).await?;
 
         // Try to commit the manifest
+        // 写入manifest文件
         let result = write_manifest_file(
             object_store,
             commit_handler,
@@ -967,6 +998,8 @@ pub(crate) async fn commit_transaction(
                         _ => {}
                     };
                 }
+
+                // TODO zhangyue.1010 这里可以搞一个commit finish hook，在Commit成功后对外界发送某种信息
                 return Ok((manifest, manifest_location));
             }
             Err(CommitError::CommitConflict) => {

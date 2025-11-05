@@ -184,12 +184,23 @@ pub trait FieldEncoder: Send {
     ///
     /// This may be called intermittently throughout encoding but will always be called
     /// once at the end of encoding just before calling finish
+    ///
+    ///
+    /// Flush数据：
+    /// 1. 将Buffers中所有剩余的数据全部构建 encoding tasks并 flush
+    /// 2. 每一个encode task生成一个page，并排序这些Page，通常来说我们并不关注column之间的顺序，但是相同column中的不同page需要有序
+    /// 3. finish方法在写入过程中可能会被调用。但一定会在完成写入的时候再调用一次
+    ///
+    /// 这里以PrimitiveFieldEncoder为例，继续展开源码阅读
     fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>>;
+
     /// Finish encoding and return column metadata
     ///
     /// This is called only once, after all encode tasks have completed
     ///
     /// This returns a Vec because a single field may have created multiple columns
+    /// 
+    /// 完成编码，并返回Column元数据
     fn finish(
         &mut self,
         external_buffers: &mut OutOfLineBuffers,

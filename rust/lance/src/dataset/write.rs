@@ -444,18 +444,25 @@ pub async fn do_write_fragments(
             // ************************************ finish() function is VERY IMPORTANT *********************************
             // 涉及到元数据组装，而这里的元数据组装是 TODO zhangyue.1010 binary copy的核心逻辑之一
             // 返回 num_rows 以及 data file对象
+            // ---------- 至此当前文件已完成全部写入，包括数据与元数据
             let (num_rows, data_file) = writer.take().unwrap().finish().await?;
+
+
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
             debug_assert_eq!(num_rows, num_rows_in_current_file);
+            // 标记当前progress的fragment完成写入
             params.progress.complete(fragments.last().unwrap()).await?;
+            // 填充fragment的physical_rows和files信息
             let last_fragment = fragments.last_mut().unwrap();
             last_fragment.physical_rows = Some(num_rows as usize);
             last_fragment.files.push(data_file);
+            // 重置total row number
             num_rows_in_current_file = 0;
         }
     }
 
     // Complete the final writer
+    // 完成最后一个writer的写入
     if let Some(mut writer) = writer.take() {
         let (num_rows, data_file) = writer.finish().await?;
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
@@ -464,6 +471,7 @@ pub async fn do_write_fragments(
         last_fragment.files.push(data_file);
     }
 
+    // ---------- 至此，所有数据写入均已完成
     Ok(fragments)
 }
 
@@ -705,6 +713,7 @@ pub async fn write_fragments_internal(
 
     // 前置Schema以及参数渲染已经完成
     // 开始写入fragments data file
+    // ------------------ 至此，所有数据写入都已经完成了
     let fragments_fut = do_write_fragments(
         object_store.clone(),
         base_dir,
@@ -715,8 +724,8 @@ pub async fn write_fragments_internal(
         target_bases_info,
     );
 
-    // --------------------------------- 到这里了---------------------------------
 
+    // 处理下blob_data的写入
     let (default, blob) = if let Some(blob_data) = blob_data {
         let blob_schema = schema.retain_storage_class(StorageClass::Blob);
         let blobs_path = base_dir.child("_blobs");
@@ -738,6 +747,8 @@ pub async fn write_fragments_internal(
         ((fragments, frag_schema), None)
     };
 
+    // 将写入的fragment信息组装为WrittenFragments并返回
+    // 这里也特殊处理了下blob
     Ok(WrittenFragments { default, blob })
 }
 
@@ -834,10 +845,10 @@ impl GenericWriter for V2WriterAdapter {
         let (major, minor) = self.writer.version().to_numbers();
 
         // 调用writer的finish方法，并等待其完成
-        // --------------------------------------- 看到这里了 -----------------------------------
+        // ------------------------ 至此当前文件已经完成所有写入 包括数据与元数据，以及footer ---------------------
         let num_rows = self.writer.finish().await? as u32;
 
-        //
+        // 构建DataFile对象
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
@@ -848,7 +859,7 @@ impl GenericWriter for V2WriterAdapter {
             self.base_id,
         );
 
-        //
+        // 返回当次写入的num_rows以及data_file对象
         Ok((num_rows, data_file))
     }
 }

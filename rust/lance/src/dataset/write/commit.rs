@@ -181,12 +181,20 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// 开始Commit元数据
+    ///
+    ///
+    ///
+    ///
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
+
+        // 初始化Session
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
             .unwrap_or_default();
 
+        // 基于dest，初始化object_store，base_path以及commit_handler
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
@@ -205,6 +213,7 @@ impl<'a> CommitBuilder<'a> {
                 {
                     self.commit_handler.as_ref().unwrap().clone()
                 } else {
+                    // 基于给定的store（存储类型）初始化对应的commit-handler（rename？）
                     resolve_commit_handler(uri, self.commit_handler.clone(), &self.store_params)
                         .await?
                 };
@@ -215,6 +224,7 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
+        // 初始化 Write Destination 对象
         let dest = match &self.dest {
             WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
             WriteDestination::Uri(uri) => {
@@ -234,6 +244,9 @@ impl<'a> CommitBuilder<'a> {
                     builder = builder.with_version(transaction.read_version)
                 }
 
+                // ----- 加载元数据信息，即加载dataset信息
+                // 并调用 WriteDestination::Dataset API 初始化 WriteDestination
+                // 如果加载失败，且"Not Found"异常，则代表此为新表，第一次写入，此时返回 WriteDestination::Uri(uri)
                 match builder.load().await {
                     Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
                     Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
@@ -243,6 +256,9 @@ impl<'a> CommitBuilder<'a> {
                 }
             }
         };
+        // -------- 至此 dest: WriteDestination已经完成初始化 -------
+        // 对于已存在的表为  WriteDestination::Dataset(Arc::new(dataset))
+        // 对于新表为 WriteDestination::Uri(uri)
 
         if dest.dataset().is_none()
             && !matches!(
@@ -265,6 +281,7 @@ impl<'a> CommitBuilder<'a> {
             validate_operation(None, &transaction.operation)?;
         }
 
+        // 获取 metadata_cache 以及 index_cache
         let (metadata_cache, index_cache) = match &dest {
             WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
             WriteDestination::Uri(uri) => (
@@ -273,6 +290,7 @@ impl<'a> CommitBuilder<'a> {
             ),
         };
 
+        // 确定 manifest 的命名规范
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
             ds.manifest_location.naming_scheme
         } else if self.enable_v2_manifest_paths {
@@ -281,6 +299,7 @@ impl<'a> CommitBuilder<'a> {
             ManifestNamingScheme::V1
         };
 
+        // 是否开启 uses_stable_row_ids
         let use_stable_row_ids = if let Some(ds) = dest.dataset() {
             ds.manifest.uses_stable_row_ids()
         } else {
@@ -312,6 +331,14 @@ impl<'a> CommitBuilder<'a> {
             ..Default::default()
         };
 
+        //
+        // ****************************************************************************************
+        //
+        // IMPORTANT: 终于开始要写元数据文件了 ==> 1. 重点看 commit_transaction 这个方法 2. commit_new_dataset
+        //
+        // ****************************************************************************************
+        //
+        //
         let (manifest, manifest_location) = if let Some(dataset) = dest.dataset() {
             if self.detached {
                 if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
@@ -330,6 +357,8 @@ impl<'a> CommitBuilder<'a> {
                 )
                 .await?
             } else {
+                // 重点看这里
+                // commit元数据，当然是基于 transaction 的
                 commit_transaction(
                     dataset,
                     object_store.as_ref(),
@@ -349,6 +378,7 @@ impl<'a> CommitBuilder<'a> {
                 location: location!(),
             });
         } else {
+            // 对于新表，走这里
             commit_new_dataset(
                 object_store.as_ref(),
                 commit_handler.as_ref(),
@@ -372,6 +402,7 @@ impl<'a> CommitBuilder<'a> {
             operation=&transaction.operation.name()
         );
 
+        // 构建 fragment_bitmap
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
         match &self.dest {

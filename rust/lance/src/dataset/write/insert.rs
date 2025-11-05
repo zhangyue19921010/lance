@@ -89,10 +89,11 @@ impl<'a> InsertBuilder<'a> {
         stream: SendableRecordBatchStream,
         schema: Schema,
     ) -> Result<Dataset> {
-        // 写数据问题
+        // 写数据文件
+        // ------- 至此所有数据文件均完成写入，且初始化transaction对象
         let (transaction, context) = self.write_uncommitted_stream_impl(stream, schema).await?;
 
-        // 提交commit，写元数据文件
+        // 开始提交元数据！！！
         Self::do_commit(&context, transaction).await
     }
 
@@ -124,7 +125,11 @@ impl<'a> InsertBuilder<'a> {
         self.write_uncommitted_impl(data).await.map(|(t, _)| t)
     }
 
+    /// 开始提交元数据信息！！！
+    /// 这里先渲染一些参数
     async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
+
+        // 初始化Commit builder对象
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_stable_row_ids(context.params.enable_stable_row_ids)
             .with_storage_format(context.storage_version)
@@ -133,14 +138,17 @@ impl<'a> InsertBuilder<'a> {
             .with_object_store(context.object_store.clone())
             .with_skip_auto_cleanup(context.params.skip_auto_cleanup);
 
+        // 渲染 store_params参数
         if let Some(params) = context.params.store_params.as_ref() {
             commit_builder = commit_builder.with_store_params(params.clone());
         }
 
+        // 渲染 params.session 参数
         if let Some(session) = context.params.session.as_ref() {
             commit_builder = commit_builder.with_session(session.clone());
         }
 
+        // 开始执行 commit with transaction
         commit_builder.execute(transaction).await
     }
 
@@ -206,6 +214,7 @@ impl<'a> InsertBuilder<'a> {
             validate_and_resolve_target_bases(&mut context.params, existing_base_paths).await?;
 
         // 开始写入fragments
+        // ---------- 至此所有数据的写入都已经完成，并返回writtenFragments
         let written_frags = write_fragments_internal(
             context.dest.dataset(),
             context.object_store.clone(),
@@ -217,16 +226,20 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
+        // 构建Operation，并基于此初始化transaction对象
         let transaction = Self::build_transaction(schema, written_frags, &context)?;
 
         Ok((transaction, context))
     }
 
+    /// 构建Operation对象，并基于此初始化transaction对象
     fn build_transaction(
         schema: Schema,
         written_frags: WrittenFragments,
         context: &WriteContext<'_>,
     ) -> Result<Transaction> {
+
+        // 渲染Operation信息
         let operation = match context.params.mode {
             WriteMode::Create => {
                 // Fetch auto_cleanup params from context
@@ -291,6 +304,7 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments: blob.0 },
         });
 
+        // 基于operation以及version，初始化transaction，并返回
         let transaction = TransactionBuilder::new(
             context
                 .dest

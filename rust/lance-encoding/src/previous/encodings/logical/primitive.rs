@@ -494,7 +494,7 @@ impl PrimitiveFieldEncoder {
             let array = arrays.into_iter().next().unwrap();
             // 获取 buffer size in bytes
             let size_bytes = array.get_buffer_memory_size();
-            // 按32KiB切分当前buffer，看看总共需要多个page
+            // 按32MiB切分当前buffer，看看总共需要多个page
             let num_parts = bit_util::ceil(size_bytes, self.max_page_bytes as usize); // max_page_bytes默认32MiB
             // Can't slice it finer than 1 page per row
             // 当个Page至少一行数据
@@ -557,9 +557,15 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         }
     }
 
+    ///
+    /// 1. 调用“累积队列”的flush方法，获取队列中的Vec<ArrayRef>
+    /// 2. 对每个ArrayRef触发一次 do flush操作
+    /// 
+    /// 
     // If there is any data left in the buffer then create an encode task from it
     fn flush(&mut self, _external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.flush() {
+            // 对于每个array，触发一次do_flush操作，即生成一个EncodeTask Future，该Task完成后会生成一个 EncodePage对象
             Ok(self.do_flush(arrays.0)?)
         } else {
             Ok(vec![])
@@ -570,6 +576,8 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         1
     }
 
+    ///Finish 以及返回 EncodedColumn（Column元数据）
+    /// 
     fn finish(
         &mut self,
         _external_buffers: &mut OutOfLineBuffers,

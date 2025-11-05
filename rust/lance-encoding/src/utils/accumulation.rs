@@ -92,6 +92,8 @@ impl AccumulationQueue {
         }
     }
 
+    /// 取出队列中剩余的所有arrays
+    /// 
     pub fn flush(&mut self) -> Option<(Vec<ArrayRef>, u64, u64)> {
         if self.buffered_arrays.is_empty() {
             trace!(

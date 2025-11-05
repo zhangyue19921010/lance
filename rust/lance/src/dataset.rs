@@ -615,12 +615,19 @@ impl Dataset {
         )
     }
 
+    /// 加载 manifest 并缓存index信息到session中
+    ///
+    /// 这里在加载的时候有一个 last_block 的优化，减少IO次数
+    ///
     pub(crate) async fn load_manifest(
         object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
         uri: &str,
         session: &Session,
     ) -> Result<Manifest> {
+
+        // 初始化 object reader
+        // 根据是否直到 manifest_location 的 size，有不同的初始化方式
         let object_reader = if let Some(size) = manifest_location.size {
             object_store
                 .open_with_size(&manifest_location.path, size as usize)
@@ -637,6 +644,7 @@ impl Dataset {
             _ => e,
         })?;
 
+        // 获取一个block大小的数据
         let last_block =
             read_last_block(object_reader.as_ref())
                 .await
@@ -651,18 +659,26 @@ impl Dataset {
                         location: location!(),
                     },
                 })?;
+
+        // 基于 last block 获取 metadata 的 offset
         let offset = read_metadata_offset(&last_block)?;
 
         // If manifest is in the last block, we can decode directly from memory.
+        // 获取manifest文件的size
         let manifest_size = object_reader.size().await?;
+
         let mut manifest = if manifest_size - offset <= last_block.len() {
+            // 如果manifest完整包含在last block中
             let manifest_len = manifest_size - offset;
             let offset_in_block = last_block.len() - manifest_len;
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
+
+            // 直接寻址last block并反序列化生成Manifest
             Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
         } else {
+            // 否则按offset加载manifest
             read_struct(object_reader.as_ref(), offset).await
         }?;
 
@@ -680,6 +696,7 @@ impl Dataset {
 
         // If indices were also the last block, we can take the opportunity to
         // decode them now and cache them.
+        // 从manifest中加载indexSection，并缓存到session中
         if let Some(index_offset) = manifest.index_section {
             if manifest_size - index_offset <= last_block.len() {
                 let offset_in_block = last_block.len() - (manifest_size - index_offset);
@@ -695,6 +712,8 @@ impl Dataset {
                     .map(IndexMetadata::try_from)
                     .collect::<Result<Vec<_>>>()?;
                 retain_supported_indices(&mut indices);
+
+                // 将index信息缓存到session中
                 let ds_index_cache = session.index_cache.for_dataset(uri);
                 let metadata_key = crate::session::index_caches::IndexMetadataKey {
                     version: manifest_location.version,

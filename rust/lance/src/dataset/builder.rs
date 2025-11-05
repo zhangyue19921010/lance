@@ -461,6 +461,7 @@ impl DatasetBuilder {
         }
     }
 
+    /// Load 元数据信息
     #[instrument(skip_all)]
     pub async fn load(self) -> Result<Dataset> {
         let uri = self.table_uri.clone();
@@ -477,6 +478,9 @@ impl DatasetBuilder {
         }
     }
 
+    /// Load 元数据信息，并构建 Dataset 对象
+    ///
+    ///
     async fn load_impl(mut self) -> Result<Dataset> {
         // Apply storage_options_override last to ensure namespace options take precedence
         if let Some(override_opts) = self.storage_options_override.take() {
@@ -499,6 +503,7 @@ impl DatasetBuilder {
         let table_uri = self.table_uri.clone();
 
         // How do we detect which version scheme is in use?
+        // 获取当前的manifest，如果获取失败则直接报错
         let manifest = self.manifest.take();
 
         let file_reader_options = self.file_reader_options.clone();
@@ -542,6 +547,8 @@ impl DatasetBuilder {
             None => (None, None),
         };
 
+        // -------------------------- IMPORTANT --------------------------
+        // 基于给定uri加载dataset（元数据而非数据）
         let dataset = Self::load_by_uri(
             session,
             manifest,
@@ -576,6 +583,7 @@ impl DatasetBuilder {
         Ok(dataset)
     }
 
+    /// 基于uri完成dataset的加载
     #[allow(clippy::too_many_arguments)]
     pub async fn load_by_uri(
         session: Arc<Session>,
@@ -588,17 +596,34 @@ impl DatasetBuilder {
         commit_handler: Arc<dyn CommitHandler>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Dataset> {
+
+        // 加载manifest以及获取对应location
         let (manifest, location) = if let Some(mut manifest) = manifest {
+
+            // 如果传入的manifest存在，那么直接获取location
             let location = commit_handler
                 .resolve_version_location(&base_path, manifest.version, &object_store.inner)
                 .await?;
+
+            //  如果传入的manifest存在，那么直接加载字段的Dictionary信息
             if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
                 let reader = object_store.open(&location.path).await?;
                 populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
             }
+
+            // 返回manifest对象以及location信息
+            // 此时完成了按需从manifest中column加载Dictionary信息
             (manifest, location)
         } else {
+
+            // 如果当前manifest不存在，则
+
+            // 基于version进行判断
             let manifest_location = match version_number {
+
+                // 如果指定version，则尝试加载对应manifest，并用latest manifest兜底，若加载失败则报错
+                // 如果没有指定version，则通过commit handler获取 latest manifest，若latest也不存在，则报错 DatasetNotFound
+
                 Some(version) => {
                     let target_manifest_result = commit_handler
                         .resolve_version_location(&base_path, version, &object_store.inner)
@@ -628,6 +653,9 @@ impl DatasetBuilder {
                         location: location!(),
                     })?,
             };
+
+            // ************************** IMPORTANT **************************
+            // 加载manifest
             let manifest = Dataset::load_manifest(
                 &object_store,
                 &manifest_location,
@@ -638,6 +666,7 @@ impl DatasetBuilder {
             (manifest, manifest_location)
         };
 
+        // 在加载到正确的manifest后，checkout当前manifest，构建dataset
         Dataset::checkout_manifest(
             object_store,
             base_path,

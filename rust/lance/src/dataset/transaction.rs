@@ -1637,6 +1637,10 @@ impl Transaction {
             }
         };
 
+        // 计算初始的fragment ID
+        // 对于Overwrite而言，从0开始计数
+        // 对于其他operation而言，从max_fragment_id + 1开始
+        // 默认从0开始计数
         let mut fragment_id = if matches!(self.operation, Operation::Overwrite { .. }) {
             0
         } else {
@@ -1665,6 +1669,7 @@ impl Transaction {
             }
         };
 
+        // 查看现有表中，是否已经有fragment了
         let maybe_existing_fragments =
             current_manifest
                 .map(|m| m.fragments.as_ref())
@@ -1676,6 +1681,9 @@ impl Transaction {
                     location: location!(),
                 });
 
+        ///
+        /// 针对不同的operation进行细分操作
+        ///
         match &self.operation {
             Operation::Clone { .. } => {
                 return Err(Error::Internal {
@@ -1683,11 +1691,18 @@ impl Transaction {
                     location: location!(),
                 })
             }
+            //  ********** 先看看Append操作都干了些啥。。。
             Operation::Append { ref fragments } => {
-                final_fragments.extend(maybe_existing_fragments?.clone());
+
+                final_fragments.extend(maybe_existing_fragments?.clone()); // extend 将maybe_existing_fragments添加到final_fragments的末尾
+
+                // ************ 对 Fragments 赋值 Fragments ID
+                // 对新增的fragments进行fragment id赋值（初始id值为0），基于上次的max fragment id 开始单调递增 +1
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
+
+                // stable row id
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Add version metadata for all new fragments
@@ -1699,6 +1714,7 @@ impl Transaction {
                         fragment.created_at_version_meta = version_meta;
                     }
                 }
+                // 将新的Fragments添加到final_fragments的末尾
                 final_fragments.extend(new_fragments);
             }
             Operation::Delete {
@@ -2175,6 +2191,7 @@ impl Transaction {
             }
         };
 
+        // 将 final_fragments 基于id排序
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
 
@@ -2191,6 +2208,7 @@ impl Transaction {
         let mut manifest = if let Some(current_manifest) = current_manifest {
             // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
             // So we always use new_from_previous which preserves base_paths
+            // 基于老的manifest构建新的manifest
             let mut prev_manifest = Manifest::new_from_previous(
                 current_manifest,
                 schema,
@@ -2209,6 +2227,7 @@ impl Transaction {
 
             prev_manifest
         } else {
+            // 新表直接创建
             let data_storage_format =
                 Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
             Manifest::new(
