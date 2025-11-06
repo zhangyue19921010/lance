@@ -679,7 +679,7 @@ pub async fn write_fragments_internal(
         (converted_schema, params.storage_version_or_default())
     };
 
-    // TODO zhangyue.1010 这里可以改
+    // TODO zhangyue.1010 这里可以改 --- 改不了
     let data_schema = schema.project_by_schema(
         data.schema().as_ref(),
         OnMissing::Error,

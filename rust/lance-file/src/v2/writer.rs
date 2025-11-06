@@ -311,7 +311,7 @@ impl FileWriter {
         // because we wouldn't want buffers getting mixed up across pages.
 
         // 循环等待encoding_tasks 完成
-        // TODO zhangyue.1010 可以考虑在这里引入 Disruptor，解决压缩编码快，但写入慢的场景？意义不大，这里本身就是异步的了
+        // TODO zhangyue.1010 可以考虑在这里引入 Disruptor，解决压缩编码快，但写入慢的场景？意义不大，这里本身就是异步的了 -- 够呛
         while let Some(encoding_task) = encoding_tasks.next().await {
 
             // 当前 encoding task完成
