@@ -115,6 +115,7 @@ use crate::io::deletion::read_dataset_deletion_file;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Options to be passed to [compact_files].
+/// 看一下一共有哪些参数
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionOptions {
     /// Target number of rows per file. Defaults to 1 million.
@@ -129,7 +130,7 @@ pub struct CompactionOptions {
     /// how they are re-written if selected.
     pub max_rows_per_group: usize,
     /// Max number of bytes per file
-    ///
+    /// TODO zhangyue.1010 typos
     /// This does not affect which frgamnets need compaction, but does affect
     /// how they are re-written if selected.
     ///
@@ -175,6 +176,7 @@ impl Default for CompactionOptions {
 
 impl CompactionOptions {
     pub fn validate(&mut self) {
+        // 当materialize_deletions_threshold > 100% 时 将materialize_deletions设置为false
         // If threshold is 100%, same as turning off deletion materialization.
         if self.materialize_deletions && self.materialize_deletions_threshold >= 1.0 {
             self.materialize_deletions = false;
@@ -215,14 +217,24 @@ impl AddAssign for CompactionMetrics {
 /// This method tries to preserve the insertion order of rows in the dataset.
 ///
 /// If no compaction is needed, this method will not make a new version of the table.
+///
+/// 对于给定的dataset以及options，规划并执行compactions
+///
+///
+///
 pub async fn compact_files(
     dataset: &mut Dataset,
     mut options: CompactionOptions,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
+    // 打印日志
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
+    // 校验options
     options.validate();
 
+    // ************************************* IMPORTANT *************************************
+    // 构建Compaction Plan
+    //
     let compaction_plan: CompactionPlan = plan_compaction(dataset, &options).await?;
 
     // If nothing to compact, don't make a commit.
@@ -461,10 +473,13 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
 ///
 /// The compaction plan will contain a list of tasks to execute. Each task
 /// will contain approximately `target_rows_per_fragment` rows and will be
-/// rewriting fragments that are adjacent in the dataset's fragment list. Some
+/// rewriting fragments that are adjacent（相邻） in the dataset's fragment list. Some
 /// tasks may contain a single fragment when that fragment has deletions that
 /// are being materialized and doesn't have any neighbors that need to be
 /// compacted.
+///
+///
+///
 pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
