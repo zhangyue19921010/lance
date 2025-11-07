@@ -918,6 +918,9 @@ impl FileFragment {
         data_file.fields.first().copied().unwrap_or(0) as u32
     }
 
+    /// 初始化一个读取当前Data File的Reader
+    /// RecordBatch
+    /// TODO zhangyue.1010 这里可能跟Binary Copy有关
     async fn open_reader(
         &self,
         data_file: &DataFile,
@@ -1104,6 +1107,7 @@ impl FileFragment {
                 ..
             }) => Ok(*num_deleted),
             _ => {
+                // TODO zhangyue1992.1010 typos
                 let deleletion_vector = self.get_deletion_vector().await?;
                 if let Some(deletion_vector) = deleletion_vector {
                     Ok(deletion_vector.len())
@@ -1118,6 +1122,8 @@ impl FileFragment {
     ///
     /// If there are no deleted rows, this is equal to the number of rows in the
     /// fragment.
+    /// 
+    /// 初始化一个reader，并从reader的元数据中获取row number
     pub async fn physical_rows(&self) -> Result<usize> {
         if self.metadata.files.is_empty() {
             return Err(Error::io(
@@ -1137,6 +1143,7 @@ impl FileFragment {
 
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
+        // 初始化一个reader，并从reader的元数据中获取row number
         let reader = self
             .open_reader(some_file, None, &FragReadConfig::default())
             .await?

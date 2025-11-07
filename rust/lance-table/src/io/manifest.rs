@@ -124,6 +124,7 @@ pub async fn read_manifest_indexes(
         } else {
             object_store.open(&location.path).await?
         };
+        // 读取pos位置的pb数据并反序列化为IndexSection对象
         let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
 
         let indices = section

@@ -219,7 +219,7 @@ impl AddAssign for CompactionMetrics {
 /// If no compaction is needed, this method will not make a new version of the table.
 ///
 /// 对于给定的dataset以及options，规划并执行compactions
-///
+/// 先进行plan compaction
 ///
 ///
 pub async fn compact_files(
@@ -234,7 +234,6 @@ pub async fn compact_files(
 
     // ************************************* IMPORTANT *************************************
     // 构建Compaction Plan
-    //
     let compaction_plan: CompactionPlan = plan_compaction(dataset, &options).await?;
 
     // If nothing to compact, don't make a commit.
@@ -244,6 +243,8 @@ pub async fn compact_files(
 
     let dataset_ref = &dataset.clone();
 
+    // 并行执行Compaction Plan中的Tasks
+    // TODO zhangyue.1010 这里可以策略化
     let result_stream = futures::stream::iter(compaction_plan.tasks.into_iter())
         .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &options))
         .buffer_unordered(
@@ -252,10 +253,13 @@ pub async fn compact_files(
                 .unwrap_or_else(get_num_compute_intensive_cpus),
         );
 
+    // 收集完成的compaction task结果
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
+    // commit compaction
     let metrics = commit_compaction(dataset, completed_tasks, remap_options, &options).await?;
 
+    // 完成
     Ok(metrics)
 }
 
@@ -284,6 +288,9 @@ impl FragmentMetrics {
     }
 }
 
+/// 基于给定的fragment，收集其metrics信息，并组装为FragmentMetrics
+/// 1. 物理行数 包括 rows以及delete rows
+/// 2. num_deletions
 async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
     let physical_rows = fragment.physical_rows();
     let num_deletions = fragment.count_deletions();
@@ -407,6 +414,8 @@ struct CandidateBin {
 
 impl CandidateBin {
     /// Return true if compacting these fragments wouldn't do anything.
+    /// 1. fragments 为 空
+    /// 2. fragments 长度为1 且不是 CompactItself，则没有意义
     fn is_noop(&self) -> bool {
         if self.fragments.is_empty() {
             return true;
@@ -420,6 +429,8 @@ impl CandidateBin {
     }
 
     /// Split into one or more bins with at least `min_num_rows` in them.
+    ///
+    /// 如果当前bin的总的条数超过min_num_rows，则将当前bin切分为多个bins
     fn split_for_size(mut self, min_num_rows: usize) -> Vec<Self> {
         let mut bins = Vec::new();
 
@@ -454,13 +465,23 @@ impl CandidateBin {
     }
 }
 
+///
+/// 加载index --> fragments bitmap
+///
 async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
+    // 加载 dataset中的indices
     let indices = dataset.load_indices().await?;
     let mut index_fragmaps = Vec::with_capacity(indices.len());
+
+    // 遍历indices中的每一个index
     for index in indices.iter() {
+
         if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
+            // 若index中包含fragment_bitmap，则直接收集到index_fragmaps中
             index_fragmaps.push(fragment_bitmap.clone());
         } else {
+            // 若 index中没有fragment_bitmap信息，
+            // 则 checkout index所在的version 并获取当前version的所有fragments，并构建bitmap
             let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
             let frags = 0..dataset_at_index.manifest.max_fragment_id.unwrap_or(0);
             index_fragmaps.push(RoaringBitmap::from_sorted_iter(frags).unwrap());
@@ -493,8 +514,11 @@ pub async fn plan_compaction(
             .all(|w| w[0].id() < w[1].id()),
         "fragments in manifest are not sorted"
     );
+    // 遍历fragments
+    // 解析fragment，构建<metadata,metrics> Pair
     let mut fragment_metrics = futures::stream::iter(dataset.get_fragments())
         .map(|fragment| async move {
+            // 对于每一个fragment，构建 <fragment.metadata, metrics> Pair
             match collect_metrics(&fragment).await {
                 Ok(metrics) => Ok((fragment.metadata, metrics)),
                 Err(e) => Err(e),
@@ -502,7 +526,12 @@ pub async fn plan_compaction(
         })
         .buffered(dataset.object_store().io_parallelism());
 
+    // TODO zhangyue.1010 在不做remap的情况下，需要再重新加载index吗？？？
+    // 加载 index --> fragments bitmap
     let index_fragmaps = load_index_fragmaps(dataset).await?;
+
+    // 定义一个匿名函数
+    // 给定fragment id，获取当前fragment id包含在哪些index中
     let indices_containing_frag = |frag_id: u32| {
         index_fragmaps
             .iter()
@@ -516,14 +545,22 @@ pub async fn plan_compaction(
     let mut current_bin: Option<CandidateBin> = None;
     let mut i = 0;
 
+    // 遍历fragments，开始plan compaction，尤其涉及到对fragment的分组
     while let Some(res) = fragment_metrics.next().await {
+        // 获取 fragment 以及 metrics
         let (fragment, metrics) = res?;
 
+        // 判定当前fragment是否为“候选人”
+        // 1. 如果当前delete rows的占比满足要求，则任务当前fragment为 CompactItself 的candidate
+        // 2. 如果当前 fragment包含的physical_rows小于target_rows_per_fragment，则认为当前fragment为CompactWithNeighbors类型的candidate
+        // 否则则忽略当前fragment
         let candidacy = if options.materialize_deletions
             && metrics.deletion_percentage() > options.materialize_deletions_threshold
         {
+            // 如果当前delete rows的占比满足要求，则认为当前fragment为 CompactItself 的candidate
             Some(CompactionCandidacy::CompactItself)
         } else if metrics.physical_rows < options.target_rows_per_fragment {
+            // 如果当前 fragment包含的physical_rows小于target_rows_per_fragment，则认为当前fragment为CompactWithNeighbors类型的candidate
             // Only want to compact if their are neighbors to compact such that
             // we can get a larger fragment.
             Some(CompactionCandidacy::CompactWithNeighbors)
@@ -532,12 +569,16 @@ pub async fn plan_compaction(
             None
         };
 
+        // 对于给定的 fragment.id，判断其涉及到哪些索引
         let indices = indices_containing_frag(fragment.id as u32);
 
+        // 处理candidacy
         match (candidacy, &mut current_bin) {
             (None, None) => {} // keep searching
             (Some(candidacy), None) => {
+                // 开启一个新的 current_bin，构建一个CandidateBin对象
                 // Start a new bin
+                // TODO zhangyue.1010 CandidateBin的初始化可以搞一个方法，这样就不用跟下面写两遍了
                 current_bin = Some(CandidateBin {
                     fragments: vec![fragment],
                     pos_range: i..(i + 1),
@@ -546,9 +587,12 @@ pub async fn plan_compaction(
                     indices,
                 });
             }
+            // 对于新的<candidate,indices> 尝试与 current bin进行融合
             (Some(candidacy), Some(bin)) => {
                 // We cannot mix "indexed" and "non-indexed" fragments and so we only consider
                 // the existing bin if it contains the same indices
+
+                // 如果二者的indices相等，则直接进行融合
                 if bin.indices == indices {
                     // Add to current bin
                     bin.fragments.push(fragment);
@@ -557,6 +601,8 @@ pub async fn plan_compaction(
                     bin.row_counts.push(metrics.num_rows());
                 } else {
                     // Index set is different.  Complete previous bin and start new one
+                    // 如果二者的indices不相等，则将current_bin缓存
+                    // 并用当前candidate创建新的bin
                     candidate_bins.push(current_bin.take().unwrap());
                     current_bin = Some(CandidateBin {
                         fragments: vec![fragment],
@@ -567,6 +613,7 @@ pub async fn plan_compaction(
                     });
                 }
             }
+            // 当前没有新的candidate了，代码遍历完成， 则进行收尾工作
             (None, Some(_)) => {
                 // Bin is complete
                 candidate_bins.push(current_bin.take().unwrap());
@@ -581,14 +628,19 @@ pub async fn plan_compaction(
         candidate_bins.push(bin);
     }
 
+    // 开始校验 candidate_bins
     let final_bins = candidate_bins
         .into_iter()
+        // 过滤不符合要求的bin
         .filter(|bin| !bin.is_noop())
+        // 根据target_rows_per_fragment将大的bin切分为多个子bin
         .flat_map(|bin| bin.split_for_size(options.target_rows_per_fragment))
+        // 构建TaskData
         .map(|bin| TaskData {
             fragments: bin.fragments,
         });
 
+    // 构建CompactionPlan，设置final_bins，并返回
     let mut compaction_plan = CompactionPlan::new(dataset.manifest.version, options.clone());
     compaction_plan.extend_tasks(final_bins);
 

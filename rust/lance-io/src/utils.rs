@@ -90,6 +90,7 @@ pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize)
         return Err(Error::io("file size is too small".to_string(), location!()));
     }
 
+    // 获取要读的范围（例如从pos开始后的一个block size大小的位置）
     let range = pos..min(pos + reader.block_size(), file_size);
     let buf = reader.get_range(range.clone()).await?;
     let msg_len = LittleEndian::read_u32(&buf) as usize;

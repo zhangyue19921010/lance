@@ -477,6 +477,7 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
+    /// 加载indices
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
@@ -484,12 +485,14 @@ impl DatasetIndexExt for Dataset {
         let indices = match self.index_cache.get_with_key(&metadata_key).await {
             Some(indices) => indices,
             None => {
+                // 读取manifest中的indexes信息
                 let mut loaded_indices = read_manifest_indexes(
                     &self.object_store,
                     &self.manifest_location,
                     &self.manifest,
                 )
                 .await?;
+                // 
                 retain_supported_indices(&mut loaded_indices);
                 let loaded_indices = Arc::new(loaded_indices);
                 self.index_cache
@@ -889,6 +892,8 @@ impl DatasetIndexExt for Dataset {
     }
 }
 
+/// 过滤有效的indices
+/// 对比 index_version 以及 idx version
 pub(crate) fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
     indices.retain(|idx| {
         let max_supported_version = idx
