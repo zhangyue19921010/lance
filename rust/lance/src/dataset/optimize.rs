@@ -218,17 +218,22 @@ pub trait CompactionPlanner: Send + Sync {
         dataset.get_fragments()
     }
 
-    // no filter by default
-    async fn filter_fragments(
+    /// Build compaction plan.
+    ///
+    /// This method analyzes the dataset's fragments and generates a [`CompactionPlan`]
+    /// containing a list of compaction tasks to execute.
+    ///
+    /// # Arguments
+    ///
+    /// * `dataset` - Reference to the dataset to be compacted
+    /// * `options` - Compaction options including target row count, deletion thresholds, etc.
+    /// * `configs` - Additional configuration parameters as key-value pairs
+    async fn plan(
         &self,
-        _dataset: &Dataset,
-        fragments: Vec<FileFragment>,
-        _options: &CompactionOptions,
-    ) -> Result<Vec<FileFragment>> {
-        Ok(fragments)
-    }
-
-    async fn plan(&self, dataset: &Dataset, options: &CompactionOptions) -> Result<CompactionPlan>;
+        dataset: &Dataset,
+        options: &CompactionOptions,
+        configs: HashMap<String, String>,
+    ) -> Result<CompactionPlan>;
 }
 
 /// Formulate a plan to compact the files in a dataset
@@ -244,7 +249,12 @@ pub struct DefaultCompactionPlanner;
 
 #[async_trait::async_trait]
 impl CompactionPlanner for DefaultCompactionPlanner {
-    async fn plan(&self, dataset: &Dataset, options: &CompactionOptions) -> Result<CompactionPlan> {
+    async fn plan(
+        &self,
+        dataset: &Dataset,
+        options: &CompactionOptions,
+        _configs: HashMap<String, String>,
+    ) -> Result<CompactionPlan> {
         let fragments = self.get_fragments(dataset, options);
         debug_assert!(
             fragments.windows(2).all(|w| w[0].id() < w[1].id()),
@@ -355,7 +365,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
 /// Compacts the files in the dataset without reordering them.
 ///
-/// By default, his does a few things:
+/// By default, this does a few things:
 ///  * Removes deleted rows from fragments.
 ///  * Removes dropped columns from fragments.
 ///  * Merges fragments that are too small.
@@ -381,7 +391,7 @@ pub async fn compact_files_with_planner(
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
     options.validate();
 
-    let compaction_plan: CompactionPlan = planner.plan(dataset, &options).await?;
+    let compaction_plan: CompactionPlan = planner.plan(dataset, &options, HashMap::new()).await?;
 
     // If nothing to compact, don't make a commit.
     if compaction_plan.tasks().is_empty() {
@@ -620,7 +630,7 @@ pub async fn plan_compaction(
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
     let planner = DefaultCompactionPlanner;
-    planner.plan(dataset, options).await
+    planner.plan(dataset, options, HashMap::new()).await
 }
 
 /// The result of a single compaction task.
@@ -3591,7 +3601,10 @@ mod tests {
             target_rows_per_fragment: 5000,
             ..Default::default()
         };
-        let plan = planner.plan(&dataset, &options).await.unwrap();
+        let plan = planner
+            .plan(&dataset, &options, HashMap::new())
+            .await
+            .unwrap();
 
         // Should create tasks to compact small fragments
         assert!(!plan.tasks.is_empty());
