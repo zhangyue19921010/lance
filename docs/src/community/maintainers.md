@@ -76,22 +76,22 @@ To become a maintainer:
 Here are some example areas of valuable contributions:
 
 - **Code Contributions**:
-  - Submit pull requests implementing features or fixing bugs
-  - Review code and provide constructive feedback on PRs
-  - Tackle issues on GitHub, especially those marked "good first issue"
+    - Submit pull requests implementing features or fixing bugs
+    - Review code and provide constructive feedback on PRs
+    - Tackle issues on GitHub, especially those marked "good first issue"
 - **Community Support**:
-  - Help other users in Discord and GitHub discussions
-  - Answer questions and provide guidance to newcomers
-  - Host or participate in tech discussions and special interest groups
+    - Help other users in Discord and GitHub discussions
+    - Answer questions and provide guidance to newcomers
+    - Host or participate in tech discussions and special interest groups
 - **Documentation and Content**:
-  - Write or improve documentation, tutorials, and guides
-  - Create blog posts, demos, or case studies showcasing Lance
-  - Share your Lance journey through articles and technical content
+    - Write or improve documentation, tutorials, and guides
+    - Create blog posts, demos, or case studies showcasing Lance
+    - Share your Lance journey through articles and technical content
 - **Advocacy and Outreach**:
-  - Present Lance at meetups, conferences, or community events
-  - Spread awareness on social media and developer platforms
-  - Beta test new features and provide detailed feedback
-  - Champion Lance adoption in your organization or community
+    - Present Lance at meetups, conferences, or community events
+    - Spread awareness on social media and developer platforms
+    - Beta test new features and provide detailed feedback
+    - Champion Lance adoption in your organization or community
 
 To be granted GitHub write access, the maintainer should:
 
