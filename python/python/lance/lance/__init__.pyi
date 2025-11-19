@@ -82,13 +82,6 @@ from .trace import capture_trace_events as capture_trace_events
 from .trace import shutdown_tracing as shutdown_tracing
 from .trace import trace_to_chrome as trace_to_chrome
 
-def infer_tfrecord_schema(
-    uri: str,
-    tensor_features: Optional[List[str]] = None,
-    string_features: Optional[List[str]] = None,
-) -> pa.Schema: ...
-def read_tfrecord(uri: str, schema: pa.Schema) -> pa.RecordBatchReader: ...
-
 class CleanupStats:
     bytes_removed: int
     old_versions: int

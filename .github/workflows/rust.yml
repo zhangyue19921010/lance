@@ -174,13 +174,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build tests
         run: |
-          cargo test --profile ci --locked --features fp16kernels,cli,tensorflow,dynamodb,substrait --no-run
+          cargo test --profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
       - name: Run tests
         run: |
-          cargo test --profile ci --features fp16kernels,cli,tensorflow,dynamodb,substrait
+          cargo test --profile ci --features fp16kernels,cli,dynamodb,substrait
       - name: Check benchmarks
         run: |
-          cargo check --profile ci --benches --features fp16kernels,cli,tensorflow,dynamodb,substrait
+          cargo check --profile ci --benches --features fp16kernels,cli,dynamodb,substrait
   windows-build:
     runs-on: windows-latest
     defaults:
