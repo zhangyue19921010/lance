@@ -1541,9 +1541,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.51"
+version = "4.5.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c26d721170e0295f191a69bd9a1f93efcdb0aff38684b61ab5750468972e5f5"
+checksum = "aa8120877db0e5c011242f96806ce3c94e0737ab8108532a76a3300a01db2ab8"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -1551,9 +1551,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.5.51"
+version = "4.5.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75835f0c7bf681bfd05abe44e965760fea999a5286c6eb2d59883634fd02011a"
+checksum = "02576b399397b659c26064fbc92a75fede9d18ffd5f80ca1cd74ddab167016e1"
 dependencies = [
  "anstream",
  "anstyle",
@@ -3325,7 +3325,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -4364,7 +4364,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4452,7 +4452,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4470,7 +4470,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrayref",
  "paste",
@@ -4479,7 +4479,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4517,7 +4517,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4548,7 +4548,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4567,7 +4567,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4614,7 +4614,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4640,7 +4640,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4682,7 +4682,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "approx",
  "arrow",
@@ -4755,7 +4755,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4801,7 +4801,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4822,7 +4822,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4836,7 +4836,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4881,7 +4881,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4927,7 +4927,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4936,7 +4936,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4947,7 +4947,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "clap",
  "lance-core",
@@ -8103,9 +8103,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "symbolic-common"
-version = "12.16.3"
+version = "12.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d03f433c9befeea460a01d750e698aa86caf86dcfbd77d552885cd6c89d52f50"
+checksum = "b3d8046c5674ab857104bc4559d505f4809b8060d57806e45d49737c97afeb60"
 dependencies = [
  "debugid",
  "memmap2",
@@ -8115,9 +8115,9 @@ dependencies = [
 
 [[package]]
 name = "symbolic-demangle"
-version = "12.16.3"
+version = "12.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13d359ef6192db1760a34321ec4f089245ede4342c27e59be99642f12a859de8"
+checksum = "1accb6e5c4b0f682de907623912e616b44be1c9e725775155546669dbff720ec"
 dependencies = [
  "cpp_demangle",
  "rustc-demangle",
