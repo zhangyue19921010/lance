@@ -13,12 +13,15 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 
+use crate::dataset::blob::blob_version_from_config;
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
-use lance_core::datatypes::{Field, OnMissing, OnTypeMismatch, Projectable, Projection};
+use lance_core::datatypes::{
+    BlobVersion, Field, OnMissing, OnTypeMismatch, Projectable, Projection,
+};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
@@ -31,8 +34,11 @@ use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{
+    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams,
+};
 use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
+use lance_namespace::LanceNamespace;
 use lance_table::format::{
     pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
 };
@@ -56,7 +62,7 @@ use std::sync::Arc;
 use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
-mod blob;
+pub(crate) mod blob;
 mod branch_location;
 pub mod builder;
 pub mod cleanup;
@@ -104,6 +110,7 @@ pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 use lance_core::box_error;
 pub use lance_core::ROW_ID;
+use lance_namespace::models::{CreateEmptyTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -388,6 +395,7 @@ impl ProjectionRequest {
     }
 
     pub fn into_projection_plan(self, dataset: Arc<Dataset>) -> Result<ProjectionPlan> {
+        let blob_version = dataset.blob_version();
         match self {
             Self::Schema(schema) => {
                 // The schema might contain system columns (_rowid, _rowaddr) which are not
@@ -400,7 +408,7 @@ impl ProjectionRequest {
                 if system_columns_present {
                     // If system columns are present, we can't use project_by_schema directly
                     // Just pass the schema to ProjectionPlan::from_schema which handles it
-                    ProjectionPlan::from_schema(dataset, schema.as_ref())
+                    ProjectionPlan::from_schema(dataset, schema.as_ref(), blob_version)
                 } else {
                     // No system columns, use normal path with validation
                     let projection = dataset.schema().project_by_schema(
@@ -408,10 +416,10 @@ impl ProjectionRequest {
                         OnMissing::Error,
                         OnTypeMismatch::Error,
                     )?;
-                    ProjectionPlan::from_schema(dataset, &projection)
+                    ProjectionPlan::from_schema(dataset, &projection, blob_version)
                 }
             }
-            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns),
+            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns, blob_version),
         }
     }
 }
@@ -790,6 +798,143 @@ impl Dataset {
         }
         Box::pin(builder.execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>))
             .await
+    }
+
+    /// Write into a namespace-managed table with automatic credential vending.
+    ///
+    /// For CREATE mode, calls create_empty_table() to initialize the table.
+    /// For other modes, calls describe_table() and opens dataset with namespace credentials.
+    ///
+    /// # Arguments
+    ///
+    /// * `batches` - The record batches to write
+    /// * `namespace` - The namespace to use for table management
+    /// * `table_id` - The table identifier
+    /// * `params` - Write parameters
+    /// * `ignore_namespace_table_storage_options` - If true, ignore storage options returned
+    ///   by the namespace and only use the storage options in params. The storage options
+    ///   provider will not be created, so credentials will not be automatically refreshed.
+    pub async fn write_into_namespace(
+        batches: impl RecordBatchReader + Send + 'static,
+        namespace: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        mut params: Option<WriteParams>,
+        ignore_namespace_table_storage_options: bool,
+    ) -> Result<Self> {
+        let mut write_params = params.take().unwrap_or_default();
+
+        match write_params.mode {
+            WriteMode::Create => {
+                let request = CreateEmptyTableRequest {
+                    id: Some(table_id.clone()),
+                    location: None,
+                    properties: None,
+                };
+                let response =
+                    namespace
+                        .create_empty_table(request)
+                        .await
+                        .map_err(|e| Error::Namespace {
+                            source: Box::new(e),
+                            location: location!(),
+                        })?;
+
+                let uri = response.location.ok_or_else(|| Error::Namespace {
+                    source: Box::new(std::io::Error::other(
+                        "Table location not found in create_empty_table response",
+                    )),
+                    location: location!(),
+                })?;
+
+                // Set initial credentials and provider unless ignored
+                if !ignore_namespace_table_storage_options {
+                    if let Some(namespace_storage_options) = response.storage_options {
+                        let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                            namespace, table_id,
+                        ));
+
+                        // Merge namespace storage options with any existing options
+                        let mut merged_options = write_params
+                            .store_params
+                            .as_ref()
+                            .and_then(|p| p.storage_options.clone())
+                            .unwrap_or_default();
+                        merged_options.extend(namespace_storage_options);
+
+                        let existing_params = write_params.store_params.take().unwrap_or_default();
+                        write_params.store_params = Some(ObjectStoreParams {
+                            storage_options: Some(merged_options),
+                            storage_options_provider: Some(provider),
+                            ..existing_params
+                        });
+                    }
+                }
+
+                Self::write(batches, uri.as_str(), Some(write_params)).await
+            }
+            WriteMode::Append | WriteMode::Overwrite => {
+                let request = DescribeTableRequest {
+                    id: Some(table_id.clone()),
+                    version: None,
+                };
+                let response =
+                    namespace
+                        .describe_table(request)
+                        .await
+                        .map_err(|e| Error::Namespace {
+                            source: Box::new(e),
+                            location: location!(),
+                        })?;
+
+                let uri = response.location.ok_or_else(|| Error::Namespace {
+                    source: Box::new(std::io::Error::other(
+                        "Table location not found in describe_table response",
+                    )),
+                    location: location!(),
+                })?;
+
+                // Set initial credentials and provider unless ignored
+                if !ignore_namespace_table_storage_options {
+                    if let Some(namespace_storage_options) = response.storage_options {
+                        let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                            namespace.clone(),
+                            table_id.clone(),
+                        ));
+
+                        // Merge namespace storage options with any existing options
+                        let mut merged_options = write_params
+                            .store_params
+                            .as_ref()
+                            .and_then(|p| p.storage_options.clone())
+                            .unwrap_or_default();
+                        merged_options.extend(namespace_storage_options);
+
+                        let existing_params = write_params.store_params.take().unwrap_or_default();
+                        write_params.store_params = Some(ObjectStoreParams {
+                            storage_options: Some(merged_options),
+                            storage_options_provider: Some(provider),
+                            ..existing_params
+                        });
+                    }
+                }
+
+                // For APPEND/OVERWRITE modes, we must open the existing dataset first
+                // and pass it to InsertBuilder. If we pass just the URI, InsertBuilder
+                // assumes no dataset exists and converts the mode to CREATE.
+                let mut builder = DatasetBuilder::from_uri(uri.as_str());
+                if let Some(ref store_params) = write_params.store_params {
+                    if let Some(ref storage_options) = store_params.storage_options {
+                        builder = builder.with_storage_options(storage_options.clone());
+                    }
+                    if let Some(ref provider) = store_params.storage_options_provider {
+                        builder = builder.with_storage_options_provider(provider.clone());
+                    }
+                }
+                let dataset = Arc::new(builder.load().await?);
+
+                Self::write(batches, dataset, Some(write_params)).await
+            }
+        }
     }
 
     /// Append to existing [Dataset] with a stream of [RecordBatch]s
@@ -1608,12 +1753,12 @@ impl Dataset {
     /// Similar to [Self::schema], but only returns fields that are not marked as blob columns
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
-        Projection::empty(self.clone())
+        Projection::empty(self.clone()).with_blob_version(self.blob_version())
     }
 
     /// Creates a projection that includes all columns in the dataset
     pub fn full_projection(self: &Arc<Self>) -> Projection {
-        Projection::full(self.clone())
+        Projection::full(self.clone()).with_blob_version(self.blob_version())
     }
 
     /// Get fragments.
@@ -2332,6 +2477,10 @@ impl Dataset {
         &self.manifest.config
     }
 
+    pub(crate) fn blob_version(&self) -> BlobVersion {
+        blob_version_from_config(&self.manifest.config)
+    }
+
     /// Delete keys from the config.
     #[deprecated(
         note = "Use the new update_config(values, replace) method - pass None values to delete keys"
@@ -2612,6 +2761,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use mock_instant::thread_local::MockClock;
 
+    use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
     use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
     use arrow::datatypes::UInt64Type;
@@ -2643,7 +2793,6 @@ mod tests {
     use lance_index::scalar::FullTextSearchQuery;
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, IndexType};
     use lance_io::assert_io_eq;
-    use lance_io::utils::tracking_store::IOTracker;
     use lance_io::utils::CachedFileSize;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
@@ -2897,9 +3046,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_manifest_iops() {
-        // Need to use in-memory for accurate IOPS tracking.
-        let io_tracker = Arc::new(IOTracker::default());
-
         // Use consistent session so memory store can be reused.
         let session = Arc::new(Session::default());
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -2917,10 +3063,6 @@ mod tests {
             batches,
             "memory://test",
             Some(WriteParams {
-                store_params: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
                 session: Some(session.clone()),
                 ..Default::default()
             }),
@@ -2928,17 +3070,10 @@ mod tests {
         .await
         .unwrap();
 
-        let _ = io_tracker.incremental_stats(); //reset
+        let _ = _original_ds.object_store().io_stats_incremental(); //reset
 
         let _dataset = DatasetBuilder::from_uri("memory://test")
-            .with_read_params(ReadParams {
-                store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
-                session: Some(session),
-                ..Default::default()
-            })
+            .with_session(session)
             .load()
             .await
             .unwrap();
@@ -2947,7 +3082,7 @@ mod tests {
         // 1. List _versions directory to get the latest manifest location
         // 2. Read the manifest file. (The manifest is small enough to be read in one go.
         //    Larger manifests would result in more IOPS.)
-        let io_stats = io_tracker.incremental_stats();
+        let io_stats = _dataset.object_store().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 2);
     }
 
@@ -4935,7 +5070,7 @@ mod tests {
         dataset.delete("true").await.unwrap();
 
         // This behavior will be re-introduced once we work on empty vector index handling.
-        // https://github.com/lancedb/lance/issues/4034
+        // https://github.com/lance-format/lance/issues/4034
         // let indices = dataset.load_indices().await.unwrap();
         // // With the new retention behavior, indices are kept even when all fragments are deleted
         // // This allows the index configuration to persist through data changes
@@ -8884,7 +9019,6 @@ mod tests {
         }
 
         let session = Arc::new(Session::default());
-        let io_tracker = Arc::new(IOTracker::default());
 
         // Case 1: Default write_flag=true, delete external transaction file, read should use inline transaction
         let ds = create_dataset(5).await;
@@ -8901,23 +9035,15 @@ mod tests {
         // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
         let read_ds2 = DatasetBuilder::from_uri(ds2.uri.clone())
             .with_session(session.clone())
-            .with_read_params(ReadParams {
-                store_options: Some(ObjectStoreParams {
-                    object_store_wrapper: Some(io_tracker.clone()),
-                    ..Default::default()
-                }),
-                session: Some(session.clone()),
-                ..Default::default()
-            })
             .load()
             .await
             .unwrap();
-        let stats = io_tracker.incremental_stats(); // Reset
+        let stats = read_ds2.object_store().io_stats_incremental(); // Reset
         assert!(stats.read_bytes < 64 * 1024);
         // Because the manifest is so small, we should have opportunistically
         // cached the transaction in memory already.
         let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
-        let stats = io_tracker.incremental_stats();
+        let stats = read_ds2.object_store().io_stats_incremental();
         assert_eq!(stats.read_iops, 0);
         assert_eq!(stats.read_bytes, 0);
         assert_eq!(inline_tx, tx);
