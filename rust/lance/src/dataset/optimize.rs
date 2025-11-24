@@ -212,13 +212,6 @@ impl AddAssign for CompactionMetrics {
 /// the `plan` method. The default implementation is provided by [`DefaultCompactionPlanner`].
 #[async_trait::async_trait]
 pub trait CompactionPlanner: Send + Sync {
-    // get all fragments by default
-    fn get_fragments(&self, dataset: &Dataset, _options: &CompactionOptions) -> Vec<FileFragment> {
-        // get_fragments should be returning fragments in sorted order (by id)
-        // and fragment ids should be unique
-        dataset.get_fragments()
-    }
-
     /// Build compaction plan.
     ///
     /// This method analyzes the dataset's fragments and generates a [`CompactionPlan`]
@@ -232,9 +225,10 @@ pub trait CompactionPlanner: Send + Sync {
     async fn plan(
         &self,
         dataset: &Dataset,
-        options: &CompactionOptions,
         configs: HashMap<String, String>,
     ) -> Result<CompactionPlan>;
+
+    fn get_compaction_options(&self) -> &CompactionOptions;
 }
 
 /// Formulate a plan to compact the files in a dataset
@@ -246,17 +240,28 @@ pub trait CompactionPlanner: Send + Sync {
 /// are being materialized and doesn't have any neighbors that need to be
 /// compacted.
 #[derive(Debug, Clone, Default)]
-pub struct DefaultCompactionPlanner;
+pub struct DefaultCompactionPlanner {
+    options: CompactionOptions,
+}
+
+impl DefaultCompactionPlanner {
+    pub fn from_options(mut options: CompactionOptions) -> Self {
+        options.validate();
+        Self { options }
+    }
+}
 
 #[async_trait::async_trait]
 impl CompactionPlanner for DefaultCompactionPlanner {
     async fn plan(
         &self,
         dataset: &Dataset,
-        options: &CompactionOptions,
         _configs: HashMap<String, String>,
     ) -> Result<CompactionPlan> {
-        let fragments = self.get_fragments(dataset, options);
+        // get_fragments should be returning fragments in sorted order (by id)
+        // and fragment ids should be unique
+        let fragments = dataset.get_fragments();
+
         debug_assert!(
             fragments.windows(2).all(|w| w[0].id() < w[1].id()),
             "fragments in manifest are not sorted"
@@ -287,11 +292,11 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         while let Some(res) = fragment_metrics.next().await {
             let (fragment, metrics) = res?;
 
-            let candidacy = if options.materialize_deletions
-                && metrics.deletion_percentage() > options.materialize_deletions_threshold
+            let candidacy = if self.options.materialize_deletions
+                && metrics.deletion_percentage() > self.options.materialize_deletions_threshold
             {
                 Some(CompactionCandidacy::CompactItself)
-            } else if metrics.physical_rows < options.target_rows_per_fragment {
+            } else if metrics.physical_rows < self.options.target_rows_per_fragment {
                 // Only want to compact if their are neighbors to compact such that
                 // we can get a larger fragment.
                 Some(CompactionCandidacy::CompactWithNeighbors)
@@ -352,15 +357,20 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         let final_bins = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
-            .flat_map(|bin| bin.split_for_size(options.target_rows_per_fragment))
+            .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
             .map(|bin| TaskData {
                 fragments: bin.fragments,
             });
 
-        let mut compaction_plan = CompactionPlan::new(dataset.manifest.version, options.clone());
+        let mut compaction_plan =
+            CompactionPlan::new(dataset.manifest.version, self.options.clone());
         compaction_plan.extend_tasks(final_bins);
 
         Ok(compaction_plan)
+    }
+
+    fn get_compaction_options(&self) -> &CompactionOptions {
+        &self.options
     }
 }
 
@@ -379,20 +389,18 @@ pub async fn compact_files(
     options: CompactionOptions,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
-    let planner = DefaultCompactionPlanner;
-    compact_files_with_planner(dataset, options, remap_options, &planner).await
+    info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
+    let planner = DefaultCompactionPlanner::from_options(options);
+    compact_files_with_planner(dataset, remap_options, &planner).await
 }
 
 pub async fn compact_files_with_planner(
     dataset: &mut Dataset,
-    mut options: CompactionOptions,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
-    info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
-    options.validate();
-
-    let compaction_plan: CompactionPlan = planner.plan(dataset, &options, HashMap::new()).await?;
+    let compaction_plan: CompactionPlan = planner.plan(dataset, HashMap::new()).await?;
+    let options = planner.get_compaction_options();
 
     // If nothing to compact, don't make a commit.
     if compaction_plan.tasks().is_empty() {
@@ -402,7 +410,7 @@ pub async fn compact_files_with_planner(
     let dataset_ref = &dataset.clone();
 
     let result_stream = futures::stream::iter(compaction_plan.tasks.into_iter())
-        .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &options))
+        .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, options))
         .buffer_unordered(
             options
                 .num_threads
@@ -411,7 +419,7 @@ pub async fn compact_files_with_planner(
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
-    let metrics = commit_compaction(dataset, completed_tasks, remap_options, &options).await?;
+    let metrics = commit_compaction(dataset, completed_tasks, remap_options, options).await?;
 
     Ok(metrics)
 }
@@ -630,8 +638,8 @@ pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
-    let planner = DefaultCompactionPlanner;
-    planner.plan(dataset, options, HashMap::new()).await
+    let planner = DefaultCompactionPlanner::from_options(options.clone());
+    planner.plan(dataset, HashMap::new()).await
 }
 
 /// The result of a single compaction task.
@@ -3657,15 +3665,13 @@ mod tests {
         assert_eq!(dataset.get_fragments().len(), 5);
 
         // Test default planner
-        let planner = DefaultCompactionPlanner;
         let options = CompactionOptions {
             target_rows_per_fragment: 5000,
             ..Default::default()
         };
-        let plan = planner
-            .plan(&dataset, &options, HashMap::new())
-            .await
-            .unwrap();
+
+        let planner = DefaultCompactionPlanner::from_options(options);
+        let plan = planner.plan(&dataset, HashMap::new()).await.unwrap();
 
         // Should create tasks to compact small fragments
         assert!(!plan.tasks.is_empty());
