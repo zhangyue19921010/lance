@@ -4,7 +4,7 @@
     xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.lancedb</groupId>
+    <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
     <version>1.0.0-beta.10</version>
@@ -40,7 +40,7 @@
         <spotless.delimiter>package</spotless.delimiter>
         <rust.release.build>false</rust.release.build>
         <skip.build.jni>false</skip.build.jni>
-        <shade.base>com.lancedb.lance.shaded</shade.base>
+        <shade.base>org.lance.shaded</shade.base>
         <spotless.license.header>
         /*
         * Licensed under the Apache License, Version 2.0 (the "License");
@@ -317,7 +317,7 @@
                             </googleJavaFormat>
 
                             <importOrder>
-                                <order>com.lancedb.lance,,javax,java,\#</order>
+                                <order>org.lance,,javax,java,\#</order>
                             </importOrder>
 
                             <removeUnusedImports />
