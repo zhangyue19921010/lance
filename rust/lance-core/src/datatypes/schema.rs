@@ -110,6 +110,40 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
     }
 }
 
+struct SchemaLeafFieldIterPreOrder<'a> {
+    leaf_field_stack: Vec<&'a Field>,
+}
+
+impl<'a> SchemaLeafFieldIterPreOrder<'a> {
+    #[allow(dead_code)]
+    fn new(schema: &'a Schema) -> Self {
+        let mut field_stack = Vec::with_capacity(schema.fields.len() * 2);
+        for field in schema.fields.iter().rev() {
+            field_stack.push(field);
+        }
+        Self {
+            leaf_field_stack: field_stack,
+        }
+    }
+}
+
+/// Iterator implementation for a pre-order traversal of leaf fields
+impl<'a> Iterator for SchemaLeafFieldIterPreOrder<'a> {
+    type Item = &'a Field;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(next_field) = self.leaf_field_stack.pop() {
+            for child in next_field.children.iter().rev() {
+                self.leaf_field_stack.push(child);
+            }
+            if next_field.children.is_empty() {
+                return Some(next_field);
+            }
+        }
+        None
+    }
+}
+
 impl Schema {
     /// The unenforced primary key fields in the schema
     pub fn unenforced_primary_key(&self) -> Vec<&Field> {
@@ -329,6 +363,12 @@ impl Schema {
     /// before its children
     pub fn fields_pre_order(&self) -> impl Iterator<Item = &Field> {
         SchemaFieldIterPreOrder::new(self)
+    }
+
+    /// Iterates over the fields using a pre-order traversal
+    /// Only leaf fields (fields that don't have any children) are visited.
+    pub fn leaf_fields_pre_order(&self) -> impl Iterator<Item = &Field> {
+        SchemaLeafFieldIterPreOrder::new(self)
     }
 
     /// Returns a new schema that only contains the fields in `column_ids`.

@@ -540,3 +540,118 @@ def test_add_cols_all_null_with_sql(tmp_path: Path):
             "b": pa.int32(),
         }
     )
+
+def test_struct_fields_evolution_meta_only(tmp_path: Path):
+    struct_ab = pa.struct([("a", pa.int64()), ("b", pa.string())])
+    base = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int64()),
+            "struct_fields": pa.array(
+                [
+                    {"a": 1, "b": "foo"},
+                    {"a": 2, "b": "bar"},
+                    {"a": 3, "b": "baz"},
+                ],
+                type=struct_ab,
+            ),
+        }
+    )
+    ds = lance.write_dataset(base, tmp_path / "add_struct_column_only.lance")
+    assert ds.schema == pa.schema(
+        [pa.field("id", pa.int64()), pa.field("struct_fields", struct_ab)]
+    )
+
+    ds.add_columns(pa.field("embedding", pa.list_(pa.float32(), 128)))
+    expected = base.append_column(
+        "embedding", pa.array([None, None, None], pa.list_(pa.float32(), 128))
+    )
+    assert ds.schema == pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("struct_fields", struct_ab),
+            pa.field("embedding", pa.list_(pa.float32(), 128)),
+        ]
+    )
+    assert ds.to_table() == expected
+
+    new_schema = pa.schema([("label", pa.string()), ("score", pa.float32())])
+    ds.add_columns(new_schema)
+    expected = expected.append_column(
+        "label", pa.array([None, None, None], pa.string())
+    ).append_column("score", pa.array([None, None, None], pa.float32()))
+    assert ds.schema == pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("struct_fields", struct_ab),
+            pa.field("embedding", pa.list_(pa.float32(), 128)),
+            pa.field("label", pa.string()),
+            pa.field("score", pa.float32()),
+        ]
+    )
+    assert ds.to_table() == expected
+
+    new_schema_2 = pa.schema(
+        [("struct_fields", pa.struct([("c", pa.string()), ("d", pa.string())]))]
+    )
+    ds.add_columns(new_schema_2)
+    struct_abcd = pa.struct(
+        [("a", pa.int64()), ("b", pa.string()), ("c", pa.string()), ("d", pa.string())]
+    )
+    struct_vals_abcd = pa.array(
+        [{"a": 1, "b": "foo"}, {"a": 2, "b": "bar"}, {"a": 3, "b": "baz"}],
+        type=struct_abcd,
+    )
+    expected = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int64()),
+            "struct_fields": struct_vals_abcd,
+            "embedding": pa.array([None, None, None], pa.list_(pa.float32(), 128)),
+            "label": pa.array([None, None, None], pa.string()),
+            "score": pa.array([None, None, None], pa.float32()),
+        }
+    )
+    assert ds.schema == pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("struct_fields", struct_abcd),
+            pa.field("embedding", pa.list_(pa.float32(), 128)),
+            pa.field("label", pa.string()),
+            pa.field("score", pa.float32()),
+        ]
+    )
+    assert ds.to_table() == expected
+
+    insert_vals = pa.array(
+        [
+            {"a": 11, "b": "foo11", "c": "bar11", "d": "baz11"},
+            {"a": 22, "b": "ba22r", "c": "bar22", "d": "baz22"},
+            {"a": 33, "b": "baz33", "c": "bar33", "d": "baz33"},
+        ],
+        type=struct_abcd,
+    )
+    insert_tab = pa.table(
+        {"id": pa.array([11, 22, 33], pa.int64()), "struct_fields": insert_vals}
+    )
+    ds.insert(insert_tab)
+
+    final_expected = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 11, 22, 33], pa.int64()),
+            "struct_fields": pa.concat_arrays([struct_vals_abcd, insert_vals]),
+            "embedding": pa.array(
+                [None, None, None, None, None, None], pa.list_(pa.float32(), 128)
+            ),
+            "label": pa.array([None, None, None, None, None, None], pa.string()),
+            "score": pa.array([None, None, None, None, None, None], pa.float32()),
+        }
+    )
+    assert ds.schema == pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("struct_fields", struct_abcd),
+            pa.field("embedding", pa.list_(pa.float32(), 128)),
+            pa.field("label", pa.string()),
+            pa.field("score", pa.float32()),
+        ]
+    )
+    assert ds.to_table() == final_expected
