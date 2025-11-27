@@ -67,6 +67,11 @@ replace = 'lance-file = {{ version = "={new_version}"'
 
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"
+search = 'lance-geo = {{ version = "={current_version}"'
+replace = 'lance-geo = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
 search = 'lance-index = {{ version = "={current_version}"'
 replace = 'lance-index = {{ version = "={new_version}"'
 
