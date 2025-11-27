@@ -541,6 +541,7 @@ def test_add_cols_all_null_with_sql(tmp_path: Path):
         }
     )
 
+
 def test_struct_fields_evolution_meta_only(tmp_path: Path):
     struct_ab = pa.struct([("a", pa.int64()), ("b", pa.string())])
     base = pa.table(
@@ -548,9 +549,9 @@ def test_struct_fields_evolution_meta_only(tmp_path: Path):
             "id": pa.array([1, 2, 3], pa.int64()),
             "struct_fields": pa.array(
                 [
-                    {"a": 1, "b": "foo"},
-                    {"a": 2, "b": "bar"},
-                    {"a": 3, "b": "baz"},
+                    {"a": 1, "b": "tom"},
+                    {"a": 2, "b": "jerry"},
+                    {"a": 3, "b": "jack"},
                 ],
                 type=struct_ab,
             ),
@@ -598,7 +599,7 @@ def test_struct_fields_evolution_meta_only(tmp_path: Path):
         [("a", pa.int64()), ("b", pa.string()), ("c", pa.string()), ("d", pa.string())]
     )
     struct_vals_abcd = pa.array(
-        [{"a": 1, "b": "foo"}, {"a": 2, "b": "bar"}, {"a": 3, "b": "baz"}],
+        [{"a": 1, "b": "tom"}, {"a": 2, "b": "jerry"}, {"a": 3, "b": "jack"}],
         type=struct_abcd,
     )
     expected = pa.table(
@@ -623,9 +624,9 @@ def test_struct_fields_evolution_meta_only(tmp_path: Path):
 
     insert_vals = pa.array(
         [
-            {"a": 11, "b": "foo11", "c": "bar11", "d": "baz11"},
-            {"a": 22, "b": "ba22r", "c": "bar22", "d": "baz22"},
-            {"a": 33, "b": "baz33", "c": "bar33", "d": "baz33"},
+            {"a": 11, "b": "tom11", "c": "jerry11", "d": "jack11"},
+            {"a": 22, "b": "tom22", "c": "jerry22", "d": "jack22"},
+            {"a": 33, "b": "tom33", "c": "jerry33", "d": "jack33"},
         ],
         type=struct_abcd,
     )
