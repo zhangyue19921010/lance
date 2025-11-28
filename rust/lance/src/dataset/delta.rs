@@ -288,10 +288,7 @@ impl DatasetDelta {
     fn build_upserted_rows_filter(&self) -> String {
         let inserted_row_filter = self.build_inserted_rows_filter();
         let updated_rows_filter = self.build_updated_rows_batch_filter();
-        format!(
-            "({}) OR ({})",
-            inserted_row_filter, updated_rows_filter
-        )
+        format!("({}) OR ({})", inserted_row_filter, updated_rows_filter)
     }
 
     /// Get upserted rows between the two versions.
