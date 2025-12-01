@@ -1409,7 +1409,6 @@ mod tests {
             .as_primitive::<UInt64Type>()
             .values();
         let keys = result["key"].as_primitive::<Int32Type>().values();
-        let a = 1;
 
         for i in 0..result.num_rows() {
             let key = keys[i];
