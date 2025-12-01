@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::rc::Rc;
-use chrono::{DateTime, Utc};
 use super::transaction::Transaction;
 use crate::dataset::scanner::DatasetRecordBatchStream;
+use crate::dataset::Version;
 use crate::Dataset;
 use crate::Result;
+use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::Error;
@@ -15,7 +15,7 @@ use lance_core::ROW_ID;
 use lance_core::ROW_LAST_UPDATED_AT_VERSION;
 use lance_core::WILDCARD;
 use snafu::location;
-use crate::dataset::Version;
+use std::rc::Rc;
 
 /// Builder for creating a [`DatasetDelta`] to explore changes between dataset versions.
 ///
@@ -604,7 +604,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             None,
         )
-            .await;
+        .await;
 
         let created_at = result[ROW_CREATED_AT_VERSION]
             .as_primitive::<UInt64Type>()
@@ -656,7 +656,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             None,
         )
-            .await;
+        .await;
 
         let created_at = result[ROW_CREATED_AT_VERSION]
             .as_primitive::<UInt64Type>()
@@ -699,7 +699,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             None,
         )
-            .await;
+        .await;
 
         let created_at = result[ROW_CREATED_AT_VERSION]
             .as_primitive::<UInt64Type>()
@@ -835,7 +835,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION],
             Some("_row_created_at_version = 1"),
         )
-            .await;
+        .await;
 
         assert_eq!(result.num_rows(), 50);
         let created_at = result[ROW_CREATED_AT_VERSION]
@@ -854,7 +854,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION],
             Some("_row_created_at_version = 2"),
         )
-            .await;
+        .await;
 
         assert_eq!(result.num_rows(), 50);
         let created_at = result[ROW_CREATED_AT_VERSION]
@@ -873,7 +873,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION],
             Some("_row_created_at_version >= 2"),
         )
-            .await;
+        .await;
 
         assert_eq!(result.num_rows(), 50);
         for i in 0..result.num_rows() {
@@ -1044,7 +1044,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             Some("_row_created_at_version = 1 AND _row_last_updated_at_version = 1"),
         )
-            .await;
+        .await;
 
         // Should have 40 rows (keys 0-19 and 30-49)
         assert_eq!(result.num_rows(), 40);
@@ -1070,7 +1070,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             Some("_row_created_at_version = 1 AND _row_last_updated_at_version = 3"),
         )
-            .await;
+        .await;
 
         // Should have 10 rows (keys 20-29)
         assert_eq!(result.num_rows(), 10);
@@ -1095,7 +1095,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             Some("_row_created_at_version = _row_last_updated_at_version"),
         )
-            .await;
+        .await;
 
         // Should have 90 rows (40 from v1 that weren't updated + 50 from v2)
         assert_eq!(result.num_rows(), 90);
@@ -1117,7 +1117,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             Some("_row_created_at_version != _row_last_updated_at_version"),
         )
-            .await;
+        .await;
 
         // Should have 10 rows (keys 20-29 that were updated)
         assert_eq!(result.num_rows(), 10);
@@ -1152,7 +1152,7 @@ mod tests {
             &["key", "value", ROW_LAST_UPDATED_AT_VERSION],
             Some("key < 50 AND _row_last_updated_at_version = 2"),
         )
-            .await;
+        .await;
 
         // Should have 20 rows (keys 30-49 that were updated in v2)
         assert_eq!(result.num_rows(), 20);
@@ -1298,7 +1298,7 @@ mod tests {
         for i in 0..result.num_rows() {
             assert_eq!(created_at[i], 1); // Created at version 1
             assert_eq!(updated_at[i], 2); // Updated at version 2
-            // Keys should be in range [0, 30) but excluding [10, 20)
+                                          // Keys should be in range [0, 30) but excluding [10, 20)
             assert!(keys[i] < 30);
             assert!(keys[i] < 10 || keys[i] >= 20);
         }
@@ -1357,25 +1357,31 @@ mod tests {
         // 版本1，时间 t=10s
         mock_instant::thread_local::MockClock::set_system_time(std::time::Duration::from_secs(10));
         let mut ds = write_dataset_temp(&temp_dir, 0, 50, 1, "v1", true, false).await;
-        let t1 = chrono::DateTime::from_timestamp(10, 0).unwrap().to_rfc3339();
+        let t1 = chrono::DateTime::from_timestamp(10, 0)
+            .unwrap()
+            .to_rfc3339();
         assert_eq!(ds.version().version, 1);
 
         // Version 2, time t=20s (append)
         mock_instant::thread_local::MockClock::set_system_time(std::time::Duration::from_secs(20));
         ds = write_dataset_temp(&temp_dir, 50, 10, 1, "v2_append", true, true).await;
-        let t2 = chrono::DateTime::from_timestamp(20, 0).unwrap().to_rfc3339();
+        let t2 = chrono::DateTime::from_timestamp(20, 0)
+            .unwrap()
+            .to_rfc3339();
         assert_eq!(ds.version().version, 2);
 
         // Version 3, time t=30s (update)
         mock_instant::thread_local::MockClock::set_system_time(std::time::Duration::from_secs(30));
         ds = update_where(ds, "key >= 0 AND key < 10", "updated_v3").await;
-        let t3 = chrono::DateTime::from_timestamp(30, 0).unwrap().to_rfc3339();
+        let t3 = chrono::DateTime::from_timestamp(30, 0)
+            .unwrap()
+            .to_rfc3339();
         assert_eq!(ds.version().version, 3);
 
         // Note: with_end_date currently uses "< date" semantics. To include version t3, we set end to t3 + 1s
         let t3_plus = (chrono::DateTime::from_timestamp(30, 0).unwrap()
             + chrono::Duration::seconds(1))
-            .to_rfc3339();
+        .to_rfc3339();
 
         // Build delta, begin=t1(exclusive v1), end=t3_plus(inclusive v3) -> expect to include both v2 and v3 transactions
         let delta = ds
