@@ -1351,10 +1351,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_delta_build_with_date_range_transactions() {
-        // 使用 MockClock 控制各版本的时间戳
         let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
 
-        // 版本1，时间 t=10s
+        // Version 2, time t=10s (append)
         mock_instant::thread_local::MockClock::set_system_time(std::time::Duration::from_secs(10));
         let mut ds = write_dataset_temp(&temp_dir, 0, 50, 1, "v1", true, false).await;
         let t1 = chrono::DateTime::from_timestamp(10, 0)
