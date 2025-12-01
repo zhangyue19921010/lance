@@ -1353,7 +1353,7 @@ mod tests {
     async fn test_delta_build_with_date_range_transactions() {
         let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
 
-        // Version 2, time t=10s (append)
+        // Version 1, time t=10s (append)
         mock_instant::thread_local::MockClock::set_system_time(std::time::Duration::from_secs(10));
         let mut ds = write_dataset_temp(&temp_dir, 0, 50, 1, "v1", true, false).await;
         let t1 = chrono::DateTime::from_timestamp(10, 0)
