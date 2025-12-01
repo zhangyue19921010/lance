@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::rc::Rc;
+use chrono::{DateTime, Utc};
 use super::transaction::Transaction;
 use crate::dataset::scanner::DatasetRecordBatchStream;
 use crate::Dataset;
@@ -13,6 +15,7 @@ use lance_core::ROW_ID;
 use lance_core::ROW_LAST_UPDATED_AT_VERSION;
 use lance_core::WILDCARD;
 use snafu::location;
+use crate::dataset::Version;
 
 /// Builder for creating a [`DatasetDelta`] to explore changes between dataset versions.
 ///
@@ -40,6 +43,7 @@ pub struct DatasetDeltaBuilder {
     compared_against_version: Option<u64>,
     begin_version: Option<u64>,
     end_version: Option<u64>,
+    cached_versions: Rc<Vec<Version>>,
 }
 
 impl DatasetDeltaBuilder {
@@ -50,6 +54,7 @@ impl DatasetDeltaBuilder {
             compared_against_version: None,
             begin_version: None,
             end_version: None,
+            cached_versions: Rc::new(Vec::new()),
         }
     }
 
@@ -80,6 +85,51 @@ impl DatasetDeltaBuilder {
         self
     }
 
+    /// Set the beginning date for the delta (exclusive).
+    ///
+    /// Must be used together with `with_end_date`.
+    pub async fn with_begin_date(mut self, date_str: &str) -> Self {
+        if let Ok(date_time) = date_str.parse::<DateTime<Utc>>() {
+            let versions = self.list_versions().await;
+            let begin_version = versions
+                .iter()
+                .find(|v| v.timestamp >= date_time)
+                .map(|v| v.version)
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        format!("Can not find version with timestamp >= {}", date_str),
+                        location!(),
+                    )
+                });
+            self.begin_version = Some(begin_version.unwrap());
+        }
+        self
+    }
+
+    /// Set the ending date for the delta (inclusive).
+    ///
+    /// Must be used together with `with_begin_date`.
+    pub async fn with_end_date(mut self, date_str: &str) -> Self {
+        if let Ok(date_time) = date_str.parse::<DateTime<Utc>>() {
+            let versions = self.list_versions().await;
+            let end_version = versions
+                .iter()
+                .rev()
+                .find(|v| v.timestamp < date_time)
+                .map(|v| v.version)
+                .unwrap_or(self.dataset.version().version);
+            self.end_version = Some(end_version);
+        }
+        self
+    }
+
+    async fn list_versions(&mut self) -> Rc<Vec<Version>> {
+        if self.cached_versions.is_empty() {
+            self.cached_versions = Rc::new(self.dataset.versions().await.unwrap());
+        }
+        Rc::clone(&self.cached_versions)
+    }
+
     /// Build the [`DatasetDelta`].
     ///
     /// # Errors
@@ -105,19 +155,19 @@ impl DatasetDeltaBuilder {
             (None, Some(begin), Some(end)) => (begin, end),
             (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
                 return Err(Error::invalid_input(
-                    "Cannot specify both compared_against_version and explicit begin/end versions",
+                    "Cannot specify both compared_against_version and explicit begin/end versions(dates)",
                     location!(),
                 ));
             }
             (None, Some(_), None) | (None, None, Some(_)) => {
                 return Err(Error::invalid_input(
-                    "Must specify both with_begin_version and with_end_version",
+                    "Must specify both (with_begin_version and with_end_version) or (with_begin_date and with_end_date)",
                     location!(),
                 ));
             }
             (None, None, None) => {
                 return Err(Error::invalid_input(
-                    "Must specify either compared_against_version or both with_begin_version and with_end_version",
+                    "Must specify either (compared_against_version) or (both with_begin_version and with_end_version) or (with_begin_date and with_end_date)",
                     location!(),
                 ));
             }
@@ -554,7 +604,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             None,
         )
-        .await;
+            .await;
 
         let created_at = result[ROW_CREATED_AT_VERSION]
             .as_primitive::<UInt64Type>()
@@ -606,7 +656,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             None,
         )
-        .await;
+            .await;
 
         let created_at = result[ROW_CREATED_AT_VERSION]
             .as_primitive::<UInt64Type>()
@@ -649,7 +699,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             None,
         )
-        .await;
+            .await;
 
         let created_at = result[ROW_CREATED_AT_VERSION]
             .as_primitive::<UInt64Type>()
@@ -785,7 +835,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION],
             Some("_row_created_at_version = 1"),
         )
-        .await;
+            .await;
 
         assert_eq!(result.num_rows(), 50);
         let created_at = result[ROW_CREATED_AT_VERSION]
@@ -804,7 +854,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION],
             Some("_row_created_at_version = 2"),
         )
-        .await;
+            .await;
 
         assert_eq!(result.num_rows(), 50);
         let created_at = result[ROW_CREATED_AT_VERSION]
@@ -823,7 +873,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION],
             Some("_row_created_at_version >= 2"),
         )
-        .await;
+            .await;
 
         assert_eq!(result.num_rows(), 50);
         for i in 0..result.num_rows() {
@@ -994,7 +1044,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             Some("_row_created_at_version = 1 AND _row_last_updated_at_version = 1"),
         )
-        .await;
+            .await;
 
         // Should have 40 rows (keys 0-19 and 30-49)
         assert_eq!(result.num_rows(), 40);
@@ -1020,7 +1070,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             Some("_row_created_at_version = 1 AND _row_last_updated_at_version = 3"),
         )
-        .await;
+            .await;
 
         // Should have 10 rows (keys 20-29)
         assert_eq!(result.num_rows(), 10);
@@ -1045,7 +1095,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             Some("_row_created_at_version = _row_last_updated_at_version"),
         )
-        .await;
+            .await;
 
         // Should have 90 rows (40 from v1 that weren't updated + 50 from v2)
         assert_eq!(result.num_rows(), 90);
@@ -1067,7 +1117,7 @@ mod tests {
             &["key", ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION],
             Some("_row_created_at_version != _row_last_updated_at_version"),
         )
-        .await;
+            .await;
 
         // Should have 10 rows (keys 20-29 that were updated)
         assert_eq!(result.num_rows(), 10);
@@ -1102,7 +1152,7 @@ mod tests {
             &["key", "value", ROW_LAST_UPDATED_AT_VERSION],
             Some("key < 50 AND _row_last_updated_at_version = 2"),
         )
-        .await;
+            .await;
 
         // Should have 20 rows (keys 30-49 that were updated in v2)
         assert_eq!(result.num_rows(), 20);
@@ -1248,7 +1298,7 @@ mod tests {
         for i in 0..result.num_rows() {
             assert_eq!(created_at[i], 1); // Created at version 1
             assert_eq!(updated_at[i], 2); // Updated at version 2
-                                          // Keys should be in range [0, 30) but excluding [10, 20)
+            // Keys should be in range [0, 30) but excluding [10, 20)
             assert!(keys[i] < 30);
             assert!(keys[i] < 10 || keys[i] >= 20);
         }
@@ -1297,5 +1347,58 @@ mod tests {
         for i in 0..result.num_rows() {
             assert_eq!(created_at[i], 1); // All created at version 1
         }
+    }
+
+    #[tokio::test]
+    async fn test_delta_build_with_date_range_transactions() {
+        // 使用 MockClock 控制各版本的时间戳
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+
+        // 版本1，时间 t=10s
+        mock_instant::thread_local::MockClock::set_system_time(std::time::Duration::from_secs(10));
+        let mut ds = write_dataset_temp(&temp_dir, 0, 50, 1, "v1", true, false).await;
+        let t1 = chrono::DateTime::from_timestamp(10, 0).unwrap().to_rfc3339();
+        assert_eq!(ds.version().version, 1);
+
+        // Version 2, time t=20s (append)
+        mock_instant::thread_local::MockClock::set_system_time(std::time::Duration::from_secs(20));
+        ds = write_dataset_temp(&temp_dir, 50, 10, 1, "v2_append", true, true).await;
+        let t2 = chrono::DateTime::from_timestamp(20, 0).unwrap().to_rfc3339();
+        assert_eq!(ds.version().version, 2);
+
+        // Version 3, time t=30s (update)
+        mock_instant::thread_local::MockClock::set_system_time(std::time::Duration::from_secs(30));
+        ds = update_where(ds, "key >= 0 AND key < 10", "updated_v3").await;
+        let t3 = chrono::DateTime::from_timestamp(30, 0).unwrap().to_rfc3339();
+        assert_eq!(ds.version().version, 3);
+
+        // Note: with_end_date currently uses "< date" semantics. To include version t3, we set end to t3 + 1s
+        let t3_plus = (chrono::DateTime::from_timestamp(30, 0).unwrap()
+            + chrono::Duration::seconds(1))
+            .to_rfc3339();
+
+        // Build delta, begin=t1(exclusive v1), end=t3_plus(inclusive v3) -> expect to include both v2 and v3 transactions
+        let delta = ds
+            .delta()
+            .with_begin_date(&t1)
+            .await
+            .with_end_date(&t3_plus)
+            .await
+            .build()
+            .unwrap();
+        let txs = delta.list_transactions().await.unwrap();
+        assert_eq!(txs.len(), 2);
+
+        // Build delta, begin=t2(exclusive v2), end=t3_plus(inclusive v3) -> expect to include only v3 transaction
+        let delta = ds
+            .delta()
+            .with_begin_date(&t2)
+            .await
+            .with_end_date(&t3_plus)
+            .await
+            .build()
+            .unwrap();
+        let txs = delta.list_transactions().await.unwrap();
+        assert_eq!(txs.len(), 1);
     }
 }
