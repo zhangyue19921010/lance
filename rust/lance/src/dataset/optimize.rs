@@ -113,6 +113,16 @@ pub mod remapping;
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
+use lance_encoding::decoder::PageInfo as DecPageInfo;
+use lance_file::reader::FileReader as LFReader;
+use lance_file::format::{pb, pbfile, MAGIC};
+use lance_file::datatypes::FieldsWithMeta;
+use prost::Message;
+use prost_types::Any;
+use tokio::io::AsyncWriteExt;
+use lance_io::object_writer::ObjectWriter;
+use lance_io::traits::Writer;
+use super::rowids::load_row_id_sequence;
 
 /// Options to be passed to [compact_files].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,6 +165,9 @@ pub struct CompactionOptions {
     /// not be remapped during this compaction operation. Instead, the fragment reuse index
     /// is updated and will be used to perform remapping later.
     pub defer_index_remap: bool,
+    /// Whether to enable binary copy optimization when eligible.
+    /// Defaults to false.
+    pub enable_binary_copy: bool,
 }
 
 impl Default for CompactionOptions {
@@ -169,6 +182,7 @@ impl Default for CompactionOptions {
             max_bytes_per_file: None,
             batch_size: None,
             defer_index_remap: false,
+            enable_binary_copy: false,
         }
     }
 }
@@ -180,6 +194,89 @@ impl CompactionOptions {
             self.materialize_deletions = false;
         }
     }
+}
+
+/// Decide whether binary copy can be used for this compaction task.
+///
+/// Staged checks:
+/// 1) Feature flag: must be explicitly enabled via `enable_binary_copy`
+/// 2) Storage version: only supported for Lance file V2.1 / V2.2
+/// 3) Fragment constraints: no deletion files, single non-legacy data file per fragment
+/// 4) Layout consistency: fragment data files must match current schema field ids and
+///    column index ordering (dense [0..leaf_count))
+fn can_use_binary_copy(dataset: &Dataset, options: &CompactionOptions, fragments: &[Fragment]) -> bool {
+    use lance_file::version::LanceFileVersion;
+    if !options.enable_binary_copy {
+        return false;
+    }
+    // Check dataset storage version is supported
+    let storage_ok = dataset
+        .manifest
+        .data_storage_format
+        .lance_file_version()
+        .map(|v| matches!(v.resolve(), LanceFileVersion::V2_0 | LanceFileVersion::V2_1 | LanceFileVersion::V2_2))
+        .unwrap_or(false);
+    if !storage_ok {
+        return false;
+    }
+    // Check all fragments' data files have the same file version and it is either 2.1 or 2.2
+    if fragments.is_empty() {
+        return false;
+    }
+    let mut files_iter = fragments.iter().flat_map(|f| f.files.iter());
+    let first_df = match files_iter.next() {
+        Some(df) => df,
+        None => return false,
+    };
+    let first_ver = LanceFileVersion::try_from_major_minor(
+        first_df.file_major_version,
+        first_df.file_minor_version,
+    )
+    .map(|v| v.resolve())
+    .unwrap();
+    if matches!(first_ver, LanceFileVersion::Legacy) {
+        return false;
+    }
+    let same_version = fragments
+        .iter()
+        .flat_map(|f| f.files.iter())
+        .all(|df| {
+            LanceFileVersion::try_from_major_minor(df.file_major_version, df.file_minor_version)
+                .map(|v| v.resolve())
+                .map_or(false, |v| v == first_ver)
+        });
+    if !same_version {
+        return false;
+    }
+    // No deletion vector support in binary copy
+    if fragments.iter().any(|f| f.deletion_file.is_some()) {
+        return false;
+    }
+    // Each fragment should have exactly one non-legacy data file
+    if fragments
+        .iter()
+        .any(|f| f.files.len() != 1 || f.files[0].is_legacy_file())
+    {
+        return false;
+    }
+    // Data layout must match current schema (field ids and dense column indices)
+    let schema = dataset.schema().clone();
+    let leaf_count = schema.fields_pre_order().filter(|f| f.is_leaf()).count();
+    let field_ids = schema.field_ids();
+    let layout_ok = fragments.iter().all(|f| {
+        let df = &f.files[0];
+        df.fields == field_ids
+            && df.column_indices.len() == leaf_count
+            && df
+                .column_indices
+                .iter()
+                .enumerate()
+                .all(|(i, ci)| *ci == i as i32)
+    });
+    if !layout_ok {
+        return false;
+    }
+    true
 }
 
 /// Metrics returned by [compact_files].
@@ -671,11 +768,11 @@ async fn rewrite_files(
         .sum::<u64>();
     // If we aren't using stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_stable_row_ids();
+    let mut new_fragments: Vec<Fragment> = Vec::new();
     let mut scanner = dataset.scan();
     if let Some(batch_size) = options.batch_size {
         scanner.batch_size(batch_size);
     }
-    // Generate an ID for logging purposes
     let task_id = uuid::Uuid::new_v4();
     log::info!(
         "Compaction task {}: Begin compacting {} rows across {} fragments",
@@ -683,19 +780,26 @@ async fn rewrite_files(
         num_rows,
         fragments.len()
     );
-    scanner
-        .with_fragments(fragments.clone())
-        .scan_in_order(true);
-    let (row_ids_rx, reader) = if needs_remapping {
-        scanner.with_row_id();
-        let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
-        let (data_no_row_ids, row_id_rx) =
-            make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
-        (Some(row_id_rx), data_no_row_ids)
+    let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments);
+    let mut row_ids_rx = None;
+    let reader;
+    if !can_binary_copy {
+        scanner
+            .with_fragments(fragments.clone())
+            .scan_in_order(true);
+        if needs_remapping {
+            scanner.with_row_id();
+            let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+            let (data_no_row_ids, rx) =
+                make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
+            row_ids_rx = Some(rx);
+            reader = data_no_row_ids;
+        } else {
+            reader = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+        }
     } else {
-        let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
-        (None, data)
-    };
+        reader = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+    }
 
     let mut rows_read = 0;
     let schema = reader.schema();
@@ -724,16 +828,35 @@ async fn rewrite_files(
         params.enable_stable_row_ids = true;
     }
 
-    let (mut new_fragments, _) = write_fragments_internal(
-        Some(dataset.as_ref()),
-        dataset.object_store.clone(),
-        &dataset.base,
-        dataset.schema().clone(),
-        reader,
-        params,
-        None, // Compaction doesn't use target_bases
-    )
-    .await?;
+    if can_binary_copy {
+        new_fragments = rewrite_files_binary_copy(dataset.as_ref(), &fragments, &params).await?;
+        // fall back to common path if binary copy is not supported
+        if new_fragments.is_empty() {
+            let (frags, _) = write_fragments_internal(
+                Some(dataset.as_ref()),
+                dataset.object_store.clone(),
+                &dataset.base,
+                dataset.schema().clone(),
+                reader,
+                params,
+                None,
+            )
+            .await?;
+            new_fragments = frags;
+        }
+    } else {
+        let (frags, _) = write_fragments_internal(
+            Some(dataset.as_ref()),
+            dataset.object_store.clone(),
+            &dataset.base,
+            dataset.schema().clone(),
+            reader,
+            params,
+            None,
+        )
+        .await?;
+        new_fragments = frags;
+    }
 
     log::info!("Compaction task {}: file written", task_id);
 
@@ -760,9 +883,9 @@ async fn rewrite_files(
             (Some(row_id_map), None)
         }
     } else {
-        log::info!("Compaction task {}: rechunking stable row ids", task_id);
-        rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
         if dataset.manifest.uses_stable_row_ids() {
+            log::info!("Compaction task {}: rechunking stable row ids", task_id);
+            rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
             recalc_versions_for_rewritten_fragments(
                 dataset.as_ref(),
                 &mut new_fragments,
@@ -962,6 +1085,343 @@ async fn recalc_versions_for_rewritten_fragments(
         );
     }
 
+    Ok(())
+}
+
+async fn rewrite_files_binary_copy(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+    params: &WriteParams,
+) -> Result<Vec<Fragment>> {
+    // Merge small Lance files into larger ones by page-level binary copy.
+    let schema = dataset.schema().clone();
+    let full_field_ids = schema.field_ids();
+    let version = lance_file::version::LanceFileVersion::try_from_major_minor(
+        fragments[0].files[0].file_major_version,
+        fragments[0].files[0].file_minor_version,
+    )
+    .unwrap()
+    .resolve();
+    let leaf_count = schema.fields_pre_order().filter(|f| f.is_leaf()).count();
+
+    let mut out: Vec<Fragment> = Vec::new();
+    let mut current_writer: Option<ObjectWriter> = None;
+    let mut current_filename: Option<String> = None;
+    let mut current_pos: u64 = 0;
+    let mut current_page_table: Vec<lance_encoding::decoder::ColumnInfo> = Vec::new();
+    let mut col_pages: Vec<Vec<DecPageInfo>> = std::iter::repeat_with(|| Vec::<DecPageInfo>::new())
+        .take(leaf_count)
+        .collect();
+    let mut col_buffers: Vec<Vec<(u64, u64)>> = vec![Vec::new(); leaf_count];
+    let mut total_rows_in_current: u64 = 0;
+    let mut col_encodings: Option<Vec<lance_encoding::format::pb::ColumnEncoding>> = None;
+    let max_rows_per_file = params.max_rows_per_file as u64;
+    let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
+    let mut current_row_ids = lance_table::rowids::RowIdSequence::new();
+
+    const ALIGN: usize = 64;
+    // Visit each fragment and all of its data files (a fragment may contain multiple files)
+    for frag in fragments.iter() {
+        let mut frag_row_ids_offset: u64 = 0;
+        let frag_row_ids = if uses_stable_row_ids {
+            Some(load_row_id_sequence(dataset, frag).await?)
+        } else {
+            None
+        };
+        for df in frag.files.iter() {
+            let object_store = if let Some(base_id) = df.base_id {
+                dataset.object_store_for_base(base_id).await?
+            } else {
+                dataset.object_store.clone()
+            };
+            let full_path = dataset.data_file_dir(df)?.child(df.path.as_str());
+            let scan_scheduler = lance_io::scheduler::ScanScheduler::new(object_store.clone(), lance_io::scheduler::SchedulerConfig::max_bandwidth(&object_store));
+            let file_scheduler = scan_scheduler
+                .open_file_with_priority(&full_path, 0, &df.file_size_bytes)
+                .await?;
+            let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
+            let src_cols = file_meta.column_infos.clone();
+            // Initialize page table layout once and verify encoding consistency thereafter
+            if col_encodings.is_none() {
+                col_encodings = Some(src_cols.iter().map(|ci| ci.encoding.clone()).collect());
+                current_page_table = src_cols
+                    .iter()
+                    .map(|ci| lance_encoding::decoder::ColumnInfo {
+                        index: ci.index,
+                        buffer_offsets_and_sizes: Arc::from(Vec::<(u64, u64)>::new().into_boxed_slice()),
+                        page_infos: Arc::from(Vec::<DecPageInfo>::new().into_boxed_slice()),
+                        encoding: ci.encoding.clone(),
+                    })
+                    .collect();
+            } else {
+                let expected = col_encodings.as_ref().unwrap();
+                if !expected.iter().zip(src_cols.iter()).all(|(e, ci)| *e == ci.encoding) {
+                    return Ok(Vec::new());
+                }
+            }
+            for (col_idx, src_column_info) in src_cols.iter().enumerate() {
+                for page in src_column_info.page_infos.iter() {
+                    let mut new_offsets = Vec::with_capacity(page.buffer_offsets_and_sizes.len());
+                    if current_writer.is_none() {
+                        let filename = format!("{}.lance", crate::dataset::fragment::write::generate_random_filename());
+                        let path = dataset.base.child(super::DATA_DIR).child(filename.as_str());
+                        let writer = dataset.object_store.create(&path).await?;
+                        current_writer = Some(writer);
+                        current_filename = Some(filename);
+                        current_pos = 0;
+                    }
+                    let ranges: Vec<Range<u64>> = page
+                        .buffer_offsets_and_sizes
+                        .iter()
+                        .map(|(offset, size)| (*offset)..(*offset + *size))
+                        .collect();
+                    let bytes_vec = file_scheduler.submit_request(ranges, 0).await?;
+                    for bytes in bytes_vec.into_iter() {
+                        let writer = current_writer.as_mut().unwrap();
+                        let pad = (ALIGN - (current_pos as usize % ALIGN)) % ALIGN;
+                        if pad != 0 {
+                            let zeros = vec![0u8; pad];
+                            writer.write_all(&zeros).await?;
+                            current_pos += pad as u64;
+                        }
+                        let start = current_pos;
+                        writer.write_all(&bytes).await?;
+                        current_pos += bytes.len() as u64;
+                        new_offsets.push((start, bytes.len() as u64));
+                    }
+                    let encoding = if page.encoding.is_structural() {
+                        lance_encoding::decoder::PageEncoding::Structural(
+                            page.encoding.as_structural().clone(),
+                        )
+                    } else {
+                        lance_encoding::decoder::PageEncoding::Legacy(
+                            page.encoding.as_legacy().clone(),
+                        )
+                    };
+                    // Record page metadata for the output file (no re-encoding)
+                    let new_page_info = DecPageInfo {
+                        num_rows: page.num_rows,
+                        priority: page.priority + total_rows_in_current,
+                        encoding,
+                        buffer_offsets_and_sizes: Arc::from(new_offsets.into_boxed_slice()),
+                    };
+                    col_pages[col_idx].push(new_page_info);
+                }
+                // Copy column-level buffers (outside page data) with alignment
+                if !src_column_info.buffer_offsets_and_sizes.is_empty() {
+                    let ranges: Vec<std::ops::Range<u64>> = src_column_info
+                        .buffer_offsets_and_sizes
+                        .iter()
+                        .map(|(offset, size)| (*offset)..(*offset + *size))
+                        .collect();
+                    let bytes_vec = file_scheduler.submit_request(ranges, 0).await?;
+                    for bytes in bytes_vec.into_iter() {
+                        let writer = current_writer.as_mut().unwrap();
+                        let pad = (ALIGN - (current_pos as usize % ALIGN)) % ALIGN;
+                        if pad != 0 {
+                            let zeros = vec![0u8; pad];
+                            writer.write_all(&zeros).await?;
+                            current_pos += pad as u64;
+                        }
+                        let start = current_pos;
+                        writer.write_all(&bytes).await?;
+                        current_pos += bytes.len() as u64;
+                        col_buffers[col_idx].push((start, bytes.len() as u64));
+                    }
+                }
+            }
+            // Accumulate rows for the current output file and flush when reaching the threshold
+            total_rows_in_current += file_meta.num_rows;
+            if uses_stable_row_ids {
+                if let Some(seq) = frag_row_ids.as_ref() {
+                    let count = file_meta.num_rows as usize;
+                    let slice = seq.slice(frag_row_ids_offset as usize, count);
+                    let ids_vec: Vec<u64> = slice.iter().collect();
+                    current_row_ids
+                        .extend(lance_table::rowids::RowIdSequence::from(ids_vec.as_slice()));
+                    frag_row_ids_offset += count as u64;
+                }
+            }
+            if total_rows_in_current >= max_rows_per_file {
+                let mut final_cols: Vec<Arc<lance_encoding::decoder::ColumnInfo>> = Vec::with_capacity(leaf_count);
+                for (i, column_info) in current_page_table.iter().enumerate() {
+                    let pages_arc = Arc::from(std::mem::take(&mut col_pages[i]).into_boxed_slice());
+                    let buffers_vec = std::mem::take(&mut col_buffers[i]);
+                    final_cols.push(Arc::new(lance_encoding::decoder::ColumnInfo::new(
+                        column_info.index,
+                        pages_arc,
+                        buffers_vec,
+                        column_info.encoding.clone(),
+                    )));
+                }
+                let writer = current_writer.as_mut().unwrap();
+                flush_footer(writer, &schema, &final_cols, total_rows_in_current, version, ALIGN, &mut current_pos).await?;
+                // Register the newly closed output file as a fragment data file
+                let (maj, min) = version.to_numbers();
+                let mut frag_out = Fragment::new(0);
+                let mut data_file_out = lance_table::format::DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
+                data_file_out.fields = full_field_ids.clone();
+                data_file_out.column_indices = (0..leaf_count).map(|i| i as i32).collect();
+                frag_out.files.push(data_file_out);
+                frag_out.physical_rows = Some(total_rows_in_current as usize);
+                if uses_stable_row_ids {
+                    frag_out.row_id_meta = Some(RowIdMeta::Inline(lance_table::rowids::write_row_ids(&current_row_ids)));
+                }
+                // Reset state for next output file
+                current_writer = None;
+                current_pos = 0;
+                current_page_table.clear();
+                for v in col_pages.iter_mut() { v.clear(); }
+                for v in col_buffers.iter_mut() { v.clear(); }
+                col_encodings = None;
+                out.push(frag_out);
+                total_rows_in_current = 0;
+                if uses_stable_row_ids {
+                    current_row_ids = lance_table::rowids::RowIdSequence::new();
+                }
+            }
+        }
+    }
+    if total_rows_in_current > 0 {
+        // Flush remaining rows as a final output file
+        let mut final_cols: Vec<Arc<lance_encoding::decoder::ColumnInfo>> = Vec::with_capacity(leaf_count);
+        for (i, ci) in current_page_table.iter().enumerate() {
+            let pages_arc = Arc::from(std::mem::take(&mut col_pages[i]).into_boxed_slice());
+            let buffers_vec = std::mem::take(&mut col_buffers[i]);
+            final_cols.push(Arc::new(lance_encoding::decoder::ColumnInfo::new(
+                ci.index,
+                pages_arc,
+                buffers_vec,
+                ci.encoding.clone(),
+            )));
+        }
+        if current_writer.is_none() {
+            let filename = format!("{}.lance", crate::dataset::fragment::write::generate_random_filename());
+            let path = dataset.base.child(super::DATA_DIR).child(filename.as_str());
+            let writer = dataset.object_store.create(&path).await?;
+            current_writer = Some(writer);
+            current_filename = Some(filename);
+            current_pos = 0;
+        }
+        let writer = current_writer.as_mut().unwrap();
+        flush_footer(writer, &schema, &final_cols, total_rows_in_current, version, ALIGN, &mut current_pos).await?;
+        // Register the final file
+        let (maj, min) = version.to_numbers();
+        let mut frag = Fragment::new(0);
+        let mut df = lance_table::format::DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
+        df.fields = full_field_ids.clone();
+        df.column_indices = (0..leaf_count).map(|i| i as i32).collect();
+        frag.files.push(df);
+        frag.physical_rows = Some(total_rows_in_current as usize);
+        if uses_stable_row_ids {
+            frag.row_id_meta = Some(RowIdMeta::Inline(lance_table::rowids::write_row_ids(&current_row_ids)));
+        }
+        out.push(frag);
+    }
+    Ok(out)
+}
+
+async fn flush_footer(
+    writer: &mut ObjectWriter,
+    schema: &lance_core::datatypes::Schema,
+    final_cols: &[Arc<lance_encoding::decoder::ColumnInfo>],
+    total_rows_in_current: u64,
+    version: lance_file::version::LanceFileVersion,
+    align: usize,
+    current_pos: &mut u64,
+) -> Result<()> {
+    // 1) Write schema descriptor (FileDescriptor) as a global buffer, aligned
+    let fields_with_meta = FieldsWithMeta::from(schema);
+    let file_descriptor = pb::FileDescriptor {
+        schema: Some(pb::Schema { fields: fields_with_meta.fields.0, metadata: fields_with_meta.metadata }),
+        length: total_rows_in_current,
+    };
+    let file_descriptor_bytes = file_descriptor.encode_to_vec();
+    let pad = (align - (*current_pos as usize % align)) % align;
+    if pad != 0 {
+        let zeros = vec![0u8; pad];
+        writer.write_all(&zeros).await?;
+        *current_pos += pad as u64;
+    }
+    let fd_pos = *current_pos;
+    let fd_len = file_descriptor_bytes.len() as u64;
+    writer.write_all(&file_descriptor_bytes).await?;
+    *current_pos += fd_len;
+    let mut global_buffer_offsets = vec![(fd_pos, fd_len)];
+    // 2) Write per-column metadata blocks and collect their positions
+    let column_metadata_start = *current_pos;
+    let mut metadata_positions = Vec::with_capacity(final_cols.len());
+    for col in final_cols {
+        let pages = col
+            .page_infos
+            .iter()
+            .map(|page_info| {
+                let encoded_encoding = match &page_info.encoding {
+                    lance_encoding::decoder::PageEncoding::Legacy(array_encoding) => Any::from_msg(array_encoding)?.encode_to_vec(),
+                    lance_encoding::decoder::PageEncoding::Structural(page_layout) => Any::from_msg(page_layout)?.encode_to_vec(),
+                };
+                let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
+                    .buffer_offsets_and_sizes
+                    .as_ref()
+                    .iter()
+                    .cloned()
+                    .unzip();
+                Ok(pbfile::column_metadata::Page {
+                    buffer_offsets,
+                    buffer_sizes,
+                    encoding: Some(pbfile::Encoding {
+                        location: Some(pbfile::encoding::Location::Direct(pbfile::DirectEncoding { encoding: encoded_encoding })),
+                    }),
+                    length: page_info.num_rows,
+                    priority: page_info.priority,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) =
+            col.buffer_offsets_and_sizes.iter().cloned().unzip();
+        let encoded_col_encoding = Any::from_msg(&col.encoding)?.encode_to_vec();
+        let column = pbfile::ColumnMetadata {
+            pages,
+            buffer_offsets,
+            buffer_sizes,
+            encoding: Some(pbfile::Encoding {
+                location: Some(pbfile::encoding::Location::Direct(pbfile::DirectEncoding { encoding: encoded_col_encoding })),
+            }),
+        };
+        let column_bytes = column.encode_to_vec();
+        let position = *current_pos;
+        let len = column_bytes.len() as u64;
+        writer.write_all(&column_bytes).await?;
+        *current_pos += len;
+        metadata_positions.push((position, len));
+    }
+    // 3) Write column metadata offsets (CMO) and global buffer offsets (GBO)
+    let cmo_table_start = *current_pos;
+    for (meta_pos, meta_len) in metadata_positions {
+        writer.write_u64_le(meta_pos).await?;
+        writer.write_u64_le(meta_len).await?;
+        *current_pos += 16;
+    }
+    let gbo_table_start = *current_pos;
+    for (gbo_pos, gbo_len) in global_buffer_offsets.drain(..) {
+        writer.write_u64_le(gbo_pos).await?;
+        writer.write_u64_le(gbo_len).await?;
+        *current_pos += 16;
+    }
+    // 4) Write footer pointers & version, then close the writer
+    let (maj, min) = version.to_numbers();
+    let num_global_buffers = 1u32;
+    let num_columns = final_cols.len() as u32;
+    writer.write_u64_le(column_metadata_start).await?;
+    writer.write_u64_le(cmo_table_start).await?;
+    writer.write_u64_le(gbo_table_start).await?;
+    writer.write_u32_le(num_global_buffers).await?;
+    writer.write_u32_le(num_columns).await?;
+    writer.write_u16_le(maj as u16).await?;
+    writer.write_u16_le(min as u16).await?;
+    writer.write_all(MAGIC).await?;
+    *current_pos += 8 + 8 + 8 + 4 + 4 + 2 + 2 + (MAGIC.len() as u64);
+    writer.shutdown().await?;
     Ok(())
 }
 
@@ -1515,6 +1975,296 @@ mod tests {
             .map(|f| f.id())
             .collect::<Vec<_>>();
         assert_eq!(fragment_ids, vec![3, 7, 8, 9, 10]);
+    }
+
+
+    #[tokio::test]
+    async fn test_binary_copy_merge_small_files() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let reader2 = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 2_500,
+            max_rows_per_group: 1_000,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+        dataset.append(reader2, Some(write_params)).await.unwrap();
+
+        let before = dataset.scan().try_into_batch().await.unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 100_000_000,
+            enable_binary_copy: true,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        let debug = dataset.manifest.clone();
+        assert!(metrics.fragments_added >= 1);
+        assert_eq!(dataset.count_rows(None).await.unwrap() as usize, before.num_rows());
+        let after = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_binary_copy_nested_fixed_size_list_with_defer_remap() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(RandomVector::new().vec_width(16).named("vec".to_owned())))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let mut dataset = Dataset::write(
+            data_gen.batch(6_000),
+            "memory://test/binary_copy_nested",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::Next),
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let before_batch = dataset
+            .scan()
+            .project(&["vec", "i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 180,
+            defer_index_remap: true,
+            enable_binary_copy: true,
+            ..Default::default()
+        };
+        let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
+
+        let after_batch = dataset
+            .scan()
+            .project(&["vec", "i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(before_batch, after_batch);
+    }
+
+    #[tokio::test]
+    async fn test_binary_copy_with_stable_row_ids_enabled() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(RandomVector::new().vec_width(8).named("vec".to_owned())))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let mut dataset = Dataset::write(
+            data_gen.batch(4_000),
+            "memory://test/binary_copy_stable_row_ids",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::Next),
+                max_rows_per_file: 500,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let before_batch = dataset
+            .scan()
+            .project(&["vec", "i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            enable_binary_copy: true,
+            ..Default::default()
+        };
+        let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
+
+        let after_batch = dataset
+            .scan()
+            .project(&["vec", "i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(before_batch, after_batch);
+    }
+
+    #[tokio::test]
+    async fn test_binary_copy_v22_enabled() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(RandomVector::new().vec_width(12).named("vec".to_owned())))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let mut dataset = Dataset::write(
+            data_gen.batch(5_000),
+            "memory://test/binary_copy_v22",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                max_rows_per_file: 500,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let before_batch = dataset
+            .scan()
+            .project(&["vec", "i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            enable_binary_copy: true,
+            ..Default::default()
+        };
+        let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        let frags = dataset.get_fragments();
+        // Assert new fragments use 2.2 footer (2,2)
+        let last = frags.last().unwrap();
+        let (maj, min) = (
+            last.metadata.files[0].file_major_version,
+            last.metadata.files[0].file_minor_version,
+        );
+
+        let after_batch = dataset
+            .scan()
+            .project(&["vec", "i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(before_batch, after_batch);
+    }
+
+    #[tokio::test]
+    async fn test_binary_copy_v20_enabled() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(RandomVector::new().vec_width(8).named("vec".to_owned())))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let mut dataset = Dataset::write(
+            data_gen.batch(4_000),
+            "memory://test/binary_copy_v20",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_0),
+                max_rows_per_file: 500,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let before_batch = dataset
+            .scan()
+            .project(&["vec", "i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            enable_binary_copy: true,
+            ..Default::default()
+        };
+        let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        let frags = dataset.get_fragments();
+        // Assert new fragments use 2.0 footer alias (0,3)
+        let last = frags.last().unwrap();
+        let (maj, min) = (
+            last.metadata.files[0].file_major_version,
+            last.metadata.files[0].file_minor_version,
+        );
+
+        let after_batch = dataset
+            .scan()
+            .project(&["vec", "i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(before_batch, after_batch);
+    }
+
+    #[tokio::test]
+    async fn test_perf_binary_copy_vs_full() {
+        use std::time::Instant;
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let mut data_gen = BatchGenerator::new()
+            .col(Box::new(RandomVector::new().vec_width(12).named("vec".to_owned())))
+            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let base_rows = 10;
+        let full_dir = TempStrDir::default();
+        let mut dataset_full = Dataset::write(
+            data_gen.batch(base_rows),
+            &*full_dir,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let bin_dir = TempStrDir::default();
+        let mut dataset_binary = Dataset::write(
+            data_gen.batch(base_rows),
+            &*bin_dir,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let opt_full = CompactionOptions {enable_binary_copy: false, ..Default::default() };
+        let opt_bin = CompactionOptions {enable_binary_copy: true, ..Default::default() };
+
+        let t0 = Instant::now();
+        let _ = compact_files(&mut dataset_full, opt_full, None).await.unwrap();
+        let d_full = t0.elapsed();
+
+        let t1 = Instant::now();
+        let _ = compact_files(&mut dataset_binary, opt_bin, None).await.unwrap();
+        let d_bin = t1.elapsed();
+
+        println!("perf: full_compaction={:?}, binary_copy={:?}, speedup={:.2}x", d_full, d_bin, (d_full.as_secs_f64() / d_bin.as_secs_f64()));
+
+        let rows_bin = dataset_binary.count_rows(None).await.unwrap();
+        let rows_full = dataset_full.count_rows(None).await.unwrap();
+        assert_eq!(rows_bin, rows_full);
     }
 
     #[rstest]
