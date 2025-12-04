@@ -118,9 +118,9 @@ use crate::io::deletion::read_dataset_deletion_file;
 use lance_core::datatypes::Schema;
 use lance_encoding::decoder::{ColumnInfo, PageEncoding, PageInfo as DecPageInfo};
 use lance_encoding::version::LanceFileVersion;
-use lance_file::datatypes::FieldsWithMeta;
-use lance_file::format::{pb, pbfile, MAGIC};
+use lance_file::format::pbfile;
 use lance_file::reader::FileReader as LFReader;
+use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Writer;
@@ -1443,18 +1443,8 @@ async fn rewrite_files_binary_copy(
                         column_info.encoding.clone(),
                     )));
                 }
-                let writer = current_writer.as_mut().unwrap();
-                // finish writing the current file
-                flush_footer(
-                    writer,
-                    &schema,
-                    &final_cols,
-                    total_rows_in_current,
-                    version,
-                    ALIGN,
-                    &mut current_pos,
-                )
-                .await?;
+                let writer = current_writer.take().unwrap();
+                flush_footer(writer, &schema, &final_cols, total_rows_in_current, version).await?;
 
                 // Register the newly closed output file as a fragment data file
                 let (maj, min) = version.to_numbers();
@@ -1483,7 +1473,8 @@ async fn rewrite_files_binary_copy(
                 fragment_out.files.push(data_file_out);
                 fragment_out.physical_rows = Some(total_rows_in_current as usize);
                 if uses_stable_row_ids {
-                    fragment_out.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&current_row_ids)));
+                    fragment_out.row_id_meta =
+                        Some(RowIdMeta::Inline(write_row_ids(&current_row_ids)));
                 }
                 // Reset state for next output file
                 current_writer = None;
@@ -1503,7 +1494,6 @@ async fn rewrite_files_binary_copy(
             }
         }
     } // Complete the writing of all fragments, except for some data remaining in memory
-
 
     if total_rows_in_current > 0 {
         // Flush remaining rows as a final output file
@@ -1538,17 +1528,8 @@ async fn rewrite_files_binary_copy(
             current_filename = Some(filename);
             current_pos = 0;
         }
-        let writer = current_writer.as_mut().unwrap();
-        flush_footer(
-            writer,
-            &schema,
-            &final_cols,
-            total_rows_in_current,
-            version,
-            ALIGN,
-            &mut current_pos,
-        )
-        .await?;
+        let writer = current_writer.take().unwrap();
+        flush_footer(writer, &schema, &final_cols, total_rows_in_current, version).await?;
         // Register the final file
         let (maj, min) = version.to_numbers();
         let mut frag = Fragment::new(0);
@@ -1580,41 +1561,41 @@ async fn rewrite_files_binary_copy(
     Ok(out)
 }
 
-/// TODO Doc Here.
+/// Finalizes a compacted data file by writing the Lance footer via `FileWriter`.
+///
+/// This function does not manually craft the footer. Instead it:
+/// - Pads the current `ObjectWriter` position to a 64‑byte boundary (required for v2_1+ readers).
+/// - Converts the collected per‑column info (`final_cols`) into `ColumnMetadata`.
+/// - Constructs a `lance_file::writer::FileWriter` with the active `schema`, column metadata,
+///   and `total_rows_in_current`.
+/// - Calls `FileWriter::finish()` to emit column metadata, offset tables, global buffers
+///   (schema descriptor), version, and to close the writer.
+///
+/// Preconditions:
+/// - All page data and column‑level buffers referenced by `final_cols` have already been written
+///   to `writer`; otherwise offsets in the footer will be invalid.
+///
+/// Version notes:
+/// - v2_0 structural single‑page enforcement is handled when building `final_cols`; this function
+///   only performs consistent finalization.
 async fn flush_footer(
-    writer: &mut ObjectWriter,
+    mut writer: ObjectWriter,
     schema: &Schema,
     final_cols: &[Arc<ColumnInfo>],
     total_rows_in_current: u64,
     version: LanceFileVersion,
-    align: usize,
-    current_pos: &mut u64,
 ) -> Result<()> {
-    // 1) Write schema descriptor (FileDescriptor) as a global buffer, aligned
-    let fields_with_meta = FieldsWithMeta::from(schema);
-    let file_descriptor = pb::FileDescriptor {
-        schema: Some(pb::Schema {
-            fields: fields_with_meta.fields.0,
-            metadata: fields_with_meta.metadata,
-        }),
-        length: total_rows_in_current,
-    };
-    let file_descriptor_bytes = file_descriptor.encode_to_vec();
-    let pad = (align - (*current_pos as usize % align)) % align;
-    if pad != 0 {
+    if version >= LanceFileVersion::V2_1 {
+        const ALIGN: usize = 64;
         static ZERO_BUFFER: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-        let zero_buf = ZERO_BUFFER.get_or_init(|| vec![0u8; align]);
-        writer.write_all(&zero_buf[..pad]).await?;
-        *current_pos += pad as u64;
+        let zero_buf = ZERO_BUFFER.get_or_init(|| vec![0u8; ALIGN]);
+        let pos = writer.tell().await? as u64;
+        let pad = (ALIGN as u64 - (pos % ALIGN as u64)) % ALIGN as u64;
+        if pad != 0 {
+            writer.write_all(&zero_buf[..pad as usize]).await?;
+        }
     }
-    let fd_pos = *current_pos;
-    let fd_len = file_descriptor_bytes.len() as u64;
-    writer.write_all(&file_descriptor_bytes).await?;
-    *current_pos += fd_len;
-    let mut global_buffer_offsets = vec![(fd_pos, fd_len)];
-    // 2) Write per-column metadata blocks and collect their positions
-    let column_metadata_start = *current_pos;
-    let mut metadata_positions = Vec::with_capacity(final_cols.len());
+    let mut col_metadatas = Vec::with_capacity(final_cols.len());
     for col in final_cols {
         let pages = col
             .page_infos
@@ -1662,40 +1643,21 @@ async fn flush_footer(
                 })),
             }),
         };
-        let column_bytes = column.encode_to_vec();
-        let position = *current_pos;
-        let len = column_bytes.len() as u64;
-        writer.write_all(&column_bytes).await?;
-        *current_pos += len;
-        metadata_positions.push((position, len));
+        col_metadatas.push(column);
     }
-    // 3) Write column metadata offsets (CMO) and global buffer offsets (GBO)
-    let cmo_table_start = *current_pos;
-    for (meta_pos, meta_len) in metadata_positions {
-        writer.write_u64_le(meta_pos).await?;
-        writer.write_u64_le(meta_len).await?;
-        *current_pos += 16;
-    }
-    let gbo_table_start = *current_pos;
-    for (gbo_pos, gbo_len) in global_buffer_offsets.drain(..) {
-        writer.write_u64_le(gbo_pos).await?;
-        writer.write_u64_le(gbo_len).await?;
-        *current_pos += 16;
-    }
-    // 4) Write footer pointers & version, then close the writer
-    let (maj, min) = version.to_numbers();
-    let num_global_buffers = 1u32;
-    let num_columns = final_cols.len() as u32;
-    writer.write_u64_le(column_metadata_start).await?;
-    writer.write_u64_le(cmo_table_start).await?;
-    writer.write_u64_le(gbo_table_start).await?;
-    writer.write_u32_le(num_global_buffers).await?;
-    writer.write_u32_le(num_columns).await?;
-    writer.write_u16_le(maj as u16).await?;
-    writer.write_u16_le(min as u16).await?;
-    writer.write_all(MAGIC).await?;
-    *current_pos += 8 + 8 + 8 + 4 + 4 + 2 + 2 + (MAGIC.len() as u64);
-    writer.shutdown().await?;
+    let mut file_writer = FileWriter::new_lazy(
+        writer,
+        FileWriterOptions {
+            format_version: Some(version),
+            ..Default::default()
+        },
+    );
+    file_writer.initialize_with_external_metadata(
+        schema.clone(),
+        col_metadatas,
+        total_rows_in_current,
+    );
+    file_writer.finish().await?;
     Ok(())
 }
 
