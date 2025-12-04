@@ -1492,15 +1492,29 @@ impl Dataset {
         blob::take_blobs(self, row_ids, column.as_ref()).await
     }
 
-    /// Take [BlobFile] by row indices.
+    /// Take [BlobFile] by row addresses.
     ///
+    /// Row addresses are `u64` values encoding `(fragment_id << 32) | row_offset`.
+    /// Use this method when you already have row addresses, for example from
+    /// a scan with `with_row_address()`. For row IDs (stable identifiers), use
+    /// [`Self::take_blobs`]. For row indices (offsets), use
+    /// [`Self::take_blobs_by_indices`].
+    pub async fn take_blobs_by_addresses(
+        self: &Arc<Self>,
+        row_addrs: &[u64],
+        column: impl AsRef<str>,
+    ) -> Result<Vec<BlobFile>> {
+        blob::take_blobs_by_addresses(self, row_addrs, column.as_ref()).await
+    }
+
+    /// Take [BlobFile] by row indices (offsets in the dataset).
     pub async fn take_blobs_by_indices(
         self: &Arc<Self>,
         row_indices: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<BlobFile>> {
         let row_addrs = row_offsets_to_row_addresses(self, row_indices).await?;
-        blob::take_blobs(self, &row_addrs, column.as_ref()).await
+        blob::take_blobs_by_addresses(self, &row_addrs, column.as_ref()).await
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.
