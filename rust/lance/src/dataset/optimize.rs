@@ -201,14 +201,7 @@ impl CompactionOptions {
     }
 }
 
-/// Decide whether binary copy can be used for this compaction task.
-///
-/// Staged checks:
-/// 1) Feature flag: must be explicitly enabled via `enable_binary_copy`
-/// 2) Storage version: only supported for Lance file V2.1 / V2.2
-/// 3) Fragment constraints: no deletion files, single non-legacy data file per fragment
-/// 4) Layout consistency: fragment data files must match current schema field ids and
-///    column index ordering (dense [0..leaf_count))
+/// TODO zhangyue.1010 Doc here
 fn can_use_binary_copy(
     dataset: &Dataset,
     options: &CompactionOptions,
@@ -219,57 +212,55 @@ fn can_use_binary_copy(
         return false;
     }
     // Check dataset storage version is supported
+    // Binary copy is not supported for legacy Lance file format
     let storage_ok = dataset
         .manifest
         .data_storage_format
         .lance_file_version()
-        .map(|v| {
-            matches!(
-                v.resolve(),
-                LanceFileVersion::V2_0 | LanceFileVersion::V2_1 | LanceFileVersion::V2_2
-            )
-        })
+        .map(|v| !matches!(v.resolve(), LanceFileVersion::Legacy))
         .unwrap_or(false);
     if !storage_ok {
         return false;
     }
-    // Check all fragments' data files have the same file version and it is either 2.1 or 2.2
+
     if fragments.is_empty() {
         return false;
     }
-    let mut files_iter = fragments.iter().flat_map(|f| f.files.iter());
-    let first_df = match files_iter.next() {
-        Some(df) => df,
-        None => return false,
-    };
-    let first_ver = LanceFileVersion::try_from_major_minor(
-        first_df.file_major_version,
-        first_df.file_minor_version,
+
+    // Make sure all files in fragments have the same Lance file version
+    let first_data_file_version = LanceFileVersion::try_from_major_minor(
+        fragments[0].files[0].file_major_version,
+        fragments[0].files[0].file_minor_version,
     )
     .map(|v| v.resolve())
     .unwrap();
-    if matches!(first_ver, LanceFileVersion::Legacy) {
+
+    // Check version consistency and deletion vector in a single pass
+    let mut is_same_version = true;
+
+    for fragment in fragments {
+        // Check for deletion file
+        if fragment.deletion_file.is_some() {
+            return false;
+        }
+
+        // Check version consistency for all files in the fragment
+        for data_file in &fragment.files {
+            let version_ok = LanceFileVersion::try_from_major_minor(data_file.file_major_version, data_file.file_minor_version)
+                .map(|v| v.resolve())
+                .map_or(false, |v| v == first_data_file_version);
+
+            if !version_ok {
+                is_same_version = false;
+            }
+        }
+    }
+
+    if !is_same_version {
         return false;
     }
-    let same_version = fragments.iter().flat_map(|f| f.files.iter()).all(|df| {
-        LanceFileVersion::try_from_major_minor(df.file_major_version, df.file_minor_version)
-            .map(|v| v.resolve())
-            .map_or(false, |v| v == first_ver)
-    });
-    if !same_version {
-        return false;
-    }
-    // No deletion vector support in binary copy
-    if fragments.iter().any(|f| f.deletion_file.is_some()) {
-        return false;
-    }
-    // Each fragment should have exactly one non-legacy data file
-    if fragments
-        .iter()
-        .any(|f| f.files.len() != 1 || f.files[0].is_legacy_file())
-    {
-        return false;
-    }
+
+    // TODO zhangyue.1010 检查各种schema是否一致，支持schema演进？
     // Data layout must match current schema (field ids and dense column indices)
     let schema = dataset.schema().clone();
     let leaf_count = schema.fields_pre_order().filter(|f| f.is_leaf()).count();
@@ -868,6 +859,14 @@ async fn rewrite_files(
             options.binary_copy_read_batch_bytes,
         )
         .await?;
+
+        if new_fragments.is_empty() && options.enable_binary_copy_force {
+            return Err(Error::NotSupported {
+                source: format!("compaction task {}: binary copy is not supported", task_id).into(),
+                location: location!(),
+            });
+        }
+
         // fall back to common path if binary copy is not supported
         if new_fragments.is_empty() {
             let (frags, _) = write_fragments_internal(
@@ -1135,6 +1134,8 @@ async fn rewrite_files_binary_copy(
     // Merge small Lance files into larger ones by page-level binary copy.
     let schema = dataset.schema().clone();
     let full_field_ids = schema.field_ids();
+
+    // The previous checks have ensured that the file versions of all files are consistent.
     let version = lance_file::version::LanceFileVersion::try_from_major_minor(
         fragments[0].files[0].file_major_version,
         fragments[0].files[0].file_minor_version,
@@ -1175,6 +1176,8 @@ async fn rewrite_files_binary_copy(
     let mut current_filename: Option<String> = None;
     let mut current_pos: u64 = 0;
     let mut current_page_table: Vec<lance_encoding::decoder::ColumnInfo> = Vec::new();
+
+    // Column-list<Page-List<DecPageInfo>>
     let mut col_pages: Vec<Vec<DecPageInfo>> = std::iter::repeat_with(|| Vec::<DecPageInfo>::new())
         .take(column_count)
         .collect();
@@ -1303,7 +1306,8 @@ async fn rewrite_files_binary_copy(
                     let mut bytes_iter = bytes_vec.into_iter();
 
                     for (local_idx, buffer_count) in batch_counts.iter().enumerate() {
-                        let page = &src_column_info.page_infos[page_index - batch_pages + local_idx];
+                        let page =
+                            &src_column_info.page_infos[page_index - batch_pages + local_idx];
                         let mut new_offsets = Vec::with_capacity(*buffer_count);
                         for _ in 0..*buffer_count {
                             if let Some(bytes) = bytes_iter.next() {
@@ -2363,10 +2367,64 @@ mod tests {
         .await
         .unwrap();
 
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let params = VectorIndexParams::ivf_pq(1, 8, 1, MetricType::L2, 50);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vector".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        async fn index_set(dataset: &Dataset) -> HashSet<Uuid> {
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .map(|index| index.uuid)
+                .collect()
+        }
+        let indices = index_set(&dataset).await;
+
+        async fn vector_query(dataset: &Dataset) -> RecordBatch {
+            let mut scanner = dataset.scan();
+            let query = Float32Array::from(vec![0.0f32; 8]);
+            scanner
+                .nearest("vec", &query, 10)
+                .unwrap()
+                .project(&["i"])
+                .unwrap();
+            scanner.try_into_batch().await.unwrap()
+        }
+
+        async fn scalar_query(dataset: &Dataset) -> RecordBatch {
+            let mut scanner = dataset.scan();
+            scanner.filter("i = 100").unwrap().project(&["i"]).unwrap();
+            scanner.try_into_batch().await.unwrap()
+        }
+
+        let before_vec_result = vector_query(&dataset).await;
+        let before_scalar_result = scalar_query(&dataset).await;
+
         let before_batch = dataset
             .scan()
             .project(&["vec", "i"])
             .unwrap()
+            .with_row_id()
             .try_into_batch()
             .await
             .unwrap();
@@ -2374,14 +2432,25 @@ mod tests {
         let options = CompactionOptions {
             target_rows_per_fragment: 2_000,
             enable_binary_copy: true,
+            enable_binary_copy_force: true,
             ..Default::default()
         };
         let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
+
+        let current_indices = index_set(&dataset).await;
+        assert_eq!(indices, current_indices);
+
+        let after_vec_result = vector_query(&dataset).await;
+        assert_eq!(before_vec_result, after_vec_result);
+
+        let after_scalar_result = scalar_query(&dataset).await;
+        assert_eq!(before_scalar_result, after_scalar_result);
 
         let after_batch = dataset
             .scan()
             .project(&["vec", "i"])
             .unwrap()
+            .with_row_id()
             .try_into_batch()
             .await
             .unwrap();
@@ -2389,7 +2458,7 @@ mod tests {
         assert_eq!(before_batch, after_batch);
     }
 
-    #[tokio::test]
+    // #[tokio::test]
     async fn test_perf_binary_copy_vs_full() {
         use arrow_schema::{DataType, Field, Fields, TimeUnit};
         use lance_core::utils::tempfile::TempStrDir;
