@@ -2083,7 +2083,8 @@ pub mod array {
     use arrow_array::{
         ArrowNativeTypeOp, BooleanArray, Date32Array, Date64Array, Time32MillisecondArray,
         Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
     };
     use arrow_schema::{IntervalUnit, TimeUnit};
     use chrono::Utc;
