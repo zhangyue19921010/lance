@@ -103,6 +103,7 @@ use lance_core::Error;
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, RowIdMeta};
+use lance_arrow::DataTypeExt;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -1132,6 +1133,24 @@ async fn rewrite_files_binary_copy(
     .unwrap()
     .resolve();
     let leaf_count = schema.fields_pre_order().filter(|f| f.is_leaf()).count();
+    let column_count = if version == lance_file::version::LanceFileVersion::V2_0 {
+        schema.fields_pre_order().count()
+    } else {
+        leaf_count
+    };
+
+    // For v2_0, build a map to identify struct header columns
+    // These columns should only have one page even when copying from multiple files
+    let mut is_non_leaf_column: Vec<bool> = vec![false; column_count];
+    if version == lance_file::version::LanceFileVersion::V2_0 {
+        let mut col_idx = 0;
+        for field in schema.fields_pre_order() {
+            // Only mark non-packed Struct fields (lists must keep all pages)
+            let is_non_leaf = field.data_type().is_struct() && !field.is_packed_struct();
+            is_non_leaf_column[col_idx] = is_non_leaf;
+            col_idx += 1;
+        }
+    }
 
     let mut out: Vec<Fragment> = Vec::new();
     let mut current_writer: Option<ObjectWriter> = None;
@@ -1139,9 +1158,9 @@ async fn rewrite_files_binary_copy(
     let mut current_pos: u64 = 0;
     let mut current_page_table: Vec<lance_encoding::decoder::ColumnInfo> = Vec::new();
     let mut col_pages: Vec<Vec<DecPageInfo>> = std::iter::repeat_with(|| Vec::<DecPageInfo>::new())
-        .take(leaf_count)
+        .take(column_count)
         .collect();
-    let mut col_buffers: Vec<Vec<(u64, u64)>> = vec![Vec::new(); leaf_count];
+    let mut col_buffers: Vec<Vec<(u64, u64)>> = vec![Vec::new(); column_count];
     let mut total_rows_in_current: u64 = 0;
     let mut col_encodings: Option<Vec<lance_encoding::format::pb::ColumnEncoding>> = None;
     let max_rows_per_file = params.max_rows_per_file as u64;
@@ -1198,6 +1217,14 @@ async fn rewrite_files_binary_copy(
                 }
             }
             for (col_idx, src_column_info) in src_cols.iter().enumerate() {
+                // For v2_0 non-leaf columns, skip all pages after the first one
+                let is_non_leaf = col_idx < is_non_leaf_column.len() && is_non_leaf_column[col_idx];
+                let should_skip_column = is_non_leaf && !col_pages[col_idx].is_empty();
+
+                if should_skip_column {
+                    continue;
+                }
+
                 for page in src_column_info.page_infos.iter() {
                     let mut new_offsets = Vec::with_capacity(page.buffer_offsets_and_sizes.len());
                     if current_writer.is_none() {
@@ -1285,9 +1312,20 @@ async fn rewrite_files_binary_copy(
             }
             if total_rows_in_current >= max_rows_per_file {
                 let mut final_cols: Vec<Arc<lance_encoding::decoder::ColumnInfo>> =
-                    Vec::with_capacity(leaf_count);
+                    Vec::with_capacity(column_count);
                 for (i, column_info) in current_page_table.iter().enumerate() {
-                    let pages_arc = Arc::from(std::mem::take(&mut col_pages[i]).into_boxed_slice());
+                    // For v2_0 struct headers, force a single page and set num_rows to total
+                    let mut pages_vec = std::mem::take(&mut col_pages[i]);
+                    if version == lance_file::version::LanceFileVersion::V2_0
+                        && is_non_leaf_column.get(i).copied().unwrap_or(false)
+                    {
+                        if !pages_vec.is_empty() {
+                            pages_vec[0].num_rows = total_rows_in_current;
+                            pages_vec[0].priority = 0;
+                            pages_vec.truncate(1);
+                        }
+                    }
+                    let pages_arc = Arc::from(pages_vec.into_boxed_slice());
                     let buffers_vec = std::mem::take(&mut col_buffers[i]);
                     final_cols.push(Arc::new(lance_encoding::decoder::ColumnInfo::new(
                         column_info.index,
@@ -1360,9 +1398,20 @@ async fn rewrite_files_binary_copy(
     if total_rows_in_current > 0 {
         // Flush remaining rows as a final output file
         let mut final_cols: Vec<Arc<lance_encoding::decoder::ColumnInfo>> =
-            Vec::with_capacity(leaf_count);
+            Vec::with_capacity(column_count);
         for (i, ci) in current_page_table.iter().enumerate() {
-            let pages_arc = Arc::from(std::mem::take(&mut col_pages[i]).into_boxed_slice());
+            // For v2_0 struct headers, force a single page and set num_rows to total
+            let mut pages_vec = std::mem::take(&mut col_pages[i]);
+            if version == lance_file::version::LanceFileVersion::V2_0
+                && is_non_leaf_column.get(i).copied().unwrap_or(false)
+            {
+                if !pages_vec.is_empty() {
+                    pages_vec[0].num_rows = total_rows_in_current;
+                    pages_vec[0].priority = 0;
+                    pages_vec.truncate(1);
+                }
+            }
+            let pages_arc = Arc::from(pages_vec.into_boxed_slice());
             let buffers_vec = std::mem::take(&mut col_buffers[i]);
             final_cols.push(Arc::new(lance_encoding::decoder::ColumnInfo::new(
                 ci.index,
@@ -2101,6 +2150,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_binary_copy_merge_small_files() {
+        for version in LanceFileVersion::iter_non_legacy() {
+            do_test_binary_copy_merge_small_files(version).await;
+        }
+    }
+
+    async fn do_test_binary_copy_merge_small_files(version: LanceFileVersion) {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
@@ -2110,6 +2165,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 2_500,
             max_rows_per_group: 1_000,
+            data_storage_version: Some(version),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params.clone()))
@@ -2138,6 +2194,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_binary_copy_with_defer_remap() {
+        for version in LanceFileVersion::iter_non_legacy() {
+            do_test_binary_copy_with_defer_remap(version).await;
+        }
+    }
+
+    async fn do_test_binary_copy_with_defer_remap(version: LanceFileVersion) {
+
         use arrow_schema::{DataType, Field, Fields, TimeUnit};
         use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
         use std::sync::Arc;
@@ -2181,11 +2244,12 @@ mod tests {
             "memory://test/binary_copy_nested",
             Some(WriteParams {
                 max_rows_per_file: 1_000,
+                data_storage_version: Some(version),
                 ..Default::default()
             }),
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         let before_batch = dataset.scan().try_into_batch().await.unwrap();
 
@@ -2204,6 +2268,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_binary_copy_with_stable_row_ids_enabled() {
+        for version in LanceFileVersion::iter_non_legacy() {
+            do_test_binary_copy_with_stable_row_ids_enabled(version).await;
+        }
+    }
+
+    async fn do_test_binary_copy_with_stable_row_ids_enabled(version: LanceFileVersion) {
         use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
         let mut data_gen = BatchGenerator::new()
             .col(Box::new(
@@ -2216,7 +2286,7 @@ mod tests {
             "memory://test/binary_copy_stable_row_ids",
             Some(WriteParams {
                 enable_stable_row_ids: true,
-                data_storage_version: Some(lance_file::version::LanceFileVersion::Next),
+                data_storage_version: Some(version),
                 max_rows_per_file: 500,
                 ..Default::default()
             }),
@@ -2238,116 +2308,6 @@ mod tests {
             ..Default::default()
         };
         let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
-
-        let after_batch = dataset
-            .scan()
-            .project(&["vec", "i"])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        assert_eq!(before_batch, after_batch);
-    }
-
-    #[tokio::test]
-    async fn test_binary_copy_v22_enabled() {
-        use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
-        let mut data_gen = BatchGenerator::new()
-            .col(Box::new(
-                RandomVector::new().vec_width(12).named("vec".to_owned()),
-            ))
-            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
-
-        let mut dataset = Dataset::write(
-            data_gen.batch(5_000),
-            "memory://test/binary_copy_v22",
-            Some(WriteParams {
-                enable_stable_row_ids: true,
-                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
-                max_rows_per_file: 500,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let before_batch = dataset
-            .scan()
-            .project(&["vec", "i"])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        let options = CompactionOptions {
-            target_rows_per_fragment: 2_000,
-            enable_binary_copy: true,
-            ..Default::default()
-        };
-        let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
-        let frags = dataset.get_fragments();
-        // Assert new fragments use 2.2 footer (2,2)
-        let last = frags.last().unwrap();
-        let (maj, min) = (
-            last.metadata.files[0].file_major_version,
-            last.metadata.files[0].file_minor_version,
-        );
-
-        let after_batch = dataset
-            .scan()
-            .project(&["vec", "i"])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        assert_eq!(before_batch, after_batch);
-    }
-
-    #[tokio::test]
-    async fn test_binary_copy_v20_enabled() {
-        use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
-        let mut data_gen = BatchGenerator::new()
-            .col(Box::new(
-                RandomVector::new().vec_width(8).named("vec".to_owned()),
-            ))
-            .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
-
-        let mut dataset = Dataset::write(
-            data_gen.batch(4_000),
-            "memory://test/binary_copy_v20",
-            Some(WriteParams {
-                enable_stable_row_ids: true,
-                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_0),
-                max_rows_per_file: 500,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let before_batch = dataset
-            .scan()
-            .project(&["vec", "i"])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        let options = CompactionOptions {
-            target_rows_per_fragment: 2_000,
-            enable_binary_copy: true,
-            ..Default::default()
-        };
-        let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
-        let frags = dataset.get_fragments();
-        // Assert new fragments use 2.0 footer alias (0,3)
-        let last = frags.last().unwrap();
-        let (maj, min) = (
-            last.metadata.files[0].file_major_version,
-            last.metadata.files[0].file_minor_version,
-        );
 
         let after_batch = dataset
             .scan()
