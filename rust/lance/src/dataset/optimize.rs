@@ -2678,6 +2678,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_perf_binary_copy_vs_full() {
+        use arrow_schema::{DataType, Field, Fields, TimeUnit};
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
+        use std::time::Instant;
+
+        let row_num = 5_000_000;
+
+        let inner_fields = Fields::from(vec![
+            Field::new("x", DataType::UInt32, true),
+            Field::new("y", DataType::LargeUtf8, true),
+        ]);
+        let nested_fields = Fields::from(vec![
+            Field::new("inner", DataType::Struct(inner_fields.clone()), true),
+            Field::new("fsb", DataType::FixedSizeBinary(16), true),
+            Field::new("bin", DataType::Binary, true),
+        ]);
+        let event_fields = Fields::from(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+            Field::new("payload", DataType::Binary, true),
+        ]);
+
+        let reader_full = gen_batch()
+            .col("vec1", array::rand_vec::<Float32Type>(Dimension::from(12)))
+            .col("vec2", array::rand_vec::<Float32Type>(Dimension::from(8)))
+            .col("i32", array::step::<Int32Type>())
+            .col("i64", array::step::<Int64Type>())
+            .col("f32", array::rand::<Float32Type>())
+            .col("f64", array::rand::<Float64Type>())
+            .col("bool", array::rand_boolean())
+            .col("date32", array::rand_date32())
+            .col("date64", array::rand_date64())
+            .col(
+                "ts_ms",
+                array::rand_timestamp(&DataType::Timestamp(TimeUnit::Millisecond, None)),
+            )
+            .col(
+                "utf8",
+                array::rand_utf8(lance_datagen::ByteCount::from(16), false),
+            )
+            .col("large_utf8", array::random_sentence(1, 6, true))
+            .col(
+                "bin",
+                array::rand_fixedbin(lance_datagen::ByteCount::from(24), false),
+            )
+            .col(
+                "large_bin",
+                array::rand_fixedbin(lance_datagen::ByteCount::from(24), true),
+            )
+            .col(
+                "varbin",
+                array::rand_varbin(
+                    lance_datagen::ByteCount::from(8),
+                    lance_datagen::ByteCount::from(32),
+                ),
+            )
+            .col("fsb16", array::rand_fsb(16))
+            .col(
+                "fsl4",
+                array::cycle_vec(array::rand::<Float32Type>(), Dimension::from(4)),
+            )
+            .col("struct_simple", array::rand_struct(inner_fields.clone()))
+            .col("struct_nested", array::rand_struct(nested_fields))
+            .col(
+                "events",
+                array::rand_list_any(array::rand_struct(event_fields.clone()), true),
+            )
+            .into_reader_rows(RowCount::from(row_num), BatchCount::from(10));
+
+        let full_dir = TempStrDir::default();
+        let a = full_dir.as_into_string().into();
+        println!("full_dir: {:?}", a);
+        let mut dataset = Dataset::write(
+            reader_full,
+            &*full_dir,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: (row_num / 100) as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let opt_full = CompactionOptions {
+            enable_binary_copy: false,
+            ..Default::default()
+        };
+        let opt_binary = CompactionOptions {
+            enable_binary_copy: true,
+            ..Default::default()
+        };
+
+        let t0 = Instant::now();
+        let _ = compact_files(&mut dataset, opt_full, None).await.unwrap();
+        let d_full = t0.elapsed();
+        let before = dataset.count_rows(None).await.unwrap();
+
+        let versions = dataset.versions().await.unwrap();
+        let mut dataset = dataset.checkout_version(1).await.unwrap();
+        dataset.restore().await.unwrap();
+        let t1 = Instant::now();
+        let _ = compact_files(&mut dataset, opt_binary, None).await.unwrap();
+        let d_bin = t1.elapsed();
+        let after = dataset.count_rows(None).await.unwrap();
+
+        println!(
+            "perf: full_compaction={:?}, binary_copy={:?}, speedup={:.2}x",
+            d_full,
+            d_bin,
+            (d_full.as_secs_f64() / d_bin.as_secs_f64())
+        );
+
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
     async fn test_can_use_binary_copy_schema_consistency_ok() {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;

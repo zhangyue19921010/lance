@@ -24,8 +24,8 @@ fn bench_binary_copy(c: &mut Criterion) {
     let dataset = Arc::new(dataset);
 
     let mut group = c.benchmark_group("binary_copy_compaction");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(20));
+    group.sample_size(1);
+    group.measurement_time(Duration::from_secs(600));
 
     group.bench_function("full_compaction", |b| {
         let dataset = dataset.clone();
