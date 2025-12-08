@@ -98,7 +98,7 @@ use crate::Result;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
-use lance_arrow::DataTypeExt;
+use lance_core::datatypes::BlobHandling;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_core::Error;
@@ -820,7 +820,7 @@ async fn rewrite_files(
     // The versions of Lance prior to when we started writing the writer version
     // sometimes wrote incorrect `Fragment.physical_rows` values, so we should
     // make sure to recompute them.
-    // See: https://github.com/lancedb/lance/issues/1531
+    // See: https://github.com/lance-format/lance/issues/1531
     let recompute_stats = previous_writer_version.is_none();
 
     // It's possible the fragments are old and don't have physical rows or
@@ -835,6 +835,13 @@ async fn rewrite_files(
     let needs_remapping = !dataset.manifest.uses_stable_row_ids();
     let mut new_fragments: Vec<Fragment>;
     let mut scanner = dataset.scan();
+    let has_blob_columns = dataset
+        .schema()
+        .fields_pre_order()
+        .any(|field| field.is_blob());
+    if has_blob_columns {
+        scanner.blob_handling(BlobHandling::AllBinary);
+    }
     if let Some(batch_size) = options.batch_size {
         scanner.batch_size(batch_size);
     }
@@ -1826,12 +1833,13 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type};
     use arrow_array::{
-        Float32Array, Int64Array, LargeStringArray, PrimitiveArray, RecordBatch,
-        RecordBatchIterator,
+        ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+        PrimitiveArray, RecordBatch, RecordBatchIterator,
     };
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
+    use lance_arrow::BLOB_META_KEY;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::Error;
@@ -1848,6 +1856,7 @@ mod tests {
     use rstest::rstest;
     use std::collections::HashSet;
     use std::io::Cursor;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     #[test]
@@ -2075,6 +2084,57 @@ mod tests {
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_columns() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("blob", DataType::LargeBinary, false)
+                .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
+        ]));
+        let expected_payload: Vec<Vec<u8>> =
+            vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9, 10], vec![11]];
+        let id_column: ArrayRef = Arc::new(Int32Array::from_iter_values(
+            0..expected_payload.len() as i32,
+        ));
+        let blob_array: ArrayRef = Arc::new(LargeBinaryArray::from_iter(
+            expected_payload.iter().map(|value| Some(value.as_slice())),
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_column, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.validate().await.unwrap();
+        assert!(dataset.get_fragments().len() > 1);
+
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let dataset = Arc::new(dataset);
+        let row_indices: Vec<u64> = (0..expected_payload.len() as u64).collect();
+        let blobs = dataset
+            .take_blobs_by_indices(&row_indices, "blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), expected_payload.len());
+        for (blob, expected) in blobs.iter().zip(expected_payload.iter()) {
+            let bytes = blob.read().await.unwrap();
+            assert_eq!(bytes.as_ref(), expected.as_slice());
+        }
     }
 
     fn row_addrs(frag_idx: u32, offsets: Range<u32>) -> Range<u64> {
@@ -4397,7 +4457,7 @@ mod tests {
 
         // Run compaction with deferred index remapping
         let options = CompactionOptions {
-            target_rows_per_fragment: 2_000,
+            target_rows_per_fragment: 50_000,
             defer_index_remap: true,
             ..Default::default()
         };
