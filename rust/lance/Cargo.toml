@@ -162,9 +162,5 @@ harness = false
 name = "random_access"
 harness = false
 
-[[bench]]
-name = "binary_copy"
-harness = false
-
 [lints]
 workspace = true
