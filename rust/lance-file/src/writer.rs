@@ -485,6 +485,18 @@ impl FileWriter {
         self.schema_metadata.insert(key.into(), value.into());
     }
 
+    pub fn initialize_with_external_metadata(
+        &mut self,
+        schema: lance_core::datatypes::Schema,
+        column_metadata: Vec<pbfile::ColumnMetadata>,
+        rows_written: u64,
+    ) {
+        self.schema = Some(schema);
+        self.num_columns = column_metadata.len() as u32;
+        self.column_metadata = column_metadata;
+        self.rows_written = rows_written;
+    }
+
     /// Adds a global buffer to the file
     ///
     /// The global buffer can contain any arbitrary bytes.  It will be written to the disk
@@ -585,7 +597,9 @@ impl FileWriter {
             .collect::<FuturesOrdered<_>>();
         self.write_pages(encoding_tasks).await?;
 
-        self.finish_writers().await?;
+        if !self.column_writers.is_empty() {
+            self.finish_writers().await?;
+        }
 
         // 3. write global buffers (we write the schema here)
         let global_buffer_offsets = self.write_global_buffers().await?;
