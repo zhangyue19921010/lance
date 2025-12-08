@@ -227,6 +227,16 @@ fn can_use_binary_copy(
     if !options.enable_binary_copy {
         return false;
     }
+
+    // not support blob column for now
+    let has_blob_columns = dataset
+        .schema()
+        .fields_pre_order()
+        .any(|field| field.is_blob());
+    if !has_blob_columns {
+        return false;
+    }
+
     // Check dataset storage version is supported
     // Binary copy is not supported for legacy Lance file format
     let storage_ok = dataset
