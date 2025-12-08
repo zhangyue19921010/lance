@@ -215,7 +215,7 @@ impl CompactionOptions {
 /// - Fragment list is non-empty
 /// - All data files share identical Lance file versions
 /// - No fragment has a deletion file
-/// TODO need to support schema evolution case like add column and drop column
+///   TODO need to support schema evolution case like add column and drop column
 /// - All data files share identical schema mappings (`fields`, `column_indices`)
 fn can_use_binary_copy(
     dataset: &Dataset,
@@ -268,7 +268,7 @@ fn can_use_binary_copy(
                 data_file.file_minor_version,
             )
             .map(|v| v.resolve())
-            .map_or(false, |v| v == first_data_file_version);
+            .is_ok_and(|v| v == first_data_file_version);
 
             if !version_ok {
                 is_same_version = false;
@@ -833,7 +833,7 @@ async fn rewrite_files(
         .sum::<u64>();
     // If we aren't using stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_stable_row_ids();
-    let mut new_fragments: Vec<Fragment> = Vec::new();
+    let mut new_fragments: Vec<Fragment>;
     let mut scanner = dataset.scan();
     if let Some(batch_size) = options.batch_size {
         scanner.batch_size(batch_size);
@@ -852,9 +852,9 @@ async fn rewrite_files(
             location: location!(),
         });
     }
-    let mut row_ids_rx = None;
+    let mut row_ids_rx;
 
-    let (mut reader, rx_initial) = if !can_binary_copy {
+    let (reader, rx_initial) = if !can_binary_copy {
         prepare_reader(
             dataset.as_ref(),
             &fragments,
@@ -940,24 +940,21 @@ async fn rewrite_files(
             )
             .await?;
             new_fragments = frags;
-        } else {
-            if needs_remapping {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let mut addrs = RoaringTreemap::new();
-                for frag in &fragments {
-                    let frag_id = frag.id as u32;
-                    let count = frag.physical_rows.unwrap_or(0);
-                    for i in 0..count {
-                        let addr = lance_core::utils::address::RowAddress::new_from_parts(
-                            frag_id, i as u32,
-                        );
-                        addrs.insert(u64::from(addr));
-                    }
+        } else if needs_remapping {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut addrs = RoaringTreemap::new();
+            for frag in &fragments {
+                let frag_id = frag.id as u32;
+                let count = frag.physical_rows.unwrap_or(0);
+                for i in 0..count {
+                    let addr =
+                        lance_core::utils::address::RowAddress::new_from_parts(frag_id, i as u32);
+                    addrs.insert(u64::from(addr));
                 }
-                let captured = CapturedRowIds::AddressStyle(addrs);
-                let _ = tx.send(captured);
-                row_ids_rx = Some(rx);
             }
+            let captured = CapturedRowIds::AddressStyle(addrs);
+            let _ = tx.send(captured);
+            row_ids_rx = Some(rx);
         }
     } else {
         let (frags, _) = write_fragments_internal(
@@ -1247,12 +1244,10 @@ async fn rewrite_files_binary_copy(
     // - In v2_1+ these headers are not stored as columns and this map is unused
     let mut is_non_leaf_column: Vec<bool> = vec![false; column_count];
     if version == LanceFileVersion::V2_0 {
-        let mut col_idx = 0;
-        for field in schema.fields_pre_order() {
+        for (col_idx, field) in schema.fields_pre_order().enumerate() {
             // Only mark non-packed Struct fields (lists remain as leaf data carriers)
             let is_non_leaf = field.data_type().is_struct() && !field.is_packed_struct();
             is_non_leaf_column[col_idx] = is_non_leaf;
-            col_idx += 1;
         }
     }
 
@@ -1263,7 +1258,7 @@ async fn rewrite_files_binary_copy(
     let mut current_page_table: Vec<ColumnInfo> = Vec::new();
 
     // Column-list<Page-List<DecPageInfo>>
-    let mut col_pages: Vec<Vec<DecPageInfo>> = std::iter::repeat_with(|| Vec::<DecPageInfo>::new())
+    let mut col_pages: Vec<Vec<DecPageInfo>> = std::iter::repeat_with(Vec::<DecPageInfo>::new)
         .take(column_count)
         .collect();
     let mut col_buffers: Vec<Vec<(u64, u64)>> = vec![Vec::new(); column_count];
@@ -1364,7 +1359,7 @@ async fn rewrite_files_binary_copy(
                         let page_bytes: u64 = current_page
                             .buffer_offsets_and_sizes
                             .iter()
-                            .map(|(_, size)| *size as u64)
+                            .map(|(_, size)| *size)
                             .sum();
                         let would_exceed =
                             batch_pages > 0 && (batch_bytes + page_bytes > read_batch_bytes);
@@ -1489,12 +1484,11 @@ async fn rewrite_files_binary_copy(
                     let mut pages_vec = std::mem::take(&mut col_pages[i]);
                     if version == LanceFileVersion::V2_0
                         && is_non_leaf_column.get(i).copied().unwrap_or(false)
+                        && !pages_vec.is_empty()
                     {
-                        if !pages_vec.is_empty() {
-                            pages_vec[0].num_rows = total_rows_in_current;
-                            pages_vec[0].priority = 0;
-                            pages_vec.truncate(1);
-                        }
+                        pages_vec[0].num_rows = total_rows_in_current;
+                        pages_vec[0].priority = 0;
+                        pages_vec.truncate(1);
                     }
                     let pages_arc = Arc::from(pages_vec.into_boxed_slice());
                     let buffers_vec = std::mem::take(&mut col_buffers[i]);
@@ -1520,10 +1514,7 @@ async fn rewrite_files_binary_copy(
                 let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
                 let mut curr_col_idx: i32 = 0;
                 for field in schema.fields_pre_order() {
-                    if field.is_packed_struct() {
-                        field_column_indices.push(curr_col_idx);
-                        curr_col_idx += 1;
-                    } else if field.children.is_empty() || !is_structural {
+                    if field.is_packed_struct() || field.children.is_empty() || !is_structural {
                         field_column_indices.push(curr_col_idx);
                         curr_col_idx += 1;
                     } else {
@@ -1566,12 +1557,11 @@ async fn rewrite_files_binary_copy(
             let mut pages_vec = std::mem::take(&mut col_pages[i]);
             if version == LanceFileVersion::V2_0
                 && is_non_leaf_column.get(i).copied().unwrap_or(false)
+                && !pages_vec.is_empty()
             {
-                if !pages_vec.is_empty() {
-                    pages_vec[0].num_rows = total_rows_in_current;
-                    pages_vec[0].priority = 0;
-                    pages_vec.truncate(1);
-                }
+                pages_vec[0].num_rows = total_rows_in_current;
+                pages_vec[0].priority = 0;
+                pages_vec.truncate(1);
             }
             let pages_arc = Arc::from(pages_vec.into_boxed_slice());
             let buffers_vec = std::mem::take(&mut col_buffers[i]);
@@ -1588,7 +1578,6 @@ async fn rewrite_files_binary_copy(
             let writer = dataset.object_store.create(&path).await?;
             current_writer = Some(writer);
             current_filename = Some(filename);
-            current_pos = 0;
         }
         let writer = current_writer.take().unwrap();
         flush_footer(writer, &schema, &final_cols, total_rows_in_current, version).await?;
@@ -1601,10 +1590,7 @@ async fn rewrite_files_binary_copy(
         let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
         let mut curr_col_idx: i32 = 0;
         for field in schema.fields_pre_order() {
-            if field.is_packed_struct() {
-                field_column_indices.push(curr_col_idx);
-                curr_col_idx += 1;
-            } else if field.children.is_empty() || !is_structural {
+            if field.is_packed_struct() || field.children.is_empty() || !is_structural {
                 field_column_indices.push(curr_col_idx);
                 curr_col_idx += 1;
             } else {
