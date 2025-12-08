@@ -462,6 +462,13 @@ async fn prepare_reader(
     Option<std::sync::mpsc::Receiver<CapturedRowIds>>,
 )> {
     let mut scanner = dataset.scan();
+    let has_blob_columns = dataset
+        .schema()
+        .fields_pre_order()
+        .any(|field| field.is_blob());
+    if has_blob_columns {
+        scanner.blob_handling(BlobHandling::AllBinary);
+    }
     if let Some(bs) = batch_size {
         scanner.batch_size(bs);
     }
