@@ -12,6 +12,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use lance::dataset::{optimize::CompactionOptions, Dataset, WriteParams};
 use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
 use tempfile::TempDir;
+use lance_encoding::version::LanceFileVersion;
 
 const ROW_NUM: usize = 5_000_000;
 
@@ -24,8 +25,8 @@ fn bench_binary_copy(c: &mut Criterion) {
     let dataset = Arc::new(dataset);
 
     let mut group = c.benchmark_group("binary_copy_compaction");
-    group.sample_size(1);
-    group.measurement_time(Duration::from_secs(600));
+    group.sample_size(3);
+    group.measurement_time(Duration::from_secs(3600));
 
     group.bench_function("full_compaction", |b| {
         let dataset = dataset.clone();
@@ -118,6 +119,7 @@ async fn prepare_dataset_on_disk(row_num: usize) -> TempDir {
         uri,
         Some(WriteParams {
             max_rows_per_file: (row_num / 100) as usize,
+            data_storage_version: Some(LanceFileVersion::V2_2),
             ..Default::default()
         }),
     )
@@ -130,11 +132,11 @@ async fn prepare_dataset_on_disk(row_num: usize) -> TempDir {
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
-    config = Criterion::default().significance_level(0.1).sample_size(10);
+    config = Criterion::default().significance_level(0.1).sample_size(1);
     targets = bench_binary_copy);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
-    config = Criterion::default().significance_level(0.1).sample_size(10);
+    config = Criterion::default().significance_level(0.1).sample_size(1);
     targets = bench_binary_copy);
 criterion_main!(benches);
