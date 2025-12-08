@@ -852,17 +852,6 @@ async fn rewrite_files(
     // If we aren't using stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_stable_row_ids();
     let mut new_fragments: Vec<Fragment>;
-    let mut scanner = dataset.scan();
-    let has_blob_columns = dataset
-        .schema()
-        .fields_pre_order()
-        .any(|field| field.is_blob());
-    if has_blob_columns {
-        scanner.blob_handling(BlobHandling::AllBinary);
-    }
-    if let Some(batch_size) = options.batch_size {
-        scanner.batch_size(batch_size);
-    }
     let task_id = uuid::Uuid::new_v4();
     log::info!(
         "Compaction task {}: Begin compacting {} rows across {} fragments",
@@ -2755,6 +2744,7 @@ mod tests {
             &*full_dir,
             Some(WriteParams {
                 enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
                 max_rows_per_file: (row_num / 100) as usize,
                 ..Default::default()
             }),
