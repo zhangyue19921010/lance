@@ -2463,7 +2463,7 @@ mod tests {
 
         let mut dataset = Dataset::write(
             data_gen.batch(4_000),
-            "memory://test/binary_copy_stable_row_ids",
+            format!("memory://test/binary_copy_stable_row_ids_{}", version).as_str(),
             Some(WriteParams {
                 enable_stable_row_ids: true,
                 data_storage_version: Some(version),
