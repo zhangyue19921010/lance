@@ -3,7 +3,11 @@ on:
   push:
     branches:
       - main
+      - release/**
   pull_request:
+    branches:
+      - main
+      - release/**
     paths:
       - rust/**
       - protos/**
@@ -33,6 +37,19 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt -- --check
+
+  rustdoc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Check documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
   clippy:
     permissions:
       checks: write
@@ -64,10 +81,6 @@ jobs:
   linux-build:
     runs-on: "warp-ubuntu-latest-x64-4x"
     timeout-minutes: 60
-    strategy:
-      matrix:
-        toolchain:
-          - stable
     env:
       # Need up-to-date compilers for kernels
       CC: clang
@@ -77,8 +90,8 @@ jobs:
       # pin the toolchain version to avoid surprises
       - name: Setup rust toolchain
         run: |
-          rustup toolchain install ${{ matrix.toolchain }}
-          rustup default ${{ matrix.toolchain }}
+          rustup toolchain install nightly
+          rustup default nightly
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
@@ -90,12 +103,10 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run tests
-        if: ${{ matrix.toolchain == 'stable' }}
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo llvm-cov --profile ci --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
+          cargo +nightly llvm-cov --profile ci --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
       - name: Upload coverage to Codecov
-        if: ${{ matrix.toolchain == 'stable' }}
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
