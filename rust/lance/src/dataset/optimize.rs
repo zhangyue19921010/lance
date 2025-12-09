@@ -220,7 +220,6 @@ pub trait CompactionPlanner: Send + Sync {
     /// # Arguments
     ///
     /// * `dataset` - Reference to the dataset to be compacted
-    /// * `options` - Compaction options including target row count, deletion thresholds, etc.
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan>;
 }
 
@@ -3668,7 +3667,7 @@ mod tests {
         // Should create tasks to compact small fragments
         assert!(!plan.tasks.is_empty());
         assert_eq!(plan.read_version, dataset.manifest.version);
-        // make sure options.validate() is worked
+        // make sure options.validate() worked
         assert_eq!(plan.options.materialize_deletions, false);
     }
 }
