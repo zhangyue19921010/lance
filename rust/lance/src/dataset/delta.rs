@@ -165,6 +165,12 @@ impl DatasetDeltaBuilder {
                     location!(),
                 ));
             }
+            (None, None, None, None, None) => {
+                return Err(Error::invalid_input(
+                    "Must specify either compared_against_version or both with_begin_version and with_end_version",
+                    location!(),
+                ));
+            }
             _ => {
                 return Err(Error::invalid_input(
                     "Invalid combination of parameters for DatasetDeltaBuilder",
