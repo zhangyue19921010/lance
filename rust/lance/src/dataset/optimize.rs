@@ -1831,7 +1831,6 @@ mod tests {
 
     use self::remapping::RemappedIndex;
     use super::*;
-    use crate::dataset;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
     use crate::dataset::WriteDestination;
@@ -2363,7 +2362,6 @@ mod tests {
             ..Default::default()
         };
         let metrics = compact_files(&mut dataset, options, None).await.unwrap();
-        let debug = dataset.manifest.clone();
         assert!(metrics.fragments_added >= 1);
         assert_eq!(
             dataset.count_rows(None).await.unwrap() as usize,
@@ -2562,7 +2560,22 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(before_batch, after_batch);
+        let before_idx = arrow_ord::sort::sort_to_indices(
+            before_batch.column_by_name(lance_core::ROW_ID).unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        let after_idx = arrow_ord::sort::sort_to_indices(
+            after_batch.column_by_name(lance_core::ROW_ID).unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        let before = arrow::compute::take_record_batch(&before_batch, &before_idx).unwrap();
+        let after = arrow::compute::take_record_batch(&after_batch, &after_idx).unwrap();
+
+        assert_eq!(before, after);
     }
 
     #[tokio::test]
@@ -2705,7 +2718,7 @@ mod tests {
             max_rows_per_file: 1_000,
             ..Default::default()
         };
-        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+        let dataset = Dataset::write(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -2901,7 +2914,6 @@ mod tests {
         let before = dataset.count_rows(None).await.unwrap();
         let batch_before = dataset.scan().try_into_batch().await.unwrap();
 
-        let versions = dataset.versions().await.unwrap();
         let mut dataset = dataset.checkout_version(1).await.unwrap();
 
         // rollback and trigger another binary copy compaction

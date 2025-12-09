@@ -214,10 +214,18 @@ async fn resolve_s3_region(
                 client_options = client_options.with_config(*client_key, value.clone());
             }
         }
-
-        let bucket_region =
-            object_store::aws::resolve_bucket_region(bucket, &client_options).await?;
-        Ok(Some(bucket_region))
+        match object_store::aws::resolve_bucket_region(bucket, &client_options).await {
+            Ok(bucket_region) => Ok(Some(bucket_region)),
+            Err(e) => {
+                log::debug!(
+                    "Failed to resolve S3 bucket region for '{}': {:?}; defaulting to provider chain",
+                    bucket,
+                    e
+                );
+                // Fallback to region provider chain; let downstream choose a default
+                Ok(None)
+            }
+        }
     } else {
         Ok(None)
     }
