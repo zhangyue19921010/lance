@@ -3063,7 +3063,7 @@ mod tests {
 
         // Run compaction with deferred index remapping
         let options = CompactionOptions {
-            target_rows_per_fragment: 2_000,
+            target_rows_per_fragment: 50_000,
             defer_index_remap: true,
             ..Default::default()
         };
