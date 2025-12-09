@@ -3,7 +3,6 @@
 
 use super::transaction::Transaction;
 use crate::dataset::scanner::DatasetRecordBatchStream;
-use crate::dataset::Version;
 use crate::Dataset;
 use crate::Result;
 use chrono::{DateTime, Utc};
@@ -15,7 +14,6 @@ use lance_core::ROW_ID;
 use lance_core::ROW_LAST_UPDATED_AT_VERSION;
 use lance_core::WILDCARD;
 use snafu::location;
-use std::rc::Rc;
 
 /// Builder for creating a [`DatasetDelta`] to explore changes between dataset versions.
 ///
@@ -35,15 +33,23 @@ use std::rc::Rc;
 ///     .with_begin_version(3)
 ///     .with_end_version(7)
 ///     .build()?;
+///
+/// // Or specify explicit time range
+/// let delta = DatasetDeltaBuilder::new(dataset.clone())
+///     .with_begin_date(chrono::Utc::now())
+///     .with_end_date(chrono::Utc::now())
+///     .build()?;
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Clone, Debug)]
 pub struct DatasetDeltaBuilder {
     dataset: Dataset,
     compared_against_version: Option<u64>,
     begin_version: Option<u64>,
     end_version: Option<u64>,
-    cached_versions: Rc<Vec<Version>>,
+    begin_timestamp: Option<DateTime<Utc>>,
+    end_timestamp: Option<DateTime<Utc>>,
 }
 
 impl DatasetDeltaBuilder {
@@ -54,7 +60,8 @@ impl DatasetDeltaBuilder {
             compared_against_version: None,
             begin_version: None,
             end_version: None,
-            cached_versions: Rc::new(Vec::new()),
+            begin_timestamp: None,
+            end_timestamp: None,
         }
     }
 
@@ -85,49 +92,22 @@ impl DatasetDeltaBuilder {
         self
     }
 
-    /// Set the beginning date for the delta (exclusive).
+    /// Set the beginning timestamp for the delta (exclusive).
     ///
     /// Must be used together with `with_end_date`.
-    pub async fn with_begin_date(mut self, date_str: &str) -> Self {
-        if let Ok(date_time) = date_str.parse::<DateTime<Utc>>() {
-            let versions = self.list_versions().await;
-            let begin_version = versions
-                .iter()
-                .find(|v| v.timestamp >= date_time)
-                .map(|v| v.version)
-                .ok_or_else(|| {
-                    Error::invalid_input(
-                        format!("Can not find version with timestamp >= {}", date_str),
-                        location!(),
-                    )
-                });
-            self.begin_version = Some(begin_version.unwrap());
-        }
+    /// Cannot be used together with `compared_against_version` or explicit version range.
+    pub fn with_begin_date(mut self, timestamp: DateTime<Utc>) -> Self {
+        self.begin_timestamp = Some(timestamp);
         self
     }
 
-    /// Set the ending date for the delta (inclusive).
+    /// Set the ending timestamp for the delta (inclusive).
     ///
     /// Must be used together with `with_begin_date`.
-    pub async fn with_end_date(mut self, date_str: &str) -> Self {
-        if let Ok(date_time) = date_str.parse::<DateTime<Utc>>() {
-            let versions = self.list_versions().await;
-            let end_version = versions
-                .iter()
-                .rev()
-                .find(|v| v.timestamp < date_time)
-                .map(|v| v.version)
-                .unwrap_or(self.dataset.version().version);
-            self.end_version = Some(end_version);
-        }
+    /// Cannot be used together with `compared_against_version` or explicit version range.
+    pub fn with_end_date(mut self, timestamp: DateTime<Utc>) -> Self {
+        self.end_timestamp = Some(timestamp);
         self
-    }
-
-    async fn list_versions(&mut self) -> Rc<Vec<Version>> {
-        if self.cached_versions.is_empty() {
-            self.cached_versions = Rc::new(self.dataset.versions().await.unwrap());
-        }
-        Rc::clone(&self.cached_versions)
     }
 
     /// Build the [`DatasetDelta`].
@@ -139,35 +119,54 @@ impl DatasetDeltaBuilder {
     /// - Neither `compared_against_version` nor explicit version range are specified
     /// - Only one of `with_begin_version` or `with_end_version` is specified
     pub fn build(self) -> Result<DatasetDelta> {
-        let (begin_version, end_version) = match (
+        // Validate incompatible combinations
+        if self.compared_against_version.is_some()
+            && (self.begin_version.is_some()
+                || self.end_version.is_some()
+                || self.begin_timestamp.is_some()
+                || self.end_timestamp.is_some())
+        {
+            return Err(Error::invalid_input(
+                "Cannot combine compared_against_version with explicit begin/end versions or dates",
+                location!(),
+            ));
+        }
+
+        // Resolve parameters and construct DatasetDelta. For date ranges, defer mapping to versions.
+        let (begin_version, end_version, begin_ts, end_ts) = match (
             self.compared_against_version,
             self.begin_version,
             self.end_version,
+            self.begin_timestamp,
+            self.end_timestamp,
         ) {
-            (Some(compared), None, None) => {
+            (Some(compared), None, None, None, None) => {
                 let current_version = self.dataset.version().version;
                 if current_version > compared {
-                    (compared, current_version)
+                    (compared, current_version, None, None)
                 } else {
-                    (current_version, compared)
+                    (current_version, compared, None, None)
                 }
             }
-            (None, Some(begin), Some(end)) => (begin, end),
-            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            (None, Some(begin), Some(end), None, None) => (begin, end, None, None),
+            (None, None, None, Some(begin_ts), Some(end_ts)) => {
+                (0, 0, Some(begin_ts), Some(end_ts))
+            }
+            (None, Some(_), None, None, None) | (None, None, Some(_), None, None) => {
                 return Err(Error::invalid_input(
-                    "Cannot specify both compared_against_version and explicit begin/end versions(dates)",
+                    "Must specify both with_begin_version and with_end_version",
                     location!(),
                 ));
             }
-            (None, Some(_), None) | (None, None, Some(_)) => {
+            (None, None, None, Some(_), None) | (None, None, None, None, Some(_)) => {
                 return Err(Error::invalid_input(
-                    "Must specify both (with_begin_version and with_end_version) or (with_begin_date and with_end_date)",
+                    "Must specify both with_begin_date and with_end_date",
                     location!(),
                 ));
             }
-            (None, None, None) => {
+            _ => {
                 return Err(Error::invalid_input(
-                    "Must specify either (compared_against_version) or (both with_begin_version and with_end_version) or (with_begin_date and with_end_date)",
+                    "Invalid combination of parameters for DatasetDeltaBuilder",
                     location!(),
                 ));
             }
@@ -177,6 +176,8 @@ impl DatasetDeltaBuilder {
             begin_version,
             end_version,
             base_dataset: self.dataset,
+            begin_timestamp: begin_ts,
+            end_timestamp: end_ts,
         })
     }
 }
@@ -189,12 +190,47 @@ pub struct DatasetDelta {
     pub(crate) end_version: u64,
     /// The Lance dataset to compute delta
     pub(crate) base_dataset: Dataset,
+    pub(crate) begin_timestamp: Option<DateTime<Utc>>,
+    pub(crate) end_timestamp: Option<DateTime<Utc>>,
 }
 
 impl DatasetDelta {
+    /// Resolve the effective version range for this delta.
+    ///
+    /// If a date window is set (`begin_timestamp` and `end_timestamp` provided), this lazily
+    /// maps timestamps to version ids by scanning dataset versions:
+    /// - Begin is exclusive: pick the greatest version with `timestamp < begin_timestamp`.
+    /// - End is inclusive:  pick the greatest version with `timestamp <= end_timestamp`.
+    ///
+    /// If no date window is set, returns the explicit `begin_version`/`end_version` stored on
+    /// the struct.
+    async fn resolve_range(&self) -> Result<(u64, u64)> {
+        if let (Some(begin_ts), Some(end_ts)) = (self.begin_timestamp, self.end_timestamp) {
+            // Load all dataset versions and fold them to a version interval matching the date window
+            let versions = self.base_dataset.versions().await?;
+            let mut begin_version: u64 = 0;
+            let mut end_version: u64 = 0;
+            for v in &versions {
+                // Exclusive begin: track the largest version strictly before begin_ts
+                if v.timestamp < begin_ts && v.version > begin_version {
+                    begin_version = v.version;
+                }
+                // Inclusive end: track the largest version at or before end_ts
+                if v.timestamp <= end_ts && v.version > end_version {
+                    end_version = v.version;
+                }
+            }
+            Ok((begin_version, end_version))
+        } else {
+            // No date window: use the pre-resolved version interval
+            Ok((self.begin_version, self.end_version))
+        }
+    }
+
     /// Listing the transactions between two versions.
     pub async fn list_transactions(&self) -> Result<Vec<Transaction>> {
-        stream::iter((self.begin_version + 1)..=self.end_version)
+        let (begin_version, end_version) = self.resolve_range().await?;
+        stream::iter((begin_version + 1)..=end_version)
             .map(|version| {
                 let base_dataset = self.base_dataset.clone();
                 async move {
@@ -265,9 +301,10 @@ impl DatasetDelta {
         ])?;
 
         // Filter for rows created in the version range
+        let (begin_version, end_version) = self.resolve_range().await?;
         let filter = format!(
             "_row_created_at_version > {} AND _row_created_at_version <= {}",
-            self.begin_version, self.end_version
+            begin_version, end_version
         );
         scanner.filter(&filter)?;
 
@@ -318,9 +355,10 @@ impl DatasetDelta {
         ])?;
 
         // Filter for rows that were updated (not inserted) in the version range
+        let (begin_version, end_version) = self.resolve_range().await?;
         let filter = format!(
             "_row_created_at_version <= {} AND _row_last_updated_at_version > {} AND _row_last_updated_at_version <= {}",
-            self.begin_version, self.begin_version, self.end_version
+            begin_version, begin_version, end_version
         );
         scanner.filter(&filter)?;
 
@@ -1350,60 +1388,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delta_build_with_date_range_transactions() {
-        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
-
-        // Version 1, time t=10s (append)
-        mock_instant::thread_local::MockClock::set_system_time(std::time::Duration::from_secs(10));
-        let mut ds = write_dataset_temp(&temp_dir, 0, 50, 1, "v1", true, false).await;
-        let t1 = chrono::DateTime::from_timestamp(10, 0)
-            .unwrap()
-            .to_rfc3339();
+    async fn test_build_with_date_window_basic() {
+        MockClock::set_system_time(std::time::Duration::from_secs(10));
+        let ds = create_test_dataset(50, 1, "v1", true).await;
         assert_eq!(ds.version().version, 1);
 
-        // Version 2, time t=20s (append)
-        mock_instant::thread_local::MockClock::set_system_time(std::time::Duration::from_secs(20));
-        ds = write_dataset_temp(&temp_dir, 50, 10, 1, "v2_append", true, true).await;
-        let t2 = chrono::DateTime::from_timestamp(20, 0)
-            .unwrap()
-            .to_rfc3339();
+        MockClock::set_system_time(std::time::Duration::from_secs(20));
+        let ds = update_where(ds, "key < 10", "v2").await;
         assert_eq!(ds.version().version, 2);
 
-        // Version 3, time t=30s (update)
-        mock_instant::thread_local::MockClock::set_system_time(std::time::Duration::from_secs(30));
-        ds = update_where(ds, "key >= 0 AND key < 10", "updated_v3").await;
-        let t3 = chrono::DateTime::from_timestamp(30, 0)
-            .unwrap()
-            .to_rfc3339();
+        MockClock::set_system_time(std::time::Duration::from_secs(30));
+        let ds = update_where(ds, "key >= 10 AND key < 20", "v3").await;
         assert_eq!(ds.version().version, 3);
 
-        // Note: with_end_date currently uses "< date" semantics. To include version t3, we set end to t3 + 1s
-        let t3_plus = (chrono::DateTime::from_timestamp(30, 0).unwrap()
-            + chrono::Duration::seconds(1))
-        .to_rfc3339();
+        let begin_ts = chrono::DateTime::<chrono::Utc>::from_timestamp(15, 0).unwrap();
+        let end_ts = chrono::DateTime::<chrono::Utc>::from_timestamp(25, 0).unwrap();
 
-        // Build delta, begin=t1(exclusive v1), end=t3_plus(inclusive v3) -> expect to include both v2 and v3 transactions
         let delta = ds
             .delta()
-            .with_begin_date(&t1)
-            .await
-            .with_end_date(&t3_plus)
-            .await
+            .with_begin_date(begin_ts)
+            .with_end_date(end_ts)
             .build()
             .unwrap();
-        let txs = delta.list_transactions().await.unwrap();
-        assert_eq!(txs.len(), 2);
 
-        // Build delta, begin=t2(exclusive v2), end=t3_plus(inclusive v3) -> expect to include only v3 transaction
-        let delta = ds
-            .delta()
-            .with_begin_date(&t2)
-            .await
-            .with_end_date(&t3_plus)
-            .await
-            .build()
-            .unwrap();
         let txs = delta.list_transactions().await.unwrap();
         assert_eq!(txs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_build_with_date_window_edges() {
+        MockClock::set_system_time(std::time::Duration::from_secs(100));
+        let ds = create_test_dataset(10, 1, "v1", true).await;
+        assert_eq!(ds.version().version, 1);
+
+        MockClock::set_system_time(std::time::Duration::from_secs(200));
+        let ds = update_where(ds, "key < 5", "v2").await;
+        assert_eq!(ds.version().version, 2);
+
+        let begin_ts = chrono::DateTime::<chrono::Utc>::from_timestamp(50, 0).unwrap();
+        let end_ts = chrono::DateTime::<chrono::Utc>::from_timestamp(250, 0).unwrap();
+
+        let delta = ds
+            .delta()
+            .with_begin_date(begin_ts)
+            .with_end_date(end_ts)
+            .build()
+            .unwrap();
+
+        let txs = delta.list_transactions().await.unwrap();
+        assert_eq!(txs.len(), 2);
     }
 }
