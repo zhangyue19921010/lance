@@ -158,9 +158,10 @@ impl DatasetDeltaBuilder {
                     location!(),
                 ));
             }
-            (None, None, None, Some(_), None) | (None, None, None, None, Some(_)) => {
+            (None, None, None, Some(begin_ts), None) => (0, 0, Some(begin_ts), None),
+            (None, None, None, None, Some(_)) => {
                 return Err(Error::invalid_input(
-                    "Must specify both with_begin_date and with_end_date",
+                    "Must specify with_begin_date when with_end_date is provided",
                     location!(),
                 ));
             }
@@ -220,6 +221,17 @@ impl DatasetDelta {
                     end_version = v.version;
                 }
             }
+            Ok((begin_version, end_version))
+        } else if let (Some(begin_ts), None) = (self.begin_timestamp, self.end_timestamp) {
+            // Open-ended range: use latest version as end
+            let versions = self.base_dataset.versions().await?;
+            let mut begin_version: u64 = 0;
+            for v in &versions {
+                if v.timestamp < begin_ts && v.version > begin_version {
+                    begin_version = v.version;
+                }
+            }
+            let end_version = self.base_dataset.latest_version_id().await?;
             Ok((begin_version, end_version))
         } else {
             // No date window: use the pre-resolved version interval
@@ -1436,6 +1448,33 @@ mod tests {
             .unwrap();
 
         let txs = delta.list_transactions().await.unwrap();
+        assert_eq!(txs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_build_with_date_open_end_uses_latest() {
+        MockClock::set_system_time(std::time::Duration::from_secs(10));
+        let ds = create_test_dataset(20, 1, "v1", true).await;
+        assert_eq!(ds.version().version, 1);
+
+        MockClock::set_system_time(std::time::Duration::from_secs(20));
+        let ds = update_where(ds, "key < 5", "v2").await;
+        assert_eq!(ds.version().version, 2);
+
+        MockClock::set_system_time(std::time::Duration::from_secs(30));
+        let ds = update_where(ds, "key >= 5 AND key < 10", "v3").await;
+        assert_eq!(ds.version().version, 3);
+
+        let begin_ts = chrono::DateTime::<chrono::Utc>::from_timestamp(15, 0).unwrap();
+
+        let delta = ds
+            .delta()
+            .with_begin_date(begin_ts)
+            .build()
+            .unwrap();
+
+        let txs = delta.list_transactions().await.unwrap();
+        // Should include transactions at v2 and v3
         assert_eq!(txs.len(), 2);
     }
 }
