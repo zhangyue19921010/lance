@@ -1467,11 +1467,7 @@ mod tests {
 
         let begin_ts = chrono::DateTime::<chrono::Utc>::from_timestamp(15, 0).unwrap();
 
-        let delta = ds
-            .delta()
-            .with_begin_date(begin_ts)
-            .build()
-            .unwrap();
+        let delta = ds.delta().with_begin_date(begin_ts).build().unwrap();
 
         let txs = delta.list_transactions().await.unwrap();
         // Should include transactions at v2 and v3
