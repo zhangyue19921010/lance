@@ -3668,6 +3668,6 @@ mod tests {
         assert!(!plan.tasks.is_empty());
         assert_eq!(plan.read_version, dataset.manifest.version);
         // make sure options.validate() worked
-        assert_eq!(plan.options.materialize_deletions, false);
+        assert!(!plan.options.materialize_deletions);
     }
 }
