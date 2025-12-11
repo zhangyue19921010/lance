@@ -485,6 +485,15 @@ impl FileWriter {
         self.schema_metadata.insert(key.into(), value.into());
     }
 
+    /// Prepare the writer when column data and metadata were produced externally.
+    ///
+    /// This is useful for flows that copy already-encoded pages (e.g., binary copy
+    /// during compaction) where the column buffers have been written directly and we
+    /// only need to write the footer and schema metadata. The provided
+    /// `column_metadata` must describe the buffers already persisted by the
+    /// underlying `ObjectWriter`, and `rows_written` should reflect the total number
+    /// of rows in those buffers. Call this on a lazily created writer before
+    /// invoking [`finish`].
     pub fn initialize_with_external_metadata(
         &mut self,
         schema: lance_core::datatypes::Schema,

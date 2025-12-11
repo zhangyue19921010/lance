@@ -176,7 +176,13 @@ pub struct CompactionOptions {
     /// Whether to enable binary copy optimization when eligible.
     /// Defaults to false.
     pub enable_binary_copy: bool,
+    /// Whether to force binary copy optimization. If true, compaction will fail
+    /// if binary copy is not supported for the given fragments.
+    /// Defaults to false.
     pub enable_binary_copy_force: bool,
+    /// The batch size in bytes for reading during binary copy operations.
+    /// Controls how much data is read at once when performing binary copy.
+    /// Defaults to 16MB (16 * 1024 * 1024).
     pub binary_copy_read_batch_bytes: Option<usize>,
 }
 
@@ -216,7 +222,7 @@ impl CompactionOptions {
 /// - Fragment list is non-empty
 /// - All data files share identical Lance file versions
 /// - No fragment has a deletion file
-///   TODO need to support schema evolution case like add column and drop column
+///   TODO: Need to support schema evolution case like add column and drop column
 /// - All data files share identical schema mappings (`fields`, `column_indices`)
 fn can_use_binary_copy(
     dataset: &Dataset,
@@ -253,13 +259,15 @@ fn can_use_binary_copy(
         return false;
     }
 
-    // Establish version baseline from first data file
-    let first_data_file_version = LanceFileVersion::try_from_major_minor(
-        fragments[0].files[0].file_major_version,
-        fragments[0].files[0].file_minor_version,
-    )
-    .map(|v| v.resolve())
-    .unwrap();
+    // Establish version baseline from the dataset manifest
+    let storage_file_version = match dataset
+        .manifest
+        .data_storage_format
+        .lance_file_version()
+    {
+        Ok(version) => version.resolve(),
+        Err(_) => return false,
+    };
     // Capture schema mapping baseline from first data file
     let ref_fields = &fragments[0].files[0].fields;
     let ref_cols = &fragments[0].files[0].column_indices;
@@ -279,7 +287,7 @@ fn can_use_binary_copy(
                 data_file.file_minor_version,
             )
             .map(|v| v.resolve())
-            .is_ok_and(|v| v == first_data_file_version);
+            .is_ok_and(|v| v == storage_file_version);
 
             if !version_ok {
                 is_same_version = false;
@@ -342,7 +350,7 @@ pub async fn compact_files(
 
     if compaction_plan.tasks().is_empty() && options.enable_binary_copy_force {
         return Err(Error::NotSupported {
-            source: "not execute binary copy compaction task".into(),
+            source: "cannot execute binary copy compaction task".into(),
             location: location!(),
         });
     }
@@ -866,41 +874,36 @@ async fn rewrite_files(
             location: location!(),
         });
     }
-    let mut row_ids_rx;
+    let mut row_ids_rx: Option<std::sync::mpsc::Receiver<CapturedRowIds>> = None;
+    let mut reader: Option<SendableRecordBatchStream> = None;
 
-    let (reader, rx_initial) = if !can_binary_copy {
-        prepare_reader(
+    if !can_binary_copy {
+        let (prepared_reader, rx_initial) = prepare_reader(
             dataset.as_ref(),
             &fragments,
             options.batch_size,
             true,
             needs_remapping,
         )
-        .await?
-    } else {
-        prepare_reader(
-            dataset.as_ref(),
-            &fragments,
-            options.batch_size,
-            false,
-            false,
-        )
-        .await?
-    };
-    row_ids_rx = rx_initial;
+        .await?;
+        row_ids_rx = rx_initial;
 
-    let mut rows_read = 0;
-    let schema = reader.schema();
-    let reader = reader.inspect_ok(move |batch| {
-        rows_read += batch.num_rows();
-        log::info!(
-            "Compaction task {}: Read progress {}/{}",
-            task_id,
-            rows_read,
-            num_rows,
-        );
-    });
-    let reader = Box::pin(RecordBatchStreamAdapter::new(schema, reader));
+        let mut rows_read = 0;
+        let schema = prepared_reader.schema();
+        let reader_with_progress = prepared_reader.inspect_ok(move |batch| {
+            rows_read += batch.num_rows();
+            log::info!(
+                "Compaction task {}: Read progress {}/{}",
+                task_id,
+                rows_read,
+                num_rows,
+            );
+        });
+        reader = Some(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            reader_with_progress,
+        )));
+    }
 
     let mut params = WriteParams {
         max_rows_per_file: options.target_rows_per_fragment,
@@ -932,29 +935,7 @@ async fn rewrite_files(
             });
         }
 
-        if new_fragments.is_empty() {
-            // rollback to common compaction if binary copy not supported
-            let (reader_fallback, rx_fb) = prepare_reader(
-                dataset.as_ref(),
-                &fragments,
-                options.batch_size,
-                true,
-                needs_remapping,
-            )
-            .await?;
-            row_ids_rx = rx_fb;
-            let (frags, _) = write_fragments_internal(
-                Some(dataset.as_ref()),
-                dataset.object_store.clone(),
-                &dataset.base,
-                dataset.schema().clone(),
-                reader_fallback,
-                params,
-                None,
-            )
-            .await?;
-            new_fragments = frags;
-        } else if needs_remapping {
+        if needs_remapping {
             let (tx, rx) = std::sync::mpsc::channel();
             let mut addrs = RoaringTreemap::new();
             for frag in &fragments {
@@ -976,7 +957,7 @@ async fn rewrite_files(
             dataset.object_store.clone(),
             &dataset.base,
             dataset.schema().clone(),
-            reader,
+            reader.expect("reader must be prepared for non-binary-copy path"),
             params,
             None,
         )
@@ -1309,10 +1290,10 @@ async fn rewrite_files_binary_copy(
                 .open_file_with_priority(&full_path, 0, &df.file_size_bytes)
                 .await?;
             let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
-            let src_collum_infos = file_meta.column_infos.clone();
+            let src_colum_infos = file_meta.column_infos.clone();
             // Initialize current_page_table
             if current_page_table.is_empty() {
-                current_page_table = src_collum_infos
+                current_page_table = src_colum_infos
                     .iter()
                     .map(|column_index| ColumnInfo {
                         index: column_index.index,
@@ -1326,7 +1307,7 @@ async fn rewrite_files_binary_copy(
             }
 
             // Iterate through each column of the current data file of the current fragment
-            for (col_idx, src_column_info) in src_collum_infos.iter().enumerate() {
+            for (col_idx, src_column_info) in src_colum_infos.iter().enumerate() {
                 // v2_0 compatibility: special handling for non-leaf structural header columns
                 // - v2_0 expects structural header columns to have a SINGLE page; they carry layout
                 //   metadata only and are not true data carriers.
@@ -1474,12 +1455,8 @@ async fn rewrite_files_binary_copy(
                     // Take the subsequence of row IDs corresponding to this file
                     let slice = seq.slice(frag_row_ids_offset as usize, count);
 
-                    // Materialize the slice into a Vec for conversion
-                    // NOTE: This allocation can be avoided by extending with `slice` directly.
-                    let ids_vec: Vec<u64> = slice.iter().collect();
-
                     // Append these row IDs to the accumulated sequence for the current output
-                    current_row_ids.extend(RowIdSequence::from(ids_vec.as_slice()));
+                    current_row_ids.extend(slice.iter().into_iter().collect());
 
                     // Advance the offset so the next file reads the subsequent row IDs
                     frag_row_ids_offset += count as u64;
@@ -1560,7 +1537,7 @@ async fn rewrite_files_binary_copy(
                 }
             }
         }
-    } // Complete the writing of all fragments, except for some data remaining in memory
+    } // Finished writing all fragments; any remaining data in memory will be flushed below
 
     if total_rows_in_current > 0 {
         // Flush remaining rows as a final output file
@@ -2745,6 +2722,50 @@ mod tests {
         if let Some(df) = frags.get_mut(0).and_then(|f| f.files.get_mut(0)) {
             df.file_minor_version = if df.file_minor_version == 1 { 2 } else { 1 };
         }
+        assert!(!can_use_binary_copy(&dataset, &options, &frags));
+    }
+
+    #[tokio::test]
+    async fn test_can_use_binary_copy_version_mismatch() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 500,
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Append additional data and then mark its files as a newer format version (v2.1).
+        let reader_append = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        
+        dataset.append(reader_append, None).await.unwrap();
+
+        let options = CompactionOptions {
+            enable_binary_copy: true,
+            ..Default::default()
+        };
+        let mut frags: Vec<Fragment> = dataset
+            .get_fragments()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert!(
+            frags.len() >= 2,
+            "expected multiple fragments for version mismatch test"
+        );
+
+        // Simulate mixed file versions by marking the second fragment as v2.1.
+        let (v21_major, v21_minor) = LanceFileVersion::V2_1.to_numbers();
+        for file in &mut frags[1].files {
+            file.file_major_version = v21_major;
+            file.file_minor_version = v21_minor;
+        }
+
         assert!(!can_use_binary_copy(&dataset, &options, &frags));
     }
 
