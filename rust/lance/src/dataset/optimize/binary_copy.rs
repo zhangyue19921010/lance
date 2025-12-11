@@ -144,10 +144,10 @@ pub async fn rewrite_files_binary_copy(
                 .open_file_with_priority(&full_path, 0, &df.file_size_bytes)
                 .await?;
             let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
-            let src_colum_infos = file_meta.column_infos.clone();
+            let src_column_infos = file_meta.column_infos.clone();
             // Initialize current_page_table
             if current_page_table.is_empty() {
-                current_page_table = src_colum_infos
+                current_page_table = src_column_infos
                     .iter()
                     .map(|column_index| ColumnInfo {
                         index: column_index.index,
@@ -161,7 +161,7 @@ pub async fn rewrite_files_binary_copy(
             }
 
             // Iterate through each column of the current data file of the current fragment
-            for (col_idx, src_column_info) in src_colum_infos.iter().enumerate() {
+            for (col_idx, src_column_info) in src_column_infos.iter().enumerate() {
                 // v2_0 compatibility: special handling for non-leaf structural header columns
                 // - v2_0 expects structural header columns to have a SINGLE page; they carry layout
                 //   metadata only and are not true data carriers.
