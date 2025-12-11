@@ -490,13 +490,6 @@ pub async fn compact_files_with_planner(
 ) -> Result<CompactionMetrics> {
     let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
 
-    if compaction_plan.tasks().is_empty() && options.enable_binary_copy_force {
-        return Err(Error::NotSupported {
-            source: "cannot execute binary copy compaction task".into(),
-            location: location!(),
-        });
-    }
-
     // If nothing to compact, don't make a commit.
     if compaction_plan.tasks().is_empty() {
         return Ok(CompactionMetrics::default());
