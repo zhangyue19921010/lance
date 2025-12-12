@@ -789,7 +789,7 @@ impl CoreFieldDecoderStrategy {
             let scheduler = self.create_primitive_scheduler(field, column_info, buffers)?;
             return Ok(scheduler);
         } else if data_type.is_binary_like() {
-            let column_info = column_infos.next().unwrap().clone();
+            let column_info = column_infos.expect_next()?.clone();
             // Column is blob and user is asking for binary data
             if let Some(blob_col) = Self::unwrap_blob(column_info.as_ref()) {
                 let desc_scheduler =
