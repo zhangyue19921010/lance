@@ -1887,3 +1887,28 @@ def test_nested_field_vector_index(tmp_path):
 
     # Verify total row count
     assert dataset.count_rows() == num_rows + 50
+
+
+def test_prewarm_index(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path, data_storage_version="2.1")
+    dataset = dataset.create_index(
+        "vector",
+        name="vector_index",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+    )
+    # Prewarm the index
+    dataset.prewarm_index("vector_index")
+
+    new_data = create_table(nvec=10)
+    dataset = lance.write_dataset(new_data, dataset.uri, mode="append")
+    q = new_data["vector"][0].as_py()
+
+    def func(rs: pa.Table):
+        if "vector" not in rs:
+            return
+        assert rs["vector"][0].as_py() == q
+
+    run(dataset, q=np.array(q), assert_func=func)
