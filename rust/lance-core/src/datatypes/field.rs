@@ -21,7 +21,7 @@ use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
 use lance_arrow::{
     json::{is_arrow_json_field, is_json_field},
-    DataTypeExt, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME,
+    DataTypeExt, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME,
 };
 use snafu::location;
 
@@ -516,6 +516,22 @@ impl Field {
             .unwrap_or(false)
     }
 
+    /// If the field is a blob, update this field with the same name and id
+    /// but with the data type set to a struct of the blob description fields.
+    ///
+    /// If the field is not a blob, return the field itself.
+    pub fn unloaded_mut(&mut self) {
+        if self.is_blob_v2() {
+            self.logical_type = BLOB_V2_DESC_LANCE_FIELD.logical_type.clone();
+            self.children = BLOB_V2_DESC_LANCE_FIELD.children.clone();
+            self.metadata = BLOB_V2_DESC_LANCE_FIELD.metadata.clone();
+        } else if self.is_blob() {
+            self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
+            self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+            self.metadata = BLOB_DESC_LANCE_FIELD.metadata.clone();
+        }
+    }
+
     /// If the field is a blob, return a new field with the same name and id
     /// but with the data type set to a struct of the blob description fields.
     ///
@@ -737,6 +753,17 @@ impl Field {
                 location: location!(),
             });
         }
+
+        if self.is_blob() != other.is_blob() {
+            return Err(Error::Arrow {
+                message: format!(
+                    "Attempt to intersect blob and non-blob field: {}",
+                    self.name
+                ),
+                location: location!(),
+            });
+        }
+
         let self_type = self.data_type();
         let other_type = other.data_type();
 
@@ -744,6 +771,13 @@ impl Field {
             (&self_type, &other_type),
             (DataType::Struct(_), DataType::Struct(_)) | (DataType::List(_), DataType::List(_))
         ) {
+            // Blob v2 uses a struct logical type for descriptors, which differs from the logical
+            // input struct (data/uri). When intersecting schemas for projection we want to keep
+            // the projected blob layout instead of intersecting by child names.
+            if self.is_blob() {
+                return Ok(self.clone());
+            }
+
             let children = self
                 .children
                 .iter()
@@ -1007,15 +1041,15 @@ impl TryFrom<&ArrowField> for Field {
 
         if is_blob_v2 {
             metadata
-                .entry(BLOB_META_KEY.to_string())
-                .or_insert_with(|| "true".to_string());
+                .entry(ARROW_EXT_NAME_KEY.to_string())
+                .or_insert_with(|| BLOB_V2_EXT_NAME.to_string());
         }
 
         // Check for JSON extension types (both Arrow and Lance)
         let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
             LogicalType::from("json")
         } else if is_blob_v2 {
-            LogicalType::from(super::BLOB_LOGICAL_TYPE)
+            LogicalType::from("struct")
         } else {
             LogicalType::try_from(field.data_type())?
         };
@@ -1056,11 +1090,6 @@ impl From<&Field> for ArrowField {
         let mut metadata = field.metadata.clone();
 
         if field.logical_type.is_blob() {
-            metadata.insert(
-                ARROW_EXT_NAME_KEY.to_string(),
-                lance_arrow::BLOB_V2_EXT_NAME.to_string(),
-            );
-            metadata.entry(ARROW_EXT_META_KEY.to_string()).or_default();
             metadata
                 .entry(BLOB_META_KEY.to_string())
                 .or_insert_with(|| "true".to_string());
@@ -1084,7 +1113,7 @@ mod tests {
 
     use arrow_array::{DictionaryArray, StringArray, UInt32Array};
     use arrow_schema::{Fields, TimeUnit};
-    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
+    use lance_arrow::BLOB_META_KEY;
     use std::collections::HashMap;
     #[test]
     fn arrow_field_to_field() {
@@ -1568,45 +1597,5 @@ mod tests {
         let unloaded = field.into_unloaded_with_version(BlobVersion::V2);
         assert_eq!(unloaded.children.len(), 5);
         assert_eq!(unloaded.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
-    }
-
-    #[test]
-    fn blob_v2_detection_by_extension() {
-        let metadata = HashMap::from([
-            (ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string()),
-            (BLOB_META_KEY.to_string(), "true".to_string()),
-        ]);
-        let field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
-            .with_metadata(metadata)
-            .try_into()
-            .unwrap();
-        assert!(field.is_blob_v2());
-    }
-
-    #[test]
-    fn blob_extension_roundtrip() {
-        let metadata = HashMap::from([
-            (ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string()),
-            (ARROW_EXT_META_KEY.to_string(), "".to_string()),
-        ]);
-        let arrow_field =
-            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(metadata);
-        let field = Field::try_from(&arrow_field).unwrap();
-        assert_eq!(
-            field.logical_type,
-            LogicalType::from(crate::datatypes::BLOB_LOGICAL_TYPE)
-        );
-        assert!(field.is_blob());
-        assert_eq!(field.data_type(), DataType::LargeBinary);
-
-        let roundtrip: ArrowField = ArrowField::from(&field);
-        assert_eq!(
-            roundtrip.metadata().get(ARROW_EXT_NAME_KEY),
-            Some(&BLOB_V2_EXT_NAME.to_string())
-        );
-        assert_eq!(
-            roundtrip.metadata().get(BLOB_META_KEY),
-            Some(&"true".to_string())
-        );
     }
 }
