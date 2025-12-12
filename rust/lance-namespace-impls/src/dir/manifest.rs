@@ -348,14 +348,23 @@ impl ManifestNamespace {
     }
 
     /// Construct a full URI from root and relative location
-    fn construct_full_uri(&self, relative_location: &str) -> Result<String> {
-        let base_url = lance_io::object_store::uri_to_url(&self.root)?;
+    pub(crate) fn construct_full_uri(root: &str, relative_location: &str) -> Result<String> {
+        let mut base_url = lance_io::object_store::uri_to_url(root)?;
+
+        // Ensure the base URL has a trailing slash so that URL.join() appends
+        // rather than replaces the last path segment.
+        // Without this fix, "s3://bucket/path/subdir".join("table.lance")
+        // would incorrectly produce "s3://bucket/path/table.lance" (missing subdir).
+        if !base_url.path().ends_with('/') {
+            base_url.set_path(&format!("{}/", base_url.path()));
+        }
+
         let full_url = base_url
             .join(relative_location)
             .map_err(|e| Error::InvalidInput {
                 source: format!(
-                    "Failed to join URI '{}' with '{}': {}",
-                    self.root, relative_location, e
+                    "Failed to join URI '{}' with '{}': {:?}",
+                    root, relative_location, e
                 )
                 .into(),
                 location: location!(),
@@ -1080,7 +1089,7 @@ impl LanceNamespace for ManifestNamespace {
         match table_info {
             Some(info) => {
                 // Construct full URI from relative location
-                let table_uri = self.construct_full_uri(&info.location)?;
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
 
                 // Try to open the dataset to get version and schema
                 match Dataset::open(&table_uri).await {
@@ -1192,7 +1201,7 @@ impl LanceNamespace for ManifestNamespace {
             // Child namespace table or dir listing disabled: use hash-based naming
             Self::generate_dir_name(&object_id)
         };
-        let table_uri = self.construct_full_uri(&dir_name)?;
+        let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
 
         // Validate that request_data is provided
         if data.is_empty() {
@@ -1273,7 +1282,7 @@ impl LanceNamespace for ManifestNamespace {
 
                 // Delete physical data directory using the dir_name from manifest
                 let table_path = self.base_path.child(info.location.as_str());
-                let table_uri = self.construct_full_uri(&info.location)?;
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
 
                 // Remove the table directory
                 self.object_store
@@ -1560,7 +1569,7 @@ impl LanceNamespace for ManifestNamespace {
             Self::generate_dir_name(&object_id)
         };
         let table_path = self.base_path.child(dir_name.as_str());
-        let table_uri = self.construct_full_uri(&dir_name)?;
+        let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
 
         // Validate location if provided
         if let Some(req_location) = &request.location {
@@ -1721,9 +1730,7 @@ impl LanceNamespace for ManifestNamespace {
             Some(info) => {
                 // Delete from manifest only (leave physical data intact)
                 self.delete_from_manifest(&object_id).await?;
-
-                // Construct the full URI using helper function
-                self.construct_full_uri(&info.location)?
+                Self::construct_full_uri(&self.root, &info.location)?
             }
             None => {
                 return Err(Error::Namespace {
@@ -1744,7 +1751,7 @@ impl LanceNamespace for ManifestNamespace {
 
 #[cfg(test)]
 mod tests {
-    use crate::DirectoryNamespaceBuilder;
+    use crate::{DirectoryNamespaceBuilder, ManifestNamespace};
     use bytes::Bytes;
     use lance_core::utils::tempfile::TempStdDir;
     use lance_namespace::models::{
@@ -2420,6 +2427,61 @@ mod tests {
         assert_eq!(
             response.properties.unwrap().get("key1"),
             Some(&"value1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_construct_full_uri_with_cloud_urls() {
+        // Test S3-style URL with nested path (no trailing slash)
+        let s3_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/path/subdir", "table.lance")
+                .unwrap();
+        assert_eq!(
+            s3_result, "s3://bucket/path/subdir/table.lance",
+            "S3 URL should correctly append table name to nested path"
+        );
+
+        // Test Azure-style URL with nested path (no trailing slash)
+        let az_result =
+            ManifestNamespace::construct_full_uri("az://container/path/subdir", "table.lance")
+                .unwrap();
+        assert_eq!(
+            az_result, "az://container/path/subdir/table.lance",
+            "Azure URL should correctly append table name to nested path"
+        );
+
+        // Test GCS-style URL with nested path (no trailing slash)
+        let gs_result =
+            ManifestNamespace::construct_full_uri("gs://bucket/path/subdir", "table.lance")
+                .unwrap();
+        assert_eq!(
+            gs_result, "gs://bucket/path/subdir/table.lance",
+            "GCS URL should correctly append table name to nested path"
+        );
+
+        // Test with deeper nesting
+        let deep_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/a/b/c/d", "my_table.lance").unwrap();
+        assert_eq!(
+            deep_result, "s3://bucket/a/b/c/d/my_table.lance",
+            "Deeply nested path should work correctly"
+        );
+
+        // Test with root-level path (single segment after bucket)
+        let shallow_result =
+            ManifestNamespace::construct_full_uri("s3://bucket", "table.lance").unwrap();
+        assert_eq!(
+            shallow_result, "s3://bucket/table.lance",
+            "Single-level nested path should work correctly"
+        );
+
+        // Test that URLs with trailing slash already work (no regression)
+        let trailing_slash_result =
+            ManifestNamespace::construct_full_uri("s3://bucket/path/subdir/", "table.lance")
+                .unwrap();
+        assert_eq!(
+            trailing_slash_result, "s3://bucket/path/subdir/table.lance",
+            "URL with existing trailing slash should still work"
         );
     }
 }
