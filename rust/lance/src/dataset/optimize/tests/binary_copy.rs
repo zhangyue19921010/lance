@@ -2,6 +2,48 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_io::object_store::ObjectStoreParams;
+use std::collections::HashMap;
+use std::env;
+use std::time::Instant;
+
+fn perf_s3_config_from_env() -> Option<(String, ObjectStoreParams)> {
+    let base_uri = env::var("LANCE_PERF_S3_URI").ok()?;
+    let key = env::var("LANCE_PERF_S3_ACCESS_KEY")
+        .or_else(|_| env::var("AWS_ACCESS_KEY_ID"))
+        .ok()?;
+    let secret = env::var("LANCE_PERF_S3_SECRET_KEY")
+        .or_else(|_| env::var("AWS_SECRET_ACCESS_KEY"))
+        .ok()?;
+    let region = env::var("LANCE_PERF_S3_REGION")
+        .or_else(|_| env::var("AWS_DEFAULT_REGION"))
+        .ok()?;
+    let endpoint = env::var("LANCE_PERF_S3_ENDPOINT")
+        .or_else(|_| env::var("AWS_ENDPOINT"))
+        .ok()?;
+
+    let mut storage_options = HashMap::from([
+        ("access_key_id".to_string(), key),
+        ("secret_access_key".to_string(), secret),
+        ("aws_region".to_string(), region),
+        ("aws_endpoint".to_string(), endpoint.clone()),
+        (
+            "virtual_hosted_style_request".to_string(),
+            "true".to_string(),
+        ),
+    ]);
+    if endpoint.starts_with("http://") {
+        storage_options.insert("allow_http".to_string(), "true".to_string());
+    }
+
+    Some((
+        base_uri,
+        ObjectStoreParams {
+            storage_options: Some(storage_options),
+            ..Default::default()
+        },
+    ))
+}
 
 #[tokio::test]
 async fn test_binary_copy_merge_small_files() {
@@ -771,4 +813,176 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
 
     assert_eq!(before, after);
     assert_eq!(batch_before, batch_after);
+}
+
+async fn measure_point_and_scan(
+    dataset: &Dataset,
+    point_value: i64,
+) -> ((usize, std::time::Duration), (usize, std::time::Duration)) {
+    let filter = format!("i64 = {}", point_value);
+
+    let mut point_scanner = dataset.scan();
+    point_scanner.filter(&filter).unwrap();
+    point_scanner.project(&["i64"]).unwrap();
+    let point_start = Instant::now();
+    let point_batch = point_scanner.try_into_batch().await.unwrap();
+    let point_elapsed = point_start.elapsed();
+
+    let mut scan_scanner = dataset.scan();
+    scan_scanner.project(&["i64"]).unwrap();
+    let scan_start = Instant::now();
+    let scan_batch = scan_scanner.try_into_batch().await.unwrap();
+    let scan_elapsed = scan_start.elapsed();
+
+    (
+        (point_batch.num_rows(), point_elapsed),
+        (scan_batch.num_rows(), scan_elapsed),
+    )
+}
+
+#[tokio::test]
+async fn test_perf_binary_copy_vs_full() {
+    use arrow_schema::{DataType, Field, Fields, TimeUnit};
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
+
+    let row_num = 1_000_000;
+
+    let inner_fields = Fields::from(vec![
+        Field::new("x", DataType::UInt32, true),
+        Field::new("y", DataType::LargeUtf8, true),
+    ]);
+    let nested_fields = Fields::from(vec![
+        Field::new("inner", DataType::Struct(inner_fields.clone()), true),
+        Field::new("fsb", DataType::FixedSizeBinary(16), true),
+        Field::new("bin", DataType::Binary, true),
+    ]);
+    let event_fields = Fields::from(vec![
+        Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+        Field::new("payload", DataType::Binary, true),
+    ]);
+
+    let reader_full = gen_batch()
+        .col("vec1", array::rand_vec::<Float32Type>(Dimension::from(12)))
+        .col("vec2", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .col("i32", array::step::<Int32Type>())
+        .col("i64", array::step::<Int64Type>())
+        .col("f32", array::rand::<Float32Type>())
+        .col("f64", array::rand::<Float64Type>())
+        .col("bool", array::rand_boolean())
+        .col("date32", array::rand_date32())
+        .col("date64", array::rand_date64())
+        .col(
+            "ts_ms",
+            array::rand_timestamp(&DataType::Timestamp(TimeUnit::Millisecond, None)),
+        )
+        .col(
+            "utf8",
+            array::rand_utf8(lance_datagen::ByteCount::from(16), false),
+        )
+        .col("large_utf8", array::random_sentence(1, 6, true))
+        .col(
+            "bin",
+            array::rand_fixedbin(lance_datagen::ByteCount::from(24), false),
+        )
+        .col(
+            "large_bin",
+            array::rand_fixedbin(lance_datagen::ByteCount::from(24), true),
+        )
+        .col(
+            "varbin",
+            array::rand_varbin(
+                lance_datagen::ByteCount::from(8),
+                lance_datagen::ByteCount::from(32),
+            ),
+        )
+        .col("fsb16", array::rand_fsb(16))
+        .col(
+            "fsl4",
+            array::cycle_vec(array::rand::<Float32Type>(), Dimension::from(4)),
+        )
+        .col("struct_simple", array::rand_struct(inner_fields.clone()))
+        .col("struct_nested", array::rand_struct(nested_fields))
+        .col(
+            "events",
+            array::rand_list_any(array::rand_struct(event_fields.clone()), true),
+        )
+        .into_reader_rows(RowCount::from(row_num), BatchCount::from(10));
+
+    let _local_dir = TempStrDir::default();
+    let (base_uri, store_params) = perf_s3_config_from_env()
+        .map(|(uri, params)| (uri, Some(params)))
+        .unwrap_or_else(|| (_local_dir.to_string(), None));
+    println!("perf dataset uri: {}", base_uri);
+
+    let mut dataset = Dataset::write(
+        reader_full,
+        &base_uri,
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            max_rows_per_file: (row_num / 100) as usize,
+            store_params: store_params.clone(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let opt_binary = CompactionOptions {
+        enable_binary_copy: false,
+        ..Default::default()
+    };
+    let opt_full = CompactionOptions {
+        enable_binary_copy: true,
+        enable_binary_copy_force: true,
+        ..Default::default()
+    };
+
+    let target_point = (row_num / 2) as i64;
+    let before_rows = dataset.count_rows(None).await.unwrap();
+    let ((point_before_rows, point_before), (scan_before_rows, scan_before)) =
+        measure_point_and_scan(&dataset, target_point).await;
+
+    let t0 = Instant::now();
+    let _ = compact_files(&mut dataset, opt_full, None).await.unwrap();
+    let d_full = t0.elapsed();
+    let ((point_full_rows, point_full), (scan_full_rows, scan_full)) =
+        measure_point_and_scan(&dataset, target_point).await;
+    let after_full = dataset.count_rows(None).await.unwrap();
+
+    let mut dataset = dataset.checkout_version(1).await.unwrap();
+    dataset.restore().await.unwrap();
+    let t1 = Instant::now();
+    let _ = compact_files(&mut dataset, opt_binary, None).await.unwrap();
+    let d_bin = t1.elapsed();
+    let ((point_bin_rows, point_bin), (scan_bin_rows, scan_bin)) =
+        measure_point_and_scan(&dataset, target_point).await;
+    let after_bin = dataset.count_rows(None).await.unwrap();
+
+    println!(
+        "perf: full_compaction={:?}, binary_copy={:?}, speedup={:.2}x",
+        d_full,
+        d_bin,
+        (d_full.as_secs_f64() / d_bin.as_secs_f64())
+    );
+
+    println!(
+        "point query (before/full/bin): {:?} / {:?} / {:?}, scan (before/full/bin): {:?} / {:?} / {:?}, point speedup (full/bin): {:.2}x / {:.2}x, scan speedup (full/bin): {:.2}x / {:.2}x",
+        point_before, point_full, point_bin,
+        scan_before, scan_full, scan_bin,
+        point_before.as_secs_f64() / point_full.as_secs_f64(),
+        point_before.as_secs_f64() / point_bin.as_secs_f64(),
+        scan_before.as_secs_f64() / scan_full.as_secs_f64(),
+        scan_before.as_secs_f64() / scan_bin.as_secs_f64(),
+    );
+
+    assert_eq!(point_before_rows, 1);
+    assert_eq!(point_full_rows, 1);
+    assert_eq!(point_bin_rows, 1);
+    assert_eq!(scan_before_rows, before_rows);
+    assert_eq!(scan_full_rows, before_rows);
+    assert_eq!(scan_bin_rows, before_rows);
+    assert_eq!(before_rows, after_full);
+    assert_eq!(before_rows, after_bin);
 }
