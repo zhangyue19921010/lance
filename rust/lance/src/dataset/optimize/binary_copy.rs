@@ -16,12 +16,14 @@ use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Writer;
-use lance_table::format::{DataFile, Fragment};
+use lance_table::format::{DataFile, Fragment, RowIdMeta};
+use lance_table::rowids::{write_row_ids, RowIdSequence};
 use prost::Message;
 use prost_types::Any;
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+use crate::dataset::rowids::load_row_id_sequence;
 
 /// Rewrite the files in a single task using binary copy semantics.
 ///
@@ -69,8 +71,8 @@ pub async fn rewrite_files_binary_copy(
         fragments[0].files[0].file_major_version,
         fragments[0].files[0].file_minor_version,
     )
-    .unwrap()
-    .resolve();
+        .unwrap()
+        .resolve();
     // v2_0 compatibility: column layout differs across file versions
     // - v2_0 materializes BOTH leaf columns and non-leaf structural headers (e.g., Struct / List)
     //   which means the ColumnInfo set includes all fields in pre-order traversal.
@@ -111,6 +113,8 @@ pub async fn rewrite_files_binary_copy(
     let mut col_buffers: Vec<Vec<(u64, u64)>> = vec![Vec::new(); column_count];
     let mut total_rows_in_current: u64 = 0;
     let max_rows_per_file = params.max_rows_per_file as u64;
+    let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
+    let mut current_row_ids = RowIdSequence::new();
 
     // Align all writes to 64-byte boundaries to honor typical IO alignment and
     // keep buffer offsets valid across concatenated pages.
@@ -119,6 +123,12 @@ pub async fn rewrite_files_binary_copy(
     let zero_buf = ZERO_BUFFER.get_or_init(|| vec![0u8; ALIGN]);
     // Visit each fragment and all of its data files (a fragment may contain multiple files)
     for frag in fragments.iter() {
+        let mut frag_row_ids_offset: u64 = 0;
+        let frag_row_ids = if uses_stable_row_ids {
+            Some(load_row_id_sequence(dataset, frag).await?)
+        } else {
+            None
+        };
         for df in frag.files.iter() {
             let object_store = if let Some(base_id) = df.base_id {
                 dataset.object_store_for_base(base_id).await?
@@ -290,6 +300,23 @@ pub async fn rewrite_files_binary_copy(
                 }
             } // finished all columns in the current source file
 
+            if uses_stable_row_ids {
+                // When stable row IDs are enabled, incorporate the fragment's row IDs
+                if let Some(seq) = frag_row_ids.as_ref() {
+                    // Number of rows in the current source file
+                    let count = file_meta.num_rows as usize;
+
+                    // Take the subsequence of row IDs corresponding to this file
+                    let slice = seq.slice(frag_row_ids_offset as usize, count);
+
+                    // Append these row IDs to the accumulated sequence for the current output
+                    current_row_ids.extend(slice.iter().collect());
+
+                    // Advance the offset so the next file reads the subsequent row IDs
+                    frag_row_ids_offset += count as u64;
+                }
+            }
+
             // Accumulate rows for the current output file and flush when reaching the threshold
             total_rows_in_current += file_meta.num_rows;
             if total_rows_in_current >= max_rows_per_file {
@@ -325,25 +352,39 @@ pub async fn rewrite_files_binary_copy(
                 let mut fragment_out = Fragment::new(0);
                 let mut data_file_out =
                     DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-                // v2_0 vs v2_1+ field-to-column index mapping
-                // - v2_1+ stores only leaf columns; non-leaf fields get `-1` in the mapping
-                // - v2_0 includes structural headers as columns; non-leaf fields map to a concrete index
-                let is_structural = version >= LanceFileVersion::V2_1;
+                // Field-to-column index mapping notes:
+                // - v2_0 materializes structural headers as columns; every field maps to a concrete index.
+                // - v2_1+ materializes only leaf fields. Use `is_leaf()` to detect leaves and set
+                //   non-leaf fields to `-1`.
+                // Rationale: `List` is a data leaf even though it has a child (its value). Using
+                // `children.is_empty()` would misclassify `List` as non-leaf and write `-1`, which
+                // corrupts the manifest mapping and can lead to mismatched RecordBatch column lengths
+                // after subsequent compaction.
                 let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
                 let mut curr_col_idx: i32 = 0;
-                for field in schema.fields_pre_order() {
-                    if field.is_packed_struct() || field.children.is_empty() || !is_structural {
+                if version == LanceFileVersion::V2_0 {
+                    for _ in schema.fields_pre_order() {
                         field_column_indices.push(curr_col_idx);
                         curr_col_idx += 1;
-                    } else {
-                        field_column_indices.push(-1);
+                    }
+                } else {
+                    for field in schema.fields_pre_order() {
+                        if field.is_leaf() {
+                            field_column_indices.push(curr_col_idx);
+                            curr_col_idx += 1;
+                        } else {
+                            field_column_indices.push(-1);
+                        }
                     }
                 }
                 data_file_out.fields = full_field_ids.clone();
                 data_file_out.column_indices = field_column_indices;
                 fragment_out.files.push(data_file_out);
                 fragment_out.physical_rows = Some(total_rows_in_current as usize);
-
+                if uses_stable_row_ids {
+                    fragment_out.row_id_meta =
+                        Some(RowIdMeta::Inline(write_row_ids(&current_row_ids)));
+                }
                 // Reset state for next output file
                 current_writer = None;
                 current_pos = 0;
@@ -356,6 +397,9 @@ pub async fn rewrite_files_binary_copy(
                 }
                 out.push(fragment_out);
                 total_rows_in_current = 0;
+                if uses_stable_row_ids {
+                    current_row_ids = RowIdSequence::new();
+                }
             }
         }
     } // Finished writing all fragments; any remaining data in memory will be flushed below
@@ -397,22 +441,34 @@ pub async fn rewrite_files_binary_copy(
         let (maj, min) = version.to_numbers();
         let mut frag = Fragment::new(0);
         let mut df = DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-        // v2_0 vs v2_1+ field-to-column index mapping for the final file
-        let is_structural = version >= LanceFileVersion::V2_1;
+        // Field-to-column index mapping for the final file:
+        // - v2_0: map all fields (including structural headers) to concrete indices.
+        // - v2_1+: map only leaf fields using `is_leaf()`, non-leaf as `-1`.
+        // This avoids misclassifying `List` (leaf with children) and ensures manifest consistency.
         let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
         let mut curr_col_idx: i32 = 0;
-        for field in schema.fields_pre_order() {
-            if field.is_packed_struct() || field.children.is_empty() || !is_structural {
+        if version == LanceFileVersion::V2_0 {
+            for _ in schema.fields_pre_order() {
                 field_column_indices.push(curr_col_idx);
                 curr_col_idx += 1;
-            } else {
-                field_column_indices.push(-1);
+            }
+        } else {
+            for field in schema.fields_pre_order() {
+                if field.is_leaf() {
+                    field_column_indices.push(curr_col_idx);
+                    curr_col_idx += 1;
+                } else {
+                    field_column_indices.push(-1);
+                }
             }
         }
         df.fields = full_field_ids.clone();
         df.column_indices = field_column_indices;
         frag.files.push(df);
         frag.physical_rows = Some(total_rows_in_current as usize);
+        if uses_stable_row_ids {
+            frag.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&current_row_ids)));
+        }
         out.push(frag);
     }
     Ok(out)
