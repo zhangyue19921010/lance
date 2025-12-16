@@ -2283,6 +2283,7 @@ class LanceDataset(pa.dataset.Dataset):
     def cleanup_old_versions(
         self,
         older_than: Optional[timedelta] = None,
+        retain_versions: Optional[int] = None,
         *,
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
@@ -2302,8 +2303,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
 
         older_than: timedelta, optional
-            Only versions older than this will be removed.  If not specified, this
-            will default to two weeks.
+            Only versions older than this will be removed.  If ``older_than`` and
+            ``retain_versions`` are not specified, this will default to two weeks.
+
+        retain_versions: int, optional
+            Retain the last N versions of the dataset.
 
         delete_unverified: bool, default False
             Files leftover from a failed transaction may appear to be part of an
@@ -2323,10 +2327,14 @@ class LanceDataset(pa.dataset.Dataset):
             be ignored without any error and only untagged versions will be
             cleaned up.
         """
-        if older_than is None:
+        if older_than is None and retain_versions is None:
             older_than = timedelta(days=14)
+
         return self._ds.cleanup_old_versions(
-            td_to_micros(older_than), delete_unverified, error_if_tagged_old_versions
+            td_to_micros(older_than) if older_than else None,
+            retain_versions,
+            delete_unverified,
+            error_if_tagged_old_versions,
         )
 
     def create_scalar_index(
