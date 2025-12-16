@@ -2,11 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::dataset::builder::DatasetBuilder;
 use lance_io::object_store::ObjectStoreParams;
 use std::collections::HashMap;
 use std::env;
 use std::time::Instant;
-use tantivy::schema::Value;
 
 fn perf_s3_config_from_env() -> Option<(String, ObjectStoreParams)> {
     let base_uri = env::var("LANCE_PERF_S3_URI").ok()?;
@@ -990,7 +990,7 @@ async fn test_perf_binary_copy_vs_full() {
 
 #[tokio::test]
 async fn do_compact_binary_copy() {
-    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest")
+    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest-binary-compaction")
         .await
         .unwrap();
     let mut dataset = dataset.checkout_version(1).await.unwrap();
@@ -1007,7 +1007,7 @@ async fn do_compact_binary_copy() {
 
 #[tokio::test]
 async fn do_compact_normal() {
-    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest")
+    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest-normal-compaction")
         .await
         .unwrap();
     let mut dataset = dataset.checkout_version(1).await.unwrap();
@@ -1028,7 +1028,7 @@ async fn do_normal_write() {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
 
-    let row_num = 1_000_000;
+    let row_num = 5_000_000;
 
     let inner_fields = Fields::from(vec![
         Field::new("x", DataType::UInt32, true),
@@ -1107,3 +1107,191 @@ async fn do_normal_write() {
         .await
         .unwrap();
 }
+
+/// Pick a point value from the dataset for querying
+async fn pick_point_value(dataset: &Dataset, column: &str) -> Result<i32> {
+    let mut scanner = dataset.scan();
+    scanner.project(&[column])?;
+    scanner.limit(Some(1), None)?;
+    let batch = scanner.try_into_batch().await?;
+
+    if batch.num_rows() == 0 {
+        return Err(Error::invalid_input(
+            "dataset is empty; cannot derive point query value",
+            location!(),
+        ));
+    }
+
+    let column_data = batch.column_by_name(column)
+        .ok_or_else(|| Error::invalid_input("column not found", location!()))?;
+    let int_array = column_data
+        .as_any()
+        .downcast_ref::<arrow_array::Int32Array>()
+        .ok_or_else(|| Error::invalid_input("column is not Int32", location!()))?;
+
+    Ok(int_array.value(0))
+}
+
+/// Select versions to benchmark (first, middle, last)
+async fn select_versions(dataset: &Dataset) -> Result<Vec<u64>> {
+    let versions = dataset.versions().await?;
+    let mut version_numbers: Vec<u64> = versions.iter().map(|v| v.version).collect();
+    version_numbers.sort();
+
+    if version_numbers.len() < 3 {
+        return Err(Error::invalid_input(
+            format!(
+                "dataset at {} needs at least 3 versions; found {}",
+                dataset.uri(),
+                version_numbers.len()
+            ),
+            location!(),
+        ));
+    }
+
+    let first = version_numbers[0];
+    let middle = version_numbers[std::cmp::min(2, version_numbers.len() - 1)];
+    let last = *version_numbers.last().unwrap();
+
+    Ok(vec![first, middle, last])
+}
+
+/// Measure point query and scan performance
+async fn measure(
+    dataset: &Dataset,
+    column: &str,
+    value: i32,
+) -> Result<(usize, std::time::Duration, usize, std::time::Duration)> {
+    let filter_expr = format!("{} = {}", column, value);
+
+    // Point query
+    let point_start = Instant::now();
+    let mut point_scanner = dataset.scan();
+    point_scanner.project(&[column])?;
+    point_scanner.filter(&filter_expr)?;
+    let point_batch = point_scanner.try_into_batch().await?;
+    let point_time = point_start.elapsed();
+    let point_rows = point_batch.num_rows();
+
+    // Full scan
+    let scan_start = Instant::now();
+    let mut scan_scanner = dataset.scan();
+    scan_scanner.project(&[column])?;
+    let scan_batch = scan_scanner.try_into_batch().await?;
+    let scan_time = scan_start.elapsed();
+    let scan_rows = scan_batch.num_rows();
+
+    Ok((point_rows, point_time, scan_rows, scan_time))
+}
+
+#[tokio::test]
+async fn test_s3_dataset_version_performance() {
+    // S3 configuration
+    let uri = "s3://zy-test-lance/binary-copy/binary_copy/";
+    let mut storage_options = HashMap::new();
+    storage_options.insert(
+        "access_key_id".to_string(),
+        " ".to_string(),
+    );
+    storage_options.insert(
+        "secret_access_key".to_string(),
+        " ==".to_string(),
+    );
+    storage_options.insert("aws_region".to_string(), "cn-beijing".to_string());
+    storage_options.insert(
+        "aws_endpoint".to_string(),
+        "https:// ing.volces.com".to_string(),
+    );
+    storage_options.insert(
+        "virtual_hosted_style_request".to_string(),
+        "true".to_string(),
+    );
+
+    // Open dataset using DatasetBuilder
+    let dataset = DatasetBuilder::from_uri(uri)
+        .with_storage_options(storage_options)
+        .load()
+        .await
+        .expect("Failed to open dataset");
+
+    println!("Dataset schema: {:?}", dataset.schema());
+    println!();
+
+    // Test with specific versions
+    let versions = vec![3];
+    let column = "i32";
+
+    // Pick a point value for querying
+    let point_value = pick_point_value(&dataset, column)
+        .await
+        .expect("Failed to pick point value");
+
+    println!("Using point value: {}", point_value);
+    println!();
+
+    // // Check version 3
+    // let version_3 = dataset
+    //     .checkout_version(3)
+    //     .await
+    //     .expect("Failed to checkout version 3");
+    // println!("Version 3 schema: {:?}", version_3.schema());
+    // let version_3_fragments = version_3.get_fragments();
+    // println!("Version 3 fragments count: {}", version_3_fragments.len());
+    // println!();
+    //
+    // // Check version 6
+    // let version_6 = dataset
+    //     .checkout_version(6)
+    //     .await
+    //     .expect("Failed to checkout version 6");
+    // println!("Version 6 schema: {:?}", version_6.schema());
+    // let version_6_fragments = version_6.get_fragments();
+    // println!("Version 6 fragments count: {}", version_6_fragments.len());
+    // println!();
+
+    let mut baseline_point: Option<std::time::Duration> = None;
+    let mut baseline_scan: Option<std::time::Duration> = None;
+
+    // Measure performance for each version
+    for (idx, &version) in versions.iter().enumerate() {
+        let ds_version = dataset
+            .checkout_version(version)
+            .await
+            .expect(&format!("Failed to checkout version {}", version));
+
+        let total_rows = ds_version.count_rows(None).await.unwrap();
+        let fragments = ds_version.get_fragments();
+
+        let (point_rows, point_time, scan_rows, scan_time) =
+            measure(&ds_version, column, point_value)
+                .await
+                .expect("Failed to measure");
+
+        println!(
+            "[{}] version={} rows={} fragments={} point_rows={} point_time={:.3}s scan_rows={} scan_time={:.3}s",
+            idx,
+            version,
+            total_rows,
+            fragments.len(),
+            point_rows,
+            point_time.as_secs_f64(),
+            scan_rows,
+            scan_time.as_secs_f64()
+        );
+
+        if idx == 0 {
+            baseline_point = Some(point_time);
+            baseline_scan = Some(scan_time);
+        } else {
+            if let (Some(bp), Some(bs)) = (baseline_point, baseline_scan) {
+                let point_speedup = bp.as_secs_f64() / point_time.as_secs_f64();
+                let scan_speedup = bs.as_secs_f64() / scan_time.as_secs_f64();
+                println!(
+                    "    speedup vs entry0: point {:.2}x, scan {:.2}x",
+                    point_speedup, scan_speedup
+                );
+            }
+        }
+    }
+}
+
