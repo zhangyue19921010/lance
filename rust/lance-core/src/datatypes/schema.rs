@@ -697,6 +697,16 @@ impl TryFrom<&ArrowSchema> for Schema {
                             location: location!(),
                         });
                     }
+
+                    if ancestor.logical_type.is_map() {
+                        return Err(Error::Schema {
+                            message: format!(
+                                "Primary key column must not be in a map type: {}",
+                                ancestor
+                            ),
+                            location: location!(),
+                        });
+                    }
                 }
             }
         }

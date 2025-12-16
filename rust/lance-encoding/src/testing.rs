@@ -126,6 +126,14 @@ fn column_indices_from_schema_helper(
                     is_structural_encoding,
                 );
             }
+            DataType::Map(entries, _) => {
+                column_indices_from_schema_helper(
+                    std::slice::from_ref(entries),
+                    column_indices,
+                    column_counter,
+                    is_structural_encoding,
+                );
+            }
             DataType::FixedSizeList(inner, _) => {
                 // FSL(primitive) does not get its own column in either approach
                 column_indices_from_schema_helper(
@@ -209,7 +217,8 @@ async fn test_decode(
         is_structural_encoding,
         /*should_validate=*/ true,
         rx,
-    );
+    )
+    .unwrap();
 
     let mut offset = 0;
     while let Some(batch) = decode_stream.next().await {
