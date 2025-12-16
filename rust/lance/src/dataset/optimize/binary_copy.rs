@@ -71,8 +71,8 @@ pub async fn rewrite_files_binary_copy(
         fragments[0].files[0].file_major_version,
         fragments[0].files[0].file_minor_version,
     )
-    .unwrap()
-    .resolve();
+        .unwrap()
+        .resolve();
     // v2_0 compatibility: column layout differs across file versions
     // - v2_0 materializes BOTH leaf columns and non-leaf structural headers (e.g., Struct / List)
     //   which means the ColumnInfo set includes all fields in pre-order traversal.
@@ -81,7 +81,10 @@ pub async fn rewrite_files_binary_copy(
     // To correctly align copy layout, we derive `column_count` by version:
     // - v2_0: use total number of fields in pre-order (leaf + non-leaf headers)
     // - v2_1+: use only the number of leaf fields
-    let leaf_count = schema.fields_pre_order().filter(|f| f.is_leaf()).count();
+    let leaf_count = schema
+        .fields_pre_order()
+        .filter(|f| !(f.data_type().is_struct() && !f.is_packed_struct()))
+        .count();
     let column_count = if version == LanceFileVersion::V2_0 {
         schema.fields_pre_order().count()
     } else {
@@ -352,14 +355,6 @@ pub async fn rewrite_files_binary_copy(
                 let mut fragment_out = Fragment::new(0);
                 let mut data_file_out =
                     DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-                // Field-to-column index mapping notes:
-                // - v2_0 materializes structural headers as columns; every field maps to a concrete index.
-                // - v2_1+ materializes only leaf fields. Use `is_leaf()` to detect leaves and set
-                //   non-leaf fields to `-1`.
-                // Rationale: `List` is a data leaf even though it has a child (its value). Using
-                // `children.is_empty()` would misclassify `List` as non-leaf and write `-1`, which
-                // corrupts the manifest mapping and can lead to mismatched RecordBatch column lengths
-                // after subsequent compaction.
                 let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
                 let mut curr_col_idx: i32 = 0;
                 if version == LanceFileVersion::V2_0 {
@@ -369,11 +364,11 @@ pub async fn rewrite_files_binary_copy(
                     }
                 } else {
                     for field in schema.fields_pre_order() {
-                        if field.is_leaf() {
+                        if field.data_type().is_struct() && !field.is_packed_struct() {
+                            field_column_indices.push(-1);
+                        } else {
                             field_column_indices.push(curr_col_idx);
                             curr_col_idx += 1;
-                        } else {
-                            field_column_indices.push(-1);
                         }
                     }
                 }
@@ -441,10 +436,7 @@ pub async fn rewrite_files_binary_copy(
         let (maj, min) = version.to_numbers();
         let mut frag = Fragment::new(0);
         let mut df = DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-        // Field-to-column index mapping for the final file:
-        // - v2_0: map all fields (including structural headers) to concrete indices.
-        // - v2_1+: map only leaf fields using `is_leaf()`, non-leaf as `-1`.
-        // This avoids misclassifying `List` (leaf with children) and ensures manifest consistency.
+        // v2_0 vs v2_1+ field-to-column index mapping for the final file
         let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
         let mut curr_col_idx: i32 = 0;
         if version == LanceFileVersion::V2_0 {
@@ -454,11 +446,11 @@ pub async fn rewrite_files_binary_copy(
             }
         } else {
             for field in schema.fields_pre_order() {
-                if field.is_leaf() {
+                if field.data_type().is_struct() && !field.is_packed_struct() {
+                    field_column_indices.push(-1);
+                } else {
                     field_column_indices.push(curr_col_idx);
                     curr_col_idx += 1;
-                } else {
-                    field_column_indices.push(-1);
                 }
             }
         }
