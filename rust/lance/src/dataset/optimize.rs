@@ -113,7 +113,6 @@ use tracing::info;
 mod binary_copy;
 pub mod remapping;
 
-use super::rowids::load_row_id_sequence;
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 use binary_copy::rewrite_files_binary_copy;
