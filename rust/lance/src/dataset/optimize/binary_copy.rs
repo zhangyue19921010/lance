@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::dataset::fragment::write::generate_random_filename;
-use crate::dataset::optimize::load_row_id_sequence;
 use crate::dataset::WriteParams;
 use crate::dataset::DATA_DIR;
 use crate::datatypes::Schema;
@@ -17,8 +16,7 @@ use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Writer;
-use lance_table::format::{DataFile, Fragment, RowIdMeta};
-use lance_table::rowids::{write_row_ids, RowIdSequence};
+use lance_table::format::{DataFile, Fragment};
 use prost::Message;
 use prost_types::Any;
 use std::ops::Range;
@@ -113,8 +111,6 @@ pub async fn rewrite_files_binary_copy(
     let mut col_buffers: Vec<Vec<(u64, u64)>> = vec![Vec::new(); column_count];
     let mut total_rows_in_current: u64 = 0;
     let max_rows_per_file = params.max_rows_per_file as u64;
-    let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
-    let mut current_row_ids = RowIdSequence::new();
 
     // Align all writes to 64-byte boundaries to honor typical IO alignment and
     // keep buffer offsets valid across concatenated pages.
@@ -123,12 +119,6 @@ pub async fn rewrite_files_binary_copy(
     let zero_buf = ZERO_BUFFER.get_or_init(|| vec![0u8; ALIGN]);
     // Visit each fragment and all of its data files (a fragment may contain multiple files)
     for frag in fragments.iter() {
-        let mut frag_row_ids_offset: u64 = 0;
-        let frag_row_ids = if uses_stable_row_ids {
-            Some(load_row_id_sequence(dataset, frag).await?)
-        } else {
-            None
-        };
         for df in frag.files.iter() {
             let object_store = if let Some(base_id) = df.base_id {
                 dataset.object_store_for_base(base_id).await?
@@ -300,23 +290,6 @@ pub async fn rewrite_files_binary_copy(
                 }
             } // finished all columns in the current source file
 
-            if uses_stable_row_ids {
-                // When stable row IDs are enabled, incorporate the fragment's row IDs
-                if let Some(seq) = frag_row_ids.as_ref() {
-                    // Number of rows in the current source file
-                    let count = file_meta.num_rows as usize;
-
-                    // Take the subsequence of row IDs corresponding to this file
-                    let slice = seq.slice(frag_row_ids_offset as usize, count);
-
-                    // Append these row IDs to the accumulated sequence for the current output
-                    current_row_ids.extend(slice.iter().collect());
-
-                    // Advance the offset so the next file reads the subsequent row IDs
-                    frag_row_ids_offset += count as u64;
-                }
-            }
-
             // Accumulate rows for the current output file and flush when reaching the threshold
             total_rows_in_current += file_meta.num_rows;
             if total_rows_in_current >= max_rows_per_file {
@@ -370,10 +343,7 @@ pub async fn rewrite_files_binary_copy(
                 data_file_out.column_indices = field_column_indices;
                 fragment_out.files.push(data_file_out);
                 fragment_out.physical_rows = Some(total_rows_in_current as usize);
-                if uses_stable_row_ids {
-                    fragment_out.row_id_meta =
-                        Some(RowIdMeta::Inline(write_row_ids(&current_row_ids)));
-                }
+
                 // Reset state for next output file
                 current_writer = None;
                 current_pos = 0;
@@ -386,9 +356,6 @@ pub async fn rewrite_files_binary_copy(
                 }
                 out.push(fragment_out);
                 total_rows_in_current = 0;
-                if uses_stable_row_ids {
-                    current_row_ids = RowIdSequence::new();
-                }
             }
         }
     } // Finished writing all fragments; any remaining data in memory will be flushed below
@@ -446,9 +413,6 @@ pub async fn rewrite_files_binary_copy(
         df.column_indices = field_column_indices;
         frag.files.push(df);
         frag.physical_rows = Some(total_rows_in_current as usize);
-        if uses_stable_row_ids {
-            frag.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&current_row_ids)));
-        }
         out.push(frag);
     }
     Ok(out)
