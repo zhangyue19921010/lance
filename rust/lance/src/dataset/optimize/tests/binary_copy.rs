@@ -7,6 +7,7 @@ use lance_io::object_store::ObjectStoreParams;
 use std::collections::HashMap;
 use std::env;
 use std::time::Instant;
+use lance_table::format::pb::data_fragment::RowIdSequence;
 
 fn perf_s3_config_from_env() -> Option<(String, ObjectStoreParams)> {
     let base_uri = env::var("LANCE_PERF_S3_URI").ok()?;
@@ -990,7 +991,7 @@ async fn test_perf_binary_copy_vs_full() {
 
 #[tokio::test]
 async fn do_compact_binary_copy() {
-    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest-binary-compaction")
+    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest/")
         .await
         .unwrap();
     let mut dataset = dataset.checkout_version(1).await.unwrap();
@@ -1007,7 +1008,7 @@ async fn do_compact_binary_copy() {
 
 #[tokio::test]
 async fn do_compact_normal() {
-    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest-normal-compaction")
+    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest/")
         .await
         .unwrap();
     let mut dataset = dataset.checkout_version(1).await.unwrap();
@@ -1098,7 +1099,6 @@ async fn do_normal_write() {
         reader_full,
         &base_uri,
         Some(WriteParams {
-            enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_1),
             max_rows_per_file: (row_num / 100) as usize,
             ..Default::default()
@@ -1191,16 +1191,16 @@ async fn test_s3_dataset_version_performance() {
     let mut storage_options = HashMap::new();
     storage_options.insert(
         "access_key_id".to_string(),
-        " ".to_string(),
+        "".to_string(),
     );
     storage_options.insert(
         "secret_access_key".to_string(),
-        " ==".to_string(),
+        "==".to_string(),
     );
     storage_options.insert("aws_region".to_string(), "cn-beijing".to_string());
     storage_options.insert(
         "aws_endpoint".to_string(),
-        "https:// ing.volces.com".to_string(),
+        "https://zy-test-lance.tos-s.volces.com".to_string(),
     );
     storage_options.insert(
         "virtual_hosted_style_request".to_string(),
@@ -1261,6 +1261,9 @@ async fn test_s3_dataset_version_performance() {
 
         let total_rows = ds_version.count_rows(None).await.unwrap();
         let fragments = ds_version.get_fragments();
+        let a = fragments.get(0).unwrap();
+        let row_id_meta = a.clone().metadata.row_id_meta.unwrap();
+        println!("{:?}", row_id_meta);
 
         let (point_rows, point_time, scan_rows, scan_time) =
             measure(&ds_version, column, point_value)

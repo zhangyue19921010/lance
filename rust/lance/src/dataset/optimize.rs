@@ -1019,7 +1019,7 @@ async fn rewrite_files(
             (Some(row_id_map), None)
         }
     } else {
-        if dataset.manifest.uses_stable_row_ids() {
+        if dataset.manifest.uses_stable_row_ids() && !can_binary_copy{
             log::info!("Compaction task {}: rechunking stable row ids", task_id);
             rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
             recalc_versions_for_rewritten_fragments(
