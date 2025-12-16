@@ -989,7 +989,9 @@ async fn test_perf_binary_copy_vs_full() {
 
 #[tokio::test]
 async fn do_compact_binary_copy() {
-    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest").await.unwrap();
+    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest")
+        .await
+        .unwrap();
     let mut dataset = dataset.checkout_version(1).await.unwrap();
     dataset.restore().await.unwrap();
 
@@ -1004,7 +1006,9 @@ async fn do_compact_binary_copy() {
 
 #[tokio::test]
 async fn do_compact_normal() {
-    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest").await.unwrap();
+    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest")
+        .await
+        .unwrap();
     let mut dataset = dataset.checkout_version(1).await.unwrap();
     dataset.restore().await.unwrap();
 
