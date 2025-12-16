@@ -986,3 +986,18 @@ async fn test_perf_binary_copy_vs_full() {
     assert_eq!(before_rows, after_full);
     assert_eq!(before_rows, after_bin);
 }
+
+#[tokio::test]
+async fn do_compact_binary_copy() {
+    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest").await.unwrap();
+    let mut dataset = dataset.checkout_version(1).await.unwrap();
+    dataset.restore().await.unwrap();
+
+    let opt = CompactionOptions {
+        enable_binary_copy: true,
+        enable_binary_copy_force: true,
+        ..Default::default()
+    };
+
+    let _ = compact_files(&mut dataset, opt, None).await.unwrap();
+}
