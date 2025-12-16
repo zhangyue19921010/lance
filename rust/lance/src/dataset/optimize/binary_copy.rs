@@ -22,7 +22,6 @@ use lance_table::rowids::{write_row_ids, RowIdSequence};
 use prost::Message;
 use prost_types::Any;
 use std::ops::Range;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
@@ -66,8 +65,6 @@ pub async fn rewrite_files_binary_copy(
     // Merge small Lance files into larger ones by page-level binary copy.
     let schema = dataset.schema().clone();
     let full_field_ids = schema.field_ids();
-    let baseline_fields = fragments[0].files[0].fields.clone();
-    let baseline_column_indices = fragments[0].files[0].column_indices.clone();
 
     // The previous checks have ensured that the file versions of all files are consistent.
     let version = LanceFileVersion::try_from_major_minor(
@@ -108,9 +105,6 @@ pub async fn rewrite_files_binary_copy(
     let mut current_filename: Option<String> = None;
     let mut current_pos: u64 = 0;
     let mut current_page_table: Vec<ColumnInfo> = Vec::new();
-    // Maps physical column index (ColumnInfo.index) to the destination position in
-    // our aggregation vectors. This ensures cross-file accumulation is aligned by index.
-    let mut col_index_to_pos: Option<HashMap<u32, usize>> = None;
 
     // Column-list<Page-List<DecPageInfo>>
     let mut col_pages: Vec<Vec<DecPageInfo>> = std::iter::repeat_with(Vec::<DecPageInfo>::new)
@@ -150,10 +144,10 @@ pub async fn rewrite_files_binary_copy(
                 .open_file_with_priority(&full_path, 0, &df.file_size_bytes)
                 .await?;
             let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
-            let src_column_infos = file_meta.column_infos.clone();
+            let src_colum_infos = file_meta.column_infos.clone();
             // Initialize current_page_table
             if current_page_table.is_empty() {
-                current_page_table = src_column_infos
+                current_page_table = src_colum_infos
                     .iter()
                     .map(|column_index| ColumnInfo {
                         index: column_index.index,
@@ -164,23 +158,10 @@ pub async fn rewrite_files_binary_copy(
                         encoding: column_index.encoding.clone(),
                     })
                     .collect();
-                // Build a mapping from physical column index -> destination position.
-                // Subsequent files may enumerate columns in different orders, so we always
-                // accumulate by physical index to avoid misalignment.
-                let mut map = HashMap::with_capacity(src_column_infos.len());
-                for (pos, ci) in src_column_infos.iter().enumerate() {
-                    map.insert(ci.index, pos);
-                }
-                col_index_to_pos = Some(map);
             }
 
             // Iterate through each column of the current data file of the current fragment
-            for src_column_info in src_column_infos.iter() {
-                // Use the physical index mapping to choose the destination aggregation slot.
-                let dest_idx = col_index_to_pos
-                    .as_ref()
-                    .and_then(|m| m.get(&src_column_info.index).copied())
-                    .unwrap_or(0);
+            for (col_idx, src_column_info) in src_colum_infos.iter().enumerate() {
                 // v2_0 compatibility: special handling for non-leaf structural header columns
                 // - v2_0 expects structural header columns to have a SINGLE page; they carry layout
                 //   metadata only and are not true data carriers.
@@ -190,8 +171,8 @@ pub async fn rewrite_files_binary_copy(
                 // - During finalization we also normalize the single remaining page’s `num_rows` to the
                 //   total number of rows in the output file and reset `priority` to 0.
                 // - For v2_1+ this logic does not apply because non-leaf headers are not stored as columns.
-                let is_non_leaf = dest_idx < is_non_leaf_column.len() && is_non_leaf_column[dest_idx];
-                if is_non_leaf && !col_pages[dest_idx].is_empty() {
+                let is_non_leaf = col_idx < is_non_leaf_column.len() && is_non_leaf_column[col_idx];
+                if is_non_leaf && !col_pages[col_idx].is_empty() {
                     continue;
                 }
 
@@ -292,18 +273,12 @@ pub async fn rewrite_files_binary_copy(
                             encoding,
                             buffer_offsets_and_sizes: Arc::from(new_offsets.into_boxed_slice()),
                         };
-                        // Accumulate pages into the slot determined by physical index.
-                        col_pages[dest_idx].push(new_page_info);
+                        col_pages[col_idx].push(new_page_info);
                     }
                 } // finished scheduling & copying pages for this column in the current source file
 
                 // Copy column-level buffers (outside page data) with alignment
-                // For v2_0 non-leaf structural columns, only copy buffers once
-                if !src_column_info.buffer_offsets_and_sizes.is_empty()
-                    && !(version == LanceFileVersion::V2_0
-                    && is_non_leaf
-                    && !col_buffers[dest_idx].is_empty())
-                {
+                if !src_column_info.buffer_offsets_and_sizes.is_empty() {
                     let ranges: Vec<Range<u64>> = src_column_info
                         .buffer_offsets_and_sizes
                         .iter()
@@ -320,8 +295,7 @@ pub async fn rewrite_files_binary_copy(
                         let start = current_pos;
                         writer.write_all(&bytes).await?;
                         current_pos += bytes.len() as u64;
-                        // Accumulate column-level buffers by physical index.
-                        col_buffers[dest_idx].push((start, bytes.len() as u64));
+                        col_buffers[col_idx].push((start, bytes.len() as u64));
                     }
                 }
             } // finished all columns in the current source file
@@ -349,10 +323,7 @@ pub async fn rewrite_files_binary_copy(
                 // v2_0 compatibility: enforce single-page structural headers before file close
                 // - We truncate to a single page and rewrite the page’s `num_rows` to match the output
                 //   file’s row count so downstream decoders see a consistent header.
-                // Reorder aggregated columns by physical index to satisfy decoder expectations
-                // (final_cols[pos].index == pos).
-                let mut final_cols_ordered: Vec<Option<Arc<ColumnInfo>>> =
-                    std::iter::repeat_with(|| None).take(column_count).collect();
+                let mut final_cols: Vec<Arc<ColumnInfo>> = Vec::with_capacity(column_count);
                 for (i, column_info) in current_page_table.iter().enumerate() {
                     // For v2_0 struct headers, force a single page and set num_rows to total
                     let mut pages_vec = std::mem::take(&mut col_pages[i]);
@@ -366,18 +337,13 @@ pub async fn rewrite_files_binary_copy(
                     }
                     let pages_arc = Arc::from(pages_vec.into_boxed_slice());
                     let buffers_vec = std::mem::take(&mut col_buffers[i]);
-                    let ci_new = Arc::new(ColumnInfo::new(
+                    final_cols.push(Arc::new(ColumnInfo::new(
                         column_info.index,
                         pages_arc,
                         buffers_vec,
                         column_info.encoding.clone(),
-                    ));
-                    final_cols_ordered[column_info.index as usize] = Some(ci_new);
+                    )));
                 }
-                let final_cols: Vec<Arc<ColumnInfo>> = final_cols_ordered
-                    .into_iter()
-                    .map(|c| c.expect("missing column info in binary copy flush"))
-                    .collect();
                 let writer = current_writer.take().unwrap();
                 flush_footer(writer, &schema, &final_cols, total_rows_in_current, version).await?;
 
@@ -386,8 +352,22 @@ pub async fn rewrite_files_binary_copy(
                 let mut fragment_out = Fragment::new(0);
                 let mut data_file_out =
                     DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-                data_file_out.fields = baseline_fields.clone();
-                data_file_out.column_indices = baseline_column_indices.clone();
+                // v2_0 vs v2_1+ field-to-column index mapping
+                // - v2_1+ stores only leaf columns; non-leaf fields get `-1` in the mapping
+                // - v2_0 includes structural headers as columns; non-leaf fields map to a concrete index
+                let is_structural = version >= LanceFileVersion::V2_1;
+                let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
+                let mut curr_col_idx: i32 = 0;
+                for field in schema.fields_pre_order() {
+                    if field.is_packed_struct() || field.children.is_empty() || !is_structural {
+                        field_column_indices.push(curr_col_idx);
+                        curr_col_idx += 1;
+                    } else {
+                        field_column_indices.push(-1);
+                    }
+                }
+                data_file_out.fields = full_field_ids.clone();
+                data_file_out.column_indices = field_column_indices;
                 fragment_out.files.push(data_file_out);
                 fragment_out.physical_rows = Some(total_rows_in_current as usize);
                 if uses_stable_row_ids {
@@ -398,8 +378,6 @@ pub async fn rewrite_files_binary_copy(
                 current_writer = None;
                 current_pos = 0;
                 current_page_table.clear();
-                // Clear the physical index mapping; it will be rebuilt from the next input file.
-                col_index_to_pos = None;
                 for v in col_pages.iter_mut() {
                     v.clear();
                 }
@@ -418,9 +396,7 @@ pub async fn rewrite_files_binary_copy(
     if total_rows_in_current > 0 {
         // Flush remaining rows as a final output file
         // v2_0 compatibility: same single-page enforcement applies for the final file close
-        // Final flush: reorder aggregated columns by physical index.
-        let mut final_cols_ordered: Vec<Option<Arc<ColumnInfo>>> =
-            std::iter::repeat_with(|| None).take(column_count).collect();
+        let mut final_cols: Vec<Arc<ColumnInfo>> = Vec::with_capacity(column_count);
         for (i, ci) in current_page_table.iter().enumerate() {
             // For v2_0 struct headers, force a single page and set num_rows to total
             let mut pages_vec = std::mem::take(&mut col_pages[i]);
@@ -434,18 +410,13 @@ pub async fn rewrite_files_binary_copy(
             }
             let pages_arc = Arc::from(pages_vec.into_boxed_slice());
             let buffers_vec = std::mem::take(&mut col_buffers[i]);
-            let ci_new = Arc::new(ColumnInfo::new(
+            final_cols.push(Arc::new(ColumnInfo::new(
                 ci.index,
                 pages_arc,
                 buffers_vec,
                 ci.encoding.clone(),
-            ));
-            final_cols_ordered[ci.index as usize] = Some(ci_new);
+            )));
         }
-        let final_cols: Vec<Arc<ColumnInfo>> = final_cols_ordered
-            .into_iter()
-            .map(|c| c.expect("missing column info in final binary copy flush"))
-            .collect();
         if current_writer.is_none() {
             let filename = format!("{}.lance", generate_random_filename());
             let path = dataset.base.child(DATA_DIR).child(filename.as_str());
@@ -459,8 +430,20 @@ pub async fn rewrite_files_binary_copy(
         let (maj, min) = version.to_numbers();
         let mut frag = Fragment::new(0);
         let mut df = DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-        df.fields = baseline_fields.clone();
-        df.column_indices = baseline_column_indices.clone();
+        // v2_0 vs v2_1+ field-to-column index mapping for the final file
+        let is_structural = version >= LanceFileVersion::V2_1;
+        let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
+        let mut curr_col_idx: i32 = 0;
+        for field in schema.fields_pre_order() {
+            if field.is_packed_struct() || field.children.is_empty() || !is_structural {
+                field_column_indices.push(curr_col_idx);
+                curr_col_idx += 1;
+            } else {
+                field_column_indices.push(-1);
+            }
+        }
+        df.fields = full_field_ids.clone();
+        df.column_indices = field_column_indices;
         frag.files.push(df);
         frag.physical_rows = Some(total_rows_in_current as usize);
         if uses_stable_row_ids {
@@ -569,65 +552,4 @@ async fn flush_footer(
     );
     file_writer.finish().await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use lance_encoding::decoder::PageInfo as DecPageInfo;
-    use lance_encoding::format::pb::ColumnEncoding;
-    use std::sync::Arc;
-
-    #[test]
-    fn test_reorder_by_physical_index() {
-        // Build a synthetic current_page_table with indices out of order: [2, 0, 1]
-        let col0 = ColumnInfo {
-            index: 2,
-            page_infos: Arc::from(Vec::<DecPageInfo>::new().into_boxed_slice()),
-            buffer_offsets_and_sizes: Arc::from(Vec::<(u64, u64)>::new().into_boxed_slice()),
-            encoding: ColumnEncoding::default(),
-        };
-        let col1 = ColumnInfo {
-            index: 0,
-            page_infos: Arc::from(Vec::<DecPageInfo>::new().into_boxed_slice()),
-            buffer_offsets_and_sizes: Arc::from(Vec::<(u64, u64)>::new().into_boxed_slice()),
-            encoding: ColumnEncoding::default(),
-        };
-        let col2 = ColumnInfo {
-            index: 1,
-            page_infos: Arc::from(Vec::<DecPageInfo>::new().into_boxed_slice()),
-            buffer_offsets_and_sizes: Arc::from(Vec::<(u64, u64)>::new().into_boxed_slice()),
-            encoding: ColumnEncoding::default(),
-        };
-        let current_page_table = vec![col0, col1, col2];
-
-        // Simulate aggregated pages/buffers vectors (empty is fine for ordering test)
-        let mut col_pages: Vec<Vec<DecPageInfo>> = vec![Vec::new(), Vec::new(), Vec::new()];
-        let mut col_buffers: Vec<Vec<(u64, u64)>> = vec![Vec::new(), Vec::new(), Vec::new()];
-
-        // Reorder aggregated columns by physical index as in rewrite_files_binary_copy
-        let mut final_cols_ordered: Vec<Option<Arc<ColumnInfo>>> =
-            std::iter::repeat_with(|| None).take(3).collect();
-        for (i, column_info) in current_page_table.iter().enumerate() {
-            let pages_arc = Arc::from(std::mem::take(&mut col_pages[i]).into_boxed_slice());
-            let buffers_vec = std::mem::take(&mut col_buffers[i]);
-            let ci_new = Arc::new(ColumnInfo::new(
-                column_info.index,
-                pages_arc,
-                buffers_vec,
-                column_info.encoding.clone(),
-            ));
-            final_cols_ordered[column_info.index as usize] = Some(ci_new);
-        }
-        let final_cols: Vec<Arc<ColumnInfo>> = final_cols_ordered
-            .into_iter()
-            .map(|c| c.expect("missing column info in reorder test"))
-            .collect();
-
-        // Assert that final ordering matches physical indices: final_cols[pos].index == pos
-        assert_eq!(final_cols.len(), 3);
-        for (pos, ci) in final_cols.iter().enumerate() {
-            assert_eq!(ci.index as usize, pos);
-        }
-    }
 }
