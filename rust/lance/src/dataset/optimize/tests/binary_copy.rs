@@ -1001,3 +1001,18 @@ async fn do_compact_binary_copy() {
 
     let _ = compact_files(&mut dataset, opt, None).await.unwrap();
 }
+
+#[tokio::test]
+async fn do_compact_normal() {
+    let dataset = Dataset::open("/home/zhangyue.1010/binarycopytest").await.unwrap();
+    let mut dataset = dataset.checkout_version(1).await.unwrap();
+    dataset.restore().await.unwrap();
+
+    let opt = CompactionOptions {
+        enable_binary_copy: false,
+        enable_binary_copy_force: false,
+        ..Default::default()
+    };
+
+    let _ = compact_files(&mut dataset, opt, None).await.unwrap();
+}
