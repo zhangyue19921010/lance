@@ -64,7 +64,6 @@ pub async fn rewrite_files_binary_copy(
     // - Optionally carries forward stable row ids and persists them inline in fragment metadata
     // Merge small Lance files into larger ones by page-level binary copy.
     let schema = dataset.schema().clone();
-    let full_field_ids = schema.field_ids();
 
     // The previous checks have ensured that the file versions of all files are consistent.
     let version = LanceFileVersion::try_from_major_minor(
@@ -81,10 +80,7 @@ pub async fn rewrite_files_binary_copy(
     // To correctly align copy layout, we derive `column_count` by version:
     // - v2_0: use total number of fields in pre-order (leaf + non-leaf headers)
     // - v2_1+: use only the number of leaf fields
-    let leaf_count = schema
-        .fields_pre_order()
-        .filter(|f| !(f.data_type().is_struct() && !f.is_packed_struct()))
-        .count();
+    let leaf_count = schema.fields_pre_order().filter(|f| f.is_leaf()).count();
     let column_count = if version == LanceFileVersion::V2_0 {
         schema.fields_pre_order().count()
     } else {
@@ -104,6 +100,31 @@ pub async fn rewrite_files_binary_copy(
     }
 
     let mut out: Vec<Fragment> = Vec::new();
+    let field_ids_template = fragments
+        .first()
+        .and_then(|f| f.files.first())
+        .map(|df| df.fields.clone())
+        .unwrap_or_else(|| schema.field_ids());
+    let compute_field_column_indices = || {
+        let is_structural = version >= LanceFileVersion::V2_1;
+        let mut field_column_indices = Vec::new();
+        let mut curr_col_idx: i32 = 0;
+        for field in schema.fields_pre_order() {
+            if field.is_packed_struct() || field.children.is_empty() || !is_structural {
+                field_column_indices.push(curr_col_idx);
+                curr_col_idx += 1;
+            } else {
+                field_column_indices.push(-1);
+            }
+        }
+        field_column_indices
+    };
+    let column_indices_template = fragments
+        .first()
+        .and_then(|f| f.files.first())
+        .map(|df| df.column_indices.clone())
+        .filter(|indices| !indices.is_empty())
+        .unwrap_or_else(compute_field_column_indices);
     let mut current_writer: Option<ObjectWriter> = None;
     let mut current_filename: Option<String> = None;
     let mut current_pos: u64 = 0;
@@ -355,25 +376,10 @@ pub async fn rewrite_files_binary_copy(
                 let mut fragment_out = Fragment::new(0);
                 let mut data_file_out =
                     DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-                let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
-                let mut curr_col_idx: i32 = 0;
-                if version == LanceFileVersion::V2_0 {
-                    for _ in schema.fields_pre_order() {
-                        field_column_indices.push(curr_col_idx);
-                        curr_col_idx += 1;
-                    }
-                } else {
-                    for field in schema.fields_pre_order() {
-                        if field.data_type().is_struct() && !field.is_packed_struct() {
-                            field_column_indices.push(-1);
-                        } else {
-                            field_column_indices.push(curr_col_idx);
-                            curr_col_idx += 1;
-                        }
-                    }
-                }
-                data_file_out.fields = full_field_ids.clone();
-                data_file_out.column_indices = field_column_indices;
+                // Preserve the source data file's field/column mapping so missing columns
+                // remain marked as absent in the manifest.
+                data_file_out.fields = field_ids_template.clone();
+                data_file_out.column_indices = column_indices_template.clone();
                 fragment_out.files.push(data_file_out);
                 fragment_out.physical_rows = Some(total_rows_in_current as usize);
                 if uses_stable_row_ids {
@@ -436,26 +442,9 @@ pub async fn rewrite_files_binary_copy(
         let (maj, min) = version.to_numbers();
         let mut frag = Fragment::new(0);
         let mut df = DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-        // v2_0 vs v2_1+ field-to-column index mapping for the final file
-        let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
-        let mut curr_col_idx: i32 = 0;
-        if version == LanceFileVersion::V2_0 {
-            for _ in schema.fields_pre_order() {
-                field_column_indices.push(curr_col_idx);
-                curr_col_idx += 1;
-            }
-        } else {
-            for field in schema.fields_pre_order() {
-                if field.data_type().is_struct() && !field.is_packed_struct() {
-                    field_column_indices.push(-1);
-                } else {
-                    field_column_indices.push(curr_col_idx);
-                    curr_col_idx += 1;
-                }
-            }
-        }
-        df.fields = full_field_ids.clone();
-        df.column_indices = field_column_indices;
+        // Preserve the source data file's field/column mapping for the final file.
+        df.fields = field_ids_template.clone();
+        df.column_indices = column_indices_template.clone();
         frag.files.push(df);
         frag.physical_rows = Some(total_rows_in_current as usize);
         if uses_stable_row_ids {
