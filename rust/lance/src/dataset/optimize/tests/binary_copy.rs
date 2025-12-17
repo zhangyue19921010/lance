@@ -848,7 +848,7 @@ async fn test_perf_binary_copy_vs_full() {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
 
-    let row_num = 5_000_000;
+    let row_num = 100_000;
 
     let inner_fields = Fields::from(vec![
         Field::new("x", DataType::UInt32, true),
@@ -911,7 +911,7 @@ async fn test_perf_binary_copy_vs_full() {
         )
         .into_reader_rows(RowCount::from(row_num), BatchCount::from(10));
 
-    let base_uri = "/home/zhangyue.1010/test2".to_string();
+    let base_uri = "/home/zhangyue.1010/test1".to_string();
 
     println!("perf dataset uri: {}", base_uri);
 
@@ -1026,7 +1026,7 @@ async fn do_normal_write() {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
 
-    let row_num = 10_000;
+    let row_num = 5_000_000;
 
     let inner_fields = Fields::from(vec![
         Field::new("x", DataType::UInt32, true),
