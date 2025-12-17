@@ -154,7 +154,10 @@ impl CacheKey for RowIdSequenceKey {
     type ValueType = RowIdSequence;
 
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_id_sequence/{}/{}", self.version, self.fragment_id))
+        Cow::Owned(format!(
+            "row_id_sequence/{}/{}",
+            self.version, self.fragment_id
+        ))
     }
 }
 
@@ -183,15 +186,11 @@ mod tests {
         // Build two different sequences representing two versions of the same fragment.
         let seq_v2_bytes = {
             let arr: Vec<u64> = vec![1, 2, 3];
-            lance_table::rowids::write_row_ids(
-                &RowIdSequence::from(arr.as_slice()),
-            )
+            lance_table::rowids::write_row_ids(&RowIdSequence::from(arr.as_slice()))
         };
         let seq_v3_bytes = {
             let arr: Vec<u64> = vec![10, 20];
-            lance_table::rowids::write_row_ids(
-                &RowIdSequence::from(arr.as_slice()),
-            )
+            lance_table::rowids::write_row_ids(&RowIdSequence::from(arr.as_slice()))
         };
         let seq_v2 = Arc::new(lance_table::rowids::read_row_ids(&seq_v2_bytes).unwrap());
         let seq_v3 = Arc::new(lance_table::rowids::read_row_ids(&seq_v3_bytes).unwrap());
@@ -220,8 +219,7 @@ mod tests {
             .await
             .expect("V2 entry should be present");
         assert_eq!(
-            got_v2,
-            seq_v2,
+            got_v2, seq_v2,
             "V2 cached sequence should match inserted sequence"
         );
 
@@ -232,11 +230,10 @@ mod tests {
             .await
             .expect("V3 entry should be present after insertion");
         assert_eq!(
-            got_v3,
-            seq_v3,
+            got_v3, seq_v3,
             "V3 cached sequence should match inserted sequence"
         );
-        
+
         assert_ne!(
             got_v2.get(0),
             got_v3.get(0),
