@@ -67,7 +67,7 @@ use {
     std::time::{Duration, SystemTime},
 };
 
-const VERSIONS_DIR: &str = "_versions";
+pub const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 const DETACHED_VERSION_PREFIX: &str = "d";
 
