@@ -492,8 +492,7 @@ impl FileWriter {
     /// only need to write the footer and schema metadata. The provided
     /// `column_metadata` must describe the buffers already persisted by the
     /// underlying `ObjectWriter`, and `rows_written` should reflect the total number
-    /// of rows in those buffers. Call this on a lazily created writer before
-    /// invoking [`finish`].
+    /// of rows in those buffers.
     pub fn initialize_with_external_metadata(
         &mut self,
         schema: lance_core::datatypes::Schema,

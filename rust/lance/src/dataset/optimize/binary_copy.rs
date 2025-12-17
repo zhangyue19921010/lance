@@ -23,6 +23,32 @@ use std::ops::Range;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
+const ALIGN: usize = 64;
+
+/// Apply 64-byte alignment padding for V2.1+ files.
+///
+/// For V2.1+, writes padding bytes to align the current position to a 64-byte boundary.
+/// For V2.0 and earlier, no padding is applied as alignment is not required.
+///
+/// Returns the new position after padding (if any).
+async fn apply_alignment_padding(
+    writer: &mut ObjectWriter,
+    current_pos: u64,
+    version: LanceFileVersion,
+) -> Result<u64> {
+    if version >= LanceFileVersion::V2_1 {
+        static ZERO_BUFFER: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let zero_buf = ZERO_BUFFER.get_or_init(|| vec![0u8; ALIGN]);
+
+        let pad = (ALIGN - (current_pos as usize % ALIGN)) % ALIGN;
+        if pad != 0 {
+            writer.write_all(&zero_buf[..pad]).await?;
+            return Ok(current_pos + pad as u64);
+        }
+    }
+    Ok(current_pos)
+}
+
 /// Rewrite the files in a single task using binary copy semantics.
 ///
 /// Flow overview (per task):
@@ -38,7 +64,7 @@ use tokio::io::AsyncWriteExt;
 /// - Assumes all input files share the same Lance file version; version drives column-count
 ///   calculation (v2.0 includes structural headers, v2.1+ only leaf columns).
 /// - Preserves stable row ids by concatenating row-id sequences when enabled.
-/// - Enforces 64-byte alignment for page and buffer writes to satisfy downstream readers.
+/// - Enforces 64-byte alignment for page and buffer writes in V2.1+ files (V2.0 does not require alignment).
 /// - For v2.0, preserves single-page structural headers and normalizes their row counts/priority.
 /// - Flushes an output file once `max_rows_per_file` rows are accumulated, then repeats.
 ///
@@ -71,19 +97,22 @@ pub async fn rewrite_files_binary_copy(
     )
     .unwrap()
     .resolve();
-    // v2_0 compatibility: column layout differs across file versions
-    // - v2_0 materializes BOTH leaf columns and non-leaf structural headers (e.g., Struct / List)
+    // v2.0 and v2.1+ handle structural headers differently during file writing:
+    // - v2_0 materializes ALL fields in pre-order traversal (leaf fields + non-leaf struct headers),
     //   which means the ColumnInfo set includes all fields in pre-order traversal.
-    // - v2_1+ materializes ONLY leaf columns. Non-leaf structural headers are not stored as columns.
-    //   As a result, the ColumnInfo set contains leaf fields only.
+    // - v2_1+ materializes fields that are either leaf columns OR packed structs. Non-leaf structural
+    //   headers (unpacked structs with children) are not stored as columns.
+    //   As a result, the ColumnInfo set contains leaf fields and packed structs.
     // To correctly align copy layout, we derive `column_count` by version:
     // - v2_0: use total number of fields in pre-order (leaf + non-leaf headers)
-    // - v2_1+: use only the number of leaf fields
-    let leaf_count = schema.fields_pre_order().filter(|f| f.is_leaf()).count();
+    // - v2_1+: use only the number of leaf fields plus packed structs
     let column_count = if version == LanceFileVersion::V2_0 {
         schema.fields_pre_order().count()
     } else {
-        leaf_count
+        schema
+            .fields_pre_order()
+            .filter(|f| f.is_packed_struct() || f.is_leaf())
+            .count()
     };
 
     // v2_0 compatibility: build a map to identify non-leaf structural header columns
@@ -112,11 +141,6 @@ pub async fn rewrite_files_binary_copy(
     let mut total_rows_in_current: u64 = 0;
     let max_rows_per_file = params.max_rows_per_file as u64;
 
-    // Align all writes to 64-byte boundaries to honor typical IO alignment and
-    // keep buffer offsets valid across concatenated pages.
-    const ALIGN: usize = 64;
-    static ZERO_BUFFER: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    let zero_buf = ZERO_BUFFER.get_or_init(|| vec![0u8; ALIGN]);
     // Visit each fragment and all of its data files (a fragment may contain multiple files)
     for frag in fragments.iter() {
         for df in frag.files.iter() {
@@ -236,11 +260,8 @@ pub async fn rewrite_files_binary_copy(
                         for _ in 0..*buffer_count {
                             if let Some(bytes) = bytes_iter.next() {
                                 let writer = current_writer.as_mut().unwrap();
-                                let pad = (ALIGN - (current_pos as usize % ALIGN)) % ALIGN;
-                                if pad != 0 {
-                                    writer.write_all(&zero_buf[..pad]).await?;
-                                    current_pos += pad as u64;
-                                }
+                                current_pos =
+                                    apply_alignment_padding(writer, current_pos, version).await?;
                                 let start = current_pos;
                                 writer.write_all(&bytes).await?;
                                 current_pos += bytes.len() as u64;
@@ -277,11 +298,7 @@ pub async fn rewrite_files_binary_copy(
                     let bytes_vec = file_scheduler.submit_request(ranges, 0).await?;
                     for bytes in bytes_vec.into_iter() {
                         let writer = current_writer.as_mut().unwrap();
-                        let pad = (ALIGN - (current_pos as usize % ALIGN)) % ALIGN;
-                        if pad != 0 {
-                            writer.write_all(&zero_buf[..pad]).await?;
-                            current_pos += pad as u64;
-                        }
+                        current_pos = apply_alignment_padding(writer, current_pos, version).await?;
                         let start = current_pos;
                         writer.write_all(&bytes).await?;
                         current_pos += bytes.len() as u64;
@@ -332,7 +349,7 @@ pub async fn rewrite_files_binary_copy(
                 let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
                 let mut curr_col_idx: i32 = 0;
                 for field in schema.fields_pre_order() {
-                    if field.is_packed_struct() || field.children.is_empty() || !is_structural {
+                    if field.is_packed_struct() || field.is_leaf() || !is_structural {
                         field_column_indices.push(curr_col_idx);
                         curr_col_idx += 1;
                     } else {
@@ -402,7 +419,7 @@ pub async fn rewrite_files_binary_copy(
         let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
         let mut curr_col_idx: i32 = 0;
         for field in schema.fields_pre_order() {
-            if field.is_packed_struct() || field.children.is_empty() || !is_structural {
+            if field.is_packed_struct() || field.is_leaf() || !is_structural {
                 field_column_indices.push(curr_col_idx);
                 curr_col_idx += 1;
             } else {
@@ -442,16 +459,9 @@ async fn flush_footer(
     total_rows_in_current: u64,
     version: LanceFileVersion,
 ) -> Result<()> {
-    if version >= LanceFileVersion::V2_1 {
-        const ALIGN: usize = 64;
-        static ZERO_BUFFER: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-        let zero_buf = ZERO_BUFFER.get_or_init(|| vec![0u8; ALIGN]);
-        let pos = writer.tell().await? as u64;
-        let pad = (ALIGN as u64 - (pos % ALIGN as u64)) % ALIGN as u64;
-        if pad != 0 {
-            writer.write_all(&zero_buf[..pad as usize]).await?;
-        }
-    }
+    let pos = writer.tell().await? as u64;
+    let _new_pos = apply_alignment_padding(&mut writer, pos, version).await?;
+
     let mut col_metadatas = Vec::with_capacity(final_cols.len());
     for col in final_cols {
         let pages = col
