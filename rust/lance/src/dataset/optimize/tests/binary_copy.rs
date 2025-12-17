@@ -911,7 +911,7 @@ async fn test_perf_binary_copy_vs_full() {
         )
         .into_reader_rows(RowCount::from(row_num), BatchCount::from(10));
 
-    let base_uri = "/home/zhangyue.1010/test1".to_string();
+    let base_uri = "/home/zhangyue.1010/test2".to_string();
 
     println!("perf dataset uri: {}", base_uri);
 
@@ -1197,7 +1197,7 @@ async fn test_s3_dataset_version_performance() {
     storage_options.insert("aws_region".to_string(), "cn-beijing".to_string());
     storage_options.insert(
         "aws_endpoint".to_string(),
-        "https://zy-test-lance.tos-s.volces.com".to_string(),
+        "https://zy-test-lance.tos-s3-cn-beijing.volces.com".to_string(),
     );
     storage_options.insert(
         "virtual_hosted_style_request".to_string(),
@@ -1226,25 +1226,22 @@ async fn test_s3_dataset_version_performance() {
     println!("Using point value: {}", point_value);
     println!();
 
-    // // Check version 3
-    // let version_3 = dataset
-    //     .checkout_version(3)
-    //     .await
-    //     .expect("Failed to checkout version 3");
-    // println!("Version 3 schema: {:?}", version_3.schema());
-    // let version_3_fragments = version_3.get_fragments();
-    // println!("Version 3 fragments count: {}", version_3_fragments.len());
-    // println!();
-    //
-    // // Check version 6
-    // let version_6 = dataset
-    //     .checkout_version(6)
-    //     .await
-    //     .expect("Failed to checkout version 6");
-    // println!("Version 6 schema: {:?}", version_6.schema());
-    // let version_6_fragments = version_6.get_fragments();
-    // println!("Version 6 fragments count: {}", version_6_fragments.len());
-    // println!();
+    // Check version 3
+    let version_3 = dataset
+        .checkout_version(3)
+        .await
+        .expect("Failed to checkout version 3");
+
+    // Check version 6
+    let version_6 = dataset
+        .checkout_version(6)
+        .await
+        .expect("Failed to checkout version 6");
+
+
+    assert_eq!(version_3.manifest.schema, version_6.manifest.schema);
+    print!("");
+
 
     let mut baseline_point: Option<std::time::Duration> = None;
     let mut baseline_scan: Option<std::time::Duration> = None;

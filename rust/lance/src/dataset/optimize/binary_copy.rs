@@ -144,10 +144,10 @@ pub async fn rewrite_files_binary_copy(
                 .open_file_with_priority(&full_path, 0, &df.file_size_bytes)
                 .await?;
             let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
-            let src_column_infos = file_meta.column_infos.clone();
+            let src_colum_infos = file_meta.column_infos.clone();
             // Initialize current_page_table
             if current_page_table.is_empty() {
-                current_page_table = src_column_infos
+                current_page_table = src_colum_infos
                     .iter()
                     .map(|column_index| ColumnInfo {
                         index: column_index.index,
@@ -161,7 +161,7 @@ pub async fn rewrite_files_binary_copy(
             }
 
             // Iterate through each column of the current data file of the current fragment
-            for (col_idx, src_column_info) in src_column_infos.iter().enumerate() {
+            for (col_idx, src_column_info) in src_colum_infos.iter().enumerate() {
                 // v2_0 compatibility: special handling for non-leaf structural header columns
                 // - v2_0 expects structural header columns to have a SINGLE page; they carry layout
                 //   metadata only and are not true data carriers.
@@ -352,29 +352,18 @@ pub async fn rewrite_files_binary_copy(
                 let mut fragment_out = Fragment::new(0);
                 let mut data_file_out =
                     DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-                // Field-to-column index mapping notes:
-                // - v2_0 materializes structural headers as columns; every field maps to a concrete index.
-                // - v2_1+ materializes only leaf fields. Use `is_leaf()` to detect leaves and set
-                //   non-leaf fields to `-1`.
-                // Rationale: `List` is a data leaf even though it has a child (its value). Using
-                // `children.is_empty()` would misclassify `List` as non-leaf and write `-1`, which
-                // corrupts the manifest mapping and can lead to mismatched RecordBatch column lengths
-                // after subsequent compaction.
+                // v2_0 vs v2_1+ field-to-column index mapping
+                // - v2_1+ stores only leaf columns; non-leaf fields get `-1` in the mapping
+                // - v2_0 includes structural headers as columns; non-leaf fields map to a concrete index
+                let is_structural = version >= LanceFileVersion::V2_1;
                 let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
                 let mut curr_col_idx: i32 = 0;
-                if version == LanceFileVersion::V2_0 {
-                    for _ in schema.fields_pre_order() {
+                for field in schema.fields_pre_order() {
+                    if field.is_packed_struct() || field.children.is_empty() || !is_structural {
                         field_column_indices.push(curr_col_idx);
                         curr_col_idx += 1;
-                    }
-                } else {
-                    for field in schema.fields_pre_order() {
-                        if field.is_leaf() {
-                            field_column_indices.push(curr_col_idx);
-                            curr_col_idx += 1;
-                        } else {
-                            field_column_indices.push(-1);
-                        }
+                    } else {
+                        field_column_indices.push(-1);
                     }
                 }
                 data_file_out.fields = full_field_ids.clone();
@@ -441,25 +430,16 @@ pub async fn rewrite_files_binary_copy(
         let (maj, min) = version.to_numbers();
         let mut frag = Fragment::new(0);
         let mut df = DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-        // Field-to-column index mapping for the final file:
-        // - v2_0: map all fields (including structural headers) to concrete indices.
-        // - v2_1+: map only leaf fields using `is_leaf()`, non-leaf as `-1`.
-        // This avoids misclassifying `List` (leaf with children) and ensures manifest consistency.
+        // v2_0 vs v2_1+ field-to-column index mapping for the final file
+        let is_structural = version >= LanceFileVersion::V2_1;
         let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
         let mut curr_col_idx: i32 = 0;
-        if version == LanceFileVersion::V2_0 {
-            for _ in schema.fields_pre_order() {
+        for field in schema.fields_pre_order() {
+            if field.is_packed_struct() || field.children.is_empty() || !is_structural {
                 field_column_indices.push(curr_col_idx);
                 curr_col_idx += 1;
-            }
-        } else {
-            for field in schema.fields_pre_order() {
-                if field.is_leaf() {
-                    field_column_indices.push(curr_col_idx);
-                    curr_col_idx += 1;
-                } else {
-                    field_column_indices.push(-1);
-                }
+            } else {
+                field_column_indices.push(-1);
             }
         }
         df.fields = full_field_ids.clone();
