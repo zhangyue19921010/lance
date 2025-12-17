@@ -146,6 +146,7 @@ impl CacheKey for RowIdIndexKey {
 
 #[derive(Debug)]
 pub struct RowIdSequenceKey {
+    pub version: u64,
     pub fragment_id: u64,
 }
 
@@ -153,7 +154,7 @@ impl CacheKey for RowIdSequenceKey {
     type ValueType = RowIdSequence;
 
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_id_sequence/{}", self.fragment_id))
+        Cow::Owned(format!("row_id_sequence/{}/{}", self.version, self.fragment_id))
     }
 }
 
@@ -162,5 +163,84 @@ impl DSMetadataCache {
     /// This is used by file readers and other components that need file-level caching.
     pub(crate) fn file_metadata_cache(&self, prefix: &Path) -> LanceCache {
         self.0.with_key_prefix(prefix.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Session;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn rowidsequence_cache_isolated_by_version() {
+        // Verify RowIdSequence cache isolation by dataset version.
+        // Simulate two versions (v2 and v3) of the same fragment id (42) in the same dataset URI.
+        // Ensure lookups do not cross-contaminate between versions.
+        let session = Session::default();
+        let ds_cache = session.metadata_cache.for_dataset("test://uri");
+
+        // Build two different sequences representing two versions of the same fragment.
+        let seq_v2_bytes = {
+            let arr: Vec<u64> = vec![1, 2, 3];
+            lance_table::rowids::write_row_ids(
+                &RowIdSequence::from(arr.as_slice()),
+            )
+        };
+        let seq_v3_bytes = {
+            let arr: Vec<u64> = vec![10, 20];
+            lance_table::rowids::write_row_ids(
+                &RowIdSequence::from(arr.as_slice()),
+            )
+        };
+        let seq_v2 = Arc::new(lance_table::rowids::read_row_ids(&seq_v2_bytes).unwrap());
+        let seq_v3 = Arc::new(lance_table::rowids::read_row_ids(&seq_v3_bytes).unwrap());
+
+        // Insert V2/frag 42
+        let key_v2 = RowIdSequenceKey {
+            version: 2,
+            fragment_id: 42,
+        };
+        ds_cache.insert_with_key(&key_v2, seq_v2.clone()).await;
+
+        // Ensure V3/frag 42 does not hit V2 entry
+        let key_v3 = RowIdSequenceKey {
+            version: 3,
+            fragment_id: 42,
+        };
+        let got = ds_cache.get_with_key(&key_v3).await;
+        assert!(
+            got.is_none(),
+            "V3 lookup should not hit V2 cached entry for same fragment"
+        );
+
+        // Ensure V2 lookup hits V2 entry and contents match exactly
+        let got_v2 = ds_cache
+            .get_with_key(&key_v2)
+            .await
+            .expect("V2 entry should be present");
+        assert_eq!(
+            got_v2,
+            seq_v2,
+            "V2 cached sequence should match inserted sequence"
+        );
+
+        // Insert V3/frag 42 and then ensure hit works
+        ds_cache.insert_with_key(&key_v3, seq_v3.clone()).await;
+        let got_v3 = ds_cache
+            .get_with_key(&key_v3)
+            .await
+            .expect("V3 entry should be present after insertion");
+        assert_eq!(
+            got_v3,
+            seq_v3,
+            "V3 cached sequence should match inserted sequence"
+        );
+        
+        assert_ne!(
+            got_v2.get(0),
+            got_v3.get(0),
+            "V2 and V3 sequences should not share identical first element"
+        );
     }
 }

@@ -27,6 +27,7 @@ pub async fn load_row_id_sequence(
         Some(RowIdMeta::Inline(data)) => {
             let data = data.clone();
             let key = RowIdSequenceKey {
+                version: dataset.manifest.version,
                 fragment_id: fragment.id,
             };
             dataset
@@ -38,6 +39,7 @@ pub async fn load_row_id_sequence(
             let file_slice = file_slice.clone();
             let dataset_clone = dataset.clone();
             let key = RowIdSequenceKey {
+                version: dataset.manifest.version,
                 fragment_id: fragment.id,
             };
             dataset
