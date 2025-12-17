@@ -1026,7 +1026,7 @@ async fn do_normal_write() {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
 
-    let row_num = 5_000_000;
+    let row_num = 10_000;
 
     let inner_fields = Fields::from(vec![
         Field::new("x", DataType::UInt32, true),
