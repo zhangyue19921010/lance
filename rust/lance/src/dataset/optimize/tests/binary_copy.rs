@@ -848,7 +848,7 @@ async fn test_perf_binary_copy_vs_full() {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
 
-    let row_num = 1_000_000;
+    let row_num = 5_000_000;
 
     let inner_fields = Fields::from(vec![
         Field::new("x", DataType::UInt32, true),
@@ -911,10 +911,8 @@ async fn test_perf_binary_copy_vs_full() {
         )
         .into_reader_rows(RowCount::from(row_num), BatchCount::from(10));
 
-    let _local_dir = TempStrDir::default();
-    let (base_uri, store_params) = perf_s3_config_from_env()
-        .map(|(uri, params)| (uri, Some(params)))
-        .unwrap_or_else(|| (_local_dir.to_string(), None));
+    let base_uri = "/home/zhangyue.1010/test1".to_string();
+
     println!("perf dataset uri: {}", base_uri);
 
     let mut dataset = Dataset::write(
@@ -924,7 +922,6 @@ async fn test_perf_binary_copy_vs_full() {
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_1),
             max_rows_per_file: (row_num / 100) as usize,
-            store_params: store_params.clone(),
             ..Default::default()
         }),
     )
