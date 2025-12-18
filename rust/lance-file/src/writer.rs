@@ -319,6 +319,7 @@ impl FileWriter {
             max_page_bytes,
             keep_original_array,
             buffer_alignment: PAGE_BUFFER_ALIGNMENT as u64,
+            version: self.version(),
         };
         let encoder =
             BatchEncoder::try_new(&schema, encoding_strategy.as_ref(), &encoding_options)?;
@@ -465,6 +466,15 @@ impl FileWriter {
     async fn write_global_buffers(&mut self) -> Result<Vec<(u64, u64)>> {
         let schema = self.schema.as_mut().ok_or(Error::invalid_input("No schema provided on writer open and no data provided.  Schema is unknown and file cannot be created", location!()))?;
         schema.metadata = std::mem::take(&mut self.schema_metadata);
+        // Use descriptor layout for blob v2 in the footer to avoid exposing logical child fields.
+        //
+        // TODO(xuanwo): this doesn't work on nested struct, need better solution like fields_per_order_mut?
+        schema.fields.iter_mut().for_each(|f| {
+            if f.is_blob_v2() {
+                f.unloaded_mut();
+            }
+        });
+
         let file_descriptor = Self::make_file_descriptor(schema, self.rows_written)?;
         let file_descriptor_bytes = file_descriptor.encode_to_vec();
         let file_descriptor_len = file_descriptor_bytes.len() as u64;
@@ -1065,6 +1075,7 @@ mod tests {
                 compression: None,        // Will use default compression if any
                 compression_level: None,
                 bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
+                minichunk_size: None,
             },
         );
 

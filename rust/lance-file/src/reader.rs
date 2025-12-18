@@ -251,10 +251,11 @@ impl ReaderProjection {
             field_id_to_column_index,
             &mut column_indices,
         )?;
-        Ok(Self {
+        let projection = Self {
             schema: Arc::new(schema.clone()),
             column_indices,
-        })
+        };
+        Ok(projection)
     }
 
     /// Creates a projection that reads the entire file
@@ -1719,6 +1720,7 @@ pub mod tests {
             max_page_bytes: 32 * 1024 * 1024,
             keep_original_array: true,
             buffer_alignment: 64,
+            version,
         };
 
         let encoding_strategy = default_encoding_strategy(version);

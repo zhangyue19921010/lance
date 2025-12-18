@@ -11,14 +11,16 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Json, Router, ServiceExt,
 };
 use serde::Deserialize;
 use tokio::sync::watch;
+use tower::Layer;
+use tower_http::normalize_path::NormalizePathLayer;
 use tower_http::trace::TraceLayer;
 
 use lance_core::{Error, Result};
@@ -65,14 +67,65 @@ impl RestAdapter {
             .route("/v1/namespace/:id/drop", post(drop_namespace))
             .route("/v1/namespace/:id/exists", post(namespace_exists))
             .route("/v1/namespace/:id/table/list", get(list_tables))
-            // Table operations
+            // Table metadata operations
             .route("/v1/table/:id/register", post(register_table))
             .route("/v1/table/:id/describe", post(describe_table))
             .route("/v1/table/:id/exists", post(table_exists))
             .route("/v1/table/:id/drop", post(drop_table))
             .route("/v1/table/:id/deregister", post(deregister_table))
+            .route("/v1/table/:id/rename", post(rename_table))
+            .route("/v1/table/:id/restore", post(restore_table))
+            .route("/v1/table/:id/version/list", get(list_table_versions))
+            .route("/v1/table/:id/stats", get(get_table_stats))
+            // Table data operations
             .route("/v1/table/:id/create", post(create_table))
             .route("/v1/table/:id/create-empty", post(create_empty_table))
+            .route("/v1/table/:id/insert", post(insert_into_table))
+            .route("/v1/table/:id/merge_insert", post(merge_insert_into_table))
+            .route("/v1/table/:id/update", post(update_table))
+            .route("/v1/table/:id/delete", post(delete_from_table))
+            .route("/v1/table/:id/query", post(query_table))
+            .route("/v1/table/:id/count_rows", get(count_table_rows))
+            // Index operations
+            .route("/v1/table/:id/create_index", post(create_table_index))
+            .route(
+                "/v1/table/:id/create_scalar_index",
+                post(create_table_scalar_index),
+            )
+            .route("/v1/table/:id/index/list", get(list_table_indices))
+            .route(
+                "/v1/table/:id/index/:index_name/stats",
+                get(describe_table_index_stats),
+            )
+            .route(
+                "/v1/table/:id/index/:index_name/drop",
+                post(drop_table_index),
+            )
+            // Schema operations
+            .route("/v1/table/:id/add_columns", post(alter_table_add_columns))
+            .route(
+                "/v1/table/:id/alter_columns",
+                post(alter_table_alter_columns),
+            )
+            .route("/v1/table/:id/drop_columns", post(alter_table_drop_columns))
+            .route(
+                "/v1/table/:id/schema_metadata/update",
+                post(update_table_schema_metadata),
+            )
+            // Tag operations
+            .route("/v1/table/:id/tags/list", get(list_table_tags))
+            .route("/v1/table/:id/tags/version", post(get_table_tag_version))
+            .route("/v1/table/:id/tags/create", post(create_table_tag))
+            .route("/v1/table/:id/tags/delete", post(delete_table_tag))
+            .route("/v1/table/:id/tags/update", post(update_table_tag))
+            // Query plan operations
+            .route("/v1/table/:id/explain_plan", post(explain_table_query_plan))
+            .route("/v1/table/:id/analyze_plan", post(analyze_table_query_plan))
+            // Transaction operations
+            .route("/v1/transaction/:id/describe", post(describe_transaction))
+            .route("/v1/transaction/:id/alter", post(alter_transaction))
+            // Global table operations
+            .route("/v1/table", get(list_all_tables))
             .layer(TraceLayer::new_for_http())
             .with_state(self.backend.clone())
     }
@@ -103,9 +156,10 @@ impl RestAdapter {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let router = self.router();
+        let app = NormalizePathLayer::trim_trailing_slash().layer(router);
 
         tokio::spawn(async move {
-            let result = axum::serve(listener, router)
+            let result = axum::serve(listener, ServiceExt::<Request>::into_make_service(app))
                 .with_graceful_shutdown(async move {
                     let _ = shutdown_rx.changed().await;
                 })
@@ -395,9 +449,10 @@ async fn drop_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
     Path(id): Path<String>,
     Query(params): Query<DelimiterQuery>,
-    Json(mut request): Json<DropTableRequest>,
 ) -> Response {
-    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    let request = DropTableRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+    };
 
     match backend.drop_table(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -427,8 +482,6 @@ async fn deregister_table(
 struct CreateTableQuery {
     delimiter: Option<String>,
     mode: Option<String>,
-    location: Option<String>,
-    properties: Option<String>,
 }
 
 async fn create_table(
@@ -437,25 +490,9 @@ async fn create_table(
     Query(params): Query<CreateTableQuery>,
     body: Bytes,
 ) -> Response {
-    use lance_namespace::models::create_table_request::Mode;
-
-    let mode = params.mode.as_deref().and_then(|m| match m {
-        "create" => Some(Mode::Create),
-        "exist_ok" => Some(Mode::ExistOk),
-        "overwrite" => Some(Mode::Overwrite),
-        _ => None,
-    });
-
-    let properties = params
-        .properties
-        .as_ref()
-        .and_then(|p| serde_json::from_str(p).ok());
-
     let request = CreateTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
-        location: params.location,
-        mode,
-        properties,
+        mode: params.mode.clone(),
     };
 
     match backend.create_table(request, body).await {
@@ -474,6 +511,509 @@ async fn create_empty_table(
 
     match backend.create_empty_table(request).await {
         Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct InsertQuery {
+    delimiter: Option<String>,
+    mode: Option<String>,
+}
+
+async fn insert_into_table(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<InsertQuery>,
+    body: Bytes,
+) -> Response {
+    let request = InsertIntoTableRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        mode: params.mode.clone(),
+    };
+
+    match backend.insert_into_table(request, body).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeInsertQuery {
+    delimiter: Option<String>,
+    on: Option<String>,
+    when_matched_update_all: Option<bool>,
+    when_matched_update_all_filt: Option<String>,
+    when_not_matched_insert_all: Option<bool>,
+    when_not_matched_by_source_delete: Option<bool>,
+    when_not_matched_by_source_delete_filt: Option<String>,
+    timeout: Option<String>,
+    use_index: Option<bool>,
+}
+
+async fn merge_insert_into_table(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<MergeInsertQuery>,
+    body: Bytes,
+) -> Response {
+    let request = MergeInsertIntoTableRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        on: params.on,
+        when_matched_update_all: params.when_matched_update_all,
+        when_matched_update_all_filt: params.when_matched_update_all_filt,
+        when_not_matched_insert_all: params.when_not_matched_insert_all,
+        when_not_matched_by_source_delete: params.when_not_matched_by_source_delete,
+        when_not_matched_by_source_delete_filt: params.when_not_matched_by_source_delete_filt,
+        timeout: params.timeout,
+        use_index: params.use_index,
+    };
+
+    match backend.merge_insert_into_table(request, body).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn update_table(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<UpdateTableRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.update_table(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn delete_from_table(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<DeleteFromTableRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.delete_from_table(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn query_table(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<QueryTableRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.query_table(request).await {
+        Ok(bytes) => (StatusCode::OK, bytes).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn count_table_rows(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+) -> Response {
+    let request = CountTableRowsRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        version: None,
+        predicate: None,
+    };
+
+    match backend.count_table_rows(request).await {
+        Ok(count) => (StatusCode::OK, Json(serde_json::json!({ "count": count }))).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+// ============================================================================
+// Table Management Operation Handlers
+// ============================================================================
+
+async fn rename_table(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<RenameTableRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.rename_table(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn restore_table(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<RestoreTableRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.restore_table(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn list_table_versions(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<PaginationQuery>,
+) -> Response {
+    let request = ListTableVersionsRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        page_token: params.page_token,
+        limit: params.limit,
+    };
+
+    match backend.list_table_versions(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn get_table_stats(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+) -> Response {
+    let request = GetTableStatsRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+    };
+
+    match backend.get_table_stats(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn list_all_tables(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Query(params): Query<PaginationQuery>,
+) -> Response {
+    let request = ListTablesRequest {
+        id: None,
+        page_token: params.page_token,
+        limit: params.limit,
+    };
+
+    match backend.list_all_tables(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+// ============================================================================
+// Index Operation Handlers
+// ============================================================================
+
+async fn create_table_index(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<CreateTableIndexRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.create_table_index(request).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn create_table_scalar_index(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<CreateTableIndexRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.create_table_scalar_index(request).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn list_table_indices(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+) -> Response {
+    let request = ListTableIndicesRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        version: None,
+        page_token: None,
+        limit: None,
+    };
+
+    match backend.list_table_indices(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct IndexPathParams {
+    id: String,
+    index_name: String,
+}
+
+async fn describe_table_index_stats(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(params): Path<IndexPathParams>,
+    Query(query): Query<DelimiterQuery>,
+) -> Response {
+    let request = DescribeTableIndexStatsRequest {
+        id: Some(parse_id(&params.id, query.delimiter.as_deref())),
+        version: None,
+        index_name: Some(params.index_name),
+    };
+
+    match backend.describe_table_index_stats(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn drop_table_index(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(params): Path<IndexPathParams>,
+    Query(query): Query<DelimiterQuery>,
+) -> Response {
+    let request = DropTableIndexRequest {
+        id: Some(parse_id(&params.id, query.delimiter.as_deref())),
+        index_name: Some(params.index_name),
+    };
+
+    match backend.drop_table_index(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+// ============================================================================
+// Schema Operation Handlers
+// ============================================================================
+
+async fn alter_table_add_columns(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<AlterTableAddColumnsRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.alter_table_add_columns(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn alter_table_alter_columns(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<AlterTableAlterColumnsRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.alter_table_alter_columns(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn alter_table_drop_columns(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<AlterTableDropColumnsRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.alter_table_drop_columns(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn update_table_schema_metadata(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<UpdateTableSchemaMetadataRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.update_table_schema_metadata(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+// ============================================================================
+// Tag Operation Handlers
+// ============================================================================
+
+async fn list_table_tags(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<PaginationQuery>,
+) -> Response {
+    let request = ListTableTagsRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        page_token: params.page_token,
+        limit: params.limit,
+    };
+
+    match backend.list_table_tags(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn get_table_tag_version(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<GetTableTagVersionRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.get_table_tag_version(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn create_table_tag(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<CreateTableTagRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.create_table_tag(request).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn delete_table_tag(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<DeleteTableTagRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.delete_table_tag(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn update_table_tag(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<UpdateTableTagRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.update_table_tag(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+// ============================================================================
+// Query Plan Operation Handlers
+// ============================================================================
+
+async fn explain_table_query_plan(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<ExplainTableQueryPlanRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.explain_table_query_plan(request).await {
+        Ok(plan) => (StatusCode::OK, plan).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn analyze_table_query_plan(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<AnalyzeTableQueryPlanRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+
+    match backend.analyze_table_query_plan(request).await {
+        Ok(plan) => (StatusCode::OK, plan).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+// ============================================================================
+// Transaction Operation Handlers
+// ============================================================================
+
+async fn describe_transaction(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(_params): Query<DelimiterQuery>,
+    Json(mut request): Json<DescribeTransactionRequest>,
+) -> Response {
+    // The path id is the transaction identifier
+    // The request.id in body is the table ID (namespace path)
+    // For the trait, we set request.id to include both table ID and transaction ID
+    // by appending the transaction ID to the table ID path
+    if let Some(ref mut table_id) = request.id {
+        table_id.push(id);
+    } else {
+        request.id = Some(vec![id]);
+    }
+
+    match backend.describe_transaction(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn alter_transaction(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    Path(id): Path<String>,
+    Query(_params): Query<DelimiterQuery>,
+    Json(mut request): Json<AlterTransactionRequest>,
+) -> Response {
+    // The path id is the transaction identifier
+    // Append it to the table ID path in the request
+    if let Some(ref mut table_id) = request.id {
+        table_id.push(id);
+    } else {
+        request.id = Some(vec![id]);
+    }
+
+    match backend.alter_transaction(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => error_to_response(e),
     }
 }
@@ -632,6 +1172,60 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_trailing_slash_handling() {
+            let fixture = RestServerFixture::new().await;
+            let port = fixture.server_handle.port();
+
+            // Create a namespace using the normal API (without trailing slash)
+            let create_req = CreateNamespaceRequest {
+                id: Some(vec!["test_namespace".to_string()]),
+                properties: None,
+                mode: None,
+            };
+            fixture
+                .namespace
+                .create_namespace(create_req)
+                .await
+                .unwrap();
+
+            // Test that a request with trailing slash works (using direct HTTP)
+            let client = reqwest::Client::new();
+
+            // Test POST endpoint with trailing slash
+            let response = client
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/namespace/test_namespace/exists/",
+                    port
+                ))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                204,
+                "POST request with trailing slash should succeed with 204 No Content"
+            );
+
+            // Test GET endpoint with trailing slash
+            let response = client
+                .get(format!(
+                    "http://127.0.0.1:{}/v1/namespace/test_namespace/list/",
+                    port
+                ))
+                .send()
+                .await
+                .unwrap();
+
+            assert!(
+                response.status().is_success(),
+                "GET request with trailing slash should succeed, got status: {}",
+                response.status()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn test_create_and_list_child_namespaces() {
             let fixture = RestServerFixture::new().await;
 
@@ -734,9 +1328,7 @@ mod tests {
             // Create table in child namespace
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
-                location: None,
-                mode: Some(create_table_request::Mode::Create),
-                properties: None,
+                mode: Some("Create".to_string()),
             };
 
             let result = fixture
@@ -788,9 +1380,7 @@ mod tests {
             for i in 1..=3 {
                 let create_table_req = CreateTableRequest {
                     id: Some(vec!["test_namespace".to_string(), format!("table{}", i)]),
-                    location: None,
-                    mode: Some(create_table_request::Mode::Create),
-                    properties: None,
+                    mode: Some("Create".to_string()),
                 };
                 fixture
                     .namespace
@@ -834,9 +1424,7 @@ mod tests {
             // Create table
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
-                location: None,
-                mode: Some(create_table_request::Mode::Create),
-                properties: None,
+                mode: Some("Create".to_string()),
             };
             fixture
                 .namespace
@@ -906,9 +1494,7 @@ mod tests {
             // Create table
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
-                location: None,
-                mode: Some(create_table_request::Mode::Create),
-                properties: None,
+                mode: Some("Create".to_string()),
             };
             fixture
                 .namespace
@@ -996,9 +1582,7 @@ mod tests {
             // Create table
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
-                location: None,
-                mode: Some(create_table_request::Mode::Create),
-                properties: None,
+                mode: Some("Create".to_string()),
             };
             fixture
                 .namespace
@@ -1304,9 +1888,7 @@ mod tests {
                     "level3".to_string(),
                     "deep_table".to_string(),
                 ]),
-                location: None,
-                mode: Some(create_table_request::Mode::Create),
-                properties: None,
+                mode: Some("Create".to_string()),
             };
 
             let result = fixture
@@ -1365,9 +1947,7 @@ mod tests {
             // Create table with same name in both namespaces
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["namespace1".to_string(), "shared_table".to_string()]),
-                location: None,
-                mode: Some(create_table_request::Mode::Create),
-                properties: None,
+                mode: Some("Create".to_string()),
             };
             fixture
                 .namespace
@@ -1377,9 +1957,7 @@ mod tests {
 
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["namespace2".to_string(), "shared_table".to_string()]),
-                location: None,
-                mode: Some(create_table_request::Mode::Create),
-                properties: None,
+                mode: Some("Create".to_string()),
             };
             fixture
                 .namespace
@@ -1429,9 +2007,7 @@ mod tests {
             // Create table in namespace
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
-                location: None,
-                mode: Some(create_table_request::Mode::Create),
-                properties: None,
+                mode: Some("Create".to_string()),
             };
             fixture
                 .namespace
@@ -1583,9 +2159,7 @@ mod tests {
                     "test_namespace".to_string(),
                     "physical_table".to_string(),
                 ]),
-                location: None,
-                mode: Some(create_table_request::Mode::Create),
-                properties: None,
+                mode: Some("Create".to_string()),
             };
             fixture
                 .namespace
@@ -1612,7 +2186,10 @@ mod tests {
             );
 
             let response = result.unwrap();
-            assert_eq!(response.location, "test_namespace$physical_table.lance");
+            assert_eq!(
+                response.location,
+                Some("test_namespace$physical_table.lance".to_string())
+            );
 
             // Verify registered table exists
             let mut exists_req = TableExistsRequest::new();
@@ -1712,9 +2289,7 @@ mod tests {
             // Create a table
             let create_table_req = CreateTableRequest {
                 id: Some(vec!["test_namespace".to_string(), "test_table".to_string()]),
-                location: None,
-                mode: Some(create_table_request::Mode::Create),
-                properties: None,
+                mode: Some("Create".to_string()),
             };
             fixture
                 .namespace
@@ -1792,9 +2367,7 @@ mod tests {
                     "test_namespace".to_string(),
                     "original_table".to_string(),
                 ]),
-                location: None,
-                mode: Some(create_table_request::Mode::Create),
-                properties: None,
+                mode: Some("Create".to_string()),
             };
             let create_response = fixture
                 .namespace
@@ -1846,7 +2419,7 @@ mod tests {
                 .expect("Failed to re-register table with new name");
 
             // Should return the exact location we registered
-            assert_eq!(register_response.location, relative_location);
+            assert_eq!(register_response.location, Some(relative_location.clone()));
 
             // Verify new table exists
             let mut exists_req = TableExistsRequest::new();

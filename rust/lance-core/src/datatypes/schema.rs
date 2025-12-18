@@ -697,6 +697,16 @@ impl TryFrom<&ArrowSchema> for Schema {
                             location: location!(),
                         });
                     }
+
+                    if ancestor.logical_type.is_map() {
+                        return Err(Error::Schema {
+                            message: format!(
+                                "Primary key column must not be in a map type: {}",
+                                ancestor
+                            ),
+                            location: location!(),
+                        });
+                    }
                 }
             }
         }
@@ -928,7 +938,9 @@ pub enum BlobHandling {
 
 impl BlobHandling {
     fn should_unload(&self, field: &Field) -> bool {
-        if !field.data_type().is_binary_like() {
+        // Blob v2 columns are Structs, so we need to treat any blob-marked field as unloadable
+        // even if the physical data type is not binary-like.
+        if !(field.data_type().is_binary_like() || field.is_blob()) {
             return false;
         }
         match self {
