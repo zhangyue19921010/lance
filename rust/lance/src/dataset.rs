@@ -449,14 +449,19 @@ impl Dataset {
 
     /// Check out a dataset version with a ref
     pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
-        let ref_: refs::Ref = version.into();
-        match ref_ {
+        let reference: refs::Ref = version.into();
+        match reference {
             refs::Ref::Version(branch, version_number) => {
-                self.checkout_by_ref(version_number, branch).await
+                self.checkout_by_ref(version_number, branch.as_deref())
+                    .await
+            }
+            refs::Ref::VersionNumber(version_number) => {
+                self.checkout_by_ref(Some(version_number), self.manifest.branch.as_deref())
+                    .await
             }
             refs::Ref::Tag(tag_name) => {
                 let tag_contents = self.tags().get(tag_name.as_str()).await?;
-                self.checkout_by_ref(Some(tag_contents.version), tag_contents.branch)
+                self.checkout_by_ref(Some(tag_contents.version), tag_contents.branch.as_deref())
                     .await
             }
         }
@@ -487,7 +492,7 @@ impl Dataset {
 
     /// Check out the latest version of the branch
     pub async fn checkout_branch(&self, branch: &str) -> Result<Self> {
-        self.checkout_by_ref(None, Some(branch.to_string())).await
+        self.checkout_by_ref(None, Some(branch)).await
     }
 
     /// This is a two-phase operation:
@@ -550,14 +555,10 @@ impl Dataset {
         self.branches().list().await
     }
 
-    fn already_checked_out(
-        &self,
-        location: &ManifestLocation,
-        branch_name: Option<String>,
-    ) -> bool {
+    fn already_checked_out(&self, location: &ManifestLocation, branch_name: Option<&str>) -> bool {
         // We check the e_tag here just in case it has been overwritten. This can
         // happen if the table has been dropped then re-created recently.
-        self.manifest.branch == branch_name
+        self.manifest.branch.as_deref() == branch_name
             && self.manifest.version == location.version
             && self.manifest_location.naming_scheme == location.naming_scheme
             && location.e_tag.as_ref().is_some_and(|e_tag| {
@@ -571,17 +572,9 @@ impl Dataset {
     async fn checkout_by_ref(
         &self,
         version_number: Option<u64>,
-        branch: Option<String>,
+        branch: Option<&str>,
     ) -> Result<Self> {
-        let new_location = if self.manifest.branch.as_ref() != branch.as_ref() {
-            if let Some(branch_name) = branch.as_deref() {
-                self.find_branch_location(branch_name)?
-            } else {
-                self.branch_location().find_main()?
-            }
-        } else {
-            self.branch_location()
-        };
+        let new_location = self.branch_location().find_branch(branch)?;
 
         let manifest_location = if let Some(version_number) = version_number {
             self.commit_handler
@@ -597,7 +590,7 @@ impl Dataset {
                 .await?
         };
 
-        if self.already_checked_out(&manifest_location, branch.clone()) {
+        if self.already_checked_out(&manifest_location, branch) {
             return Ok(self.clone());
         }
 
@@ -982,7 +975,7 @@ impl Dataset {
             uri: self.uri.clone(),
             branch: self.manifest.branch.clone(),
         };
-        current_location.find_branch(Some(branch_name.to_string()))
+        current_location.find_branch(Some(branch_name))
     }
 
     /// Get the full manifest of the dataset version.
@@ -1037,7 +1030,7 @@ impl Dataset {
             return Ok((cached_manifest, location));
         }
 
-        if self.already_checked_out(&location, self.manifest.branch.clone()) {
+        if self.already_checked_out(&location, self.manifest.branch.as_deref()) {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
@@ -2137,8 +2130,7 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let ref_ = version.into();
-        let (ref_name, version_number) = self.resolve_reference(ref_).await?;
+        let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name,
@@ -2149,7 +2141,9 @@ impl Dataset {
         let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
-            .with_store_params(store_params.unwrap_or_default())
+            .with_store_params(
+                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
+            )
             .with_object_store(Arc::new(self.object_store().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
@@ -2162,13 +2156,17 @@ impl Dataset {
                 if let Some(version_number) = version_number {
                     Ok((branch, version_number))
                 } else {
+                    let branch_location = self.branch_location().find_branch(branch.as_deref())?;
                     let version_number = self
                         .commit_handler
-                        .resolve_latest_location(&self.base, &self.object_store)
+                        .resolve_latest_location(&branch_location.path, &self.object_store)
                         .await?
                         .version;
                     Ok((branch, version_number))
                 }
+            }
+            refs::Ref::VersionNumber(version_number) => {
+                Ok((self.manifest.branch.clone(), version_number))
             }
             refs::Ref::Tag(tag_name) => {
                 let tag_contents = self.tags().get(tag_name.as_str()).await?;
