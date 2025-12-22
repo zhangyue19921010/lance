@@ -8,6 +8,7 @@ use crate::datatypes::Schema;
 use crate::Dataset;
 use crate::Result;
 use lance_arrow::DataTypeExt;
+use lance_core::Error;
 use lance_encoding::decoder::{ColumnInfo, PageEncoding, PageInfo as DecPageInfo};
 use lance_encoding::version::LanceFileVersion;
 use lance_file::format::pbfile;
@@ -19,6 +20,7 @@ use lance_io::traits::Writer;
 use lance_table::format::{DataFile, Fragment};
 use prost::Message;
 use prost_types::Any;
+use snafu::location;
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -79,6 +81,13 @@ pub async fn rewrite_files_binary_copy(
     params: &WriteParams,
     read_batch_bytes_opt: Option<usize>,
 ) -> Result<Vec<Fragment>> {
+    if fragments.is_empty() || fragments.iter().any(|fragment| fragment.files.is_empty()) {
+        return Err(Error::invalid_input(
+            "binary copy requires at least one data file",
+            location!(),
+        ));
+    }
+
     // Binary copy algorithm overview:
     // - Reads page and buffer regions directly from source files in bounded batches
     // - Appends them to a new output file with alignment, updating offsets
@@ -132,6 +141,9 @@ pub async fn rewrite_files_binary_copy(
     let mut current_filename: Option<String> = None;
     let mut current_pos: u64 = 0;
     let mut current_page_table: Vec<ColumnInfo> = Vec::new();
+    // Baseline column encodings captured from the first source file; all subsequent
+    // files must match per-column to safely concatenate column-level buffers.
+    let mut baseline_col_encoding_bytes: Vec<Vec<u8>> = Vec::new();
 
     // Column-list<Page-List<DecPageInfo>>
     let mut col_pages: Vec<Vec<DecPageInfo>> = std::iter::repeat_with(Vec::<DecPageInfo>::new)
@@ -171,6 +183,10 @@ pub async fn rewrite_files_binary_copy(
                         page_infos: Arc::from(Vec::<DecPageInfo>::new().into_boxed_slice()),
                         encoding: column_index.encoding.clone(),
                     })
+                    .collect();
+                baseline_col_encoding_bytes = src_column_infos
+                    .iter()
+                    .map(|ci| Any::from_msg(&ci.encoding).unwrap().encode_to_vec())
                     .collect();
             }
 
@@ -288,8 +304,22 @@ pub async fn rewrite_files_binary_copy(
                     }
                 } // finished scheduling & copying pages for this column in the current source file
 
-                // Copy column-level buffers (outside page data) with alignment
                 if !src_column_info.buffer_offsets_and_sizes.is_empty() {
+                    // Validate column-level encoding compatibility before copying buffers
+                    let src_col_encoding_bytes = Any::from_msg(&src_column_info.encoding)
+                        .unwrap()
+                        .encode_to_vec();
+                    let baseline_bytes = &baseline_col_encoding_bytes[col_idx];
+                    if src_col_encoding_bytes != *baseline_bytes {
+                        return Err(Error::Execution {
+                            message: format!(
+                                "binary copy: The ColumnEncoding of column {} is incompatible with the first file, \
+                                making it impossible to safely concatenate buffers",
+                                col_idx
+                            ),
+                            location: location!(),
+                        });
+                    }
                     let ranges: Vec<Range<u64>> = src_column_info
                         .buffer_offsets_and_sizes
                         .iter()
