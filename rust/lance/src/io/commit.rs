@@ -635,6 +635,7 @@ pub(crate) async fn do_commit_detached_transaction(
                     version,
                     write_config,
                     &transaction_file,
+                    &dataset.manifest,
                 )
                 .await?
             }
@@ -824,6 +825,7 @@ pub(crate) async fn commit_transaction(
                     version,
                     write_config,
                     &transaction_file,
+                    &dataset.manifest,
                 )
                 .await?
             }
@@ -957,6 +959,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::{Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
@@ -1326,6 +1329,37 @@ mod tests {
 
             dataset.validate().await.unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn test_restore_does_not_decrease_max_fragment_id() {
+        let reader = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(3), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Append a few times to advance max_fragment_id and create newer versions.
+        for _ in 0..2 {
+            let reader = gen_batch()
+                .col("i", array::step::<Int32Type>())
+                .into_reader_rows(RowCount::from(3), BatchCount::from(1));
+            dataset.append(reader, None).await.unwrap();
+        }
+
+        let latest_max = dataset.manifest.max_fragment_id().unwrap_or(0);
+
+        // Restore an earlier version (version 1) as the latest.
+        let mut dataset_v1 = dataset.checkout_version(1).await.unwrap();
+        dataset_v1.restore().await.unwrap();
+
+        // After restore, max_fragment_id should not decrease compared to the latest value before restore.
+        let restored_max = dataset_v1.manifest.max_fragment_id().unwrap_or(0);
+        assert!(
+            restored_max >= latest_max,
+            "max_fragment_id should not decrease on restore: before={}, after={}",
+            latest_max,
+            restored_max
+        );
     }
 
     async fn get_empty_dataset() -> (TempStrDir, Dataset) {
