@@ -119,6 +119,7 @@ async fn do_commit_new_dataset(
     };
 
     let (mut manifest, indices) = if let Operation::Clone {
+        is_shallow,
         ref_name,
         ref_version,
         ref_path,
@@ -139,37 +140,74 @@ async fn do_commit_new_dataset(
         )
         .await?;
 
-        let new_base_id = source_manifest
-            .base_paths
-            .keys()
-            .max()
-            .map(|id| *id + 1)
-            .unwrap_or(0);
-        let new_manifest = source_manifest.shallow_clone(
-            ref_name.clone(),
-            ref_path.clone(),
-            new_base_id,
-            branch_name.clone(),
-            transaction_file,
-        );
+        if *is_shallow {
+            let new_base_id = source_manifest
+                .base_paths
+                .keys()
+                .max()
+                .map(|id| *id + 1)
+                .unwrap_or(0);
+            let new_manifest = source_manifest.shallow_clone(
+                ref_name.clone(),
+                ref_path.clone(),
+                new_base_id,
+                branch_name.clone(),
+                transaction_file,
+            );
 
-        let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
-            let reader = object_store.open(&source_manifest_location.path).await?;
-            let section: pb::IndexSection =
-                lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-            section
-                .indices
-                .into_iter()
-                .map(|index_pb| {
-                    let mut index = IndexMetadata::try_from(index_pb)?;
-                    index.base_id = Some(new_base_id);
-                    Ok(index)
-                })
-                .collect::<Result<Vec<_>>>()?
+            let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
+                let reader = object_store.open(&source_manifest_location.path).await?;
+                let section: pb::IndexSection =
+                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+                section
+                    .indices
+                    .into_iter()
+                    .map(|index_pb| {
+                        let mut index = IndexMetadata::try_from(index_pb)?;
+                        index.base_id = Some(new_base_id);
+                        Ok(index)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                vec![]
+            };
+            (new_manifest, updated_indices)
         } else {
-            vec![]
-        };
-        (new_manifest, updated_indices)
+            // Deep clone: build a manifest that references local files (no external bases)
+            let mut new_manifest = source_manifest.clone();
+            new_manifest.base_paths.clear();
+            new_manifest.branch = None;
+            new_manifest.tag = None;
+            new_manifest.index_section = None; // will be rewritten below
+            let mut new_frags = new_manifest.fragments.as_ref().clone();
+            for f in &mut new_frags {
+                for df in &mut f.files {
+                    df.base_id = None;
+                }
+                if let Some(d) = f.deletion_file.as_mut() {
+                    d.base_id = None;
+                }
+            }
+            new_manifest.fragments = Arc::new(new_frags);
+
+            // Indices: keep metadata but normalize base to local
+            let mut updated_indices = Vec::new();
+            if let Some(index_section_pos) = source_manifest.index_section {
+                let reader = object_store.open(&source_manifest_location.path).await?;
+                let section: pb::IndexSection =
+                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+                updated_indices = section
+                    .indices
+                    .into_iter()
+                    .map(|index_pb| {
+                        let mut index = IndexMetadata::try_from(index_pb)?;
+                        index.base_id = None;
+                        Ok(index)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            }
+            (new_manifest, updated_indices)
+        }
     } else {
         let (manifest, indices) =
             transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
