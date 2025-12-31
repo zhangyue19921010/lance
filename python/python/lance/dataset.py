@@ -370,16 +370,16 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
         >>> analysis = builder.analyze_plan(new_data)
         >>> print(analysis) # doctest: +ELLIPSIS
-            MergeInsert: on=[id], ..., metrics=[..., bytes_written=..., ...], cumulative_cpu=...
-              CoalescePartitionsExec, metrics=[output_rows=..., elapsed_compute=...], cumulative_cpu=...
-                ProjectionExec: expr=[_rowid@1 as _rowid, ...], metrics=[...], cumulative_cpu=...
-                  ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...], metrics=[...], cumulative_cpu=...
-                    CoalesceBatchesExec: ..., metrics=[...], cumulative_cpu=...
-                      HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                        CooperativeExec, metrics=[], cumulative_cpu=...
-                          LanceRead: ..., metrics=[..., bytes_read=..., ...], cumulative_cpu=...
+            MergeInsert: elapsed=..., on=[id], ..., metrics=[..., bytes_written=..., ...]
+              CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
+                ProjectionExec: elapsed=..., expr=[_rowid@1 as _rowid, ...], metrics=[...]
+                  ProjectionExec: elapsed=..., expr=[id@2 IS NOT NULL as __common_expr_1, ...], metrics=[...]
+                    CoalesceBatchesExec: elapsed=..., ..., metrics=[...]
+                      HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
+                        CooperativeExec, elapsed=..., metrics=[]
+                          LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
                         RepartitionExec: ...
-                          StreamingTableExec: ..., metrics=[], ...
+                          StreamingTableExec: ..., metrics=[]
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes
@@ -588,7 +588,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_branch(
         self,
         branch: str,
-        reference: Optional[int | str | Tuple[str, int]] = None,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> "LanceDataset":
         """Create a new branch from a version or tag.
@@ -597,10 +597,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         branch: str
             Name of the branch to create.
-        reference: Optional[int | str | Tuple[str, int]]
-            The reference which could be a version_number, a tag name or a tuple of
-            (branch_name, version_number) to create the branch from.
-            If None, the latest version of the current branch is used.
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch. (None, None) means the latest
+            version_number on the main branch.
         storage_options: Optional[Dict[str, str]]
             Storage options for the underlying object store. If not provided,
             the storage options from the current dataset will be used.
@@ -616,28 +617,6 @@ class LanceDataset(pa.dataset.Dataset):
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
         ds._uri = new_ds.uri
-        ds._storage_options = self._storage_options
-        ds._default_scan_options = self._default_scan_options
-        ds._read_params = self._read_params
-        return ds
-
-    def checkout_branch(self, branch: str) -> "LanceDataset":
-        """Check out the latest version of a branch.
-
-        Parameters
-        ----------
-        branch: str
-            The branch name to checkout.
-
-        Returns
-        -------
-        LanceDataset
-            A dataset instance at the latest version of the branch.
-        """
-        inner = self._ds.checkout_branch(branch)
-        ds = LanceDataset.__new__(LanceDataset)
-        ds._ds = inner
-        ds._uri = inner.uri
         ds._storage_options = self._storage_options
         ds._default_scan_options = self._default_scan_options
         ds._read_params = self._read_params
@@ -2231,7 +2210,9 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.latest_version()
 
-    def checkout_version(self, version: int | str | Tuple[str, int]) -> "LanceDataset":
+    def checkout_version(
+        self, version: int | str | Tuple[Optional[str], Optional[int]]
+    ) -> "LanceDataset":
         """
         Load the given version of the dataset.
 
@@ -2241,9 +2222,11 @@ class LanceDataset(pa.dataset.Dataset):
 
         Parameters
         ----------
-        version: int | str | Tuple[str, int],
-            The version to check out. A version number on main (`int`), a tag
-            (`str`) or a tuple of ('branch_name', 'version_number') can be provided.
+        version: int | str | Tuple[Optional[str], Optional[int]],
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch. (None, None) means the latest
+            version_number on the main branch.
 
         Returns
         -------
@@ -2470,6 +2453,10 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
+        skip_merge: bool, default False
+            This is for the ``INVERTED`` index. If True, the index will skip the
+            partition merge stage after indexing. This can be useful for
+            distributed/fragment-level indexing where a later merge is desired.
         base_tokenizer: str, default "simple"
             This is for the ``INVERTED`` index. The base tokenizer to use. The
             value can be:
@@ -2543,7 +2530,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         column = column[0]
-        lance_field = self._ds.lance_schema.field(column)
+        lance_field = self._ds.lance_schema.field_case_insensitive(column)
         if lance_field is None:
             raise KeyError(f"{column} not found in schema")
 
@@ -2831,7 +2818,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         # validate args
         for c in column:
-            lance_field = self._ds.lance_schema.field(c)
+            lance_field = self._ds.lance_schema.field_case_insensitive(c)
             if lance_field is None:
                 raise KeyError(f"{c} not found in schema")
             field = lance_field.to_arrow()
@@ -3465,8 +3452,8 @@ class LanceDataset(pa.dataset.Dataset):
 
     def shallow_clone(
         self,
-        target_path: Union[str, Path],
-        version: Union[int, str, Tuple[int, str]],
+        target_path: str | Path,
+        reference: int | str | Tuple[Optional[str], Optional[int]],
         storage_options: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> "LanceDataset":
@@ -3480,10 +3467,11 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         target_path : str or Path
             The URI or filesystem path to clone the dataset into.
-        version : int, str or Tuple[int, str]
-            The source version to clone. An integer specifies a version number in main;
-            a string specifies a tag name; a Tuple[int, str] specifies a version number
-            in a specified branch.
+        reference : int, str or Tuple[Optional[str], Optional[int]]
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch. (None, None) means the latest
+            version_number on the main branch.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
             endpoints). If not specified, the storage options of the source dataset
@@ -3501,7 +3489,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         if storage_options is None:
             storage_options = self._storage_options
-        self._ds.shallow_clone(target_uri, version, storage_options)
+        self._ds.shallow_clone(target_uri, reference, storage_options)
 
         # Open and return a fresh dataset at the target URI to avoid manual overrides
         return LanceDataset(target_uri, storage_options=storage_options, **kwargs)
@@ -3928,6 +3916,7 @@ class Transaction:
 
 
 class Tag(TypedDict):
+    branch: Optional[str]
     version: int
     manifest_size: int
 
@@ -4712,7 +4701,7 @@ class ScannerBuilder:
     ) -> ScannerBuilder:
         q, q_dim = _coerce_query_vector(q)
 
-        lance_field = self.ds._ds.lance_schema.field(column)
+        lance_field = self.ds._ds.lance_schema.field_case_insensitive(column)
         if lance_field is None:
             raise ValueError(f"Embedding column {column} is not in the dataset")
 
@@ -5218,7 +5207,11 @@ class Tags:
         """
         return self._ds.tags_ordered(order)
 
-    def create(self, tag: str, version: int, branch: Optional[str] = None) -> None:
+    def create(
+        self,
+        tag: str,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
+    ) -> None:
         """
         Create a tag for a given dataset version.
 
@@ -5227,12 +5220,13 @@ class Tags:
         tag: str,
             The name of the tag to create. This name must be unique among all tag
             names for the dataset.
-        version: int,
-            The dataset version to tag.
-        branch: Optional[str],
-            The specified branch to create the tag, None if the specified branch is main
+        reference : int, str or Tuple[Optional[str], Optional[int]]
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch. (None, None) means the latest
+            version_number on the main branch.
         """
-        self._ds.create_tag(tag, version, branch)
+        self._ds.create_tag(tag, reference)
 
     def delete(self, tag: str) -> None:
         """
@@ -5246,7 +5240,11 @@ class Tags:
         """
         self._ds.delete_tag(tag)
 
-    def update(self, tag: str, version: int, branch: Optional[str] = None) -> None:
+    def update(
+        self,
+        tag: str,
+        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
+    ) -> None:
         """
         Update tag to a new version.
 
@@ -5254,12 +5252,13 @@ class Tags:
         ----------
         tag: str,
             The name of the tag to update.
-        version: int,
-            The new dataset version to tag.
-        branch: Optional[str],
-            The specified branch to create the tag, None if the specified branch is main
+        reference : int, str or Tuple[Optional[str], Optional[int]]
+            An integer specifies a version number in the current branch; a string
+            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
+            a version number in a specified branch. (None, None) means the latest
+            version_number on the main branch.
         """
-        self._ds.update_tag(tag, version, branch)
+        self._ds.update_tag(tag, reference)
 
 
 class Branches:
@@ -5533,16 +5532,48 @@ def write_dataset(
 
         from .namespace import (
             CreateEmptyTableRequest,
+            DeclareTableRequest,
             DescribeTableRequest,
             LanceNamespaceStorageOptionsProvider,
         )
 
         # Determine which namespace method to call based on mode
         if mode == "create":
-            request = CreateEmptyTableRequest(
-                id=table_id, location=None, properties=None
-            )
-            response = namespace.create_empty_table(request)
+            # Try declare_table first, fall back to deprecated create_empty_table
+            # for backward compatibility with older namespace implementations.
+            # create_empty_table support will be removed in 3.0.0.
+            if hasattr(namespace, "declare_table"):
+                try:
+                    from lance_namespace.errors import UnsupportedOperationError
+
+                    declare_request = DeclareTableRequest(id=table_id, location=None)
+                    response = namespace.declare_table(declare_request)
+                except (UnsupportedOperationError, NotImplementedError):
+                    # Fall back to deprecated create_empty_table
+                    import warnings
+
+                    warnings.warn(
+                        "create_empty_table is deprecated, use declare_table instead. "
+                        "Support will be removed in 3.0.0.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                    fallback_request = CreateEmptyTableRequest(
+                        id=table_id, location=None
+                    )
+                    response = namespace.create_empty_table(fallback_request)
+            else:
+                # Namespace doesn't have declare_table, fall back to create_empty_table
+                import warnings
+
+                warnings.warn(
+                    "create_empty_table is deprecated, use declare_table instead. "
+                    "Support will be removed in 3.0.0.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                fallback_request = CreateEmptyTableRequest(id=table_id, location=None)
+                response = namespace.create_empty_table(fallback_request)
         elif mode in ("append", "overwrite"):
             request = DescribeTableRequest(id=table_id, version=None)
             response = namespace.describe_table(request)

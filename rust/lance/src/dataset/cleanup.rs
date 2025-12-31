@@ -52,6 +52,7 @@ use lance_table::{
     },
 };
 use object_store::path::Path;
+use object_store::{Error as ObjectStoreError, ObjectMeta};
 use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
@@ -61,6 +62,7 @@ use std::{
 use tracing::{debug, info, instrument, Span};
 
 use super::refs::TagContents;
+use crate::dataset::TRANSACTIONS_DIR;
 use crate::{utils::temporal::utc_now, Dataset};
 
 #[derive(Clone, Debug, Default)]
@@ -240,7 +242,7 @@ impl<'a> CleanupTask<'a> {
         if let Some(relative_tx_path) = &manifest.transaction_file {
             referenced_files
                 .tx_paths
-                .insert(Path::parse("_transactions")?.child(relative_tx_path.as_str()));
+                .insert(Path::parse(TRANSACTIONS_DIR)?.child(relative_tx_path.as_str()));
         }
 
         for index in indexes {
@@ -258,26 +260,59 @@ impl<'a> CleanupTask<'a> {
         let removal_stats = Mutex::new(RemovalStats::default());
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
-        let unreferenced_paths = self
-            .dataset
-            .object_store
-            .read_dir_all(
-                &self.dataset.base,
-                inspection.earliest_retained_manifest_time,
+
+        let is_not_found_err = |e: &Error| {
+            matches!(
+                e,
+                Error::IO { source,.. }
+                    if source
+                      .downcast_ref::<ObjectStoreError>()
+                      .map(|os_err| matches!(os_err, ObjectStoreError::NotFound {.. }))
+                      .unwrap_or(false)
             )
-            .try_filter_map(|obj_meta| {
-                // If a file is new-ish then it might be part of an ongoing operation and so we only
-                // delete it if we can verify it is part of an old version.
-                let maybe_in_progress = !self.policy.delete_unverified
-                    && obj_meta.last_modified >= verification_threshold;
-                let path_to_remove =
-                    self.path_if_not_referenced(obj_meta.location, maybe_in_progress, &inspection);
-                if matches!(path_to_remove, Ok(Some(..))) {
-                    removal_stats.lock().unwrap().bytes_removed += obj_meta.size;
-                }
-                future::ready(path_to_remove)
-            })
-            .boxed();
+        };
+        // Build stream for a managed subtree
+        let build_listing_stream = |dir: Path| {
+            self.dataset
+                .object_store
+                .read_dir_all(&dir, inspection.earliest_retained_manifest_time)
+                .map_ok(|obj| stream::once(future::ready(Ok(obj))).boxed())
+                .or_else(|e| {
+                    // If the directory doesn't exist then we can just return an empty stream.
+                    if is_not_found_err(&e) {
+                        future::ready(Ok(stream::empty::<Result<ObjectMeta>>().boxed()))
+                    } else {
+                        future::ready(Err(e))
+                    }
+                })
+                .try_flatten()
+                .try_filter_map(|obj_meta| {
+                    // If a file is new-ish then it might be part of an ongoing operation and so we only
+                    // delete it if we can verify it is part of an old version.
+                    let maybe_in_progress = !self.policy.delete_unverified
+                        && obj_meta.last_modified >= verification_threshold;
+                    let path_to_remove = self.path_if_not_referenced(
+                        obj_meta.location,
+                        maybe_in_progress,
+                        &inspection,
+                    );
+                    if matches!(path_to_remove, Ok(Some(..))) {
+                        removal_stats.lock().unwrap().bytes_removed += obj_meta.size;
+                    }
+                    future::ready(path_to_remove)
+                })
+                .boxed()
+        };
+
+        // Restrict scanning to Lance-managed subtrees for safety and performance.
+        let streams = vec![
+            build_listing_stream(self.dataset.versions_dir()),
+            build_listing_stream(self.dataset.transactions_dir()),
+            build_listing_stream(self.dataset.data_dir()),
+            build_listing_stream(self.dataset.indices_dir()),
+            build_listing_stream(self.dataset.deletions_dir()),
+        ];
+        let unreferenced_paths = stream::iter(streams).flatten().boxed();
 
         let old_manifests = inspection.old_manifests.clone();
         let num_old_manifests = old_manifests.len();
@@ -486,7 +521,7 @@ impl<'a> CleanupTask<'a> {
                 }
             }
             Some("txn") => {
-                if relative_path.as_ref().starts_with("_transactions") {
+                if relative_path.as_ref().starts_with(TRANSACTIONS_DIR) {
                     if inspection
                         .referenced_files
                         .tx_paths
@@ -1781,5 +1816,47 @@ mod tests {
         );
         assert_eq!(after_count.num_data_files, 3);
         assert_eq!(after_count.num_manifest_files, 3);
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_unmanaged_dirs_and_files() {
+        // Ensure cleanup does not delete unmanaged directories/files under the dataset root
+        // Uses MockDatasetFixture and run_cleanup_with_override to match other tests' style
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let (os, base) =
+            ObjectStore::from_uri_and_params(registry, &fixture.dataset_path, &fixture.os_params())
+                .await
+                .unwrap();
+
+        // Create unmanaged directories/files under dataset root
+        let img = base.child("images").child("clip.mp4");
+        let misc = base.child("misc").child("notes.txt");
+        let branch_file = base.child("tree").child("branchA").child("data.bin");
+        os.put(&img, b"video").await.unwrap();
+        os.put(&misc, b"notes").await.unwrap();
+        os.put(&branch_file, b"branch").await.unwrap();
+
+        // Create a temporary manifest file that should be cleaned
+        let tmp_manifest = base.child("_versions").child(".tmp").child("orphan");
+        os.put(&tmp_manifest, b"tmp").await.unwrap();
+        // Delete the _transactions directory so that we can test that if not_found err will be swallowed
+        os.remove_dir_all(base.child(TRANSACTIONS_DIR))
+            .await
+            .unwrap();
+
+        fixture
+            .run_cleanup_with_override(utc_now(), Some(true), Some(false))
+            .await
+            .unwrap();
+
+        // Temp manifest file is managed by Lance and should be removed
+        assert!(!os.exists(&tmp_manifest).await.unwrap());
+        // Unrelated files must remain
+        assert!(os.exists(&img).await.unwrap());
+        assert!(os.exists(&misc).await.unwrap());
+        assert!(os.exists(&branch_file).await.unwrap());
     }
 }

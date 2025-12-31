@@ -69,8 +69,11 @@ use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
 use snafu::location;
 use std::{str::FromStr, sync::Arc};
 
-/// Default threshold for RLE compression selection.
-/// RLE is chosen when the run count is less than this fraction of total values.
+/// Default threshold for RLE compression selection when the user explicitly provides a threshold.
+///
+/// If no threshold is provided, we use a size model instead of a fixed run ratio.
+/// This preserves existing behavior for users relying on the default, while making
+/// the default selection more type-aware.
 const DEFAULT_RLE_COMPRESSION_THRESHOLD: f64 = 0.5;
 
 // Minimum block size (32kb) to trigger general block compression
@@ -168,12 +171,35 @@ fn try_rle_for_mini_block(
         return None;
     }
 
+    let type_size = bits / 8;
     let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
     let threshold = params
         .rle_threshold
         .unwrap_or(DEFAULT_RLE_COMPRESSION_THRESHOLD);
 
-    if (run_count as f64) < (data.num_values as f64) * threshold {
+    // If the user explicitly provided a threshold then honor it as an additional guard.
+    // A lower threshold makes RLE harder to trigger and can be used to avoid CPU overhead.
+    let passes_threshold = match params.rle_threshold {
+        Some(_) => (run_count as f64) < (data.num_values as f64) * threshold,
+        None => true,
+    };
+
+    if !passes_threshold {
+        return None;
+    }
+
+    // Estimate the encoded size.
+    //
+    // RLE stores (value, run_length) pairs. Run lengths are u8 and long runs are split into
+    // multiple entries of up to 255 values. We don't know the run length distribution here,
+    // so we conservatively account for splitting with an upper bound.
+    let num_values = data.num_values;
+    let estimated_pairs = (run_count + (num_values / 255)).min(num_values);
+
+    let raw_bytes = (num_values as u128) * (type_size as u128);
+    let rle_bytes = (estimated_pairs as u128) * ((type_size + 1) as u128);
+
+    if rle_bytes < raw_bytes {
         return Some(Box::new(RleMiniBlockEncoder::new()));
     }
     None
@@ -307,7 +333,7 @@ impl DefaultCompressionStrategy {
     }
 
     /// Parse compression parameters from field metadata
-    fn parse_field_metadata(field: &Field) -> CompressionFieldParams {
+    fn parse_field_metadata(field: &Field, version: &LanceFileVersion) -> CompressionFieldParams {
         let mut params = CompressionFieldParams::default();
 
         // Parse compression method
@@ -332,6 +358,27 @@ impl DefaultCompressionStrategy {
                 None => {
                     log::warn!("Invalid BSS mode '{}', using default", bss_str);
                 }
+            }
+        }
+
+        // Parse minichunk size
+        if let Some(minichunk_size_str) = field
+            .metadata
+            .get(super::constants::MINICHUNK_SIZE_META_KEY)
+        {
+            if let Ok(minichunk_size) = minichunk_size_str.parse::<i64>() {
+                // for lance v2.1, only 32kb or smaller is supported
+                if minichunk_size >= 32 * 1024 && *version <= LanceFileVersion::V2_1 {
+                    log::warn!(
+                        "minichunk_size '{}' too large for version '{}', using default",
+                        minichunk_size,
+                        version
+                    );
+                } else {
+                    params.minichunk_size = Some(minichunk_size);
+                }
+            } else {
+                log::warn!("Invalid minichunk_size '{}', skipping", minichunk_size_str);
             }
         }
 
@@ -377,12 +424,12 @@ impl DefaultCompressionStrategy {
 
         // 1. Check for explicit "none" compression
         if params.compression.as_deref() == Some("none") {
-            return Ok(Box::new(BinaryMiniBlockEncoder::default()));
+            return Ok(Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size)));
         }
 
         // 2. Check for explicit "fsst" compression
         if params.compression.as_deref() == Some("fsst") {
-            return Ok(Box::new(FsstMiniBlockEncoder::default()));
+            return Ok(Box::new(FsstMiniBlockEncoder::new(params.minichunk_size)));
         }
 
         // 3. Choose base encoder (FSST or Binary) based on data characteristics
@@ -390,9 +437,9 @@ impl DefaultCompressionStrategy {
             >= FSST_LEAST_INPUT_MAX_LENGTH
             && data_size >= FSST_LEAST_INPUT_SIZE as u64
         {
-            Box::new(FsstMiniBlockEncoder::default())
+            Box::new(FsstMiniBlockEncoder::new(params.minichunk_size))
         } else {
-            Box::new(BinaryMiniBlockEncoder::default())
+            Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size))
         };
 
         // 4. Apply general compression if configured
@@ -415,7 +462,7 @@ impl DefaultCompressionStrategy {
             .get_field_params(&field.name, &field.data_type());
 
         // Override with field metadata if present (highest priority)
-        let metadata_params = Self::parse_field_metadata(field);
+        let metadata_params = Self::parse_field_metadata(field, &self.version);
         field_params.merge(&metadata_params);
 
         field_params
@@ -1105,6 +1152,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: Some(BssMode::Off), // Explicitly disable BSS to test RLE
+                minichunk_size: None,
             },
         );
 
@@ -1136,6 +1184,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(3),
                 bss: Some(BssMode::Off), // Disable BSS to test RLE
+                minichunk_size: None,
             },
         );
 
@@ -1259,6 +1308,7 @@ mod tests {
                 compression: Some("zstd".to_string()),
                 compression_level: Some(6),
                 bss: None,
+                minichunk_size: None,
             },
         );
 
@@ -1401,6 +1451,7 @@ mod tests {
                 compression: Some("lz4".to_string()),
                 compression_level: None,
                 bss: None,
+                minichunk_size: None,
             },
         );
 

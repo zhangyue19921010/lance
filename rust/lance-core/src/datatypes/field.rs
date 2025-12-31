@@ -682,6 +682,12 @@ impl Field {
                 Ok(self.clone())
             }
             (DataType::Struct(_), DataType::Struct(_)) => {
+                // Blob v2 columns are special: they can have different struct layouts
+                // (logical input vs. descriptor struct). We treat blob v2 structs like primitive
+                // fields (e.g. a binary column) during schema set operations (union/subtract).
+                if self.is_blob() {
+                    return Ok(self.clone());
+                }
                 let mut fields = vec![];
                 for other_field in other.children.iter() {
                     let Some(child) = self.child(&other_field.name) else {
@@ -751,6 +757,33 @@ impl Field {
         } else {
             false
         }
+    }
+
+    /// Case-insensitive version of resolve.
+    /// First tries exact match for each child, then falls back to case-insensitive.
+    pub(crate) fn resolve_case_insensitive<'a>(
+        &'a self,
+        split: &mut VecDeque<&str>,
+        fields: &mut Vec<&'a Self>,
+    ) -> bool {
+        fields.push(self);
+        if split.is_empty() {
+            return true;
+        }
+        let first = split.pop_front().unwrap();
+        // Try exact match first
+        if let Some(child) = self.children.iter().find(|c| c.name == first) {
+            return child.resolve_case_insensitive(split, fields);
+        }
+        // Fall back to case-insensitive match
+        if let Some(child) = self
+            .children
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(first))
+        {
+            return child.resolve_case_insensitive(split, fields);
+        }
+        false
     }
 
     pub(crate) fn do_intersection(&self, other: &Self, ignore_types: bool) -> Result<Self> {
