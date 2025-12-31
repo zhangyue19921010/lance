@@ -14,8 +14,8 @@
 package org.lance.operation;
 
 import org.lance.Dataset;
-import org.lance.TestUtils;
 import org.lance.FragmentMetadata;
+import org.lance.TestUtils;
 import org.lance.Transaction;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -43,7 +43,10 @@ public class TruncateTest extends OperationTestBase {
       Transaction transaction =
           dataset
               .newTransactionBuilder()
-              .operation(Append.builder().fragments(java.util.Collections.singletonList(fragmentMeta)).build())
+              .operation(
+                  Append.builder()
+                      .fragments(java.util.Collections.singletonList(fragmentMeta))
+                      .build())
               .build();
       try (Dataset ds1 = transaction.commit()) {
         assertEquals(rowCount, ds1.countRows());

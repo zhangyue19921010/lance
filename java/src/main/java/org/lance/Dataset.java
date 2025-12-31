@@ -638,8 +638,8 @@ public class Dataset implements Closeable {
   private native void nativeDelete(String predicate);
 
   /**
-   * Truncate the dataset by committing an empty manifest using overwrite mode.
-   * Preserves the schema and creates a new version without fragments.
+   * Truncate the dataset by committing an empty manifest using overwrite mode. Preserves the schema
+   * and creates a new version without fragments.
    */
   public void truncateTable() {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
