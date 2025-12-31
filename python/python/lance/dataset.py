@@ -2007,6 +2007,14 @@ class LanceDataset(pa.dataset.Dataset):
             predicate = str(predicate)
         self._ds.delete(predicate, conflict_retries, retry_timeout)
 
+    def truncate_table(self) -> None:
+        """
+        Truncate the dataset to zero rows by committing an empty manifest.
+        Preserves the schema and creates a new version without fragments.
+        """
+        self._ds.truncate_table()
+        self._list_indices_res = None
+
     def insert(
         self,
         data: ReaderLike,

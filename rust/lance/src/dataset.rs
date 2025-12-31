@@ -1543,6 +1543,20 @@ impl Dataset {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_DELETING_EVENT, uri = &self.uri, predicate=predicate);
         write::delete::delete(self, predicate).await
     }
+    
+    /// Truncate the dataset by committing an empty fragments manifest.
+    pub async fn truncate_table(&mut self) -> Result<()> {
+        let op = Operation::Overwrite {
+            fragments: Vec::new(),
+            schema: self.schema().clone(),
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+        let transaction = Transaction::new(self.manifest.version, op, None);
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
+        Ok(())
+    }
 
     /// Add new base paths to the dataset.
     ///
