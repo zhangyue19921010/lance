@@ -102,12 +102,6 @@ impl From<&[u64]> for RowIdSequence {
     }
 }
 
-impl FromIterator<u64> for RowIdSequence {
-    fn from_iter<T: IntoIterator<Item = u64>>(iter: T) -> Self {
-        Self(vec![U64Segment::from_iter(iter)])
-    }
-}
-
 impl RowIdSequence {
     pub fn new() -> Self {
         Self::default()
