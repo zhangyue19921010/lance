@@ -1988,7 +1988,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def truncate_table(self) -> None:
         """
-        Truncate the dataset to zero rows by deleting all rows.
+        Truncate the dataset by deleting all rows.
         The schema is preserved and a new version is created.
         """
         self._ds.truncate_table()
