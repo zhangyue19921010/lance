@@ -1509,7 +1509,7 @@ impl Dataset {
         Ok(())
     }
 
-     /// Truncate the dataset by deleting all rows. The schema is preserved and a new version is created.
+    /// Truncate the dataset by deleting all rows. The schema is preserved and a new version is created.
     fn truncate_table(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         rt().block_on(None, new_self.truncate_table())?
