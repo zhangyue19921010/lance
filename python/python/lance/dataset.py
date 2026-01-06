@@ -1988,8 +1988,8 @@ class LanceDataset(pa.dataset.Dataset):
 
     def truncate_table(self) -> None:
         """
-        Truncate the dataset to zero rows by committing an empty manifest.
-        Preserves the schema and creates a new version without fragments.
+        Truncate the dataset to zero rows by deleting all rows.
+        The schema is preserved and a new version is created.
         """
         self._ds.truncate_table()
         self._list_indices_res = None

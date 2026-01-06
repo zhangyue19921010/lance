@@ -1563,18 +1563,9 @@ impl Dataset {
         write::delete::delete(self, predicate).await
     }
 
-    /// Truncate the dataset by committing an empty fragments manifest.
+    /// Truncate the dataset by deleting all rows.
     pub async fn truncate_table(&mut self) -> Result<()> {
-        let op = Operation::Overwrite {
-            fragments: Vec::new(),
-            schema: self.schema().clone(),
-            config_upsert_values: None,
-            initial_bases: None,
-        };
-        let transaction = Transaction::new(self.manifest.version, op, None);
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-        Ok(())
+        self.delete("true").await
     }
 
     /// Add new base paths to the dataset.
