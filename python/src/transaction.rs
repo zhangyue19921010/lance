@@ -232,6 +232,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     mem_wal_to_merge: None,
                     fields_for_preserving_frag_bitmap,
                     update_mode,
+                    inserted_rows_filter: None,
                 };
                 Ok(Self(op))
             }
