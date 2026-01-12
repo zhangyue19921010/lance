@@ -309,7 +309,9 @@ def test_defer_index_remap(tmp_path: Path):
     data = pa.table({"i": range(6_000), "val": range(6_000)})
     dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
 
-    options = dict(target_rows_per_fragment=2_000, defer_index_remap=True, num_threads=1)
+    options = dict(
+        target_rows_per_fragment=2_000, defer_index_remap=True, num_threads=1
+    )
 
     dataset.delete("i < 500")
     dataset.optimize.compact_files(**options)
