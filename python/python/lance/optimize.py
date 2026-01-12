@@ -61,7 +61,5 @@ class CompactionOptions(TypedDict):
     """
     defer_index_remap: Optional[bool]
     """
-    Whether to defer index remapping during compaction.
-    When set, compaction updates the fragment reuse index first and remaps indices lazily at query time.
-    (default: False)
+    Whether to defer index remapping during compaction (default: False).
     """
