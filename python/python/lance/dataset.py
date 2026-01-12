@@ -5144,6 +5144,7 @@ class DatasetOptimizer:
         max_bytes_per_file: Optional[int] = None,
         materialize_deletions: bool = True,
         materialize_deletions_threshold: float = 0.1,
+        defer_index_remap: bool = False,
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
     ) -> CompactionMetrics:
@@ -5185,6 +5186,8 @@ class DatasetOptimizer:
         materialize_deletions_threshold: float, default 0.1
             The fraction of original rows that are soft deleted in a fragment
             before the fragment is a candidate for compaction.
+        defer_index_remap: bool, default False
+            Whether to defer index remapping during compaction.
         num_threads: int, optional
             The number of threads to use when performing compaction. If not
             specified, defaults to the number of cores on the machine.
@@ -5208,6 +5211,7 @@ class DatasetOptimizer:
             max_bytes_per_file=max_bytes_per_file,
             materialize_deletions=materialize_deletions,
             materialize_deletions_threshold=materialize_deletions_threshold,
+            defer_index_remap=defer_index_remap,
             num_threads=num_threads,
             batch_size=batch_size,
         )

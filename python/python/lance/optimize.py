@@ -59,3 +59,9 @@ class CompactionOptions(TypedDict):
 
     The default will use the same default from ``scanner``.
     """
+    defer_index_remap: Optional[bool]
+    """
+    Whether to defer index remapping during compaction.
+    When set, compaction updates the fragment reuse index first and remaps indices lazily at query time.
+    (default: False)
+    """
