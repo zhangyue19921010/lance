@@ -4550,7 +4550,10 @@ class ScannerBuilder:
             setter = getattr(self, key, None)
             if setter is None:
                 raise ValueError(f"Unknown option {key}")
-            setter(value)
+            if isinstance(value, dict):
+                setter(**value)
+            else:
+                setter(value)
         return self
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
