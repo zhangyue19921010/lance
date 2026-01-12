@@ -1578,6 +1578,21 @@ fn inner_delete(env: &mut JNIEnv, java_dataset: JObject, predicate: JString) -> 
     Ok(())
 }
 
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeTruncateTable(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) {
+    ok_or_throw_without_return!(env, inner_truncate_table(&mut env, java_dataset))
+}
+
+fn inner_truncate_table(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.truncate_table())?;
+    Ok(())
+}
+
 //////////////////////////////
 // Schema evolution Methods //
 //////////////////////////////

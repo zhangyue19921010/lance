@@ -655,6 +655,19 @@ public class Dataset implements Closeable {
   private native void nativeDelete(String predicate);
 
   /**
+   * Truncate the dataset by deleting all rows. The schema is preserved and a new version is
+   * created.
+   */
+  public void truncateTable() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeTruncateTable();
+    }
+  }
+
+  private native void nativeTruncateTable();
+
+  /**
    * Gets the URI of the dataset.
    *
    * @return the URI of the dataset

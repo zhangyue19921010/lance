@@ -1562,6 +1562,11 @@ impl Dataset {
         write::delete::delete(self, predicate).await
     }
 
+    /// Truncate the dataset by deleting all rows.
+    pub async fn truncate_table(&mut self) -> Result<()> {
+        self.delete("true").await
+    }
+
     /// Add new base paths to the dataset.
     ///
     /// This method allows you to register additional storage locations (buckets)

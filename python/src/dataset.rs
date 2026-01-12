@@ -1554,6 +1554,15 @@ impl Dataset {
         Ok(())
     }
 
+    /// Truncate the dataset by deleting all rows. The schema is preserved and a new version is created.
+    fn truncate_table(&mut self) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(None, new_self.truncate_table())?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     /// Cleanup old versions from the dataset
     #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None))]
     fn cleanup_old_versions(
