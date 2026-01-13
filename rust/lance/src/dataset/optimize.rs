@@ -250,7 +250,11 @@ fn can_use_binary_copy(
         Ok(version) => version.resolve(),
         Err(_) => return false,
     };
+
     // Capture schema mapping baseline from first data file
+    if fragments[0].files.is_empty() {
+        return false;
+    }
     let ref_fields = &fragments[0].files[0].fields;
     let ref_cols = &fragments[0].files[0].column_indices;
     // Single-pass verification across fragments and their files
@@ -968,12 +972,17 @@ async fn rewrite_files(
             let mut addrs = RoaringTreemap::new();
             for frag in &fragments {
                 let frag_id = frag.id as u32;
-                let count = frag.physical_rows.unwrap_or(0);
-                for i in 0..count {
-                    let addr =
-                        lance_core::utils::address::RowAddress::new_from_parts(frag_id, i as u32);
-                    addrs.insert(u64::from(addr));
-                }
+                let count = u64::try_from(frag.physical_rows.unwrap_or(0)).map_err(|_| {
+                    Error::Internal {
+                        message: format!(
+                            "Fragment {} has too many physical rows to represent as row addresses",
+                            frag.id
+                        ),
+                        location: location!(),
+                    }
+                })?;
+                let start = u64::from(lance_core::utils::address::RowAddress::first_row(frag_id));
+                addrs.insert_range(start..start + count);
             }
             let captured = CapturedRowIds::AddressStyle(addrs);
             let _ = tx.send(captured);
