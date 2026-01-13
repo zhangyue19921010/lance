@@ -19,7 +19,7 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::utils::mask::{RowAddrTreeMap, RowIdMask};
+use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_table::format::Fragment;
 use lance_table::format::IndexMetadata;
@@ -47,10 +47,10 @@ pub struct DatasetPreFilter {
     // Expressing these as tasks allows us to start calculating the block list
     // and allow list at the same time we start searching the query.  We will await
     // these tasks only when we've done as much work as we can without them.
-    pub(super) deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowIdMask>>>>,
-    pub(super) filtered_ids: Option<Arc<SharedPrerequisite<RowIdMask>>>,
+    pub(super) deleted_ids: Option<Arc<SharedPrerequisite<Arc<RowAddrMask>>>>,
+    pub(super) filtered_ids: Option<Arc<SharedPrerequisite<RowAddrMask>>>,
     // When the tasks are finished this is the combined filter
-    pub(super) final_mask: Mutex<OnceCell<Arc<RowIdMask>>>,
+    pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
 }
 
 impl DatasetPreFilter {
@@ -83,7 +83,7 @@ impl DatasetPreFilter {
         dataset: Arc<Dataset>,
         missing_frags: Vec<u32>,
         frags_with_deletion_files: Vec<u32>,
-    ) -> Result<Arc<RowIdMask>> {
+    ) -> Result<Arc<RowAddrMask>> {
         let fragments = dataset.get_fragments();
         let frag_map: Arc<HashMap<u32, &FileFragment>> = Arc::new(HashMap::from_iter(
             fragments.iter().map(|frag| (frag.id() as u32, frag)),
@@ -114,11 +114,11 @@ impl DatasetPreFilter {
         for frag_id in missing_frags.into_iter() {
             deleted_ids.insert_fragment(frag_id);
         }
-        Ok(Arc::new(RowIdMask::from_block(deleted_ids)))
+        Ok(Arc::new(RowAddrMask::from_block(deleted_ids)))
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn do_create_deletion_mask_row_id(dataset: Arc<Dataset>) -> Result<Arc<RowIdMask>> {
+    async fn do_create_deletion_mask_row_id(dataset: Arc<Dataset>) -> Result<Arc<RowAddrMask>> {
         // This can only be computed as an allow list, since we have no idea
         // what the row ids were in the missing fragments.
         async fn load_row_ids_and_deletions(
@@ -137,7 +137,7 @@ impl DatasetPreFilter {
         }
 
         let dataset_clone = dataset.clone();
-        let key = crate::session::caches::RowIdMaskKey {
+        let key = crate::session::caches::RowAddrMaskKey {
             version: dataset.manifest().version,
         };
         dataset
@@ -168,7 +168,7 @@ impl DatasetPreFilter {
                     })
                     .await?;
 
-                    Ok(RowIdMask::from_allowed(allow_list))
+                    Ok(RowAddrMask::from_allowed(allow_list))
                 }
             })
             .await
@@ -186,7 +186,7 @@ impl DatasetPreFilter {
     pub fn create_deletion_mask(
         dataset: Arc<Dataset>,
         fragments: RoaringBitmap,
-    ) -> Option<BoxFuture<'static, Result<Arc<RowIdMask>>>> {
+    ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
         let mut missing_frags = Vec::new();
         let mut frags_with_deletion_files = Vec::new();
         let frag_map: HashMap<u32, &Fragment> = HashMap::from_iter(
@@ -237,7 +237,7 @@ impl PreFilter for DatasetPreFilter {
         }
         let final_mask = self.final_mask.lock().unwrap();
         final_mask.get_or_init(|| {
-            let mut combined = RowIdMask::default();
+            let mut combined = RowAddrMask::default();
             if let Some(filtered_ids) = &self.filtered_ids {
                 combined = combined & filtered_ids.get_ready();
             }
@@ -255,7 +255,7 @@ impl PreFilter for DatasetPreFilter {
     }
 
     /// Get the row id mask for this prefilter
-    fn mask(&self) -> Arc<RowIdMask> {
+    fn mask(&self) -> Arc<RowAddrMask> {
         self.final_mask
             .lock()
             .unwrap()
@@ -350,7 +350,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        assert_eq!(mask.block_list.as_ref().and_then(|x| x.len()), Some(1)); // There was just one row deleted.
+        assert_eq!(mask.block_list().and_then(|x| x.len()), Some(1)); // There was just one row deleted.
 
         // If there are deletions and missing fragments, we should get a mask
         let mask = DatasetPreFilter::create_deletion_mask(
@@ -361,7 +361,7 @@ mod test {
         let mask = mask.unwrap().await.unwrap();
         let mut expected = RowAddrTreeMap::from_iter(vec![(2 << 32) + 2]);
         expected.insert_fragment(1);
-        assert_eq!(&mask.block_list, &Some(expected));
+        assert_eq!(mask.block_list(), Some(&expected));
 
         // If we don't pass the missing fragment id, we should get a smaller mask.
         let mask = DatasetPreFilter::create_deletion_mask(
@@ -370,7 +370,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        assert_eq!(mask.block_list.as_ref().and_then(|x| x.len()), Some(1));
+        assert_eq!(mask.block_list().and_then(|x| x.len()), Some(1));
 
         // If there are only missing fragments, we should still get a mask
         let mask = DatasetPreFilter::create_deletion_mask(
@@ -382,7 +382,7 @@ mod test {
         let mut expected = RowAddrTreeMap::new();
         expected.insert_fragment(1);
         expected.insert_fragment(2);
-        assert_eq!(&mask.block_list, &Some(expected));
+        assert_eq!(mask.block_list(), Some(&expected));
     }
 
     #[tokio::test]
@@ -405,7 +405,7 @@ mod test {
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
         let expected = RowAddrTreeMap::from_iter(0..8);
-        assert_eq!(mask.allow_list, Some(expected)); // There was just one row deleted.
+        assert_eq!(mask.allow_list(), Some(&expected)); // There was just one row deleted.
 
         // If there are deletions and missing fragments, we should get an allow list
         let mask = DatasetPreFilter::create_deletion_mask(
@@ -414,7 +414,7 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        assert_eq!(mask.allow_list.as_ref().and_then(|x| x.len()), Some(5)); // There were five rows left over;
+        assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(5)); // There were five rows left over;
 
         // If there are only missing fragments, we should get an allow list
         let mask = DatasetPreFilter::create_deletion_mask(
@@ -423,6 +423,6 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        assert_eq!(mask.allow_list.as_ref().and_then(|x| x.len()), Some(3)); // There were three rows left over;
+        assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(3)); // There were three rows left over;
     }
 }

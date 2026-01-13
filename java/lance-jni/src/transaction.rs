@@ -11,7 +11,7 @@ use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
 use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
-use jni::sys::jbyte;
+use jni::sys::{jboolean, jbyte};
 use jni::JNIEnv;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
@@ -150,10 +150,13 @@ impl IntoJava for &IndexMetadata {
             JObject::null()
         };
 
-        // Create IndexMetadata object
+        // Determine index type from index_details type_url
+        let index_type = determine_index_type(env, &self.index_details)?;
+
+        // Create Index object
         Ok(env.new_object(
             "org/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Lorg/lance/index/IndexType;)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
@@ -164,8 +167,74 @@ impl IntoJava for &IndexMetadata {
                 JValue::Int(self.index_version),
                 JValue::Object(&created_at),
                 JValue::Object(&base_id),
+                JValue::Object(&index_type),
             ],
         )?)
+    }
+}
+
+/// Determine the IndexType enum value from index_details protobuf
+fn determine_index_type<'local>(
+    env: &mut JNIEnv<'local>,
+    index_details: &Option<Arc<Any>>,
+) -> Result<JObject<'local>> {
+    let type_name = if let Some(details) = index_details {
+        // Extract type name from type_url (e.g., ".lance.index.BTreeIndexDetails" -> "BTREE")
+        let type_url = &details.type_url;
+        let type_part = type_url.split('.').next_back().unwrap_or("");
+        let lower = type_part.to_lowercase();
+
+        if lower.contains("btree") {
+            Some("BTREE")
+        } else if lower.contains("bitmap") {
+            Some("BITMAP")
+        } else if lower.contains("labellist") {
+            Some("LABEL_LIST")
+        } else if lower.contains("inverted") {
+            Some("INVERTED")
+        } else if lower.contains("ngram") {
+            Some("NGRAM")
+        } else if lower.contains("zonemap") {
+            Some("ZONEMAP")
+        } else if lower.contains("bloomfilter") {
+            Some("BLOOM_FILTER")
+        } else if lower.contains("ivfhnsw") {
+            if lower.contains("sq") {
+                Some("IVF_HNSW_SQ")
+            } else if lower.contains("pq") {
+                Some("IVF_HNSW_PQ")
+            } else {
+                Some("IVF_HNSW_FLAT")
+            }
+        } else if lower.contains("ivf") {
+            if lower.contains("sq") {
+                Some("IVF_SQ")
+            } else if lower.contains("pq") {
+                Some("IVF_PQ")
+            } else {
+                Some("IVF_FLAT")
+            }
+        } else if lower.contains("vector") {
+            Some("VECTOR")
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    match type_name {
+        Some(name) => {
+            let index_type = env
+                .get_static_field(
+                    "org/lance/index/IndexType",
+                    name,
+                    "Lorg/lance/index/IndexType;",
+                )?
+                .l()?;
+            Ok(index_type)
+        }
+        None => Ok(JObject::null()),
     }
 }
 
@@ -383,7 +452,7 @@ fn inner_read_transaction<'local>(
     Ok(transaction)
 }
 
-fn convert_to_java_transaction<'local>(
+pub(crate) fn convert_to_java_transaction<'local>(
     env: &mut JNIEnv<'local>,
     transaction: Transaction,
     java_dataset: &JObject,
@@ -410,7 +479,7 @@ fn convert_to_java_transaction<'local>(
     Ok(java_transaction)
 }
 
-fn convert_to_java_operation<'local>(
+pub(crate) fn convert_to_java_operation<'local>(
     env: &mut JNIEnv<'local>,
     operation: Option<Operation>,
 ) -> Result<JObject<'local>> {
@@ -493,6 +562,7 @@ fn convert_to_java_operation_inner<'local>(
             mem_wal_to_merge: _,
             fields_for_preserving_frag_bitmap,
             update_mode,
+            inserted_rows_filter: _,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
                 .iter()
@@ -638,7 +708,7 @@ fn convert_to_java_operation_inner<'local>(
     }
 }
 
-fn convert_to_java_schema<'local>(
+pub(crate) fn convert_to_java_schema<'local>(
     env: &mut JNIEnv<'local>,
     schema: LanceSchema,
 ) -> Result<JObject<'local>> {
@@ -658,10 +728,16 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCommitTransaction<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     java_transaction: JObject,
+    detached_jbool: jboolean,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_commit_transaction(&mut env, java_dataset, java_transaction)
+        inner_commit_transaction(
+            &mut env,
+            java_dataset,
+            java_transaction,
+            detached_jbool != 0,
+        )
     )
 }
 
@@ -669,6 +745,7 @@ fn inner_commit_transaction<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
     java_transaction: JObject,
+    detached: bool,
 ) -> Result<JObject<'local>> {
     let write_param_jobj = env
         .call_method(&java_transaction, "writeParams", "()Ljava/util/Map;", &[])?
@@ -702,7 +779,7 @@ fn inner_commit_transaction<'local>(
     let new_blocking_ds = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.commit_transaction(transaction, store_params)?
+        dataset_guard.commit_transaction(transaction, store_params, detached)?
     };
     new_blocking_ds.into_java(env)
 }
@@ -974,6 +1051,7 @@ fn convert_to_rust_operation(
                 mem_wal_to_merge: None,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                inserted_rows_filter: None,
             }
         }
         "DataReplacement" => {

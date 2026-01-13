@@ -300,7 +300,7 @@ impl UpdateJob {
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
                 Ok(Err(err)) => Err(err),
-                Err(e) => Err(DataFusionError::Execution(e.to_string())),
+                Err(e) => Err(DataFusionError::ExecutionJoin(Box::new(e))),
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
@@ -391,6 +391,7 @@ impl UpdateJob {
             mem_wal_to_merge: None,
             fields_for_preserving_frag_bitmap,
             update_mode: Some(RewriteRows),
+            inserted_rows_filter: None,
         };
 
         let transaction = Transaction::new(dataset.manifest.version, operation, None);

@@ -10,8 +10,11 @@ use std::{
     time::Duration,
 };
 
+use chrono::{DateTime, Utc};
+
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::physical_plan::metrics::MetricType;
 use datafusion::{
     catalog::streaming::StreamingTable,
     dataframe::DataFrame,
@@ -26,6 +29,7 @@ use datafusion::{
         analyze::AnalyzeExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, CardinalityEffect, EmissionType},
+        metrics::MetricValue,
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -286,6 +290,7 @@ pub type ExecutionStatsCallback = Arc<dyn Fn(&ExecutionSummaryCounts) + Send + S
 pub struct LanceExecutionOptions {
     pub use_spilling: bool,
     pub mem_pool_size: Option<u64>,
+    pub max_temp_directory_size: Option<u64>,
     pub batch_size: Option<usize>,
     pub target_partition: Option<usize>,
     pub execution_stats_callback: Option<ExecutionStatsCallback>,
@@ -297,6 +302,7 @@ impl std::fmt::Debug for LanceExecutionOptions {
         f.debug_struct("LanceExecutionOptions")
             .field("use_spilling", &self.use_spilling)
             .field("mem_pool_size", &self.mem_pool_size)
+            .field("max_temp_directory_size", &self.max_temp_directory_size)
             .field("batch_size", &self.batch_size)
             .field("target_partition", &self.target_partition)
             .field("skip_logging", &self.skip_logging)
@@ -309,6 +315,7 @@ impl std::fmt::Debug for LanceExecutionOptions {
 }
 
 const DEFAULT_LANCE_MEM_POOL_SIZE: u64 = 100 * 1024 * 1024;
+const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
     pub fn mem_pool_size(&self) -> u64 {
@@ -322,6 +329,23 @@ impl LanceExecutionOptions {
                     }
                 })
                 .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE)
+        })
+    }
+
+    pub fn max_temp_directory_size(&self) -> u64 {
+        self.max_temp_directory_size.unwrap_or_else(|| {
+            std::env::var("LANCE_MAX_TEMP_DIRECTORY_SIZE")
+                .map(|s| match s.parse::<u64>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse LANCE_MAX_TEMP_DIRECTORY_SIZE: {}, using default",
+                            e
+                        );
+                        DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE
+                    }
+                })
+                .unwrap_or(DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE)
         })
     }
 
@@ -345,8 +369,10 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         session_config = session_config.with_target_partitions(target_partition);
     }
     if options.use_spilling() {
+        let disk_manager_builder = DiskManagerBuilder::default()
+            .with_max_temp_directory_size(options.max_temp_directory_size());
         runtime_env_builder = runtime_env_builder
-            .with_disk_manager_builder(DiskManagerBuilder::default())
+            .with_disk_manager_builder(disk_manager_builder)
             .with_memory_pool(Arc::new(FairSpillPool::new(
                 options.mem_pool_size() as usize
             )));
@@ -370,7 +396,9 @@ static DEFAULT_SESSION_CONTEXT_WITH_SPILLING: LazyLock<SessionContext> = LazyLoc
 });
 
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
-    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE && options.target_partition.is_none()
+    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE
+        && options.max_temp_directory_size() == DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE
+        && options.target_partition.is_none()
     {
         return if options.use_spilling() {
             DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone()
@@ -542,7 +570,14 @@ pub async fn analyze_plan(
     let plan = Arc::new(TracedExec::new(plan, Span::current()));
 
     let schema = plan.schema();
-    let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
+    // TODO(tsaucer) I chose SUMMARY here but do we also want DEV?
+    let analyze = Arc::new(AnalyzeExec::new(
+        true,
+        true,
+        vec![MetricType::SUMMARY],
+        plan,
+        schema,
+    ));
 
     let session_ctx = get_session_context(&options);
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);
@@ -566,23 +601,72 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
     /// A visitor which calculates additional metrics for all the plans.
     struct CalculateVisitor {
         highest_index: usize,
-        index_to_cumulative_cpu: HashMap<usize, usize>,
+        index_to_elapsed: HashMap<usize, Duration>,
     }
+
+    /// Result of calculating metrics for a subtree
+    struct SubtreeMetrics {
+        min_start: Option<DateTime<Utc>>,
+        max_end: Option<DateTime<Utc>>,
+    }
+
     impl CalculateVisitor {
-        fn calculate_cumulative_cpu(&mut self, plan: &Arc<dyn ExecutionPlan>) -> usize {
+        fn calculate_metrics(&mut self, plan: &Arc<dyn ExecutionPlan>) -> SubtreeMetrics {
             self.highest_index += 1;
             let plan_index = self.highest_index;
-            let elapsed_cpu: usize = match plan.metrics() {
-                Some(metrics) => metrics.elapsed_compute().unwrap_or_default(),
-                None => 0,
-            };
-            let mut cumulative_cpu = elapsed_cpu;
+
+            // Get timestamps for this node
+            let (mut min_start, mut max_end) = Self::node_timerange(plan);
+
+            // Accumulate from children
             for child in plan.children() {
-                cumulative_cpu += self.calculate_cumulative_cpu(child);
+                let child_metrics = self.calculate_metrics(child);
+                min_start = Self::min_option(min_start, child_metrics.min_start);
+                max_end = Self::max_option(max_end, child_metrics.max_end);
             }
-            self.index_to_cumulative_cpu
-                .insert(plan_index, cumulative_cpu);
-            cumulative_cpu
+
+            // Calculate wall clock duration for this subtree (only if we have timestamps)
+            let elapsed = match (min_start, max_end) {
+                (Some(start), Some(end)) => Some((end - start).to_std().unwrap_or_default()),
+                _ => None,
+            };
+
+            if let Some(e) = elapsed {
+                self.index_to_elapsed.insert(plan_index, e);
+            }
+
+            SubtreeMetrics { min_start, max_end }
+        }
+
+        fn node_timerange(
+            plan: &Arc<dyn ExecutionPlan>,
+        ) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+            let Some(metrics) = plan.metrics() else {
+                return (None, None);
+            };
+            let min_start = metrics
+                .iter()
+                .filter_map(|m| match m.value() {
+                    MetricValue::StartTimestamp(ts) => ts.value(),
+                    _ => None,
+                })
+                .min();
+            let max_end = metrics
+                .iter()
+                .filter_map(|m| match m.value() {
+                    MetricValue::EndTimestamp(ts) => ts.value(),
+                    _ => None,
+                })
+                .max();
+            (min_start, max_end)
+        }
+
+        fn min_option(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+            [a, b].into_iter().flatten().min()
+        }
+
+        fn max_option(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+            [a, b].into_iter().flatten().max()
         }
     }
 
@@ -600,7 +684,27 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
         ) -> std::fmt::Result {
             self.highest_index += 1;
             write!(f, "{:indent$}", "", indent = self.indent * 2)?;
-            plan.fmt_as(datafusion::physical_plan::DisplayFormatType::Verbose, f)?;
+
+            // Format the plan description
+            let displayable =
+                datafusion::physical_plan::display::DisplayableExecutionPlan::new(plan.as_ref());
+            let plan_str = displayable.one_line().to_string();
+            let plan_str = plan_str.trim();
+
+            // Write operator with elapsed time inserted after the name
+            match calcs.index_to_elapsed.get(&self.highest_index) {
+                Some(elapsed) => match plan_str.find(": ") {
+                    Some(i) => write!(
+                        f,
+                        "{}: elapsed={elapsed:?}, {}",
+                        &plan_str[..i],
+                        &plan_str[i + 2..]
+                    )?,
+                    None => write!(f, "{plan_str}, elapsed={elapsed:?}")?,
+                },
+                None => write!(f, "{plan_str}")?,
+            }
+
             if let Some(metrics) = plan.metrics() {
                 let metrics = metrics
                     .aggregate_by_name()
@@ -611,12 +715,6 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
             } else {
                 write!(f, ", metrics=[]")?;
             }
-            let cumulative_cpu = calcs
-                .index_to_cumulative_cpu
-                .get(&self.highest_index)
-                .unwrap();
-            let cumulative_cpu_duration = Duration::from_nanos((*cumulative_cpu) as u64);
-            write!(f, ", cumulative_cpu={cumulative_cpu_duration:?}")?;
             writeln!(f)?;
             self.indent += 1;
             for child in plan.children() {
@@ -634,9 +732,9 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
         fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
             let mut calcs = CalculateVisitor {
                 highest_index: 0,
-                index_to_cumulative_cpu: HashMap::new(),
+                index_to_elapsed: HashMap::new(),
             };
-            calcs.calculate_cumulative_cpu(&self.plan);
+            calcs.calculate_metrics(&self.plan);
             let mut prints = PrintVisitor {
                 highest_index: 0,
                 indent: 0,

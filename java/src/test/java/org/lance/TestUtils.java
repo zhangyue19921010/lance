@@ -78,8 +78,16 @@ public class TestUtils {
     public abstract Schema getSchema();
 
     public Dataset createEmptyDataset() {
+      return createEmptyDataset(false);
+    }
+
+    public Dataset createEmptyDataset(boolean enableV2Manifest) {
       Dataset dataset =
-          Dataset.create(allocator, datasetPath, getSchema(), new WriteParams.Builder().build());
+          Dataset.create(
+              allocator,
+              datasetPath,
+              getSchema(),
+              new WriteParams.Builder().withEnableV2ManifestPaths(enableV2Manifest).build());
       assertEquals(0, dataset.countRows());
       assertEquals(getSchema(), dataset.getSchema());
       List<Fragment> fragments = dataset.getFragments();
@@ -530,6 +538,7 @@ public class TestUtils {
       }
       return fragmentMetas;
     }
+
     /**
      * Test method to update columns. Note that for simplicity, the updated column rowid is fixed
      * with [0, updateNum). Please only use this method to test the first fragment.
@@ -606,6 +615,7 @@ public class TestUtils {
 
     /** Lance blob metadata key required by Rust. */
     private static final String BLOB_META_KEY = "lance-encoding:blob";
+
     /** Lance blob metadata value. */
     private static final String BLOB_META_TRUE = "true";
 

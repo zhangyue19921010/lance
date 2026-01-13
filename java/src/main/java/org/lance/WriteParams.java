@@ -16,6 +16,7 @@ package org.lance;
 import com.google.common.base.MoreObjects;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -55,8 +56,11 @@ public class WriteParams {
   private final Optional<WriteMode> mode;
   private final Optional<Boolean> enableStableRowIds;
   private final Optional<LanceFileVersion> dataStorageVersion;
+  private final Optional<Boolean> enableV2ManifestPaths;
   private Map<String, String> storageOptions = new HashMap<>();
   private final Optional<Long> s3CredentialsRefreshOffsetSeconds;
+  private final Optional<List<BasePath>> initialBases;
+  private final Optional<List<String>> targetBases;
 
   private WriteParams(
       Optional<Integer> maxRowsPerFile,
@@ -65,16 +69,22 @@ public class WriteParams {
       Optional<WriteMode> mode,
       Optional<Boolean> enableStableRowIds,
       Optional<LanceFileVersion> dataStorageVersion,
+      Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
-      Optional<Long> s3CredentialsRefreshOffsetSeconds) {
+      Optional<Long> s3CredentialsRefreshOffsetSeconds,
+      Optional<List<BasePath>> initialBases,
+      Optional<List<String>> targetBases) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
     this.mode = mode;
     this.enableStableRowIds = enableStableRowIds;
     this.dataStorageVersion = dataStorageVersion;
+    this.enableV2ManifestPaths = enableV2ManifestPaths;
     this.storageOptions = storageOptions;
     this.s3CredentialsRefreshOffsetSeconds = s3CredentialsRefreshOffsetSeconds;
+    this.initialBases = initialBases;
+    this.targetBases = targetBases;
   }
 
   public Optional<Integer> getMaxRowsPerFile() {
@@ -106,12 +116,24 @@ public class WriteParams {
     return dataStorageVersion.map(LanceFileVersion::getVersionString);
   }
 
+  public Optional<Boolean> getEnableV2ManifestPaths() {
+    return enableV2ManifestPaths;
+  }
+
   public Map<String, String> getStorageOptions() {
     return storageOptions;
   }
 
   public Optional<Long> getS3CredentialsRefreshOffsetSeconds() {
     return s3CredentialsRefreshOffsetSeconds;
+  }
+
+  public Optional<List<BasePath>> getInitialBases() {
+    return initialBases;
+  }
+
+  public Optional<List<String>> getTargetBases() {
+    return targetBases;
   }
 
   @Override
@@ -133,8 +155,11 @@ public class WriteParams {
     private Optional<WriteMode> mode = Optional.empty();
     private Optional<Boolean> enableStableRowIds = Optional.empty();
     private Optional<LanceFileVersion> dataStorageVersion = Optional.empty();
+    private Optional<Boolean> enableV2ManifestPaths;
     private Map<String, String> storageOptions = new HashMap<>();
     private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
+    private Optional<List<BasePath>> initialBases = Optional.empty();
+    private Optional<List<String>> targetBases = Optional.empty();
 
     public Builder withMaxRowsPerFile(int maxRowsPerFile) {
       this.maxRowsPerFile = Optional.of(maxRowsPerFile);
@@ -171,8 +196,23 @@ public class WriteParams {
       return this;
     }
 
+    public Builder withEnableV2ManifestPaths(boolean enableV2ManifestPaths) {
+      this.enableV2ManifestPaths = Optional.of(enableV2ManifestPaths);
+      return this;
+    }
+
     public Builder withS3CredentialsRefreshOffsetSeconds(long s3CredentialsRefreshOffsetSeconds) {
       this.s3CredentialsRefreshOffsetSeconds = Optional.of(s3CredentialsRefreshOffsetSeconds);
+      return this;
+    }
+
+    public Builder withInitialBases(List<BasePath> initialBases) {
+      this.initialBases = Optional.of(initialBases);
+      return this;
+    }
+
+    public Builder withTargetBases(List<String> targetBases) {
+      this.targetBases = Optional.of(targetBases);
       return this;
     }
 
@@ -184,8 +224,11 @@ public class WriteParams {
           mode,
           enableStableRowIds,
           dataStorageVersion,
+          enableV2ManifestPaths,
           storageOptions,
-          s3CredentialsRefreshOffsetSeconds);
+          s3CredentialsRefreshOffsetSeconds,
+          initialBases,
+          targetBases);
     }
   }
 }

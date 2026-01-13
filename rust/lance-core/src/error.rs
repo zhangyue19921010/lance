@@ -164,6 +164,26 @@ impl Error {
             location,
         }
     }
+
+    pub fn not_found(uri: impl Into<String>) -> Self {
+        Self::NotFound {
+            uri: uri.into(),
+            location: std::panic::Location::caller().to_snafu_location(),
+        }
+    }
+
+    pub fn schema(message: impl Into<String>, location: Location) -> Self {
+        let message: String = message.into();
+        Self::Schema { message, location }
+    }
+
+    pub fn not_supported(message: impl Into<String>, location: Location) -> Self {
+        let message: String = message.into();
+        Self::NotSupported {
+            source: message.into(),
+            location,
+        }
+    }
 }
 
 pub trait LanceOptionExt<T> {
@@ -184,7 +204,7 @@ impl<T> LanceOptionExt<T> for Option<T> {
     }
 }
 
-trait ToSnafuLocation {
+pub trait ToSnafuLocation {
     fn to_snafu_location(&'static self) -> snafu::Location;
 }
 

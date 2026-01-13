@@ -28,7 +28,7 @@ use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{
     utils::{
         address::RowAddress,
-        mask::{RowAddrTreeMap, RowIdMask},
+        mask::{RowAddrMask, RowAddrTreeMap},
     },
     Error, Result, ROW_ID_FIELD,
 };
@@ -295,7 +295,7 @@ impl MapIndexExec {
         column_name: String,
         index_name: String,
         dataset: Arc<Dataset>,
-        deletion_mask: Option<Arc<RowIdMask>>,
+        deletion_mask: Option<Arc<RowAddrMask>>,
         batch: RecordBatch,
         metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<RecordBatch> {
@@ -310,37 +310,24 @@ impl MapIndexExec {
             needs_recheck: false,
         });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
-        let IndexExprResult::Exact(mut row_id_mask) = query_result else {
+        let IndexExprResult::Exact(mut row_addr_mask) = query_result else {
             todo!("Support for non-exact query results as input for merge_insert")
         };
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
-            row_id_mask = row_id_mask & deletion_mask.as_ref().clone();
+            row_addr_mask = row_addr_mask & deletion_mask.as_ref().clone();
         }
 
-        if let Some(mut allow_list) = row_id_mask.allow_list {
-            // Flatten the allow list
-            if let Some(block_list) = row_id_mask.block_list {
-                allow_list -= &block_list;
-            }
-
-            let allow_list =
-                allow_list
-                    .row_addrs()
-                    .ok_or(datafusion::error::DataFusionError::External(
-                        "IndexedLookupExec: row addresses didn't have an iterable allow list"
-                            .into(),
-                    ))?;
-            let allow_list: UInt64Array = allow_list.map(u64::from).collect();
-            Ok(RecordBatch::try_new(
-                INDEX_LOOKUP_SCHEMA.clone(),
-                vec![Arc::new(allow_list)],
-            )?)
-        } else {
-            Err(datafusion::error::DataFusionError::Internal(
-                "IndexedLookupExec: row addresses didn't have an allow list".to_string(),
-            ))
-        }
+        let row_id_iter = row_addr_mask
+            .iter_addrs()
+            .ok_or(datafusion::error::DataFusionError::Internal(
+                "IndexedLookupExec: Cannot iterate over row addresses (BlockList or contains full fragments)".to_string(),
+            ))?;
+        let allow_list: UInt64Array = row_id_iter.map(u64::from).collect();
+        Ok(RecordBatch::try_new(
+            INDEX_LOOKUP_SCHEMA.clone(),
+            vec![Arc::new(allow_list)],
+        )?)
     }
 
     async fn do_execute(
@@ -585,12 +572,12 @@ impl MaterializeIndexExec {
 
 #[instrument(name = "make_row_ids", skip(mask, dataset, fragments))]
 async fn row_ids_for_mask(
-    mask: RowIdMask,
+    mask: RowAddrMask,
     dataset: &Dataset,
     fragments: &[Fragment],
 ) -> Result<Vec<u64>> {
-    match (mask.allow_list, mask.block_list) {
-        (None, None) => {
+    match mask {
+        RowAddrMask::BlockList(block_list) if block_list.is_empty() => {
             // Matches all row ids in the given fragments.
             if dataset.manifest.uses_stable_row_ids() {
                 let sequences = load_row_id_sequences(dataset, fragments)
@@ -608,7 +595,7 @@ async fn row_ids_for_mask(
                 Ok(FragIdIter::new(fragments).collect::<Vec<_>>())
             }
         }
-        (Some(mut allow_list), None) => {
+        RowAddrMask::AllowList(mut allow_list) => {
             retain_fragments(&mut allow_list, fragments, dataset).await?;
 
             if let Some(allow_list_iter) = allow_list.row_addrs() {
@@ -621,7 +608,7 @@ async fn row_ids_for_mask(
                     .collect())
             }
         }
-        (None, Some(block_list)) => {
+        RowAddrMask::BlockList(block_list) => {
             if dataset.manifest.uses_stable_row_ids() {
                 let sequences = load_row_id_sequences(dataset, fragments)
                     .map_ok(|(_frag_id, sequence)| sequence)
@@ -642,29 +629,6 @@ async fn row_ids_for_mask(
             } else {
                 Ok(FragIdIter::new(fragments)
                     .filter(|row_id| !block_list.contains(*row_id))
-                    .collect())
-            }
-        }
-        (Some(mut allow_list), Some(block_list)) => {
-            // We need to filter out irrelevant fragments as well.
-            retain_fragments(&mut allow_list, fragments, dataset).await?;
-
-            if let Some(allow_list_iter) = allow_list.row_addrs() {
-                Ok(allow_list_iter
-                    .filter_map(|addr| {
-                        let row_id = u64::from(addr);
-                        if !block_list.contains(row_id) {
-                            Some(row_id)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>())
-            } else {
-                // We shouldn't hit this branch if the row ids are stable.
-                debug_assert!(!dataset.manifest.uses_stable_row_ids());
-                Ok(FragIdIter::new(fragments)
-                    .filter(|row_id| !block_list.contains(*row_id) && allow_list.contains(*row_id))
                     .collect())
             }
         }
