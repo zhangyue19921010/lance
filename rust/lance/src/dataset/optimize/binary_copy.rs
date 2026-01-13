@@ -98,6 +98,7 @@ fn compute_field_column_indices(
 /// PAY ATTENTION current function will:
 /// - Takes (`Option::take`) the current writer and filename.
 /// - Drains `col_pages` and `col_buffers` for all columns.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_current_output_file(
     schema: &Schema,
     full_field_ids: &[i32],
@@ -111,7 +112,7 @@ async fn finalize_current_output_file(
     version: LanceFileVersion,
 ) -> Result<Fragment> {
     let mut final_cols: Vec<Arc<ColumnInfo>> = Vec::with_capacity(current_page_table.len());
-    for (i, columnInfo) in current_page_table.iter().enumerate() {
+    for (i, column_info) in current_page_table.iter().enumerate() {
         let mut pages_vec = std::mem::take(&mut col_pages[i]);
         // For v2_0 struct headers, force a single page and set num_rows to total
         if version == LanceFileVersion::V2_0
@@ -125,10 +126,10 @@ async fn finalize_current_output_file(
         let pages_arc = Arc::from(pages_vec.into_boxed_slice());
         let buffers_vec = std::mem::take(&mut col_buffers[i]);
         final_cols.push(Arc::new(ColumnInfo::new(
-            columnInfo.index,
+            column_info.index,
             pages_arc,
             buffers_vec,
-            columnInfo.encoding.clone(),
+            column_info.encoding.clone(),
         )));
     }
     let writer = current_writer.take().unwrap();
