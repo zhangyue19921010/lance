@@ -188,7 +188,7 @@ impl std::fmt::Debug for Dataset {
 }
 
 /// Dataset Version
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct Version {
     /// version number
     pub version: u64,
