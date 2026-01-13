@@ -511,7 +511,7 @@ async fn test_binary_copy_fallback_to_common_compaction() {
         .into_iter()
         .map(Into::into)
         .collect();
-    assert!(!can_use_binary_copy(&dataset, &options, &frags));
+    assert!(!can_use_binary_copy(&dataset, &options, &frags).await);
 
     let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
 
@@ -545,7 +545,7 @@ async fn test_can_use_binary_copy_schema_consistency_ok() {
         .into_iter()
         .map(Into::into)
         .collect();
-    assert!(can_use_binary_copy(&dataset, &options, &frags));
+    assert!(can_use_binary_copy(&dataset, &options, &frags).await);
 }
 
 #[tokio::test]
@@ -579,13 +579,13 @@ async fn test_can_use_binary_copy_schema_mismatch() {
             df.column_indices.push(-1);
         }
     }
-    assert!(!can_use_binary_copy(&dataset, &options, &frags));
+    assert!(!can_use_binary_copy(&dataset, &options, &frags).await);
 
     // Also introduce a version mismatch and ensure rejection
     if let Some(df) = frags.get_mut(0).and_then(|f| f.files.get_mut(0)) {
         df.file_minor_version = if df.file_minor_version == 1 { 2 } else { 1 };
     }
-    assert!(!can_use_binary_copy(&dataset, &options, &frags));
+    assert!(!can_use_binary_copy(&dataset, &options, &frags).await);
 }
 
 #[tokio::test]
@@ -628,7 +628,7 @@ async fn test_can_use_binary_copy_version_mismatch() {
         file.file_minor_version = v21_minor;
     }
 
-    assert!(!can_use_binary_copy(&dataset, &options, &frags));
+    assert!(!can_use_binary_copy(&dataset, &options, &frags).await);
 }
 
 #[tokio::test]
@@ -655,7 +655,7 @@ async fn test_can_use_binary_copy_reject_deletions() {
         .into_iter()
         .map(Into::into)
         .collect();
-    assert!(!can_use_binary_copy(&dataset, &options, &frags));
+    assert!(!can_use_binary_copy(&dataset, &options, &frags).await);
 }
 
 #[tokio::test]

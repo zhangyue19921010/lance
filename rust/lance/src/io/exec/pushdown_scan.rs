@@ -353,7 +353,7 @@ impl FragmentScanner {
                     .map(|res| match res {
                         Ok(Ok(batch)) => Ok(batch),
                         Ok(Err(err)) => Err(err),
-                        Err(err) => Err(DataFusionError::Execution(err.to_string())),
+                        Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
                     })
             });
 
@@ -541,7 +541,7 @@ impl FragmentScanner {
             .project_by_schema(&self.projection.as_ref().into())
             .map_err(|err| Error::Internal {
                 message: format!(
-                    "Failed to to select schema {} from batch with schema {}\nInner error: {}",
+                    "Failed to select schema {} from batch with schema {}\nInner error: {}",
                     self.projection,
                     batch.schema(),
                     err

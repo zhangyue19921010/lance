@@ -50,7 +50,7 @@ use lance_core::datatypes::{
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{RowAddrTreeMap, RowIdMask};
+use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
@@ -815,7 +815,7 @@ impl Scanner {
 
     fn ensure_not_fragment_scan(&self) -> Result<()> {
         if self.is_fragment_scan() {
-            Err(Error::io(
+            Err(Error::not_supported(
                 "This operation is not supported for fragment scan".to_string(),
                 location!(),
             ))
@@ -1447,12 +1447,14 @@ impl Scanner {
         arrow_schema: &ArrowSchema,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         let lance_schema = dataset.schema();
-        let field_path = lance_schema.resolve(column_name).ok_or_else(|| {
-            Error::invalid_input(
-                format!("Field '{}' not found in schema", column_name),
-                location!(),
-            )
-        })?;
+        let field_path = lance_schema
+            .resolve_case_insensitive(column_name)
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    format!("Field '{}' not found in schema", column_name),
+                    location!(),
+                )
+            })?;
 
         if field_path.len() == 1 {
             // Simple top-level column
@@ -1467,7 +1469,11 @@ impl Scanner {
             // Nested field - build a chain of GetFieldFunc calls
             let get_field_func = ScalarUDF::from(GetFieldFunc::default());
 
-            let mut expr = col(&field_path[0].name);
+            // Use Expr::Column with Column::new_unqualified to preserve exact case
+            // (col() normalizes identifiers to lowercase)
+            let mut expr = Expr::Column(datafusion::common::Column::new_unqualified(
+                &field_path[0].name,
+            ));
             for nested_field in &field_path[1..] {
                 expr = get_field_func.call(vec![expr, lit(&nested_field.name)]);
             }
@@ -1563,7 +1569,7 @@ impl Scanner {
         if self.autoproject_scoring_columns {
             if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
                 if self.explicit_projection {
-                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to to adopt the future behavior and avoid this warning");
+                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning");
                 }
                 let vector_expr = expressions::col(DIST_COL, current_schema)?;
                 output_expr.push((vector_expr, DIST_COL.to_string()));
@@ -1724,7 +1730,7 @@ impl Scanner {
                     .column(0)
                     .as_any()
                     .downcast_ref::<Int64Array>()
-                    .ok_or(Error::io(
+                    .ok_or(Error::invalid_input(
                         "Count plan did not return a UInt64Array".to_string(),
                         location!(),
                     ))?;
@@ -2336,9 +2342,9 @@ impl Scanner {
     }
 
     fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
-        let row_ids = RowAddrTreeMap::from_iter(u64s);
-        let row_id_mask = RowIdMask::from_allowed(row_ids);
-        let index_result = IndexExprResult::Exact(row_id_mask);
+        let row_addrs = RowAddrTreeMap::from_iter(u64s);
+        let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
+        let index_result = IndexExprResult::Exact(row_addr_mask);
         let fragments_covered =
             RoaringBitmap::from_iter(self.dataset.fragments().iter().map(|f| f.id as u32));
         let batch = index_result.serialize_to_arrow(&fragments_covered)?;
@@ -2706,7 +2712,7 @@ impl Scanner {
                     ROW_ID.to_string(),
                 )];
 
-                let fts_node = Arc::new(UnionExec::new(children));
+                let fts_node = UnionExec::try_new(children)?;
                 let fts_node = Arc::new(RepartitionExec::try_new(
                     fts_node,
                     Partitioning::RoundRobinBatch(1),
@@ -2765,7 +2771,7 @@ impl Scanner {
                 } else if should.len() == 1 {
                     should.pop().unwrap()
                 } else {
-                    let unioned = Arc::new(UnionExec::new(should));
+                    let unioned = UnionExec::try_new(should)?;
                     Arc::new(RepartitionExec::try_new(
                         unioned,
                         Partitioning::RoundRobinBatch(1),
@@ -2818,7 +2824,7 @@ impl Scanner {
                 } else if must_not.len() == 1 {
                     must_not.pop().unwrap()
                 } else {
-                    let unioned = Arc::new(UnionExec::new(must_not));
+                    let unioned = UnionExec::try_new(must_not)?;
                     Arc::new(RepartitionExec::try_new(
                         unioned,
                         Partitioning::RoundRobinBatch(1),
@@ -2938,7 +2944,7 @@ impl Scanner {
         // Combine plans
         let plan = match (match_plan, flat_match_plan) {
             (Some(match_plan), Some(flat_match_plan)) => {
-                let match_plan = Arc::new(UnionExec::new(vec![match_plan, flat_match_plan]));
+                let match_plan = UnionExec::try_new(vec![match_plan, flat_match_plan])?;
                 let match_plan = Arc::new(RepartitionExec::try_new(
                     match_plan,
                     Partitioning::RoundRobinBatch(1),
@@ -3183,10 +3189,10 @@ impl Scanner {
                 .schema()
                 .equivalent_names_and_types(&knn_node.schema()));
             // union
-            let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
+            let unioned = UnionExec::try_new(vec![Arc::new(topk_appended), knn_node])?;
             // Enforce only 1 partition.
             let unioned = RepartitionExec::try_new(
-                Arc::new(unioned),
+                unioned,
                 datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
             )?;
             // then we do a flat search on KNN(new data) + ANN(indexed data)
@@ -3372,13 +3378,13 @@ impl Scanner {
         };
 
         if let Some(new_data_path) = new_data_path {
-            let unioned = UnionExec::new(vec![plan, new_data_path]);
+            let unioned = UnionExec::try_new(vec![plan, new_data_path])?;
             // Enforce only 1 partition.
-            let unioned = RepartitionExec::try_new(
-                Arc::new(unioned),
+            let unioned = Arc::new(RepartitionExec::try_new(
+                unioned,
                 datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-            )?;
-            Ok(Arc::new(unioned))
+            )?);
+            Ok(unioned)
         } else {
             Ok(plan)
         }
@@ -4002,9 +4008,7 @@ impl Stream for DatasetRecordBatchStream {
         let mut this = self.project();
         let _guard = this.span.enter();
         match this.exec_node.poll_next_unpin(cx) {
-            Poll::Ready(result) => {
-                Poll::Ready(result.map(|r| r.map_err(|e| Error::io(e.to_string(), location!()))))
-            }
+            Poll::Ready(result) => Poll::Ready(result.map(|r| Ok(r?))),
             Poll::Pending => Poll::Pending,
         }
     }

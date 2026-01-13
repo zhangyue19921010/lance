@@ -210,27 +210,41 @@ impl CompactionOptions {
 /// - No fragment has a deletion file
 ///   TODO: Need to support schema evolution case like add column and drop column
 /// - All data files share identical schema mappings (`fields`, `column_indices`)
-fn can_use_binary_copy(
+/// - Input data files must not contain extra global buffers (beyond schema / file descriptor)
+async fn can_use_binary_copy(
     dataset: &Dataset,
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> bool {
+    can_use_binary_copy_impl(dataset, options, fragments)
+        .await
+        .unwrap_or_else(|err| {
+            log::warn!("Binary copy disabled due to error: {}", err);
+            false
+        })
+}
+
+async fn can_use_binary_copy_impl(
+    dataset: &Dataset,
+    options: &CompactionOptions,
+    fragments: &[Fragment],
+) -> Result<bool> {
+    use lance_file::reader::FileReader as LFReader;
     use lance_file::version::LanceFileVersion;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+
     if !options.enable_binary_copy {
-        return false;
+        return Ok(false);
     }
 
-    // not support blob column for now
     let has_blob_columns = dataset
         .schema()
         .fields_pre_order()
         .any(|field| field.is_blob());
     if has_blob_columns {
-        return false;
+        return Ok(false);
     }
 
-    // Check dataset storage version is supported
-    // Binary copy is not supported for legacy Lance file format
     let storage_ok = dataset
         .manifest
         .data_storage_format
@@ -238,31 +252,31 @@ fn can_use_binary_copy(
         .map(|v| !matches!(v.resolve(), LanceFileVersion::Legacy))
         .unwrap_or(false);
     if !storage_ok {
-        return false;
+        return Ok(false);
     }
 
     if fragments.is_empty() {
-        return false;
+        return Ok(false);
     }
 
-    // Establish version baseline from the dataset manifest
-    let storage_file_version = match dataset.manifest.data_storage_format.lance_file_version() {
-        Ok(version) => version.resolve(),
-        Err(_) => return false,
-    };
-    // Capture schema mapping baseline from first data file
+    let storage_file_version = dataset
+        .manifest
+        .data_storage_format
+        .lance_file_version()?
+        .resolve();
+
+    if fragments[0].files.is_empty() {
+        return Ok(false);
+    }
     let ref_fields = &fragments[0].files[0].fields;
     let ref_cols = &fragments[0].files[0].column_indices;
-    // Single-pass verification across fragments and their files
     let mut is_same_version = true;
 
     for fragment in fragments {
-        // Reject fragments with deletions (binary copy does not materialize deletions)
         if fragment.deletion_file.is_some() {
-            return false;
+            return Ok(false);
         }
 
-        // Check version and schema mapping equality for each data file
         for data_file in &fragment.files {
             let version_ok = LanceFileVersion::try_from_major_minor(
                 data_file.file_major_version,
@@ -274,17 +288,42 @@ fn can_use_binary_copy(
             if !version_ok {
                 is_same_version = false;
             }
-            // Schema mapping must match exactly across all files
             if data_file.fields != *ref_fields || data_file.column_indices != *ref_cols {
-                return false;
+                return Ok(false);
+            }
+
+            // check file global buffer
+            let object_store = match data_file.base_id {
+                Some(base_id) => dataset.object_store_for_base(base_id).await?,
+                None => dataset.object_store.clone(),
+            };
+            let full_path = dataset
+                .data_file_dir(data_file)?
+                .child(data_file.path.as_str());
+            let scan_scheduler = ScanScheduler::new(
+                object_store.clone(),
+                SchedulerConfig::max_bandwidth(&object_store),
+            );
+            let file_scheduler = scan_scheduler
+                .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
+                .await?;
+            let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
+            // Binary copy only preserves page and column-buffer bytes. The output file's footer
+            // (including global buffers) is re-generated, not copied from inputs.
+            //
+            // Therefore, we reject input files that contain any additional global buffers beyond
+            // the required schema / file descriptor global buffer (global buffer index 0).
+            if file_meta.file_buffers.len() > 1 {
+                return Ok(false);
             }
         }
     }
 
     if !is_same_version {
-        return false;
+        return Ok(false);
     }
-    true
+
+    Ok(true)
 }
 
 /// Metrics returned by [compact_files].
@@ -895,7 +934,7 @@ async fn rewrite_files(
         num_rows,
         fragments.len()
     );
-    let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments);
+    let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
     if !can_binary_copy && options.enable_binary_copy_force {
         return Err(Error::NotSupported {
             source: format!("compaction task {}: binary copy is not supported", task_id).into(),
@@ -968,12 +1007,17 @@ async fn rewrite_files(
             let mut addrs = RoaringTreemap::new();
             for frag in &fragments {
                 let frag_id = frag.id as u32;
-                let count = frag.physical_rows.unwrap_or(0);
-                for i in 0..count {
-                    let addr =
-                        lance_core::utils::address::RowAddress::new_from_parts(frag_id, i as u32);
-                    addrs.insert(u64::from(addr));
-                }
+                let count = u64::try_from(frag.physical_rows.unwrap_or(0)).map_err(|_| {
+                    Error::Internal {
+                        message: format!(
+                            "Fragment {} has too many physical rows to represent as row addresses",
+                            frag.id
+                        ),
+                        location: location!(),
+                    }
+                })?;
+                let start = u64::from(lance_core::utils::address::RowAddress::first_row(frag_id));
+                addrs.insert_range(start..start + count);
             }
             let captured = CapturedRowIds::AddressStyle(addrs);
             let _ = tx.send(captured);

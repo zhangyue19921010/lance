@@ -51,6 +51,101 @@ async fn apply_alignment_padding(
     Ok(current_pos)
 }
 
+async fn init_writer_if_necessary(
+    dataset: &Dataset,
+    current_writer: &mut Option<ObjectWriter>,
+    current_filename: &mut Option<String>,
+) -> Result<bool> {
+    if current_writer.is_none() {
+        let filename = format!("{}.lance", generate_random_filename());
+        let path = dataset.base.child(DATA_DIR).child(filename.as_str());
+        let writer = dataset.object_store.create(&path).await?;
+        *current_writer = Some(writer);
+        *current_filename = Some(filename);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// v2_0 vs v2_1+ field-to-column index mapping
+///  - v2_1+ stores only leaf columns; non-leaf fields get `-1` in the mapping
+///  - v2_0 includes structural headers as columns; non-leaf fields map to a concrete index
+fn compute_field_column_indices(
+    schema: &Schema,
+    full_field_ids_len: usize,
+    version: LanceFileVersion,
+) -> Vec<i32> {
+    let is_structural = version >= LanceFileVersion::V2_1;
+    let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids_len);
+    let mut curr_col_idx: i32 = 0;
+    for field in schema.fields_pre_order() {
+        if field.is_packed_struct() || field.is_leaf() || !is_structural {
+            field_column_indices.push(curr_col_idx);
+            curr_col_idx += 1;
+        } else {
+            field_column_indices.push(-1);
+        }
+    }
+    field_column_indices
+}
+
+/// Finalize the current output file and return it as a single [Fragment].
+/// - Ensures an output writer / filename is present (creates a new file if needed).
+/// - Converts the in-memory `col_pages` / `col_buffers` into `ColumnInfo` metadata, draining them.
+/// - Applies v2_0 structural header rules (single page, normalized `num_rows` and `priority`).
+/// - Writes the Lance footer via [flush_footer] and registers the resulting [DataFile] in a [Fragment].
+///
+/// PAY ATTENTION current function will:
+/// - Takes (`Option::take`) the current writer and filename.
+/// - Drains `col_pages` and `col_buffers` for all columns.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_current_output_file(
+    schema: &Schema,
+    full_field_ids: &[i32],
+    current_writer: &mut Option<ObjectWriter>,
+    current_filename: &mut Option<String>,
+    current_page_table: &[ColumnInfo],
+    col_pages: &mut [Vec<DecPageInfo>],
+    col_buffers: &mut [Vec<(u64, u64)>],
+    is_non_leaf_column: &[bool],
+    total_rows_in_current: u64,
+    version: LanceFileVersion,
+) -> Result<Fragment> {
+    let mut final_cols: Vec<Arc<ColumnInfo>> = Vec::with_capacity(current_page_table.len());
+    for (i, column_info) in current_page_table.iter().enumerate() {
+        let mut pages_vec = std::mem::take(&mut col_pages[i]);
+        // For v2_0 struct headers, force a single page and set num_rows to total
+        if version == LanceFileVersion::V2_0
+            && is_non_leaf_column.get(i).copied().unwrap_or(false)
+            && !pages_vec.is_empty()
+        {
+            pages_vec[0].num_rows = total_rows_in_current;
+            pages_vec[0].priority = 0;
+            pages_vec.truncate(1);
+        }
+        let pages_arc = Arc::from(pages_vec.into_boxed_slice());
+        let buffers_vec = std::mem::take(&mut col_buffers[i]);
+        final_cols.push(Arc::new(ColumnInfo::new(
+            column_info.index,
+            pages_arc,
+            buffers_vec,
+            column_info.encoding.clone(),
+        )));
+    }
+    let writer = current_writer.take().unwrap();
+    flush_footer(writer, schema, &final_cols, total_rows_in_current, version).await?;
+
+    // Register the newly closed output file as a fragment data file
+    let (maj, min) = version.to_numbers();
+    let mut fragment = Fragment::new(0);
+    let mut data_file = DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
+    data_file.fields = full_field_ids.to_vec();
+    data_file.column_indices = compute_field_column_indices(schema, full_field_ids.len(), version);
+    fragment.files.push(data_file);
+    fragment.physical_rows = Some(total_rows_in_current as usize);
+    Ok(fragment)
+}
+
 /// Rewrite the files in a single task using binary copy semantics.
 ///
 /// Flow overview (per task):
@@ -206,12 +301,9 @@ pub async fn rewrite_files_binary_copy(
                     continue;
                 }
 
-                if current_writer.is_none() {
-                    let filename = format!("{}.lance", generate_random_filename());
-                    let path = dataset.base.child(DATA_DIR).child(filename.as_str());
-                    let writer = dataset.object_store.create(&path).await?;
-                    current_writer = Some(writer);
-                    current_filename = Some(filename);
+                if init_writer_if_necessary(dataset, &mut current_writer, &mut current_filename)
+                    .await?
+                {
                     current_pos = 0;
                 }
 
@@ -340,56 +432,19 @@ pub async fn rewrite_files_binary_copy(
             // Accumulate rows for the current output file and flush when reaching the threshold
             total_rows_in_current += file_meta.num_rows;
             if total_rows_in_current >= max_rows_per_file {
-                // v2_0 compatibility: enforce single-page structural headers before file close
-                // - We truncate to a single page and rewrite the page’s `num_rows` to match the output
-                //   file’s row count so downstream decoders see a consistent header.
-                let mut final_cols: Vec<Arc<ColumnInfo>> = Vec::with_capacity(column_count);
-                for (i, column_info) in current_page_table.iter().enumerate() {
-                    // For v2_0 struct headers, force a single page and set num_rows to total
-                    let mut pages_vec = std::mem::take(&mut col_pages[i]);
-                    if version == LanceFileVersion::V2_0
-                        && is_non_leaf_column.get(i).copied().unwrap_or(false)
-                        && !pages_vec.is_empty()
-                    {
-                        pages_vec[0].num_rows = total_rows_in_current;
-                        pages_vec[0].priority = 0;
-                        pages_vec.truncate(1);
-                    }
-                    let pages_arc = Arc::from(pages_vec.into_boxed_slice());
-                    let buffers_vec = std::mem::take(&mut col_buffers[i]);
-                    final_cols.push(Arc::new(ColumnInfo::new(
-                        column_info.index,
-                        pages_arc,
-                        buffers_vec,
-                        column_info.encoding.clone(),
-                    )));
-                }
-                let writer = current_writer.take().unwrap();
-                flush_footer(writer, &schema, &final_cols, total_rows_in_current, version).await?;
-
-                // Register the newly closed output file as a fragment data file
-                let (maj, min) = version.to_numbers();
-                let mut fragment_out = Fragment::new(0);
-                let mut data_file_out =
-                    DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-                // v2_0 vs v2_1+ field-to-column index mapping
-                // - v2_1+ stores only leaf columns; non-leaf fields get `-1` in the mapping
-                // - v2_0 includes structural headers as columns; non-leaf fields map to a concrete index
-                let is_structural = version >= LanceFileVersion::V2_1;
-                let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
-                let mut curr_col_idx: i32 = 0;
-                for field in schema.fields_pre_order() {
-                    if field.is_packed_struct() || field.is_leaf() || !is_structural {
-                        field_column_indices.push(curr_col_idx);
-                        curr_col_idx += 1;
-                    } else {
-                        field_column_indices.push(-1);
-                    }
-                }
-                data_file_out.fields = full_field_ids.clone();
-                data_file_out.column_indices = field_column_indices;
-                fragment_out.files.push(data_file_out);
-                fragment_out.physical_rows = Some(total_rows_in_current as usize);
+                let fragment_out = finalize_current_output_file(
+                    &schema,
+                    &full_field_ids,
+                    &mut current_writer,
+                    &mut current_filename,
+                    &current_page_table,
+                    &mut col_pages,
+                    &mut col_buffers,
+                    &is_non_leaf_column,
+                    total_rows_in_current,
+                    version,
+                )
+                .await?;
 
                 // Reset state for next output file
                 current_writer = None;
@@ -409,57 +464,20 @@ pub async fn rewrite_files_binary_copy(
 
     if total_rows_in_current > 0 {
         // Flush remaining rows as a final output file
-        // v2_0 compatibility: same single-page enforcement applies for the final file close
-        let mut final_cols: Vec<Arc<ColumnInfo>> = Vec::with_capacity(column_count);
-        for (i, ci) in current_page_table.iter().enumerate() {
-            // For v2_0 struct headers, force a single page and set num_rows to total
-            let mut pages_vec = std::mem::take(&mut col_pages[i]);
-            if version == LanceFileVersion::V2_0
-                && is_non_leaf_column.get(i).copied().unwrap_or(false)
-                && !pages_vec.is_empty()
-            {
-                pages_vec[0].num_rows = total_rows_in_current;
-                pages_vec[0].priority = 0;
-                pages_vec.truncate(1);
-            }
-            let pages_arc = Arc::from(pages_vec.into_boxed_slice());
-            let buffers_vec = std::mem::take(&mut col_buffers[i]);
-            final_cols.push(Arc::new(ColumnInfo::new(
-                ci.index,
-                pages_arc,
-                buffers_vec,
-                ci.encoding.clone(),
-            )));
-        }
-        if current_writer.is_none() {
-            let filename = format!("{}.lance", generate_random_filename());
-            let path = dataset.base.child(DATA_DIR).child(filename.as_str());
-            let writer = dataset.object_store.create(&path).await?;
-            current_writer = Some(writer);
-            current_filename = Some(filename);
-        }
-        let writer = current_writer.take().unwrap();
-        flush_footer(writer, &schema, &final_cols, total_rows_in_current, version).await?;
-        // Register the final file
-        let (maj, min) = version.to_numbers();
-        let mut frag = Fragment::new(0);
-        let mut df = DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-        // v2_0 vs v2_1+ field-to-column index mapping for the final file
-        let is_structural = version >= LanceFileVersion::V2_1;
-        let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids.len());
-        let mut curr_col_idx: i32 = 0;
-        for field in schema.fields_pre_order() {
-            if field.is_packed_struct() || field.is_leaf() || !is_structural {
-                field_column_indices.push(curr_col_idx);
-                curr_col_idx += 1;
-            } else {
-                field_column_indices.push(-1);
-            }
-        }
-        df.fields = full_field_ids.clone();
-        df.column_indices = field_column_indices;
-        frag.files.push(df);
-        frag.physical_rows = Some(total_rows_in_current as usize);
+        init_writer_if_necessary(dataset, &mut current_writer, &mut current_filename).await?;
+        let frag = finalize_current_output_file(
+            &schema,
+            &full_field_ids,
+            &mut current_writer,
+            &mut current_filename,
+            &current_page_table,
+            &mut col_pages,
+            &mut col_buffers,
+            &is_non_leaf_column,
+            total_rows_in_current,
+            version,
+        )
+        .await?;
         out.push(frag);
     }
     Ok(out)

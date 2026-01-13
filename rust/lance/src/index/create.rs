@@ -9,13 +9,15 @@ use crate::{
     index::{
         scalar::build_scalar_index,
         vector::{
-            build_empty_vector_index, build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX,
+            build_distributed_vector_index, build_empty_vector_index, build_vector_index,
+            VectorIndexParams, LANCE_VECTOR_INDEX,
         },
         vector_index_details, DatasetIndexExt, DatasetIndexInternalExt,
     },
     Error, Result,
 };
 use futures::future::BoxFuture;
+use lance_core::datatypes::format_field_path;
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams, LANCE_SCALAR_INDEX},
@@ -104,13 +106,21 @@ impl<'a> CreateIndexBuilder<'a> {
                 location: location!(),
             });
         }
-        let column = &self.columns[0];
-        let Some(field) = self.dataset.schema().field(column) else {
+        let column_input = &self.columns[0];
+        // Use case-insensitive lookup for both simple and nested paths.
+        // resolve_case_insensitive tries exact match first, then falls back to case-insensitive.
+        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(column_input) else {
             return Err(Error::Index {
-                message: format!("CreateIndex: column '{column}' does not exist"),
+                message: format!("CreateIndex: column '{column_input}' does not exist"),
                 location: location!(),
             });
         };
+        let field = *field_path.last().unwrap();
+        // Reconstruct the column path with correct case from schema
+        // Use quoted format for SQL parsing (special chars are quoted)
+        let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
+        let quoted_column: String = format_field_path(&names);
+        let column = quoted_column.as_str();
 
         // If train is true but dataset is empty, automatically set train to false
         let train = if self.train {
@@ -162,7 +172,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::NGram
                 | IndexType::ZoneMap
                 | IndexType::BloomFilter
-                | IndexType::LabelList,
+                | IndexType::LabelList
+                | IndexType::RTree,
                 LANCE_SCALAR_INDEX,
             ) => {
                 assert!(
@@ -272,16 +283,32 @@ impl<'a> CreateIndexBuilder<'a> {
                     })?;
 
                 if train {
-                    // this is a large future so move it to heap
-                    Box::pin(build_vector_index(
-                        self.dataset,
-                        column,
-                        &index_name,
-                        &index_id.to_string(),
-                        vec_params,
-                        fri,
-                    ))
-                    .await?;
+                    // Check if this is distributed indexing (fragment-level)
+                    if self.fragments.is_some() {
+                        // For distributed indexing, build only on specified fragments
+                        // This creates temporary index metadata without committing
+                        Box::pin(build_distributed_vector_index(
+                            self.dataset,
+                            column,
+                            &index_name,
+                            &index_id.to_string(),
+                            vec_params,
+                            fri,
+                            self.fragments.as_ref().unwrap(),
+                        ))
+                        .await?;
+                    } else {
+                        // Standard full dataset indexing
+                        Box::pin(build_vector_index(
+                            self.dataset,
+                            column,
+                            &index_name,
+                            &index_id.to_string(),
+                            vec_params,
+                            fri,
+                        ))
+                        .await?;
+                    }
                 } else {
                     // Create empty vector index
                     build_empty_vector_index(

@@ -136,8 +136,7 @@ impl DatasetBuilder {
     ) -> Result<Self> {
         let request = DescribeTableRequest {
             id: Some(table_id.clone()),
-            version: None,
-            with_table_uri: None,
+            ..Default::default()
         };
 
         let response = namespace
@@ -520,6 +519,9 @@ impl DatasetBuilder {
                 }
                 (branch, version_number)
             }
+            // We don't have a current branch context, just specify the branch as main
+            // But the real branch will be specified by uri
+            Some(Ref::VersionNumber(version_number)) => (None, Some(version_number)),
             // Here we assume the uri and path is the root.
             // If tag not found, we need to delay checkout after loading by uri
             Some(Ref::Tag(tag_name)) => {
@@ -564,7 +566,9 @@ impl DatasetBuilder {
             }
 
             if branch.as_deref() != dataset.manifest.branch.as_deref() {
-                return dataset.checkout_version((branch, version_number)).await;
+                return dataset
+                    .checkout_version((branch.as_deref(), version_number))
+                    .await;
             }
         }
         if let Some(version_number) = version_number {
