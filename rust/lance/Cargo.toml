@@ -165,5 +165,9 @@ harness = false
 name = "random_access"
 harness = false
 
+[[bench]]
+name = "compaction_binary_copy"
+harness = false
+
 [lints]
 workspace = true
