@@ -765,20 +765,20 @@ fn inner_release_native_dataset(env: &mut JNIEnv, obj: JObject) -> Result<()> {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex(
-    mut env: JNIEnv,
-    java_dataset: JObject,
-    columns_jobj: JObject, // List<String>
+pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject<'local>,
+    columns_jobj: JObject<'local>, // List<String>
     index_type_code_jobj: jint,
-    name_jobj: JObject,              // Optional<String>
-    params_jobj: JObject,            // IndexParams
-    replace_jobj: jboolean,          // replace
-    train_jobj: jboolean,            // train
-    fragments_jobj: JObject,         // List<Integer>
-    index_uuid_jobj: JObject,        // String
-    arrow_stream_addr_jobj: JObject, // Optional<Long>
-) {
-    ok_or_throw_without_return!(
+    name_jobj: JObject<'local>,              // Optional<String>
+    params_jobj: JObject<'local>,            // IndexParams
+    replace_jobj: jboolean,                  // replace
+    train_jobj: jboolean,                    // train
+    fragments_jobj: JObject<'local>,         // List<Integer>
+    index_uuid_jobj: JObject<'local>,        // String
+    arrow_stream_addr_jobj: JObject<'local>, // Optional<Long>
+) -> JObject<'local> {
+    ok_or_throw!(
         env,
         inner_create_index(
             &mut env,
@@ -793,23 +793,23 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex(
             index_uuid_jobj,
             arrow_stream_addr_jobj,
         )
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn inner_create_index(
-    env: &mut JNIEnv,
-    java_dataset: JObject,
-    columns_jobj: JObject, // List<String>
+fn inner_create_index<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject<'local>,
+    columns_jobj: JObject<'local>, // List<String>
     index_type_code_jobj: jint,
-    name_jobj: JObject,              // Optional<String>
-    params_jobj: JObject,            // IndexParams
-    replace_jobj: jboolean,          // replace
-    train_jobj: jboolean,            // train
-    fragments_jobj: JObject,         // Optional<List<String>>
-    index_uuid_jobj: JObject,        // Optional<String>
-    arrow_stream_addr_jobj: JObject, // Optional<Long>
-) -> Result<()> {
+    name_jobj: JObject<'local>,              // Optional<String>
+    params_jobj: JObject<'local>,            // IndexParams
+    replace_jobj: jboolean,                  // replace
+    train_jobj: jboolean,                    // train
+    fragments_jobj: JObject<'local>,         // Optional<List<String>>
+    index_uuid_jobj: JObject<'local>,        // Optional<String>
+    arrow_stream_addr_jobj: JObject<'local>, // Optional<Long>
+) -> Result<JObject<'local>> {
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
     let name = env.get_string_opt(&name_jobj)?;
@@ -873,38 +873,43 @@ fn inner_create_index(
     };
 
     let params = params_result?;
-    let mut dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
-    let mut index_builder = dataset_guard
-        .inner
-        .create_index_builder(&columns_slice, index_type, params.as_ref())
-        .replace(replace)
-        .train(train);
+    // Execute index creation in a block to ensure dataset_guard is dropped
+    // before we call into_java (which needs to borrow env again)
+    let index_metadata = {
+        let mut dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
-    if let Some(name) = name {
-        index_builder = index_builder.name(name);
-    }
+        let mut index_builder = dataset_guard
+            .inner
+            .create_index_builder(&columns_slice, index_type, params.as_ref())
+            .replace(replace)
+            .train(train);
 
-    if let Some(fragment_ids) = fragment_ids {
-        index_builder = index_builder.fragments(fragment_ids);
-    }
+        if let Some(name) = name {
+            index_builder = index_builder.name(name);
+        }
 
-    if let Some(index_uuid) = index_uuid {
-        index_builder = index_builder.index_uuid(index_uuid);
-    }
+        if let Some(fragment_ids) = fragment_ids {
+            index_builder = index_builder.fragments(fragment_ids);
+        }
 
-    if let Some(reader) = batch_reader {
-        index_builder = index_builder.preprocessed_data(Box::new(reader));
-    }
+        if let Some(index_uuid) = index_uuid {
+            index_builder = index_builder.index_uuid(index_uuid);
+        }
 
-    if skip_commit {
-        RT.block_on(index_builder.execute_uncommitted())?;
-    } else {
-        RT.block_on(index_builder.into_future())?
-    }
+        if let Some(reader) = batch_reader {
+            index_builder = index_builder.preprocessed_data(Box::new(reader));
+        }
 
-    Ok(())
+        if skip_commit {
+            RT.block_on(index_builder.execute_uncommitted())?
+        } else {
+            RT.block_on(index_builder.into_future())?
+        }
+    };
+
+    (&index_metadata).into_java(env)
 }
 
 fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Result<bool> {

@@ -81,7 +81,7 @@ use lance_index::{
 };
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
-use lance_table::format::{BasePath, Fragment};
+use lance_table::format::{BasePath, Fragment, IndexMetadata};
 use lance_table::io::commit::CommitHandler;
 
 use crate::error::PythonErrorExt;
@@ -1834,7 +1834,7 @@ impl Dataset {
         train: Option<bool>,
         storage_options: Option<HashMap<String, String>>,
         kwargs: Option<&Bound<PyDict>>,
-    ) -> PyResult<()> {
+    ) -> PyResult<PyLance<IndexMetadata>> {
         let columns: Vec<&str> = columns.iter().map(|s| &**s).collect();
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
@@ -2009,19 +2009,21 @@ impl Dataset {
         use std::future::IntoFuture;
 
         // Use execute_uncommitted if fragment_ids is provided, otherwise use execute
-        if has_fragment_ids {
+        let index_metadata = if has_fragment_ids {
             // For fragment-level indexing, use execute_uncommitted
-            let _index_metadata = rt()
+            let index_metadata = rt()
                 .block_on(None, builder.execute_uncommitted())?
                 .infer_error()?;
             // Note: We don't update self.ds here as the index is not committed
+            index_metadata
         } else {
             // For regular indexing, use the standard execute path
-            rt().block_on(None, builder.into_future())?.infer_error()?;
+            let index_metadata = rt().block_on(None, builder.into_future())?.infer_error()?;
             self.ds = Arc::new(new_self);
-        }
+            index_metadata
+        };
 
-        Ok(())
+        Ok(PyLance(index_metadata))
     }
 
     fn drop_index(&mut self, name: &str) -> PyResult<()> {
