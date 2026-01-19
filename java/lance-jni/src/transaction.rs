@@ -559,7 +559,7 @@ fn convert_to_java_operation_inner<'local>(
             updated_fragments,
             new_fragments,
             fields_modified,
-            mem_wal_to_merge: _,
+            merged_generations: _,
             fields_for_preserving_frag_bitmap,
             update_mode,
             inserted_rows_filter: _,
@@ -729,6 +729,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCommitTransaction<'local>(
     java_dataset: JObject,
     java_transaction: JObject,
     detached_jbool: jboolean,
+    enable_v2_manifest_paths: jboolean,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -737,6 +738,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCommitTransaction<'local>(
             java_dataset,
             java_transaction,
             detached_jbool != 0,
+            enable_v2_manifest_paths != 0,
         )
     )
 }
@@ -746,32 +748,55 @@ fn inner_commit_transaction<'local>(
     java_dataset: JObject,
     java_transaction: JObject,
     detached: bool,
+    enable_v2_manifest_paths: bool,
 ) -> Result<JObject<'local>> {
     let write_param_jobj = env
         .call_method(&java_transaction, "writeParams", "()Ljava/util/Map;", &[])?
         .l()?;
     let write_param_jmap = JMap::from_env(env, &write_param_jobj)?;
-    let mut write_param = to_rust_map(env, &write_param_jmap)?;
+    let write_param = to_rust_map(env, &write_param_jmap)?;
 
-    // Extract s3_credentials_refresh_offset_seconds from write_param
-    let s3_credentials_refresh_offset = write_param
-        .remove("s3_credentials_refresh_offset_seconds")
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(10));
-
-    // Get the Dataset's storage_options_provider
-    let storage_options_provider = {
+    // Get the Dataset's storage_options_accessor and merge with write_param
+    let storage_options_accessor = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.get_storage_options_provider()
+        let existing_accessor = dataset_guard.inner.storage_options_accessor();
+
+        // Merge write_param with existing accessor's initial options
+        match existing_accessor {
+            Some(accessor) => {
+                let mut merged = accessor
+                    .initial_storage_options()
+                    .cloned()
+                    .unwrap_or_default();
+                merged.extend(write_param);
+                if let Some(provider) = accessor.provider().cloned() {
+                    Some(Arc::new(
+                        lance::io::StorageOptionsAccessor::with_initial_and_provider(
+                            merged, provider,
+                        ),
+                    ))
+                } else {
+                    Some(Arc::new(
+                        lance::io::StorageOptionsAccessor::with_static_options(merged),
+                    ))
+                }
+            }
+            None => {
+                if !write_param.is_empty() {
+                    Some(Arc::new(
+                        lance::io::StorageOptionsAccessor::with_static_options(write_param),
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
     };
 
-    // Build ObjectStoreParams using write_param for storage_options and provider from Dataset
+    // Build ObjectStoreParams using the merged accessor
     let store_params = ObjectStoreParams {
-        storage_options: Some(write_param),
-        storage_options_provider,
-        s3_credentials_refresh_offset,
+        storage_options_accessor,
         ..Default::default()
     };
 
@@ -779,7 +804,12 @@ fn inner_commit_transaction<'local>(
     let new_blocking_ds = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.commit_transaction(transaction, store_params, detached)?
+        dataset_guard.commit_transaction(
+            transaction,
+            store_params,
+            detached,
+            enable_v2_manifest_paths,
+        )?
     };
     new_blocking_ds.into_java(env)
 }
@@ -1048,7 +1078,7 @@ fn convert_to_rust_operation(
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_merge: None,
+                merged_generations: vec![],
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter: None,
