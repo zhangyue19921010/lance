@@ -384,9 +384,7 @@ impl DatasetDelta {
     }
 
     async fn build_updated_rows_batch_filter(&self) -> Result<String> {
-        let (begin_version, end_version) = self
-            .resolve_range()
-            .await?;
+        let (begin_version, end_version) = self.resolve_range().await?;
         Ok(format!(
             "_row_created_at_version <= {} AND _row_last_updated_at_version > {} AND _row_last_updated_at_version <= {}",
             begin_version, begin_version, end_version
@@ -451,7 +449,10 @@ impl DatasetDelta {
     async fn build_upserted_rows_filter(&self) -> Result<String> {
         let inserted_row_filter = self.build_inserted_rows_filter().await?;
         let updated_rows_filter = self.build_updated_rows_batch_filter().await?;
-       Ok( format!("({}) OR ({})", inserted_row_filter, updated_rows_filter))
+        Ok(format!(
+            "({}) OR ({})",
+            inserted_row_filter, updated_rows_filter
+        ))
     }
 }
 
