@@ -1,11 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-
+import warnings
 from typing import Optional, Tuple
 
-from lance.dependencies import torch
-from lance.log import LOGGER
+# Suppress torch.jit.script deprecation warning in PyTorch 2.10+
+# TODO: migrate to torch.compile when feasible
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torch\.jit\.script.*deprecated.*",
+    category=DeprecationWarning,
+)
+
+from lance.dependencies import torch  # noqa: E402
+from lance.log import LOGGER  # noqa: E402
 
 __all__ = [
     "pairwise_cosine",
