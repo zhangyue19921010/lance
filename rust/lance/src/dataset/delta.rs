@@ -319,21 +319,18 @@ impl DatasetDelta {
         ])?;
 
         // Filter for rows created in the version range
-        let filter = self.build_inserted_rows_filter().await;
+        let filter = self.build_inserted_rows_filter().await?;
         scanner.filter(&filter)?;
 
         scanner.try_into_stream().await
     }
 
-    async fn build_inserted_rows_filter(&self) -> String {
-        let (begin_version, end_version) = self
-            .resolve_range()
-            .await
-            .unwrap_or((self.begin_version, self.end_version));
-        format!(
+    async fn build_inserted_rows_filter(&self) -> Result<String> {
+        let (begin_version, end_version) = self.resolve_range().await?;
+        Ok(format!(
             "_row_created_at_version > {} AND _row_created_at_version <= {}",
             begin_version, end_version
-        )
+        ))
     }
 
     /// Get updated rows between the two versions.
@@ -380,21 +377,20 @@ impl DatasetDelta {
         ])?;
 
         // Filter for rows that were updated (not inserted) in the version range
-        let filter = self.build_updated_rows_batch_filter().await;
+        let filter = self.build_updated_rows_batch_filter().await?;
         scanner.filter(&filter)?;
 
         scanner.try_into_stream().await
     }
 
-    async fn build_updated_rows_batch_filter(&self) -> String {
+    async fn build_updated_rows_batch_filter(&self) -> Result<String> {
         let (begin_version, end_version) = self
             .resolve_range()
-            .await
-            .unwrap_or((self.begin_version, self.end_version));
-        format!(
+            .await?;
+        Ok(format!(
             "_row_created_at_version <= {} AND _row_last_updated_at_version > {} AND _row_last_updated_at_version <= {}",
             begin_version, begin_version, end_version
-        )
+        ))
     }
 
     /// Get upserted rows between the two versions.
@@ -446,16 +442,16 @@ impl DatasetDelta {
         ])?;
 
         // Filter for rows that were updated or inserted in the version range
-        let filter = self.build_upserted_rows_filter().await;
+        let filter = self.build_upserted_rows_filter().await?;
         scanner.filter(&filter)?;
 
         scanner.try_into_stream().await
     }
 
-    async fn build_upserted_rows_filter(&self) -> String {
-        let inserted_row_filter = self.build_inserted_rows_filter().await;
-        let updated_rows_filter = self.build_updated_rows_batch_filter().await;
-        format!("({}) OR ({})", inserted_row_filter, updated_rows_filter)
+    async fn build_upserted_rows_filter(&self) -> Result<String> {
+        let inserted_row_filter = self.build_inserted_rows_filter().await?;
+        let updated_rows_filter = self.build_updated_rows_batch_filter().await?;
+       Ok( format!("({}) OR ({})", inserted_row_filter, updated_rows_filter))
     }
 }
 
