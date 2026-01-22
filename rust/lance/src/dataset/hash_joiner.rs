@@ -311,13 +311,9 @@ mod tests {
 
     async fn create_dataset() -> Dataset {
         let uri = TempDir::default().path_str();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("i", DataType::Int32, true),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, true)]));
         let batches = RecordBatchIterator::new(std::iter::empty().map(Ok), schema.clone());
-        Dataset::write(batches, &uri, None)
-            .await
-            .unwrap();
+        Dataset::write(batches, &uri, None).await.unwrap();
 
         Dataset::open(&uri).await.unwrap()
     }
