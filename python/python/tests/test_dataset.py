@@ -1624,7 +1624,7 @@ def test_merge_columns_rowid(tmp_path: Path):
     )
 
 
-def test_merge_columns_with_nulls(tmp_path: Path):
+def test_add_columns_with_nulls(tmp_path: Path):
     table = pa.table({"a": range(100)})
     base_dir = tmp_path / "merge_columns_float32_with_nulls"
     dataset = lance.write_dataset(table, base_dir)
