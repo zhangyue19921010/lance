@@ -1624,6 +1624,28 @@ def test_merge_columns_rowid(tmp_path: Path):
     )
 
 
+def test_merge_columns_float32_with_nulls(tmp_path: Path):
+    table = pa.table({"a": range(100)})
+    base_dir = tmp_path / "merge_columns_float32_with_nulls"
+    dataset = lance.write_dataset(table, base_dir)
+
+    fragment = dataset.get_fragments()[0]
+    input_data = [float(i) for i in range(10)]
+    update = pa.table(
+        {
+            "a": range(10),
+            "b": pa.array(input_data, type=pa.float32()),
+        }
+    )
+    merged, schema = fragment.merge(update, left_on="a", right_on="a")
+    merge = lance.LanceOperation.Merge([merged], schema)
+    dataset = lance.LanceDataset.commit(base_dir, merge, read_version=dataset.version)
+
+    expected_b = pa.array(input_data + [None] * 90, type=pa.float32())
+    expected = pa.table({"a": range(100), "b": expected_b})
+    assert dataset.to_table() == expected
+
+
 def test_merge_separate_dataset(tmp_path: Path):
     base_ds = lance.write_dataset(
         pa.table({"a": range(10), "b": range(10)}), tmp_path / "base"
