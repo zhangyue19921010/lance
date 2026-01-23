@@ -491,12 +491,12 @@ def test_tag(tmp_path: Path):
 
     # test tag update
     with pytest.raises(
-            ValueError, match="Version not found error: version main:3 does not exist"
+        ValueError, match="Version not found error: version main:3 does not exist"
     ):
         ds.tags.update("tag1", 3)
 
     with pytest.raises(
-            ValueError, match="Ref not found error: tag tag3 does not exist"
+        ValueError, match="Ref not found error: tag tag3 does not exist"
     ):
         ds.tags.update("tag3", 1)
 
@@ -802,8 +802,8 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
     dataset.delete("a % 2 = 0")
     filt_table = table.filter((pa.compute.bit_wise_and(pa.compute.field("a"), 1)) != 0)
     assert (
-            dataset.to_table(offset=10).combine_chunks()
-            == filt_table.slice(10).combine_chunks()
+        dataset.to_table(offset=10).combine_chunks()
+        == filt_table.slice(10).combine_chunks()
     )
 
     dataset = dataset.checkout_version(full_ds_version)
@@ -848,7 +848,7 @@ def test_tilde_paths(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
 
     with mock.patch.dict(
-            os.environ, {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path)}
+        os.environ, {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path)}
     ):
         # NOTE: the resolution logic is a bit finicky
         # link 1 - https://docs.rs/dirs/4.0.0/dirs/fn.home_dir.html
@@ -1024,12 +1024,12 @@ def test_count_rows_via_scanner(tmp_path: Path):
     assert ds.scanner(filter="a < 50", columns=[], with_row_id=True).count_rows() == 50
 
     with pytest.raises(
-            ValueError, match="should not be called on a plan selecting columns"
+        ValueError, match="should not be called on a plan selecting columns"
     ):
         ds.scanner(filter="a < 50", columns=["a"], with_row_id=True).count_rows()
 
     with pytest.raises(
-            ValueError, match="should not be called on a plan selecting columns"
+        ValueError, match="should not be called on a plan selecting columns"
     ):
         ds.scanner(with_row_id=True).count_rows()
 
@@ -1408,7 +1408,7 @@ def test_strict_overwrite(tmp_path: Path):
         base_dir, operation, read_version=dataset_v1.version, max_retries=0
     )
     with pytest.raises(
-            OSError, match=f"Commit conflict for version {dataset_v1.version + 1}"
+        OSError, match=f"Commit conflict for version {dataset_v1.version + 1}"
     ):
         lance.LanceDataset.commit(
             base_dir, operation, read_version=dataset_v1.version, max_retries=0
@@ -1786,8 +1786,10 @@ def test_load_scanner_from_fragments(tmp_path: Path):
 
 def test_merge_data_legacy(tmp_path: Path):
     tab = pa.table({"a": range(100), "b": range(100)})
-    lance.write_dataset(tab, tmp_path / "dataset", mode="append", data_storage_version="legacy")
+    lance.write_dataset(tab, tmp_path / "dataset", mode="append")
+
     dataset = lance.dataset(tmp_path / "dataset")
+
     # rejects partial data for non-nullable types
     new_tab = pa.table({"a": range(40), "c": range(40)})
     with pytest.raises(
@@ -1903,10 +1905,10 @@ def test_delete_data(tmp_path: Path):
 
 def check_merge_stats(merge_dict, expected):
     assert (
-               merge_dict["num_inserted_rows"],
-               merge_dict["num_updated_rows"],
-               merge_dict["num_deleted_rows"],
-           ) == expected
+        merge_dict["num_inserted_rows"],
+        merge_dict["num_updated_rows"],
+        merge_dict["num_deleted_rows"],
+    ) == expected
 
 
 def test_merge_insert(tmp_path: Path):
@@ -2062,7 +2064,7 @@ def test_merge_insert_subcols(tmp_path: Path):
 
     assert len(fragments[0].data_files()) == 2
     assert (
-            fragments[0].data_files()[0].path == original_fragments[0].data_files()[0].path
+        fragments[0].data_files()[0].path == original_fragments[0].data_files()[0].path
     )
     assert len(fragments[1].data_files()) == 1
     assert str(fragments[1].data_files()[0]) == str(
@@ -2150,10 +2152,10 @@ def test_flat_vector_search_with_delete(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path / "dataset", mode="create")
     dataset.delete("id = 0")
     assert (
-            dataset.scanner(nearest={"column": "vector", "k": 10, "q": [1.0, 1.0]})
-            .to_table()
-            .num_rows
-            == 9
+        dataset.scanner(nearest={"column": "vector", "k": 10, "q": [1.0, 1.0]})
+        .to_table()
+        .num_rows
+        == 9
     )
 
 
@@ -2735,12 +2737,12 @@ def test_add_null_columns_with_conflict_names(tmp_path: Path):
     assert len(fragments[0].data_files()) == 1
 
     with pytest.raises(
-            Exception, match=".*Type conflicts between id\\(Int64\\) and id\\(Float32\\).*"
+        Exception, match=".*Type conflicts between id\\(Int64\\) and id\\(Float32\\).*"
     ):
         ds.add_columns(pa.field("id", pa.float32()))
 
     with pytest.raises(
-            Exception, match=".*Type conflicts between id\\(Int64\\) and id\\(Float32\\).*"
+        Exception, match=".*Type conflicts between id\\(Int64\\) and id\\(Float32\\).*"
     ):
         ds.add_columns([pa.field("id", pa.float32()), pa.field("good", pa.int32())])
 
@@ -3455,17 +3457,17 @@ def test_scan_deleted_rows(tmp_path: Path):
     )
 
     assert (
-            ds.scanner(with_row_id=True, include_deleted_rows=True, filter="a < 32")
-            .to_table()
-            .num_rows
-            == 7
+        ds.scanner(with_row_id=True, include_deleted_rows=True, filter="a < 32")
+        .to_table()
+        .num_rows
+        == 7
     )
 
     assert (
-            ds.scanner(include_deleted_rows=True, with_row_id=True, filter="b < 30")
-            .to_table()
-            .num_rows
-            == 5
+        ds.scanner(include_deleted_rows=True, with_row_id=True, filter="b < 30")
+        .to_table()
+        .num_rows
+        == 5
     )
 
     with pytest.raises(ValueError, match="with_row_id is false"):
@@ -4016,8 +4018,8 @@ def test_late_materialization_param(tmp_path: Path):
     assert list(dataset.to_batches(filter=filt, late_materialization=False)) == expected
     assert list(dataset.to_batches(filter=filt, late_materialization=True)) == expected
     assert (
-            list(dataset.to_batches(filter=filt, late_materialization=["values"]))
-            == expected
+        list(dataset.to_batches(filter=filt, late_materialization=["values"]))
+        == expected
     )
 
 
@@ -4027,10 +4029,10 @@ def test_late_materialization_batch_size(tmp_path: Path):
         table, tmp_path, data_storage_version="stable", max_rows_per_file=10000
     )
     for batch in dataset.to_batches(
-            columns=["values"],
-            filter="filter % 2 == 0",
-            batch_size=32,
-            late_materialization=True,
+        columns=["values"],
+        filter="filter % 2 == 0",
+        batch_size=32,
+        late_materialization=True,
     ):
         assert batch.num_rows == 32
 
@@ -4399,7 +4401,7 @@ def test_file_reader_options(tmp_path: Path):
     dataset_both = lance.dataset(
         tmp_path / "test",
         read_params={"cache_repetition_index": True, "validate_on_decode": False},
-        )
+    )
     result4 = dataset_both.to_table()
     assert result4.num_rows == 10000
 
@@ -4407,7 +4409,7 @@ def test_file_reader_options(tmp_path: Path):
     dataset_inherit = lance.dataset(
         tmp_path / "test",
         read_params={"cache_repetition_index": True, "validate_on_decode": True},
-        )
+    )
     scanner = dataset_inherit.scanner()
     result5 = scanner.to_table()
     assert result5.num_rows == 10000
@@ -4504,8 +4506,8 @@ def test_commit_message_and_get_properties(tmp_path):
     transactions = dataset.get_transactions()
     assert len(transactions) == 1
     assert (
-            transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
-            == "first commit"
+        transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
+        == "first commit"
     )
     # 2. Test case: Commit without a message
     lance.write_dataset(table, tmp_path, mode="append")
@@ -4516,13 +4518,13 @@ def test_commit_message_and_get_properties(tmp_path):
     # The latest transaction has no message,
     # so the key should be missing or properties is None
     assert (
-            transactions[0].transaction_properties == {}
-            or LANCE_COMMIT_MESSAGE_KEY not in transactions[0].transaction_properties
+        transactions[0].transaction_properties == {}
+        or LANCE_COMMIT_MESSAGE_KEY not in transactions[0].transaction_properties
     )
     # The first transaction should still have the message
     assert (
-            transactions[1].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
-            == "first commit"
+        transactions[1].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
+        == "first commit"
     )
     # 3. Test case: Transaction with no properties at all
     # A delete operation creates a new version that may have no properties.
@@ -4544,8 +4546,8 @@ def test_commit_message_and_get_properties(tmp_path):
     transactions = dataset.get_transactions()
     assert len(transactions) == 4
     assert (
-            transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
-            == "Use Dataset.commit"
+        transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
+        == "Use Dataset.commit"
     )
 
 
