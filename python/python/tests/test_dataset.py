@@ -1786,7 +1786,7 @@ def test_load_scanner_from_fragments(tmp_path: Path):
 
 def test_merge_data_legacy(tmp_path: Path):
     tab = pa.table({"a": range(100), "b": range(100)})
-    lance.write_dataset(tab, tmp_path / "dataset", mode="append")
+    lance.write_dataset(tab, tmp_path / "dataset", mode="append", data_storage_version="legacy")
 
     dataset = lance.dataset(tmp_path / "dataset")
 
