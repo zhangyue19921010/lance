@@ -2247,7 +2247,7 @@ impl DocSet {
                 max_score = f32::MIN;
             }
         }
-        if length % BLOCK_SIZE > 0 {
+        if !length.is_multiple_of(BLOCK_SIZE) {
             max_score *= idf_scale;
             block_max_scores.push(max_score);
         }
