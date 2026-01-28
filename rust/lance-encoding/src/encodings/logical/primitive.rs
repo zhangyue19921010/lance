@@ -4277,14 +4277,14 @@ impl PrimitiveStructuralEncoder {
     /// 1. Dictionary: stores unique values
     /// 2. Indices: maps each value to a dictionary entry
     ///
-    /// For FixedWidth (e.g., 128-bit Decimal):
-    /// - Dictionary: cardinality × 16 bytes (128 bits per value)
+    /// For FixedWidth:
+    /// - Dictionary values: cardinality × (bits_per_value / 8)
     /// - Indices: num_values × 4 bytes (32-bit i32)
     ///
     /// For VariableWidth (strings/binary):
     /// - Dictionary values: cardinality × avg_value_size (actual data)
     /// - Dictionary offsets: cardinality × offset_size (32 or 64 bits)
-    /// - Indices: num_values × offset_size (same as dictionary offsets)
+    /// - Indices: num_values × 4 bytes (32-bit i32)
     fn estimate_dict_size(data_block: &DataBlock, version: LanceFileVersion) -> Option<u64> {
         let cardinality = if let Some(cardinality_array) = data_block.get_stat(Stat::Cardinality) {
             cardinality_array.as_primitive::<UInt64Type>().value(0)
@@ -4293,6 +4293,9 @@ impl PrimitiveStructuralEncoder {
         };
 
         let num_values = data_block.num_values();
+        if num_values == 0 {
+            return None;
+        }
 
         match data_block {
             DataBlock::FixedWidth(fixed) => {
@@ -4322,9 +4325,8 @@ impl PrimitiveStructuralEncoder {
                     return None;
                 }
                 let bits_per_offset = var.bits_per_offset as u64;
-                if (bits_per_offset == 32 && cardinality > i32::MAX as u64)
-                    || (bits_per_offset == 64 && cardinality > i64::MAX as u64)
-                {
+                // Dictionary indices are always i32.
+                if cardinality > i32::MAX as u64 {
                     return None;
                 }
 
@@ -4335,8 +4337,8 @@ impl PrimitiveStructuralEncoder {
                 let dict_values_size = cardinality * avg_value_size;
                 // Dictionary offsets: pointers into dictionary values
                 let dict_offsets_size = cardinality * (bits_per_offset / 8);
-                // Indices: map each row to dictionary entry
-                let indices_size = num_values * (bits_per_offset / 8);
+                // Indices: map each row to dictionary entry (always i32)
+                let indices_size = num_values * (DICT_INDICES_BITS_PER_VALUE / 8);
 
                 Some(dict_values_size + dict_offsets_size + indices_size)
             }
@@ -4362,6 +4364,13 @@ impl PrimitiveStructuralEncoder {
             }
             DataBlock::VariableWidth(_) => {}
             _ => return false,
+        }
+
+        // Currently VariableWidth only supports 32 and 64 bits
+        if let DataBlock::VariableWidth(var) = data_block {
+            if var.bits_per_offset != 32 && var.bits_per_offset != 64 {
+                return false;
+            }
         }
 
         // Don't dictionary encode tiny arrays
