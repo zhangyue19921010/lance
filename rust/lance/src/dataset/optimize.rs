@@ -160,6 +160,12 @@ pub struct CompactionOptions {
     /// is updated and will be used to perform remapping later.
     pub defer_index_remap: bool,
     /// Whether to enable binary copy optimization when eligible.
+    ///
+    /// This skips re-encoding the data and can lead to faster compaction
+    /// times.  However, it cannot merge pages together and should not be
+    /// used when compacting small files together because the pages in the
+    /// compacted file will be too small and this could lead to poor I/O patterns.
+    ///
     /// Defaults to false.
     pub enable_binary_copy: bool,
     /// Whether to force binary copy optimization. If true, compaction will fail
@@ -234,6 +240,7 @@ async fn can_use_binary_copy_impl(
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
     if !options.enable_binary_copy {
+        log::debug!("Binary copy disabled: enable_binary_copy config is false");
         return Ok(false);
     }
 
@@ -242,6 +249,7 @@ async fn can_use_binary_copy_impl(
         .fields_pre_order()
         .any(|field| field.is_blob());
     if has_blob_columns {
+        log::debug!("Binary copy disabled: dataset contains blob columns");
         return Ok(false);
     }
 
@@ -252,10 +260,12 @@ async fn can_use_binary_copy_impl(
         .map(|v| !matches!(v.resolve(), LanceFileVersion::Legacy))
         .unwrap_or(false);
     if !storage_ok {
+        log::debug!("Binary copy disabled: dataset uses legacy storage format");
         return Ok(false);
     }
 
     if fragments.is_empty() {
+        log::debug!("Binary copy disabled: no fragments to compact");
         return Ok(false);
     }
 
@@ -266,6 +276,10 @@ async fn can_use_binary_copy_impl(
         .resolve();
 
     if fragments[0].files.is_empty() {
+        log::debug!(
+            "Binary copy disabled: fragment {} has no data files",
+            fragments[0].id
+        );
         return Ok(false);
     }
     let ref_fields = &fragments[0].files[0].fields;
@@ -274,6 +288,10 @@ async fn can_use_binary_copy_impl(
 
     for fragment in fragments {
         if fragment.deletion_file.is_some() {
+            log::debug!(
+                "Binary copy disabled: fragment {} has a deletion file",
+                fragment.id
+            );
             return Ok(false);
         }
 
@@ -314,12 +332,17 @@ async fn can_use_binary_copy_impl(
             // Therefore, we reject input files that contain any additional global buffers beyond
             // the required schema / file descriptor global buffer (global buffer index 0).
             if file_meta.file_buffers.len() > 1 {
+                log::debug!(
+                    "Binary copy disabled: data file has extra global buffers (len={})",
+                    file_meta.file_buffers.len()
+                );
                 return Ok(false);
             }
         }
     }
 
     if !is_same_version {
+        log::debug!("Binary copy disabled: data files use different file versions");
         return Ok(false);
     }
 
