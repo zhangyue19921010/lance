@@ -1376,7 +1376,8 @@ impl FileFragment {
         };
 
         // Then call take rows
-        self.take_rows(&row_ids, projection, false, false).await
+        self.take_rows(&row_ids, projection, false, false, false, false)
+            .await
     }
 
     /// Get the deletion vector for this fragment, using the cache if available.
@@ -1424,13 +1425,17 @@ impl FileFragment {
         projection: &Schema,
         with_row_id: bool,
         with_row_address: bool,
+        with_row_created_at_version: bool,
+        with_row_last_updated_at_version: bool,
     ) -> Result<RecordBatch> {
         let reader = self
             .open(
                 projection,
                 FragReadConfig::default()
                     .with_row_id(with_row_id)
-                    .with_row_address(with_row_address),
+                    .with_row_address(with_row_address)
+                    .with_row_created_at_version(with_row_created_at_version)
+                    .with_row_last_updated_at_version(with_row_last_updated_at_version),
             )
             .await?;
 
@@ -1590,7 +1595,9 @@ impl FileFragment {
         let mut updater = self.updater(Some(&[join_column]), None, None).await?;
 
         while let Some(batch) = updater.next().await? {
-            let batch = joiner.collect(batch[join_column].clone()).await?;
+            let batch = joiner
+                .collect(&self.dataset, batch[join_column].clone())
+                .await?;
             updater.update(batch).await?;
         }
 
@@ -2852,7 +2859,7 @@ mod tests {
             updated_fragments: vec![updated_fragment1],
             new_fragments: vec![],
             fields_modified: fields_modified1,
-            mem_wal_to_merge: None,
+            merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
@@ -2925,7 +2932,7 @@ mod tests {
             updated_fragments: vec![updated_fragment2],
             new_fragments: vec![],
             fields_modified: fields_modified2,
-            mem_wal_to_merge: None,
+            merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
@@ -3314,7 +3321,14 @@ mod tests {
 
         // Repeated indices are repeated in result.
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 5, 8], dataset.schema(), false, false)
+            .take_rows(
+                &[1, 2, 4, 5, 5, 8],
+                dataset.schema(),
+                false,
+                false,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3333,7 +3347,14 @@ mod tests {
             .unwrap();
         assert!(fragment.metadata().deletion_file.is_some());
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, false)
+            .take_rows(
+                &[1, 2, 4, 5, 8],
+                dataset.schema(),
+                false,
+                false,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3343,7 +3364,7 @@ mod tests {
 
         // Empty indices gives empty result
         let batch = fragment
-            .take_rows(&[], dataset.schema(), false, false)
+            .take_rows(&[], dataset.schema(), false, false, false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -3353,7 +3374,14 @@ mod tests {
 
         // Can get row ids
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, true)
+            .take_rows(
+                &[1, 2, 4, 5, 8],
+                dataset.schema(),
+                false,
+                true,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(

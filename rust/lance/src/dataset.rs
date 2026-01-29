@@ -19,23 +19,22 @@ use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
-use lance_core::datatypes::{
-    BlobVersion, Field, OnMissing, OnTypeMismatch, Projectable, Projection,
-};
+use lance_core::datatypes::{BlobVersion, OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
     DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
     TRACE_DATASET_EVENTS,
 };
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
-use lance_index::DatasetIndexExt;
+use lance_index::{DatasetIndexExt, IndexType};
 use lance_io::object_store::{
-    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams,
+    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
+    StorageOptionsAccessor, StorageOptionsProvider,
 };
 use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_namespace::LanceNamespace;
@@ -70,6 +69,7 @@ pub mod delta;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;
+pub mod mem_wal;
 mod metadata;
 pub mod optimize;
 pub mod progress;
@@ -84,7 +84,7 @@ pub mod transaction;
 pub mod udtf;
 pub mod updater;
 mod utils;
-mod write;
+pub mod write;
 
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
@@ -110,6 +110,7 @@ pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 use lance_core::box_error;
 pub use lance_core::ROW_ID;
+use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{
     CreateEmptyTableRequest, DeclareTableRequest, DeclareTableResponse, DescribeTableRequest,
 };
@@ -124,6 +125,7 @@ pub use write::merge_insert::{
     WhenNotMatched, WhenNotMatchedBySource,
 };
 
+use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
@@ -188,7 +190,7 @@ impl std::fmt::Debug for Dataset {
 }
 
 /// Dataset Version
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct Version {
     /// version number
     pub version: u64,
@@ -334,47 +336,9 @@ impl ProjectionRequest {
             .map(|s| s.as_ref().to_string())
             .collect::<Vec<_>>();
 
-        // Separate data columns from system columns
-        // System columns need to be added to the schema manually since Schema::project
-        // doesn't include them (they're virtual columns)
-        let mut data_columns = Vec::new();
-        let mut system_fields = Vec::new();
-
-        for col in &columns {
-            if lance_core::is_system_column(col) {
-                // For now we only support _rowid and _rowaddr in projections
-                if col == ROW_ID {
-                    system_fields.push(Field::try_from(ROW_ID_FIELD.clone()).unwrap());
-                } else if col == ROW_ADDR {
-                    system_fields.push(Field::try_from(ROW_ADDR_FIELD.clone()).unwrap());
-                }
-                // Note: Other system columns like _rowoffset are handled differently
-            } else {
-                data_columns.push(col.as_str());
-            }
-        }
-
-        // Project only the data columns
-        let mut schema = dataset_schema.project(&data_columns).unwrap();
-
-        // Add system fields in the order they appeared in the original columns list
-        // We need to reconstruct the proper order
-        let mut final_fields = Vec::new();
-        for col in &columns {
-            if lance_core::is_system_column(col) {
-                // Find and add the system field
-                if let Some(field) = system_fields.iter().find(|f| &f.name == col) {
-                    final_fields.push(field.clone());
-                }
-            } else {
-                // Find and add the data field
-                if let Some(field) = schema.fields.iter().find(|f| &f.name == col) {
-                    final_fields.push(field.clone());
-                }
-            }
-        }
-
-        schema.fields = final_fields;
+        let schema = dataset_schema
+            .project_preserve_system_columns(&columns)
+            .unwrap();
         Self::Schema(Arc::new(schema))
     }
 
@@ -808,15 +772,11 @@ impl Dataset {
     /// * `namespace` - The namespace to use for table management
     /// * `table_id` - The table identifier
     /// * `params` - Write parameters
-    /// * `ignore_namespace_table_storage_options` - If true, ignore storage options returned
-    ///   by the namespace and only use the storage options in params. The storage options
-    ///   provider will not be created, so credentials will not be automatically refreshed.
     pub async fn write_into_namespace(
         batches: impl RecordBatchReader + Send + 'static,
         namespace: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
         mut params: Option<WriteParams>,
-        ignore_namespace_table_storage_options: bool,
     ) -> Result<Self> {
         let mut write_params = params.take().unwrap_or_default();
 
@@ -865,28 +825,30 @@ impl Dataset {
                     location: location!(),
                 })?;
 
-                // Set initial credentials and provider unless ignored
-                if !ignore_namespace_table_storage_options {
-                    if let Some(namespace_storage_options) = response.storage_options {
-                        let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                            namespace, table_id,
-                        ));
+                // Set initial credentials and provider from namespace
+                if let Some(namespace_storage_options) = response.storage_options {
+                    let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
+                        LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
+                    );
 
-                        // Merge namespace storage options with any existing options
-                        let mut merged_options = write_params
-                            .store_params
-                            .as_ref()
-                            .and_then(|p| p.storage_options.clone())
-                            .unwrap_or_default();
-                        merged_options.extend(namespace_storage_options);
+                    // Merge namespace storage options with any existing options
+                    let mut merged_options = write_params
+                        .store_params
+                        .as_ref()
+                        .and_then(|p| p.storage_options().cloned())
+                        .unwrap_or_default();
+                    merged_options.extend(namespace_storage_options);
 
-                        let existing_params = write_params.store_params.take().unwrap_or_default();
-                        write_params.store_params = Some(ObjectStoreParams {
-                            storage_options: Some(merged_options),
-                            storage_options_provider: Some(provider),
-                            ..existing_params
-                        });
-                    }
+                    let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                        merged_options,
+                        provider,
+                    ));
+
+                    let existing_params = write_params.store_params.take().unwrap_or_default();
+                    write_params.store_params = Some(ObjectStoreParams {
+                        storage_options_accessor: Some(accessor),
+                        ..existing_params
+                    });
                 }
 
                 Self::write(batches, uri.as_str(), Some(write_params)).await
@@ -912,29 +874,32 @@ impl Dataset {
                     location: location!(),
                 })?;
 
-                // Set initial credentials and provider unless ignored
-                if !ignore_namespace_table_storage_options {
-                    if let Some(namespace_storage_options) = response.storage_options {
-                        let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                // Set initial credentials and provider from namespace
+                if let Some(namespace_storage_options) = response.storage_options {
+                    let provider: Arc<dyn StorageOptionsProvider> =
+                        Arc::new(LanceNamespaceStorageOptionsProvider::new(
                             namespace.clone(),
                             table_id.clone(),
                         ));
 
-                        // Merge namespace storage options with any existing options
-                        let mut merged_options = write_params
-                            .store_params
-                            .as_ref()
-                            .and_then(|p| p.storage_options.clone())
-                            .unwrap_or_default();
-                        merged_options.extend(namespace_storage_options);
+                    // Merge namespace storage options with any existing options
+                    let mut merged_options = write_params
+                        .store_params
+                        .as_ref()
+                        .and_then(|p| p.storage_options().cloned())
+                        .unwrap_or_default();
+                    merged_options.extend(namespace_storage_options);
 
-                        let existing_params = write_params.store_params.take().unwrap_or_default();
-                        write_params.store_params = Some(ObjectStoreParams {
-                            storage_options: Some(merged_options),
-                            storage_options_provider: Some(provider),
-                            ..existing_params
-                        });
-                    }
+                    let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                        merged_options,
+                        provider,
+                    ));
+
+                    let existing_params = write_params.store_params.take().unwrap_or_default();
+                    write_params.store_params = Some(ObjectStoreParams {
+                        storage_options_accessor: Some(accessor),
+                        ..existing_params
+                    });
                 }
 
                 // For APPEND/OVERWRITE modes, we must open the existing dataset first
@@ -942,11 +907,8 @@ impl Dataset {
                 // assumes no dataset exists and converts the mode to CREATE.
                 let mut builder = DatasetBuilder::from_uri(uri.as_str());
                 if let Some(ref store_params) = write_params.store_params {
-                    if let Some(ref storage_options) = store_params.storage_options {
-                        builder = builder.with_storage_options(storage_options.clone());
-                    }
-                    if let Some(ref provider) = store_params.storage_options_provider {
-                        builder = builder.with_storage_options_provider(provider.clone());
+                    if let Some(accessor) = &store_params.storage_options_accessor {
+                        builder = builder.with_storage_options_accessor(accessor.clone());
                     }
                 }
                 let dataset = Arc::new(builder.load().await?);
@@ -1612,11 +1574,22 @@ impl Dataset {
         &self.object_store
     }
 
-    /// Returns the storage options used when opening this dataset, if any.
+    /// Returns the initial storage options used when opening this dataset, if any.
+    ///
+    /// This returns the static initial options without triggering any refresh.
+    /// For the latest refreshed options, use [`Self::latest_storage_options`].
+    #[deprecated(since = "0.25.0", note = "Use initial_storage_options() instead")]
     pub fn storage_options(&self) -> Option<&HashMap<String, String>> {
+        self.initial_storage_options()
+    }
+
+    /// Returns the initial storage options without triggering any refresh.
+    ///
+    /// For the latest refreshed options, use [`Self::latest_storage_options`].
+    pub fn initial_storage_options(&self) -> Option<&HashMap<String, String>> {
         self.store_params
             .as_ref()
-            .and_then(|params| params.storage_options.as_ref())
+            .and_then(|params| params.storage_options())
     }
 
     /// Returns the storage options provider used when opening this dataset, if any.
@@ -1625,7 +1598,42 @@ impl Dataset {
     ) -> Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>> {
         self.store_params
             .as_ref()
-            .and_then(|params| params.storage_options_provider.clone())
+            .and_then(|params| params.storage_options_accessor.as_ref())
+            .and_then(|accessor| accessor.provider().cloned())
+    }
+
+    /// Returns the unified storage options accessor for this dataset, if any.
+    ///
+    /// The accessor handles both static and dynamic storage options with automatic
+    /// caching and refresh. Use [`StorageOptionsAccessor::get_storage_options`] to
+    /// get the latest options.
+    pub fn storage_options_accessor(&self) -> Option<Arc<StorageOptionsAccessor>> {
+        self.store_params
+            .as_ref()
+            .and_then(|params| params.get_accessor())
+    }
+
+    /// Returns the latest (possibly refreshed) storage options.
+    ///
+    /// If a dynamic storage options provider is configured, this will return
+    /// the cached options if still valid, or fetch fresh options if expired.
+    ///
+    /// For the initial static options without refresh, use [`Self::storage_options`].
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(options))` - Storage options are available (static or refreshed)
+    /// - `Ok(None)` - No storage options were configured for this dataset
+    /// - `Err(...)` - Error occurred while fetching/refreshing options from provider
+    pub async fn latest_storage_options(&self) -> Result<Option<StorageOptions>> {
+        // First check if we have an accessor (handles both static and dynamic options)
+        if let Some(accessor) = self.storage_options_accessor() {
+            let options = accessor.get_storage_options().await?;
+            return Ok(Some(options));
+        }
+
+        // Fallback to initial storage options if no accessor
+        Ok(self.initial_storage_options().cloned().map(StorageOptions))
     }
 
     pub fn data_dir(&self) -> Path {
@@ -1821,8 +1829,6 @@ impl Dataset {
     }
 
     /// Get fragments.
-    ///
-    /// If `filter` is provided, only fragments with the given name will be returned.
     pub fn get_fragments(&self) -> Vec<FileFragment> {
         let dataset = Arc::new(self.clone());
         self.manifest
@@ -2128,11 +2134,16 @@ impl Dataset {
     /// # use lance_table::io::commit::ManifestNamingScheme;
     /// # use lance_datagen::{array, RowCount, BatchCount};
     /// # use arrow_array::types::Int32Type;
+    /// # use lance::dataset::write::WriteParams;
     /// # let data = lance_datagen::gen_batch()
     /// #  .col("key", array::step::<Int32Type>())
     /// #  .into_reader_rows(RowCount::from(10), BatchCount::from(1));
     /// # let fut = async {
-    /// let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
+    /// # let params = WriteParams {
+    /// #     enable_v2_manifest_paths: false,
+    /// #     ..Default::default()
+    /// # };
+    /// let mut dataset = Dataset::write(data, "memory://test", Some(params)).await.unwrap();
     /// assert_eq!(dataset.manifest_location().naming_scheme, ManifestNamingScheme::V1);
     ///
     /// dataset.migrate_manifest_paths_v2().await.unwrap();
@@ -2699,6 +2710,55 @@ impl Dataset {
     ) -> Result<()> {
         let stream = Box::new(stream);
         self.merge_impl(stream, left_on, right_on).await
+    }
+
+    pub async fn merge_index_metadata(
+        &self,
+        index_uuid: &str,
+        index_type: IndexType,
+        batch_readhead: Option<usize>,
+    ) -> Result<()> {
+        let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
+        let index_dir = self.indices_dir().child(index_uuid);
+        match index_type {
+            IndexType::Inverted => {
+                // Call merge_index_files function for inverted index
+                lance_index::scalar::inverted::builder::merge_index_files(
+                    self.object_store(),
+                    &index_dir,
+                    Arc::new(store),
+                )
+                .await
+            }
+            IndexType::BTree => {
+                // Call merge_index_files function for btree index
+                lance_index::scalar::btree::merge_index_files(
+                    self.object_store(),
+                    &index_dir,
+                    Arc::new(store),
+                    batch_readhead,
+                )
+                .await
+            }
+            // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ
+            IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
+                // Merge distributed vector index partials and finalize root index via Lance IVF helper
+                crate::index::vector::ivf::finalize_distributed_merge(
+                    self.object_store(),
+                    &index_dir,
+                    Some(index_type),
+                )
+                .await?;
+                Ok(())
+            }
+            _ => Err(Error::InvalidInput {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Unsupported index type (patched): {}", index_type),
+                )),
+                location: location!(),
+            }),
+        }
     }
 }
 

@@ -3,8 +3,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::Float32Array;
-use jni::objects::{JMap, JObject, JString, JValue, JValueGen};
+use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
+use arrow_schema::{DataType, Field};
+use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jfloat, jlong};
 use jni::JNIEnv;
 use lance::dataset::optimize::CompactionOptions;
@@ -50,7 +51,6 @@ pub fn extract_write_params(
     enable_v2_manifest_paths: Option<&JObject>,
     storage_options_obj: &JObject,
     storage_options_provider_obj: &JObject, // Optional<StorageOptionsProvider>
-    s3_credentials_refresh_offset_seconds_obj: &JObject, // Optional<Long>
     initial_bases: &JObject,                // Optional<BasePath>
     target_bases: &JObject,                 // Optional<String>
 ) -> Result<WriteParams> {
@@ -90,19 +90,11 @@ pub fn extract_write_params(
         extract_storage_options(env, storage_options_obj)?;
 
     // Extract storage options provider if present
-    let storage_options_provider = env
+    let storage_options_provider: Option<Arc<dyn StorageOptionsProvider>> = env
         .get_optional(storage_options_provider_obj, |env, provider_obj| {
             JavaStorageOptionsProvider::new(env, provider_obj)
-        })?;
-
-    let storage_options_provider_arc: Option<Arc<dyn StorageOptionsProvider>> =
-        storage_options_provider.map(|v| Arc::new(v) as Arc<dyn StorageOptionsProvider>);
-
-    // Extract s3_credentials_refresh_offset_seconds if present
-    let s3_credentials_refresh_offset = env
-        .get_long_opt(s3_credentials_refresh_offset_seconds_obj)?
-        .map(|v| std::time::Duration::from_secs(v as u64))
-        .unwrap_or_else(|| std::time::Duration::from_secs(10));
+        })?
+        .map(|p| Arc::new(p) as Arc<dyn StorageOptionsProvider>);
 
     if let Some(initial_bases) =
         env.get_list_opt(initial_bases, |env, elem| elem.extract_object(env))?
@@ -114,10 +106,22 @@ pub fn extract_write_params(
         write_params.target_base_names_or_paths = Some(names);
     }
 
+    // Create storage options accessor from storage_options and provider
+    let accessor = match (storage_options.is_empty(), storage_options_provider) {
+        (false, Some(provider)) => Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_initial_and_provider(storage_options, provider),
+        )),
+        (false, None) => Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_static_options(storage_options),
+        )),
+        (true, Some(provider)) => Some(Arc::new(lance::io::StorageOptionsAccessor::with_provider(
+            provider,
+        ))),
+        (true, None) => None,
+    };
+
     write_params.store_params = Some(ObjectStoreParams {
-        storage_options: Some(storage_options),
-        storage_options_provider: storage_options_provider_arc,
-        s3_credentials_refresh_offset,
+        storage_options_accessor: accessor,
         ..Default::default()
     });
     Ok(write_params)
@@ -182,12 +186,13 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
 
         let refine_factor = env.get_optional_u32_from_method(&java_obj, "getRefineFactor")?;
 
-        let distance_type_jstr: JString = env
-            .call_method(&java_obj, "getDistanceType", "()Ljava/lang/String;", &[])?
-            .l()?
-            .into();
-        let distance_type_str: String = env.get_string(&distance_type_jstr)?.into();
-        let distance_type = DistanceType::try_from(distance_type_str.as_str())?;
+        let distance_type = if let Some(distance_type_str) =
+            env.get_optional_string_from_method(&java_obj, "getDistanceTypeString")?
+        {
+            Some(DistanceType::try_from(distance_type_str.as_str())?)
+        } else {
+            None
+        };
 
         let use_index = env.get_boolean_from_method(&java_obj, "isUseIndex")?;
 
@@ -252,7 +257,7 @@ pub fn get_vector_index_params(
             let shuffle_partition_concurrency = env
                 .get_int_as_usize_from_method(&ivf_params_obj, "getShufflePartitionConcurrency")?;
 
-            let ivf_params = IvfBuildParams {
+            let mut ivf_params = IvfBuildParams {
                 num_partitions: Some(num_partitions),
                 max_iters,
                 sample_rate,
@@ -260,6 +265,44 @@ pub fn get_vector_index_params(
                 shuffle_partition_concurrency,
                 ..Default::default()
             };
+
+            // Optional pre-trained IVF centroids from Java IvfBuildParams
+            // Method signature: float[] getCentroids()
+            let centroids_obj = env
+                .call_method(&ivf_params_obj, "getCentroids", "()[F", &[])?
+                .l()?;
+
+            if !centroids_obj.is_null() {
+                let jarray: JFloatArray = centroids_obj.into();
+                let length = env.get_array_length(&jarray)?;
+                if length > 0 {
+                    if !(length as usize).is_multiple_of(num_partitions) {
+                        return Err(Error::input_error(format!(
+                            "Invalid IVF centroids: length {} is not divisible by num_partitions {}",
+                            length, num_partitions
+                        )));
+                    }
+                    let mut buffer = vec![0.0f32; length as usize];
+                    env.get_float_array_region(&jarray, 0, &mut buffer)?;
+                    let dimension = buffer.len() / num_partitions;
+
+                    let values = Float32Array::from(buffer);
+                    let fsl = FixedSizeListArray::try_new(
+                        Arc::new(Field::new("item", DataType::Float32, false)),
+                        dimension as i32,
+                        Arc::new(values) as ArrayRef,
+                        None,
+                    )
+                    .map_err(|e| {
+                        Error::input_error(format!(
+                            "Failed to construct FixedSizeListArray for IVF centroids: {e}"
+                        ))
+                    })?;
+
+                    ivf_params.centroids = Some(Arc::new(fsl));
+                }
+            }
+
             stages.push(StageParams::Ivf(ivf_params));
 
             // Parse HnswBuildParams
@@ -301,13 +344,34 @@ pub fn get_vector_index_params(
                         env.get_int_as_usize_from_method(&pq_obj, "getKmeansRedos")?;
                     let sample_rate = env.get_int_as_usize_from_method(&pq_obj, "getSampleRate")?;
 
+                    // Optional pre-trained PQ codebook from Java PQBuildParams
+                    // Method signature: float[] getCodebook()
+                    let codebook_obj = env
+                        .call_method(&pq_obj, "getCodebook", "()[F", &[])?
+                        .l()?;
+
+                    let codebook = if !codebook_obj.is_null() {
+                        let jarray: JFloatArray = codebook_obj.into();
+                        let length = env.get_array_length(&jarray)?;
+                        if length > 0 {
+                            let mut buffer = vec![0.0f32; length as usize];
+                            env.get_float_array_region(&jarray, 0, &mut buffer)?;
+                            let values = Float32Array::from(buffer);
+                            Some(Arc::new(values) as _)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
                     Ok(PQBuildParams {
                         num_sub_vectors,
                         num_bits,
                         max_iters,
                         kmeans_redos,
+                        codebook,
                         sample_rate,
-                        ..Default::default()
                     })
                 },
             )?;

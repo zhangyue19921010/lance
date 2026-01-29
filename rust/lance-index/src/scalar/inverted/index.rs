@@ -59,13 +59,10 @@ use super::{
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
-    encoding::compress_posting_list,
+    encoding::{compress_posting_list, compress_posting_list_with_scores},
     iter::CompressedPostingListIterator,
 };
-use super::{
-    encoding::compress_positions,
-    iter::{PostingListIterator, TokenIterator, TokenSource},
-};
+use super::{encoding::compress_positions, iter::PostingListIterator};
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
@@ -305,11 +302,23 @@ impl InvertedIndex {
             .collect::<Vec<_>>();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
         let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        let mut idf_cache: HashMap<String, f32> = HashMap::new();
         while let Some(res) = parts.try_next().await? {
             if res.candidates.is_empty() {
                 continue;
             }
-            let tokens_by_position = &res.tokens_by_position;
+            let mut idf_by_position = Vec::with_capacity(res.tokens_by_position.len());
+            for token in &res.tokens_by_position {
+                let idf_weight = match idf_cache.get(token) {
+                    Some(weight) => *weight,
+                    None => {
+                        let weight = scorer.query_weight(token);
+                        idf_cache.insert(token.clone(), weight);
+                        weight
+                    }
+                };
+                idf_by_position.push(idf_weight);
+            }
             for DocCandidate {
                 row_id,
                 freqs,
@@ -318,9 +327,9 @@ impl InvertedIndex {
             {
                 let mut score = 0.0;
                 for (term_index, freq) in freqs.into_iter() {
-                    debug_assert!((term_index as usize) < tokens_by_position.len());
-                    let token = &tokens_by_position[term_index as usize];
-                    score += scorer.score(token.as_str(), freq, doc_length);
+                    debug_assert!((term_index as usize) < idf_by_position.len());
+                    score +=
+                        idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
                 }
                 if candidates.len() < limit {
                     candidates.push(Reverse(ScoredDoc::new(row_id, score)));
@@ -938,13 +947,6 @@ impl TokenSet {
         self.len() == 0
     }
 
-    pub(crate) fn iter(&self) -> TokenIterator<'_> {
-        TokenIterator::new(match &self.tokens {
-            TokenMap::HashMap(map) => TokenSource::HashMap(map.iter()),
-            TokenMap::Fst(map) => TokenSource::Fst(map.stream()),
-        })
-    }
-
     pub fn to_batch(self, format: TokenSetFormat) -> Result<RecordBatch> {
         match format {
             TokenSetFormat::Arrow => self.into_arrow_batch(),
@@ -1148,6 +1150,24 @@ impl TokenSet {
         }
 
         token_id
+    }
+
+    pub(crate) fn get_or_add(&mut self, token: &str) -> u32 {
+        let next_id = self.next_id;
+        match self.tokens {
+            TokenMap::HashMap(ref mut map) => {
+                if let Some(&token_id) = map.get(token) {
+                    return token_id;
+                }
+
+                map.insert(token.to_owned(), next_id);
+            }
+            _ => unreachable!("tokens must be HashMap while indexing"),
+        }
+
+        self.next_id += 1;
+        self.total_length += token.len();
+        next_id
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
@@ -1892,18 +1912,13 @@ impl PostingListBuilder {
         }
     }
 
-    // assume the posting list is sorted by doc id
-    pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
+    fn build_batch(
+        self,
+        compressed: LargeBinaryArray,
+        max_score: f32,
+        schema: SchemaRef,
+    ) -> Result<RecordBatch> {
         let length = self.len();
-        let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
-
-        let schema = inverted_list_schema(self.has_positions());
-        let compressed = compress_posting_list(
-            self.doc_ids.len(),
-            self.doc_ids.iter(),
-            self.frequencies.iter(),
-            block_max_scores.into_iter(),
-        )?;
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32]));
         let mut columns = vec![
             Arc::new(ListArray::try_new(
@@ -1914,7 +1929,7 @@ impl PostingListBuilder {
             )?) as ArrayRef,
             Arc::new(Float32Array::from_iter_values(std::iter::once(max_score))) as ArrayRef,
             Arc::new(UInt32Array::from_iter_values(std::iter::once(
-                self.len() as u32
+                length as u32,
             ))) as ArrayRef,
         ];
 
@@ -1936,6 +1951,37 @@ impl PostingListBuilder {
 
         let batch = RecordBatch::try_new(schema, columns)?;
         Ok(batch)
+    }
+
+    // assume the posting list is sorted by doc id
+    pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
+        let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
+        let schema = inverted_list_schema(self.has_positions());
+        let compressed = compress_posting_list(
+            self.doc_ids.len(),
+            self.doc_ids.iter(),
+            self.frequencies.iter(),
+            block_max_scores.into_iter(),
+        )?;
+        self.build_batch(compressed, max_score, schema)
+    }
+
+    pub fn to_batch_with_docs(self, docs: &DocSet, schema: SchemaRef) -> Result<RecordBatch> {
+        let length = self.len();
+        let avgdl = docs.average_length();
+        let idf_scale = idf(length, docs.len()) * (K1 + 1.0);
+        let (compressed, max_score) = compress_posting_list_with_scores(
+            length,
+            self.doc_ids.iter(),
+            self.frequencies.iter(),
+            |doc_id, freq| {
+                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(doc_id) as f32 / avgdl);
+                let freq = freq as f32;
+                freq / (freq + doc_norm)
+            },
+            idf_scale,
+        )?;
+        self.build_batch(compressed, max_score, schema)
     }
 
     pub fn remap(&mut self, removed: &[u32]) {
@@ -2184,7 +2230,9 @@ impl DocSet {
     ) -> Vec<f32> {
         let avgdl = self.average_length();
         let length = doc_ids.size_hint().0;
-        let mut block_max_scores = Vec::with_capacity(length);
+        let num_blocks = length.div_ceil(BLOCK_SIZE);
+        let mut block_max_scores = Vec::with_capacity(num_blocks);
+        let idf_scale = idf(length, self.len()) * (K1 + 1.0);
         let mut max_score = f32::MIN;
         for (i, (doc_id, freq)) in doc_ids.zip(freqs).enumerate() {
             let doc_norm = K1 * (1.0 - B + B * self.num_tokens(*doc_id) as f32 / avgdl);
@@ -2194,13 +2242,13 @@ impl DocSet {
                 max_score = score;
             }
             if (i + 1) % BLOCK_SIZE == 0 {
-                max_score *= idf(length, self.len()) * (K1 + 1.0);
+                max_score *= idf_scale;
                 block_max_scores.push(max_score);
                 max_score = f32::MIN;
             }
         }
-        if length % BLOCK_SIZE > 0 {
-            max_score *= idf(length, self.len()) * (K1 + 1.0);
+        if !length.is_multiple_of(BLOCK_SIZE) {
+            max_score *= idf_scale;
             block_max_scores.push(max_score);
         }
         block_max_scores
@@ -2540,10 +2588,12 @@ mod tests {
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
-    use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder};
+    use crate::scalar::inverted::builder::{inverted_list_schema, InnerBuilder, PositionRecorder};
     use crate::scalar::inverted::encoding::decompress_posting_list;
     use crate::scalar::inverted::query::{FtsSearchParams, Operator};
     use crate::scalar::lance_format::LanceIndexStore;
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Float32Type, UInt32Type};
 
     use super::*;
 
@@ -2583,6 +2633,54 @@ mod tests {
             .iter()
             .zip(expected.frequencies.iter())
             .all(|(a, b)| a == b));
+    }
+
+    #[test]
+    fn test_posting_list_batch_matches_docset_scoring() {
+        let mut docs = DocSet::default();
+        let num_docs = BLOCK_SIZE + 3;
+        for doc_id in 0..num_docs as u32 {
+            docs.append(doc_id as u64, doc_id % 7 + 1);
+        }
+
+        let doc_ids = (0..num_docs as u32).collect::<Vec<_>>();
+        let freqs = doc_ids
+            .iter()
+            .map(|doc_id| doc_id % 5 + 1)
+            .collect::<Vec<_>>();
+
+        let mut builder_scores = PostingListBuilder::new(false);
+        let mut builder_docs = PostingListBuilder::new(false);
+        for (&doc_id, &freq) in doc_ids.iter().zip(freqs.iter()) {
+            builder_scores.add(doc_id, PositionRecorder::Count(freq));
+            builder_docs.add(doc_id, PositionRecorder::Count(freq));
+        }
+
+        let block_max_scores = docs.calculate_block_max_scores(doc_ids.iter(), freqs.iter());
+        let batch_scores = builder_scores.to_batch(block_max_scores).unwrap();
+        let batch_docs = builder_docs
+            .to_batch_with_docs(&docs, inverted_list_schema(false))
+            .unwrap();
+
+        let scores_posting = batch_scores[POSTING_COL].as_list::<i32>().value(0);
+        let scores_posting = scores_posting.as_binary::<i64>();
+        let docs_posting = batch_docs[POSTING_COL].as_list::<i32>().value(0);
+        let docs_posting = docs_posting.as_binary::<i64>();
+        assert_eq!(scores_posting, docs_posting);
+
+        let score_left = batch_scores[MAX_SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        let score_right = batch_docs[MAX_SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        assert!((score_left - score_right).abs() < 1e-6);
+
+        let len_left = batch_scores[LENGTH_COL]
+            .as_primitive::<UInt32Type>()
+            .value(0);
+        let len_right = batch_docs[LENGTH_COL].as_primitive::<UInt32Type>().value(0);
+        assert_eq!(len_left, len_right);
     }
 
     #[tokio::test]
@@ -2762,5 +2860,104 @@ mod tests {
             row_ids.iter().any(|&id| id >= 200),
             "Should contain row_id from partition 1"
         );
+    }
+
+    #[test]
+    fn test_block_max_scores_capacity_matches_block_count() {
+        let mut docs = DocSet::default();
+        let num_docs = BLOCK_SIZE * 3 + 7;
+        let doc_ids = (0..num_docs as u32).collect::<Vec<_>>();
+        for doc_id in &doc_ids {
+            docs.append(*doc_id as u64, 1);
+        }
+
+        let freqs = vec![1_u32; doc_ids.len()];
+        let block_max_scores = docs.calculate_block_max_scores(doc_ids.iter(), freqs.iter());
+        let expected_blocks = doc_ids.len().div_ceil(BLOCK_SIZE);
+
+        assert_eq!(block_max_scores.len(), expected_blocks);
+        assert_eq!(block_max_scores.capacity(), expected_blocks);
+    }
+
+    #[tokio::test]
+    async fn test_bm25_search_uses_global_idf() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Partition 0: 3 docs, only one contains "alpha".
+        let mut builder0 = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder0.tokens.add("alpha".to_owned());
+        builder0.tokens.add("beta".to_owned());
+        builder0.posting_lists.push(PostingListBuilder::new(false));
+        builder0.posting_lists.push(PostingListBuilder::new(false));
+        builder0.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder0.posting_lists[1].add(1, PositionRecorder::Count(1));
+        builder0.posting_lists[1].add(2, PositionRecorder::Count(1));
+        builder0.docs.append(100, 1);
+        builder0.docs.append(101, 1);
+        builder0.docs.append(102, 1);
+        builder0.write(store.as_ref()).await.unwrap();
+
+        // Partition 1: 1 doc, contains "alpha".
+        let mut builder1 = InnerBuilder::new(1, false, TokenSetFormat::default());
+        builder1.tokens.add("alpha".to_owned());
+        builder1.posting_lists.push(PostingListBuilder::new(false));
+        builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder1.docs.append(200, 1);
+        builder1.write(store.as_ref()).await.unwrap();
+
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64, 1u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(vec!["alpha".to_string()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+
+        let (row_ids, scores) = index
+            .bm25_search(tokens, params, Operator::Or, prefilter, metrics)
+            .await
+            .unwrap();
+
+        assert_eq!(row_ids.len(), 2);
+        assert!(row_ids.contains(&100));
+        assert!(row_ids.contains(&200));
+        assert_eq!(row_ids.len(), scores.len());
+
+        let expected_idf = idf(2, 4);
+        for score in scores {
+            assert!(
+                (score - expected_idf).abs() < 1e-6,
+                "score: {}, expected: {}",
+                score,
+                expected_idf
+            );
+        }
     }
 }
