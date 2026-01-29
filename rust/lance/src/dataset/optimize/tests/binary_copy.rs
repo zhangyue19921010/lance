@@ -693,7 +693,7 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
         .col("i64", array::step::<Int64Type>())
         .col("f32", array::rand::<Float32Type>())
         .col("f64", array::rand::<Float64Type>())
-        .col("bool", array::rand_boolean())
+        .col("bool", array::cycle_bool(vec![false, true]))
         .col("date32", array::rand_date32())
         .col("date64", array::rand_date64())
         .col(
