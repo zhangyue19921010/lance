@@ -192,7 +192,7 @@ pub fn try_inline_value(scalar: &ArrayRef) -> Option<Vec<u8>> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{cast::AsArray, BooleanArray, FixedSizeBinaryArray, Int32Array, StringArray};
+    use arrow_array::{cast::AsArray, FixedSizeBinaryArray, Int32Array, StringArray};
 
     use super::*;
 
