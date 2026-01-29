@@ -176,7 +176,12 @@ pub fn try_inline_value(scalar: &ArrayRef) -> Option<Vec<u8>> {
     if data.buffers().len() != 1 {
         return None;
     }
+
+    let byte_width = data.data_type().byte_width_opt();
     let bytes = data.buffers()[0].as_slice();
+    if byte_width.is_none() || bytes.len() != byte_width.unwrap() {
+        return None;
+    }
     if bytes.len() > INLINE_VALUE_MAX_BYTES {
         return None;
     }
@@ -187,7 +192,7 @@ pub fn try_inline_value(scalar: &ArrayRef) -> Option<Vec<u8>> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{cast::AsArray, FixedSizeBinaryArray, Int32Array, StringArray};
+    use arrow_array::{cast::AsArray, BooleanArray, FixedSizeBinaryArray, Int32Array, StringArray};
 
     use super::*;
 
