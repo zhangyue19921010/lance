@@ -296,7 +296,7 @@ pub struct RowAddrTreeMap {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum RowAddrSelection {
+pub enum RowAddrSelection {
     Full,
     Partial(RoaringBitmap),
 }
@@ -555,6 +555,16 @@ impl RowAddrTreeMap {
             Some(RowAddrSelection::Full) => None,
             Some(RowAddrSelection::Partial(set)) => Some(set),
         }
+    }
+
+    /// Get the selection for a fragment
+    pub fn get(&self, fragment_id: &u32) -> Option<&RowAddrSelection> {
+        self.inner.get(fragment_id)
+    }
+
+    /// Iterate over (fragment_id, selection) pairs
+    pub fn iter(&self) -> impl Iterator<Item = (&u32, &RowAddrSelection)> {
+        self.inner.iter()
     }
 
     pub fn retain_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
@@ -922,6 +932,34 @@ impl Extend<Self> for RowAddrTreeMap {
             }
         }
     }
+}
+
+/// Convert a RoaringBitmap to a vector of contiguous ranges.
+///
+/// This is more efficient than iterating over individual bits and coalescing,
+/// as it builds ranges directly in a single pass.
+pub fn bitmap_to_ranges(bitmap: &RoaringBitmap) -> Vec<Range<u64>> {
+    if bitmap.is_empty() {
+        return vec![];
+    }
+
+    let mut ranges = Vec::new();
+    let mut iter = bitmap.iter();
+    let first = iter.next().unwrap();
+    let mut start = first;
+    let mut end = first;
+
+    for val in iter {
+        if val == end + 1 {
+            end = val;
+        } else {
+            ranges.push(start as u64..(end + 1) as u64);
+            start = val;
+            end = val;
+        }
+    }
+    ranges.push(start as u64..(end + 1) as u64);
+    ranges
 }
 
 #[cfg(test)]
