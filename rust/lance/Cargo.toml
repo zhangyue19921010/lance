@@ -118,7 +118,7 @@ geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 
 [features]
-default = ["aws", "azure", "gcp", "oss", "huggingface"]
+default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["dep:clap", "lzma-sys/static"]
@@ -135,6 +135,7 @@ aws = ["lance-io/aws", "dep:aws-credential-types"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]
+tencent = ["lance-io/tencent"]
 huggingface = ["lance-io/huggingface"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
