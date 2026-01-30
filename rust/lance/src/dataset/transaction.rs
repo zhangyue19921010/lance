@@ -46,12 +46,12 @@
 //!
 
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
-use super::{blob::BLOB_VERSION_CONFIG_KEY, ManifestWriteConfig};
+use super::ManifestWriteConfig;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::index::mem_wal::update_mem_wal_index_merged_generations;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
-use lance_core::{datatypes::BlobVersion, datatypes::Schema, Error, Result};
+use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MergedGeneration;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
@@ -2175,19 +2175,12 @@ impl Transaction {
         } else {
             let data_storage_format =
                 Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
-            let mut manifest = Manifest::new(
+            Manifest::new(
                 schema,
                 Arc::new(final_fragments),
                 data_storage_format,
                 reference_paths,
-            );
-            if manifest.data_storage_format.lance_file_version()? >= LanceFileVersion::V2_2 {
-                manifest.config_mut().insert(
-                    BLOB_VERSION_CONFIG_KEY.to_string(),
-                    BlobVersion::V2.config_value().to_string(),
-                );
-            }
-            manifest
+            )
         };
 
         manifest.tag.clone_from(&self.tag);

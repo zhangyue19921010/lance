@@ -592,12 +592,13 @@ fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Struc
 
 #[cfg(test)]
 mod test {
-    use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
+    use arrow_array::{Int32Array, LargeBinaryArray, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Schema as ArrowSchema};
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+    use std::collections::HashMap;
 
     use crate::dataset::{scanner::test_dataset::TestVectorDataset, WriteParams};
 
@@ -773,6 +774,72 @@ mod test {
 
         let values2 = dataset.take_rows(&[10, 50, 100], projection).await.unwrap();
         assert_eq!(values, values2);
+    }
+
+    #[tokio::test]
+    async fn test_reject_legacy_blob_schema_on_v2_2() {
+        let mut metadata = HashMap::new();
+        metadata.insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "blob",
+            DataType::LargeBinary,
+            true,
+        )
+        .with_metadata(metadata)]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(LargeBinaryArray::from(vec![Some(
+                b"hello".as_slice(),
+            )]))],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(batch)], schema);
+        let err = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Legacy blob columns"));
+        assert!(msg.contains("lance.blob.v2"));
+    }
+
+    #[tokio::test]
+    async fn test_take_blob_v2_from_blob_v2_struct_on_v2_2() {
+        let schema = Arc::new(ArrowSchema::new(vec![crate::blob::blob_field(
+            "blob", true,
+        )]));
+        let mut builder = crate::blob::BlobArrayBuilder::new(1);
+        builder.push_bytes(b"hello").unwrap();
+        let array = builder.finish().unwrap();
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(batch)], schema);
+        let dataset = crate::dataset::write::InsertBuilder::new("memory://")
+            .with_params(&write_params)
+            .execute_stream(batches)
+            .await
+            .unwrap();
+
+        let proj = ProjectionRequest::from_columns(["blob"], dataset.schema());
+        let values = dataset.take(&[0u64], proj).await.unwrap();
+
+        let struct_arr = values.column(0).as_struct();
+        assert_eq!(struct_arr.fields().len(), 5);
+        assert_eq!(struct_arr.fields()[0].name(), "kind");
+        assert_eq!(struct_arr.fields()[1].name(), "position");
+        assert_eq!(struct_arr.fields()[2].name(), "size");
+        assert_eq!(struct_arr.fields()[3].name(), "blob_id");
+        assert_eq!(struct_arr.fields()[4].name(), "blob_uri");
     }
 
     #[rstest]
