@@ -495,6 +495,26 @@ impl FileWriter {
         self.schema_metadata.insert(key.into(), value.into());
     }
 
+    /// Prepare the writer when column data and metadata were produced externally.
+    ///
+    /// This is useful for flows that copy already-encoded pages (e.g., binary copy
+    /// during compaction) where the column buffers have been written directly and we
+    /// only need to write the footer and schema metadata. The provided
+    /// `column_metadata` must describe the buffers already persisted by the
+    /// underlying `ObjectWriter`, and `rows_written` should reflect the total number
+    /// of rows in those buffers.
+    pub fn initialize_with_external_metadata(
+        &mut self,
+        schema: lance_core::datatypes::Schema,
+        column_metadata: Vec<pbfile::ColumnMetadata>,
+        rows_written: u64,
+    ) {
+        self.schema = Some(schema);
+        self.num_columns = column_metadata.len() as u32;
+        self.column_metadata = column_metadata;
+        self.rows_written = rows_written;
+    }
+
     /// Adds a global buffer to the file
     ///
     /// The global buffer can contain any arbitrary bytes.  It will be written to the disk
@@ -595,7 +615,9 @@ impl FileWriter {
             .collect::<FuturesOrdered<_>>();
         self.write_pages(encoding_tasks).await?;
 
-        self.finish_writers().await?;
+        if !self.column_writers.is_empty() {
+            self.finish_writers().await?;
+        }
 
         // 3. write global buffers (we write the schema here)
         let global_buffer_offsets = self.write_global_buffers().await?;
