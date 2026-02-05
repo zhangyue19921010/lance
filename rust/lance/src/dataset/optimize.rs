@@ -189,7 +189,7 @@ impl Default for CompactionOptions {
             num_threads: None,
             max_bytes_per_file: None,
             batch_size: None,
-            defer_index_remap: false,
+            defer_index_remap: true, // TODO Just for testing to turn on by default
             enable_binary_copy: false,
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
@@ -947,8 +947,12 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
+
+    let has_indices = !dataset.load_indices().await?.is_empty();
+
     // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids();
+    // If there is no index, then we don't need to remap indices.
+    let needs_remapping = !dataset.manifest.uses_stable_row_ids() && has_indices;
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -1070,17 +1074,16 @@ async fn rewrite_files(
         // This code path is only when we use address style ids.
         let row_addrs = captured_ids.row_addrs(None).into_owned();
 
-        log::info!(
-            "Compaction task {}: reserving fragment ids and transposing row addrs",
-            task_id
-        );
-        reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
-
         if options.defer_index_remap {
             let mut changed_row_addrs = Vec::with_capacity(row_addrs.serialized_size());
             row_addrs.serialize_into(&mut changed_row_addrs)?;
             (None, Some(changed_row_addrs))
         } else {
+            log::info!(
+                "Compaction task {}: reserving fragment ids and transposing row addrs",
+                task_id
+            );
+            reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
             let row_id_map = remapping::transpose_row_addrs(row_addrs, &fragments, &new_fragments);
             (Some(row_id_map), None)
         }
@@ -1298,7 +1301,7 @@ async fn recalc_versions_for_rewritten_fragments(
 /// be able to be committed and should be considered cancelled.
 pub async fn commit_compaction(
     dataset: &mut Dataset,
-    completed_tasks: Vec<RewriteResult>,
+    mut completed_tasks: Vec<RewriteResult>,
     remap_options: Arc<dyn IndexRemapperOptions>,
     options: &CompactionOptions,
 ) -> Result<CompactionMetrics> {
@@ -1307,7 +1310,24 @@ pub async fn commit_compaction(
     }
 
     // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
+    // If there is no index, then we don't need to remap indices.
+    let has_indices = !dataset.load_indices().await?.is_empty();
+    let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap && has_indices;
+
+    if !needs_remapping {
+        log::info!(
+                "Commit Compaction: reserving fragment ids"
+            );
+        // when needs_remapping, we already reserve fragment ids in rewrite_compaction_task
+        let fragments_to_reserve = completed_tasks
+            .iter_mut()
+            .flat_map(|task| task.new_fragments.iter_mut())
+            .filter(|fragment| fragment.id == 0)
+            .collect::<Vec<_>>();
+        if !fragments_to_reserve.is_empty() {
+            reserve_fragment_ids(dataset, fragments_to_reserve.into_iter()).await?;
+        }
+    }
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
     let mut metrics = CompactionMetrics::default();
@@ -1357,15 +1377,6 @@ pub async fn commit_compaction(
                 new_index_version: rewritten.index_version,
             })
             .collect()
-    } else if !options.defer_index_remap {
-        // We need to reserve fragment ids here so that the fragment bitmap
-        // can be updated for each index.
-        let new_fragments = rewrite_groups
-            .iter_mut()
-            .flat_map(|group| group.new_fragments.iter_mut())
-            .collect::<Vec<_>>();
-        reserve_fragment_ids(dataset, new_fragments.into_iter()).await?;
-        Vec::new()
     } else {
         Vec::new()
     };
