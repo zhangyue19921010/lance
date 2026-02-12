@@ -179,7 +179,7 @@ pub fn try_inline_value(scalar: &ArrayRef) -> Option<Vec<u8>> {
 
     let byte_width = data.data_type().byte_width_opt();
     let bytes = data.buffers()[0].as_slice();
-    if byte_width.is_none() || bytes.len() != byte_width.unwrap() {
+    if byte_width.map(|width| bytes.len() != width).unwrap_or(true) {
         return None;
     }
     if bytes.len() > INLINE_VALUE_MAX_BYTES {
