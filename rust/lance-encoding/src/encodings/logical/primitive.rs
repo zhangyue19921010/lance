@@ -6360,7 +6360,7 @@ mod tests {
         let versions: Vec<LanceFileVersion> = LanceFileVersion::iter()
             .filter(|version| {
                 let (major, minor) = version.to_numbers();
-                major >= 2 && minor >= 2;
+                major >= 2 && minor >= 2
             })
             .collect();
 
