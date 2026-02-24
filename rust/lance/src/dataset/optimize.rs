@@ -176,6 +176,12 @@ pub struct CompactionOptions {
     /// Controls how much data is read at once when performing binary copy.
     /// Defaults to 16MB (16 * 1024 * 1024).
     pub binary_copy_read_batch_bytes: Option<usize>,
+    /// Whether to preallocate fragment IDs for a compaction plan.
+    /// default false
+    pub prealloc_fragment_ids: bool,
+    /// Expansion factor applied to preallocated fragment IDs for a compaction plan.
+    /// default 1.05
+    pub fragment_id_prealloc_factor: f32,
 }
 
 impl Default for CompactionOptions {
@@ -193,6 +199,8 @@ impl Default for CompactionOptions {
             enable_binary_copy: false,
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
+            fragment_id_prealloc_factor: 1.05,
+            prealloc_fragment_ids: false,
         }
     }
 }
@@ -203,6 +211,7 @@ impl CompactionOptions {
         if self.materialize_deletions && self.materialize_deletions_threshold >= 1.0 {
             self.materialize_deletions = false;
         }
+        self.fragment_id_prealloc_factor = self.fragment_id_prealloc_factor.max(1.0);
     }
 }
 
@@ -415,6 +424,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         // get_fragments should be returning fragments in sorted order (by id)
         // and fragment ids should be unique
         let fragments = dataset.get_fragments();
+        let need_prealloc_fragment_ids = need_prealloc_fragment_ids(&self.options, dataset);
 
         debug_assert!(
             fragments.windows(2).all(|w| w[0].id() < w[1].id()),
@@ -508,17 +518,47 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let final_bins = candidate_bins
+        let flat_map = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
-            .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
-            .map(|bin| TaskData {
-                fragments: bin.fragments,
-            });
+            .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment));
+
+        let final_bins = if need_prealloc_fragment_ids {
+            flat_map
+                .map(|bin| {
+                    let live_rows = bin.row_counts.iter().map(|rows| *rows).sum::<usize>();
+                    let total_input_file_size =
+                        bin.fragments.iter().map(sum_file_size).sum::<usize>();
+                    let estimated_output_fragment_count = estimate_output_fragment_num(
+                        live_rows,
+                        total_input_file_size,
+                        &self.options,
+                    );
+                    Ok(TaskData {
+                        fragments: bin.fragments,
+                        estimated_output_fragment_count,
+                        ..Default::default()
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            flat_map
+                .map(|bin| {
+                    Ok(TaskData {
+                        fragments: bin.fragments,
+                        ..Default::default()
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
 
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
         compaction_plan.extend_tasks(final_bins);
+
+        if need_prealloc_fragment_ids {
+            compaction_plan.preallocate_fragment_ids(dataset).await?;
+        }
 
         Ok(compaction_plan)
     }
@@ -580,6 +620,11 @@ pub async fn compact_files_with_planner(
     Ok(metrics)
 }
 
+pub fn need_prealloc_fragment_ids(options: &CompactionOptions, dataset: &Dataset) -> bool {
+    // for stable row id, there is no need to do prealloc fragment ids.
+    options.prealloc_fragment_ids && !dataset.manifest().uses_stable_row_ids()
+}
+
 /// Information about a fragment used to decide its fate in compaction
 #[derive(Debug)]
 struct FragmentMetrics {
@@ -614,6 +659,33 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
         physical_rows,
         num_deletions,
     })
+}
+
+fn sum_file_size(fragment: &Fragment) -> usize {
+    fragment
+        .files
+        .iter()
+        .map(|file| file.file_size_bytes.get().map_or(0, |v| v.get() as usize))
+        .sum()
+}
+
+/// estimate fragment num of current compaction group needed
+/// based on target_rows_per_fragment and max_bytes_per_file options.
+fn estimate_output_fragment_num(
+    live_rows: usize,
+    total_input_file_size: usize,
+    options: &CompactionOptions,
+) -> Option<usize> {
+    let rows_based_frag_num = live_rows.div_ceil(options.target_rows_per_fragment);
+
+    let bytes_based_frag_num = if let Some(max_bytes_per_file) = options.max_bytes_per_file {
+        total_input_file_size.div_ceil(max_bytes_per_file)
+    } else {
+        0
+    };
+
+    let res = rows_based_frag_num.max(bytes_based_frag_num);
+    (res > 0).then_some(res)
 }
 
 /// A plan for what groups of fragments to compact.
@@ -651,6 +723,84 @@ impl CompactionPlan {
     /// The options used to produce this plan.
     pub fn options(&self) -> &CompactionOptions {
         &self.options
+    }
+
+    /// pre allocate frage ids through calling
+    async fn preallocate_fragment_ids(&mut self, dataset: &Dataset) -> Result<()> {
+        let need_prealloc_fragment_ids = need_prealloc_fragment_ids(self.options(), dataset);
+
+        if !need_prealloc_fragment_ids {
+            return Ok(());
+        }
+        log::info!(
+            "Compaction planning: prealloc fragment ids enabled for {} tasks.",
+            self.tasks.len(),
+        );
+        let mut base_total: usize = 0;
+        for task in self.tasks.iter_mut() {
+            if let Some(estimated_output_fragment_count) = task.estimated_output_fragment_count {
+                base_total += estimated_output_fragment_count;
+            }
+        }
+        if base_total == 0 {
+            log::info!(
+            "Compaction planning: no estimated output fragments, skipping preallocated fragment ids"
+        );
+            return Ok(());
+        }
+
+        let reserve_total =
+            ((base_total as f32) * self.options.fragment_id_prealloc_factor).ceil() as usize;
+        log::info!(
+        "Compaction planning: reserving preallocated fragment ids (base_total={}, reserve_total={}, factor={})",
+        base_total,
+        reserve_total,
+        self.options.fragment_id_prealloc_factor);
+
+        let reserved_ids = reserve_fragment_id_range(dataset, reserve_total).await?;
+
+        let mut cursor = reserved_ids.start;
+        let mut assigned_total = 0;
+        let last_task_idx = self.tasks.len() - 1;
+        for (task_idx, task) in self.tasks.iter_mut().enumerate() {
+            let base_len = task
+                .estimated_output_fragment_count
+                .ok_or_else(|| {
+                    log::warn!(
+                    "Compaction planning: task[{}] missing estimated_output_fragment_count while prealloc_fragment_ids is enabled",
+                    task_idx
+                );
+                    Error::Internal {
+                        message: format!(
+                            "prealloc_fragment_ids is enabled but task[{}] missing estimated_output_fragment_count",
+                            task_idx
+                        ),
+                        location: location!(),
+                    }
+                })?;
+            let assigned_len = if task_idx == last_task_idx {
+                reserve_total - assigned_total
+            } else {
+                base_len
+            };
+            task.reserved_start = Some(cursor);
+            task.reserved_len = Some(assigned_len);
+            log::debug!(
+            "Compaction planning: assigned preallocated ids to task[{}] start={} len={} estimated_outputs={}",
+            task_idx,
+            cursor,
+            assigned_len,
+            base_len);
+
+            cursor += assigned_len;
+            assigned_total += assigned_len;
+        }
+
+        log::info!(
+        "Compaction planning: assigned preallocated fragment ids across {} tasks (assigned_total={})",
+        self.tasks.len(),
+        assigned_total);
+        Ok(())
     }
 }
 
@@ -719,6 +869,23 @@ async fn prepare_reader(
 pub struct TaskData {
     /// The fragments to compact.
     pub fragments: Vec<Fragment>,
+    /// The estimated number of output fragments this task is expected to generate.
+    pub estimated_output_fragment_count: Option<usize>,
+    /// The first preallocated fragment id for this task.
+    pub reserved_start: Option<usize>,
+    /// The number of preallocated fragment ids for this task.
+    pub reserved_len: Option<usize>,
+}
+
+impl Default for TaskData {
+    fn default() -> Self {
+        Self {
+            fragments: Vec::new(),
+            estimated_output_fragment_count: None,
+            reserved_start: None,
+            reserved_len: None,
+        }
+    }
 }
 
 /// A standalone task that can be serialized and sent to another machine for
@@ -911,6 +1078,119 @@ async fn reserve_fragment_ids(
     Ok(())
 }
 
+async fn reserve_fragment_id_range(
+    dataset: &Dataset,
+    num_fragments: usize,
+) -> Result<Range<usize>> {
+    log::info!(
+        "Reserving fragment id range for compaction plan: requested={}",
+        num_fragments
+    );
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::ReserveFragments {
+            num_fragments: u32::try_from(num_fragments).map_err(|_| Error::Internal {
+                message: format!(
+                    "Cannot reserve {} fragments (exceeds u32::MAX)",
+                    num_fragments
+                ),
+                location: location!(),
+            })?,
+        },
+        None,
+    );
+
+    let (manifest, _) = commit_transaction(
+        dataset,
+        dataset.object_store(),
+        dataset.commit_handler.as_ref(),
+        &transaction,
+        &Default::default(),
+        &Default::default(),
+        dataset.manifest_location.naming_scheme,
+        None,
+    )
+    .await?;
+
+    let max_fragment_id = manifest.max_fragment_id.ok_or_else(|| Error::Internal {
+        message: "ReserveFragments commit returned no max_fragment_id".to_string(),
+        location: location!(),
+    })?;
+    let end_exclusive = usize::try_from(max_fragment_id).map_err(|_| Error::Internal {
+        message: format!(
+            "max_fragment_id {} cannot fit into usize while reserving fragments",
+            max_fragment_id
+        ),
+        location: location!(),
+    })? + 1;
+    let start = end_exclusive - num_fragments;
+    log::info!(
+        "Reserved fragment id range for compaction plan: start={}, end_exclusive={}, len={}",
+        start,
+        end_exclusive,
+        num_fragments
+    );
+    Ok(start..end_exclusive)
+}
+
+async fn assign_preallocated_fragment_ids(
+    dataset: &Dataset,
+    task: &TaskData,
+    new_fragments: &mut [Fragment],
+) -> Result<()> {
+    let (reserved_start, mut reserved_len) = match (task.reserved_start, task.reserved_len) {
+        (Some(start), Some(len)) => (start, len),
+        (reserved_start, reserved_len) => {
+            log::warn!(
+                "Compaction task: missing preallocated fragment id metadata (reserved_start={:?}, reserved_len={:?}, new_fragments={})",
+                reserved_start,
+                reserved_len,
+                new_fragments.len()
+            );
+            return Err(Error::Internal {
+                message: format!(
+                    "prealloc_fragment_ids is enabled but task missing reservation metadata (reserved_start={:?}, reserved_len={:?})",
+                    reserved_start, reserved_len
+                ),
+                location: location!(),
+            });
+        }
+    };
+
+    log::info!(
+        "Compaction task: assigning preallocated fragment ids (reserved_start={}, reserved_len={}, new_fragments={})",
+        reserved_start,
+        reserved_len,
+        new_fragments.len()
+    );
+    let mut assigned_number = 0;
+    for fragment in new_fragments.iter_mut() {
+        if reserved_len > 0 {
+            let fragment_id = reserved_start + assigned_number;
+            fragment.id = u64::try_from(fragment_id).unwrap();
+            assigned_number += 1;
+            reserved_len -= 1;
+        } else {
+            break;
+        }
+    }
+
+    if assigned_number < new_fragments.len() {
+        log::info!(
+            "Compaction task: preallocated ids exhausted, reserving {} additional fragment ids",
+            new_fragments.len() - assigned_number
+        );
+        reserve_fragment_ids(dataset, new_fragments[assigned_number..].iter_mut()).await?;
+    } else {
+        log::debug!(
+            "Compaction task: fully assigned fragment ids from preallocated range (assigned={})",
+            assigned_number
+        );
+    }
+    Ok(())
+}
+
 /// Rewrite the files in a single task.
 ///
 /// This assumes that the dataset is the correct read version to be compacted.
@@ -920,7 +1200,6 @@ async fn rewrite_files(
     options: &CompactionOptions,
 ) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
-
     if task.fragments.is_empty() {
         return Ok(RewriteResult {
             metrics,
@@ -938,6 +1217,7 @@ async fn rewrite_files(
     // make sure to recompute them.
     // See: https://github.com/lance-format/lance/issues/1531
     let recompute_stats = previous_writer_version.is_none();
+    let need_prealloc_fragment_ids = need_prealloc_fragment_ids(options, &dataset);
 
     // It's possible the fragments are old and don't have physical rows or
     // num deletions recorded. If that's the case, we need to grab and set that
@@ -1062,6 +1342,17 @@ async fn rewrite_files(
 
     log::info!("Compaction task {}: file written", task_id);
 
+    if need_prealloc_fragment_ids {
+        log::info!(
+            "Compaction task {}: assigning preallocated fragment ids (reserved_start={:?}, reserved_len={:?}, new_fragments={})",
+            task_id,
+            task.reserved_start,
+            task.reserved_len,
+            new_fragments.len()
+        );
+        assign_preallocated_fragment_ids(dataset.as_ref(), &task, &mut new_fragments).await?;
+    }
+
     let (row_id_map, changed_row_addrs) = if let Some(row_ids_rx) = row_ids_rx {
         let captured_ids = row_ids_rx.try_recv().map_err(|err| Error::Internal {
             message: format!("Failed to receive row ids: {}", err),
@@ -1070,11 +1361,13 @@ async fn rewrite_files(
         // This code path is only when we use address style ids.
         let row_addrs = captured_ids.row_addrs(None).into_owned();
 
-        log::info!(
-            "Compaction task {}: reserving fragment ids and transposing row addrs",
-            task_id
-        );
-        reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
+        if !need_prealloc_fragment_ids {
+            log::info!(
+                "Compaction task {}: reserving fragment ids and transposing row addrs",
+                task_id
+            );
+            reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
+        }
 
         if options.defer_index_remap {
             let mut changed_row_addrs = Vec::with_capacity(row_addrs.serialized_size());
@@ -1308,6 +1601,7 @@ pub async fn commit_compaction(
 
     // If we aren't using stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
+    let need_prealloc_fragment_ids = need_prealloc_fragment_ids(options, dataset);
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
     let mut metrics = CompactionMetrics::default();
@@ -1357,7 +1651,7 @@ pub async fn commit_compaction(
                 new_index_version: rewritten.index_version,
             })
             .collect()
-    } else if !options.defer_index_remap {
+    } else if !options.defer_index_remap && !need_prealloc_fragment_ids {
         // We need to reserve fragment ids here so that the fragment bitmap
         // can be updated for each index.
         let new_fragments = rewrite_groups
@@ -1618,6 +1912,7 @@ mod tests {
     async fn test_compact_all_good(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
+        #[values(false, true)] prealloc_fragment_ids: bool,
     ) {
         // Compact a table with nothing to do
         let test_dir = TempStrDir::default();
@@ -1656,6 +1951,7 @@ mod tests {
 
         let options = CompactionOptions {
             target_rows_per_fragment: 3_000,
+            prealloc_fragment_ids,
             ..Default::default()
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
@@ -1755,6 +2051,7 @@ mod tests {
     async fn test_compact_many(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
+        #[values(false, true)] prealloc_fragment_ids: bool,
     ) {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -1880,9 +2177,17 @@ mod tests {
         let mock_remapper = MockIndexRemapper::in_any_order(&[remap_a, remap_b]);
 
         // Run compaction
-        let metrics = compact_files(&mut dataset, options, Some(Arc::new(mock_remapper)))
-            .await
-            .unwrap();
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1000,
+                prealloc_fragment_ids,
+                ..Default::default()
+            },
+            Some(Arc::new(mock_remapper)),
+        )
+        .await
+        .unwrap();
 
         // Assert on metrics
         assert_eq!(metrics.fragments_removed, 6);
@@ -1903,6 +2208,7 @@ mod tests {
     async fn test_compact_data_files(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
+        #[values(false, true)] prealloc_fragment_ids: bool,
     ) {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -1961,9 +2267,16 @@ mod tests {
         assert_eq!(plan.tasks().len(), 1);
         assert_eq!(plan.tasks()[0].fragments.len(), 2);
 
-        let metrics = compact_files(&mut dataset, plan.options, Some(Arc::new(expected_remap)))
-            .await
-            .unwrap();
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                prealloc_fragment_ids,
+                ..Default::default()
+            },
+            Some(Arc::new(expected_remap)),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(metrics.files_removed, 4); // 2 fragments with 2 data files
         assert_eq!(metrics.files_added, 1); // 1 fragment with 1 data file
@@ -1989,6 +2302,7 @@ mod tests {
     async fn test_compact_deletions(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
+        #[values(false, true)] prealloc_fragment_ids: bool,
     ) {
         // For files that have few rows, we don't want to compact just 1 since
         // that won't do anything. But if there are deletions to materialize,
@@ -2014,6 +2328,7 @@ mod tests {
         // Threshold must be satisfied
         let mut options = CompactionOptions {
             materialize_deletions_threshold: 0.8,
+            prealloc_fragment_ids,
             ..Default::default()
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
@@ -2066,6 +2381,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
         #[values(false, true)] use_stable_row_id: bool,
+        #[values(false, true)] prealloc_fragment_ids: bool,
     ) {
         // Can run the tasks independently
         // Can provide subset of tasks to commit_compaction
@@ -2090,11 +2406,12 @@ mod tests {
         // Plan compaction with 3 tasks
         let options = CompactionOptions {
             target_rows_per_fragment: 3_000,
+            fragment_id_prealloc_factor: 1.0,
+            prealloc_fragment_ids: prealloc_fragment_ids,
             ..Default::default()
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 3);
-
         let dataset_ref = &dataset;
         let mut results = futures::stream::iter(plan.compaction_tasks())
             .then(|task| async move { task.execute(dataset_ref).await.unwrap() })
@@ -2128,6 +2445,10 @@ mod tests {
             // 1 commit for reserve fragments and 1 for final commit, both
             // from the call to commit_compaction
             assert_eq!(dataset.manifest.version, 3);
+        } else if prealloc_fragment_ids {
+            // 1 commit for reserve fragments during prealloc
+            // i commit for final commit
+            assert_eq!(dataset.manifest.version, 3);
         } else {
             // 1 commit for each task's reserve fragments plus 1 for
             // the call to commit_compaction
@@ -2147,6 +2468,10 @@ mod tests {
             // 1 commit for reserve fragments and 1 for final commit, both
             // from the call to commit_compaction
             assert_eq!(dataset.manifest.version, 5);
+        } else if prealloc_fragment_ids {
+            // The reserve fragments call already happened during compaction plan prealloc
+            // and so we just see the bump from the commit_compaction
+            assert_eq!(dataset.manifest.version, 4);
         } else {
             // The reserve fragments call already happened for this task
             // and so we just see the bump from the commit_compaction
