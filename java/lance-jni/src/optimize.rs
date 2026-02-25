@@ -410,6 +410,9 @@ impl FromJObjectWithEnv<TaskData> for JObject<'_> {
         })?;
         Ok(TaskData {
             fragments: task_data,
+            estimated_output_fragment_count: None,
+            reserved_start: None,
+            reserved_len: None,
         })
     }
 }

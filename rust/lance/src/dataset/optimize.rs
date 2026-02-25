@@ -526,7 +526,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         let final_bins = if need_prealloc_fragment_ids {
             flat_map
                 .map(|bin| {
-                    let live_rows = bin.row_counts.iter().map(|rows| *rows).sum::<usize>();
+                    let live_rows = bin.row_counts.iter().copied().sum::<usize>();
                     let total_input_file_size =
                         bin.fragments.iter().map(sum_file_size).sum::<usize>();
                     let estimated_output_fragment_count = estimate_output_fragment_num(
@@ -763,21 +763,7 @@ impl CompactionPlan {
         let mut assigned_total = 0;
         let last_task_idx = self.tasks.len() - 1;
         for (task_idx, task) in self.tasks.iter_mut().enumerate() {
-            let base_len = task
-                .estimated_output_fragment_count
-                .ok_or_else(|| {
-                    log::warn!(
-                    "Compaction planning: task[{}] missing estimated_output_fragment_count while prealloc_fragment_ids is enabled",
-                    task_idx
-                );
-                    Error::Internal {
-                        message: format!(
-                            "prealloc_fragment_ids is enabled but task[{}] missing estimated_output_fragment_count",
-                            task_idx
-                        ),
-                        location: location!(),
-                    }
-                })?;
+            let base_len = task.estimated_output_fragment_count.unwrap_or(0);
             let assigned_len = if task_idx == last_task_idx {
                 reserve_total - assigned_total
             } else {
@@ -865,7 +851,7 @@ async fn prepare_reader(
 /// A single group of fragments to compact, which is a view into the compaction
 /// plan. We keep the `replace_range` indices so we can map the result of the
 /// compact back to the fragments it replaces.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TaskData {
     /// The fragments to compact.
     pub fragments: Vec<Fragment>,
@@ -875,17 +861,6 @@ pub struct TaskData {
     pub reserved_start: Option<usize>,
     /// The number of preallocated fragment ids for this task.
     pub reserved_len: Option<usize>,
-}
-
-impl Default for TaskData {
-    fn default() -> Self {
-        Self {
-            fragments: Vec::new(),
-            estimated_output_fragment_count: None,
-            reserved_start: None,
-            reserved_len: None,
-        }
-    }
 }
 
 /// A standalone task that can be serialized and sent to another machine for
@@ -1139,15 +1114,24 @@ async fn assign_preallocated_fragment_ids(
     task: &TaskData,
     new_fragments: &mut [Fragment],
 ) -> Result<()> {
+    if new_fragments.is_empty() {
+        return Ok(());
+    }
+
     let (reserved_start, mut reserved_len) = match (task.reserved_start, task.reserved_len) {
-        (Some(start), Some(len)) => (start, len),
+        (Some(start), Some(len)) => {
+            if len <= 0 {
+                return Err(Error::Internal {
+                    message: format!(
+                        "prealloc_fragment_ids is enabled but task reserved_len={:?})",
+                        len
+                    ),
+                    location: location!(),
+                });
+            }
+            (start, len)
+        }
         (reserved_start, reserved_len) => {
-            log::warn!(
-                "Compaction task: missing preallocated fragment id metadata (reserved_start={:?}, reserved_len={:?}, new_fragments={})",
-                reserved_start,
-                reserved_len,
-                new_fragments.len()
-            );
             return Err(Error::Internal {
                 message: format!(
                     "prealloc_fragment_ids is enabled but task missing reservation metadata (reserved_start={:?}, reserved_len={:?})",
