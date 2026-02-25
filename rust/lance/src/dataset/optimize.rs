@@ -1120,7 +1120,7 @@ async fn assign_preallocated_fragment_ids(
 
     let (reserved_start, mut reserved_len) = match (task.reserved_start, task.reserved_len) {
         (Some(start), Some(len)) => {
-            if len <= 0 {
+            if len == 0 {
                 return Err(Error::Internal {
                     message: format!(
                         "prealloc_fragment_ids is enabled but task reserved_len={:?})",
@@ -2391,7 +2391,7 @@ mod tests {
         let options = CompactionOptions {
             target_rows_per_fragment: 3_000,
             fragment_id_prealloc_factor: 1.0,
-            prealloc_fragment_ids: prealloc_fragment_ids,
+            prealloc_fragment_ids,
             ..Default::default()
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
@@ -2466,7 +2466,220 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stable_row_indices() {
+    async fn test_compact_with_prealloc_enable() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let data = sample_data();
+
+        // Write 6 fragments so compaction can execute multiple tasks concurrently.
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 6000))], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 1000,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        dataset.delete("a >= 1200 AND a < 1800").await.unwrap();
+
+        // Verify this setup generates more than one compaction task.
+        let precheck_plan = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 2000,
+                num_threads: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            precheck_plan.tasks().len() > 1,
+            "expected multiple compaction tasks for concurrent compaction"
+        );
+
+        let version_before_compaction = dataset.manifest.version;
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2000,
+                num_threads: Some(2),
+                prealloc_fragment_ids: true,
+                fragment_id_prealloc_factor: 2.0,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // With prealloc_fragment_ids enabled, one reserve commit + one compaction commit.
+        assert_eq!(dataset.manifest.version, version_before_compaction + 2);
+
+        let scanner = dataset.scan();
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let scanned_data = concat_batches(&batches[0].schema(), &batches).unwrap();
+
+        let expected_data = RecordBatch::try_new(
+            data.schema(),
+            vec![Arc::new(Int64Array::from_iter_values(
+                (0..6000).filter(|value| !(1200..1800).contains(value)), // 1200-1800 is deleted.
+            ))],
+        )
+        .unwrap();
+        assert_eq!(scanned_data, expected_data);
+    }
+
+    #[tokio::test]
+    async fn test_prealloc_fragment_ids_exhausted() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let data = sample_data();
+        let expected_data = data.slice(0, 6000);
+
+        // Write 6 fragments (1k rows each) to produce multi-task compaction.
+        let reader = RecordBatchIterator::new(vec![Ok(expected_data.clone())], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 1000,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::Scalar,
+                Some("a_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1500,
+            max_rows_per_group: 200,
+            prealloc_fragment_ids: true,
+            fragment_id_prealloc_factor: 1.0,
+            batch_size: Some(300),
+            ..Default::default()
+        };
+
+        let mut plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert!(plan.tasks().len() > 1);
+        assert!(plan
+            .tasks()
+            .iter()
+            .any(|task| task.estimated_output_fragment_count.unwrap_or(0) > 1));
+
+        // Shrink preallocated lengths to force additional reserve calls during task execution.
+        let mut forced_prealloc_ranges = Vec::new();
+        for task in plan.tasks.iter_mut() {
+            let start = task
+                .reserved_start
+                .expect("prealloc should set reserved_start") as u64;
+            task.reserved_len = Some(1);
+            forced_prealloc_ranges.push(start..(start + 1));
+        }
+
+        let tasks = plan.compaction_tasks().collect::<Vec<_>>();
+        let dataset_ref = &dataset;
+        let rewrite_results = futures::stream::iter(tasks)
+            .then(|task| async move { task.execute(dataset_ref).await.unwrap() })
+            .collect::<Vec<_>>()
+            .await;
+        assert!(!rewrite_results.is_empty());
+        assert!(rewrite_results
+            .iter()
+            .any(|result| result.new_fragments.len() > 1));
+
+        let used_fragment_ids = rewrite_results
+            .iter()
+            .flat_map(|result| result.new_fragments.iter().map(|fragment| fragment.id))
+            .collect::<Vec<_>>();
+        assert!(
+            used_fragment_ids.iter().any(|fragment_id| forced_prealloc_ranges
+                .iter()
+                .all(|range| !range.contains(fragment_id))),
+            "expected at least one output fragment id to be allocated outside forced preallocated ranges"
+        );
+
+        let _metrics = commit_compaction(
+            &mut dataset,
+            rewrite_results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        let Some(remapped_index) = dataset.load_index_by_name("a_idx").await.unwrap() else {
+            panic!("scalar index must be available");
+        };
+
+        // make sure remap work as expected
+        let remapped_bitmap = remapped_index.fragment_bitmap.unwrap();
+        dataset.fragments().iter().for_each(|fragment| {
+            assert!(remapped_bitmap.contains(fragment.id as u32));
+        });
+
+        // Validate data correctness after compaction + remap.
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 6000);
+    }
+
+    #[tokio::test]
+    async fn test_prealloc_id_with_full_fragment_delete() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let data = sample_data();
+        let input = data.slice(0, 2000);
+        let reader = RecordBatchIterator::new(vec![Ok(input)], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 500,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert!(dataset.manifest.fragments.len() > 1);
+
+        // This removes all rows in fragments for this write layout.
+        dataset.delete("a >= 1").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+
+        let _metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1000,
+                prealloc_fragment_ids: true,
+                fragment_id_prealloc_factor: 1.0,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Validate data correctness.
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_stable_row_indices(#[values(false, true)] prealloc_fragment_ids: bool) {
         // Validate behavior of indices after compaction with stable row ids.
         let mut data_gen = BatchGenerator::new()
             .col(Box::new(
@@ -2549,6 +2762,7 @@ mod tests {
 
         let options = CompactionOptions {
             target_rows_per_fragment: 180,
+            prealloc_fragment_ids,
             ..Default::default()
         };
         let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
@@ -2565,8 +2779,9 @@ mod tests {
         assert_eq!(before_scalar_result, after_scalar_result);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_defer_index_remap() {
+    async fn test_defer_index_remap(#[values(false, true)] prealloc_fragment_ids: bool) {
         let mut data_gen = BatchGenerator::new()
             .col(Box::new(
                 RandomVector::new().vec_width(128).named("vec".to_owned()),
@@ -2630,11 +2845,13 @@ mod tests {
         let options = CompactionOptions {
             target_rows_per_fragment: 2_000,
             defer_index_remap: true,
+            prealloc_fragment_ids,
             ..Default::default()
         };
         let options2 = CompactionOptions {
             target_rows_per_fragment: 2_000,
             defer_index_remap: false,
+            prealloc_fragment_ids,
             ..Default::default()
         };
 
