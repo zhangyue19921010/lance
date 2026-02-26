@@ -1594,6 +1594,7 @@ impl Dataset {
         Ok(CleanupStats {
             bytes_removed: cleanup_stats.bytes_removed,
             old_versions: cleanup_stats.old_versions,
+            removed_data_file_num: cleanup_stats.removed_data_file_num,
         })
     }
 

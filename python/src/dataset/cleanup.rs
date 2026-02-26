@@ -19,6 +19,7 @@ use pyo3::{pyclass, pymethods};
 pub struct CleanupStats {
     pub bytes_removed: u64,
     pub old_versions: u64,
+    pub removed_data_file_num: u64,
 }
 
 #[pymethods]

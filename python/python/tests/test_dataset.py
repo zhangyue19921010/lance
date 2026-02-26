@@ -1388,6 +1388,7 @@ def test_cleanup_with_retain_versions(tmp_path: Path):
     assert len(ds.versions()) == 4
     stats = ds.cleanup_old_versions(retain_versions=3)
     assert stats.old_versions == 1
+    assert stats.removed_data_file_num == 1
     assert len(ds.versions()) == 3
     assert ds.count_rows() == len(ds.to_table())
 

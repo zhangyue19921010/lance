@@ -2629,10 +2629,11 @@ fn inner_cleanup_with_policy<'local>(
 
     let jstats = env.new_object(
         "org/lance/cleanup/RemovalStats",
-        "(JJ)V",
+        "(JJJ)V",
         &[
             JValue::Long(stats.bytes_removed as i64),
             JValue::Long(stats.old_versions as i64),
+            JValue::Long(stats.removed_data_file_num as i64),
         ],
     )?;
 
