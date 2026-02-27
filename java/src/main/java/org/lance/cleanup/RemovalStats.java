@@ -17,16 +17,28 @@ package org.lance.cleanup;
 public class RemovalStats {
   private final long bytesRemoved;
   private final long oldVersions;
-  private final long removedDataFileNum;
+  private final long removedDataFiles;
+  private final long removedTransactionFiles;
+  private final long removedIndexFiles;
+  private final long removedDeletionFiles;
 
   public RemovalStats(long bytesRemoved, long oldVersions) {
-    this(bytesRemoved, oldVersions, 0L);
+    this(bytesRemoved, oldVersions, 0L, 0L, 0L, 0L);
   }
 
-  public RemovalStats(long bytesRemoved, long oldVersions, long removedDataFileNum) {
+  public RemovalStats(
+      long bytesRemoved,
+      long oldVersions,
+      long removedDataFiles,
+      long removedTransactionFiles,
+      long removedIndexFiles,
+      long removedDeletionFiles) {
     this.bytesRemoved = bytesRemoved;
     this.oldVersions = oldVersions;
-    this.removedDataFileNum = removedDataFileNum;
+    this.removedDataFiles = removedDataFiles;
+    this.removedTransactionFiles = removedTransactionFiles;
+    this.removedIndexFiles = removedIndexFiles;
+    this.removedDeletionFiles = removedDeletionFiles;
   }
 
   public long getBytesRemoved() {
@@ -37,7 +49,19 @@ public class RemovalStats {
     return oldVersions;
   }
 
-  public long getRemovedDataFileNum() {
-    return removedDataFileNum;
+  public long getRemovedDataFiles() {
+    return removedDataFiles;
+  }
+
+  public long getRemovedTransactionFiles() {
+    return removedTransactionFiles;
+  }
+
+  public long getRemovedIndexFiles() {
+    return removedIndexFiles;
+  }
+
+  public long getRemovedDeletionFiles() {
+    return removedDeletionFiles;
   }
 }

@@ -86,7 +86,10 @@ from .trace import trace_to_chrome as trace_to_chrome
 class CleanupStats:
     bytes_removed: int
     old_versions: int
-    removed_data_file_num: int
+    removed_data_files: int
+    removed_transaction_files: int
+    removed_index_files: int
+    removed_deletion_files: int
 
 class LanceFileWriter:
     def __init__(
