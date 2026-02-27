@@ -86,7 +86,6 @@ pub struct RemovalStats {
 
 #[derive(Clone, Copy, Debug)]
 enum RemovedFileType {
-    Manifest,
     Data,
     Transaction,
     Index,
@@ -358,9 +357,9 @@ impl<'a> CleanupTask<'a> {
                     );
                     if matches!(path_to_remove, Ok(Some(..))) {
                         let mut stats = removal_stats_ref.lock().unwrap();
+                        stats.bytes_removed += obj_meta.size;
                         if let Some(file_type) = file_type {
                             match file_type {
-                                RemovedFileType::Manifest => stats.bytes_removed += obj_meta.size,
                                 RemovedFileType::Data => stats.removed_data_files += 1,
                                 RemovedFileType::Transaction => {
                                     stats.removed_transaction_files += 1
@@ -377,7 +376,7 @@ impl<'a> CleanupTask<'a> {
 
         // Restrict scanning to Lance-managed subtrees for safety and performance.
         let streams = vec![
-            build_listing_stream(self.dataset.versions_dir(), Some(RemovedFileType::Manifest)),
+            build_listing_stream(self.dataset.versions_dir(), None),
             build_listing_stream(
                 self.dataset.transactions_dir(),
                 Some(RemovedFileType::Transaction),
