@@ -120,7 +120,6 @@ pub mod remapping;
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 use binary_copy::rewrite_files_binary_copy;
-pub use compaction_planner::CompactionPlannerType;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Options to be passed to [compact_files].
@@ -403,6 +402,12 @@ pub trait CompactionPlanner: Send + Sync {
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan>;
 }
 
+#[derive(Debug, PartialEq, Eq, Copy, Hash, Clone, serde::Deserialize, serde::Serialize)]
+pub enum CompactionPlannerType {
+    Default = 0,
+    Bounded = 1,
+}
+
 /// Formulate a plan to compact the files in a dataset
 ///
 /// The compaction plan will contain a list of tasks to execute. Each task
@@ -557,18 +562,21 @@ pub async fn compact_files(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
-    let planner = build_compaction_planner(options);
+    let planner = build_compaction_planner(options)?;
     compact_files_with_planner(dataset, remap_options, planner.as_ref()).await
 }
 
 /// Build a compaction planner based on the given options.
-pub fn build_compaction_planner(options: CompactionOptions) -> Box<dyn CompactionPlanner> {
+pub fn build_compaction_planner(options: CompactionOptions) -> Result<Box<dyn CompactionPlanner>> {
     match options.compaction_planner_type {
         CompactionPlannerType::Bounded => {
             let bounded_options = BoundedCompactionPlannerOptions::from(&options);
-            Box::new(BoundedCompactionPlanner::new(options, bounded_options))
+            Ok(Box::new(BoundedCompactionPlanner::new(
+                options,
+                bounded_options,
+            )?))
         }
-        _ => Box::new(DefaultCompactionPlanner::new(options)),
+        _ => Ok(Box::new(DefaultCompactionPlanner::new(options))),
     }
 }
 
@@ -894,7 +902,7 @@ pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
-    let planner = build_compaction_planner(options.clone());
+    let planner = build_compaction_planner(options.clone())?;
     planner.plan(dataset).await
 }
 

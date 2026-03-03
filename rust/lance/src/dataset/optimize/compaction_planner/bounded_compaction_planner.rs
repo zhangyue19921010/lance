@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::optimize::{
-    CandidateBin, build_compaction_candidacy, collect_metrics, finalize_candidate_bins, get_indices_containing_frag, load_index_fragmaps
+    build_compaction_candidacy, collect_metrics, finalize_candidate_bins,
+    get_indices_containing_frag, load_index_fragmaps, CandidateBin,
 };
 use crate::Error;
 
@@ -19,9 +20,14 @@ use crate::{
     Dataset,
 };
 
+/// Options for [`BoundedCompactionPlanner`].
+///
+/// At least one of `max_compaction_size` or `max_compaction_rows` must be set.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundedCompactionPlannerOptions {
+    /// The maximum number of input bytes to include in a single compaction plan.
     pub max_compaction_size: Option<usize>,
+    /// The maximum number of input rows to include in a single compaction plan.
     pub max_compaction_rows: Option<usize>,
 }
 
@@ -52,6 +58,8 @@ impl BoundedCompactionPlannerOptions {
     }
 }
 
+/// A compaction planner that stops adding fragments once a configured byte or row
+/// budget has been reached.
 #[derive(Debug, Clone, Default)]
 pub struct BoundedCompactionPlanner {
     options: CompactionOptions,
@@ -59,17 +67,21 @@ pub struct BoundedCompactionPlanner {
 }
 
 impl BoundedCompactionPlanner {
+    /// Create a bounded compaction planner from general compaction options and
+    /// planner-specific limits.
+    ///
+    /// Returns an error when neither a byte limit nor a row limit is provided.
     pub fn new(
         mut options: CompactionOptions,
         mut bounded_compaction_planner_options: BoundedCompactionPlannerOptions,
-    ) -> Self {
+    ) -> Result<Self> {
         options.validate();
-        let _ = bounded_compaction_planner_options.validate().unwrap();
+        bounded_compaction_planner_options.validate()?;
 
-        Self {
+        Ok(Self {
             options,
             bounded_compaction_planner_options,
-        }
+        })
     }
 }
 
@@ -92,7 +104,9 @@ impl CompactionPlanner for BoundedCompactionPlanner {
             match (candidacy, &mut current_bin) {
                 (None, None) => {}
                 (Some(candidacy), None) => {
-                    if candidate_bins.is_empty() || self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows) {
+                    if candidate_bins.is_empty()
+                        || self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows)
+                    {
                         current_bin = Some(CandidateBin {
                             fragments: vec![fragment.clone()],
                             pos_range: position..(position + 1),
@@ -107,7 +121,8 @@ impl CompactionPlanner for BoundedCompactionPlanner {
                 }
                 (Some(candidacy), Some(bin)) => {
                     if bin.indices == indices {
-                        if self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows) {
+                        if self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows)
+                        {
                             bin.fragments.push(fragment.clone());
                             bin.pos_range.end += 1;
                             bin.candidacy.push(candidacy);
@@ -121,7 +136,8 @@ impl CompactionPlanner for BoundedCompactionPlanner {
                         // Index set is different.  Complete previous bin and try to start new one
                         candidate_bins.push(current_bin.take().unwrap());
 
-                        if candidate_bins.is_empty() && self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows) {
+                        if self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows)
+                        {
                             current_bin = Some(CandidateBin {
                                 fragments: vec![fragment.clone()],
                                 pos_range: position..(position + 1),
@@ -160,7 +176,12 @@ impl CompactionPlanner for BoundedCompactionPlanner {
 impl BoundedCompactionPlanner {
     /// Check if the usage exceeds the max compaction size or max compaction rows.
     /// If not, update the usage with the fragment.
-    fn check_and_update_usage(&self, usage: &mut BoundUsage, fragment: &Fragment, current_rows: usize) -> bool {
+    fn check_and_update_usage(
+        &self,
+        usage: &mut BoundUsage,
+        fragment: &Fragment,
+        current_rows: usize,
+    ) -> bool {
         let current_bytes = fragment
             .files
             .iter()
@@ -208,3 +229,4 @@ impl BoundedCompactionPlanner {
         res
     }
 }
+
