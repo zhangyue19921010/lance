@@ -371,25 +371,25 @@ impl<'a> CleanupTask<'a> {
         let all_paths_to_remove =
             stream::iter(vec![unreferenced_paths, old_manifests_stream]).flatten();
 
-        let paths_to_delete: BoxStream<Result<Path>> =
-            if let Some(rate) = self.policy.delete_rate_limit {
-                info!(
-                    "delete_rate_limit enable, limit {} ops/sec during cleanup",
-                    rate
-                );
-                let duration = Duration::try_from_secs_f64(1.0 / rate)
-                    .map_err(|e| Error::Cleanup {
-                        message: format!("delete_rate_limit {} is too small: {}", rate, e),
-                    })?;
-                let mut ticker = interval(duration);
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                IntervalStream::new(ticker)
-                    .zip(all_paths_to_remove)
-                    .map(|(_, path)| path)
-                    .boxed()
-            } else {
-                all_paths_to_remove.boxed()
-            };
+        let paths_to_delete: BoxStream<Result<Path>> = if let Some(rate) =
+            self.policy.delete_rate_limit
+        {
+            info!(
+                "delete_rate_limit enable, limit {} ops/sec during cleanup",
+                rate
+            );
+            let duration = Duration::try_from_secs_f64(1.0 / rate).map_err(|e| Error::Cleanup {
+                message: format!("delete_rate_limit {} is too small: {}", rate, e),
+            })?;
+            let mut ticker = interval(duration);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            IntervalStream::new(ticker)
+                .zip(all_paths_to_remove)
+                .map(|(_, path)| path)
+                .boxed()
+        } else {
+            all_paths_to_remove.boxed()
+        };
 
         let delete_fut = self
             .dataset
