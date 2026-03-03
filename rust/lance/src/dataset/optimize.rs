@@ -117,6 +117,33 @@ use crate::io::deletion::read_dataset_deletion_file;
 use binary_copy::rewrite_files_binary_copy;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
+/// Controls how data is rewritten during compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum CompactionMode {
+    /// Decode and re-encode data (default).
+    Reencode,
+    /// Try binary copy if fragments are compatible, fall back to [`Reencode`](CompactionMode::Reencode) otherwise.
+    TryBinaryCopy,
+    /// Use binary copy or fail if fragments are not compatible.
+    ForceBinaryCopy,
+}
+
+impl TryFrom<&str> for CompactionMode {
+    type Error = Error;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        match value.to_lowercase().as_str() {
+            "reencode" => Ok(Self::Reencode),
+            "try_binary_copy" => Ok(Self::TryBinaryCopy),
+            "force_binary_copy" => Ok(Self::ForceBinaryCopy),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid compaction mode \"{}\". Valid values: \"reencode\", \"try_binary_copy\", \"force_binary_copy\"",
+                value
+            ))),
+        }
+    }
+}
+
 /// Options to be passed to [compact_files].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionOptions {
@@ -158,18 +185,16 @@ pub struct CompactionOptions {
     /// not be remapped during this compaction operation. Instead, the fragment reuse index
     /// is updated and will be used to perform remapping later.
     pub defer_index_remap: bool,
-    /// Whether to enable binary copy optimization when eligible.
+    /// The compaction mode to use. When set, this takes priority over the
+    /// deprecated `enable_binary_copy` and `enable_binary_copy_force` fields.
     ///
-    /// This skips re-encoding the data and can lead to faster compaction
-    /// times.  However, it cannot merge pages together and should not be
-    /// used when compacting small files together because the pages in the
-    /// compacted file will be too small and this could lead to poor I/O patterns.
-    ///
-    /// Defaults to false.
+    /// Defaults to `None` (falls back to legacy boolean fields).
+    pub compaction_mode: Option<CompactionMode>,
+    /// Deprecated: use `compaction_mode` instead.
+    #[deprecated(note = "Use `compaction_mode` instead")]
     pub enable_binary_copy: bool,
-    /// Whether to force binary copy optimization. If true, compaction will fail
-    /// if binary copy is not supported for the given fragments.
-    /// Defaults to false.
+    /// Deprecated: use `compaction_mode` instead.
+    #[deprecated(note = "Use `compaction_mode` instead")]
     pub enable_binary_copy_force: bool,
     /// The batch size in bytes for reading during binary copy operations.
     /// Controls how much data is read at once when performing binary copy.
@@ -177,6 +202,7 @@ pub struct CompactionOptions {
     pub binary_copy_read_batch_bytes: Option<usize>,
 }
 
+#[allow(deprecated)]
 impl Default for CompactionOptions {
     fn default() -> Self {
         Self {
@@ -189,6 +215,7 @@ impl Default for CompactionOptions {
             max_bytes_per_file: None,
             batch_size: None,
             defer_index_remap: false,
+            compaction_mode: None,
             enable_binary_copy: false,
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
@@ -196,6 +223,7 @@ impl Default for CompactionOptions {
     }
 }
 
+#[allow(deprecated)]
 impl CompactionOptions {
     pub fn validate(&mut self) {
         // If threshold is 100%, same as turning off deletion materialization.
@@ -203,12 +231,27 @@ impl CompactionOptions {
             self.materialize_deletions = false;
         }
     }
+
+    /// Returns the effective [`CompactionMode`], preferring the new
+    /// `compaction_mode` field and falling back to the deprecated boolean
+    /// fields for backwards compatibility.
+    pub fn compaction_mode(&self) -> CompactionMode {
+        if let Some(mode) = self.compaction_mode {
+            return mode;
+        }
+        // Fall back to deprecated booleans
+        match (self.enable_binary_copy, self.enable_binary_copy_force) {
+            (true, true) => CompactionMode::ForceBinaryCopy,
+            (true, false) => CompactionMode::TryBinaryCopy,
+            _ => CompactionMode::Reencode,
+        }
+    }
 }
 
 /// Determine if page-level binary copy can safely merge the provided fragments.
 ///
 /// Preconditions checked in order:
-/// - Feature flag `enable_binary_copy` is enabled
+/// - Compaction mode is not `Reencode`
 /// - Dataset storage format is non-legacy
 /// - Fragment list is non-empty
 /// - All data files share identical Lance file versions
@@ -238,8 +281,8 @@ async fn can_use_binary_copy_impl(
     use lance_file::version::LanceFileVersion;
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
-    if !options.enable_binary_copy {
-        log::debug!("Binary copy disabled: enable_binary_copy config is false");
+    if matches!(options.compaction_mode(), CompactionMode::Reencode) {
+        log::debug!("Binary copy disabled: compaction mode is Reencode");
         return Ok(false);
     }
 
@@ -956,8 +999,9 @@ async fn rewrite_files(
         num_rows,
         fragments.len()
     );
+    let mode = options.compaction_mode();
     let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
-    if !can_binary_copy && options.enable_binary_copy_force {
+    if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
         return Err(Error::not_supported_source(
             format!("compaction task {}: binary copy is not supported", task_id).into(),
         ));
@@ -1016,7 +1060,7 @@ async fn rewrite_files(
         )
         .await?;
 
-        if new_fragments.is_empty() && options.enable_binary_copy_force {
+        if new_fragments.is_empty() && matches!(mode, CompactionMode::ForceBinaryCopy) {
             return Err(Error::not_supported_source(
                 format!("compaction task {}: binary copy is not supported", task_id).into(),
             ));
