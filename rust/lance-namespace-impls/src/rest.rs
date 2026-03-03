@@ -213,7 +213,7 @@ impl RestNamespaceBuilder {
     /// It expects:
     /// - `uri`: The base URI for the REST API (required)
     /// - `delimiter`: Delimiter for object identifiers (optional, defaults to ".")
-    /// - `header.*`: Additional headers (optional, prefix will be stripped)
+    /// - `header.*` / `headers.*`: Additional headers (optional, prefix will be stripped)
     /// - `tls.cert_file`: Path to client certificate file (optional)
     /// - `tls.key_file`: Path to client private key file (optional)
     /// - `tls.ssl_ca_cert`: Path to CA certificate file (optional)
@@ -259,10 +259,13 @@ impl RestNamespaceBuilder {
             .cloned()
             .unwrap_or_else(|| Self::DEFAULT_DELIMITER.to_string());
 
-        // Extract headers (properties prefixed with "header.")
+        // Extract headers (properties prefixed with "header." or "headers.")
         let mut headers = HashMap::new();
         for (key, value) in &properties {
-            if let Some(header_name) = key.strip_prefix("header.") {
+            if let Some(header_name) = key
+                .strip_prefix("header.")
+                .or_else(|| key.strip_prefix("headers."))
+            {
                 headers.insert(header_name.to_string(), value.clone());
             }
         }
@@ -1377,6 +1380,21 @@ mod tests {
             .build();
 
         // Successfully created the namespace - test passes if no panic
+    }
+
+    #[test]
+    fn test_rest_namespace_creation_with_headers_prefix() {
+        let mut properties = HashMap::new();
+        properties.insert("uri".to_string(), "http://example.com".to_string());
+        properties.insert(
+            "headers.Authorization".to_string(),
+            "Bearer token".to_string(),
+        );
+        properties.insert("headers.X-Custom".to_string(), "value".to_string());
+
+        let _namespace = RestNamespaceBuilder::from_properties(properties)
+            .expect("Failed to create namespace builder")
+            .build();
     }
 
     #[tokio::test]
