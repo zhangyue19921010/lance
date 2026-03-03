@@ -66,7 +66,7 @@ use std::{
     sync::{Mutex, MutexGuard},
     time::Duration,
 };
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 use tokio_stream::wrappers::IntervalStream;
 use tracing::{Span, debug, info, instrument};
 
