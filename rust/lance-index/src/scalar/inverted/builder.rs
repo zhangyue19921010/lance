@@ -23,9 +23,9 @@ use deepsize::DeepSizeOf;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::cache::LanceCache;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
-use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
 use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
@@ -550,18 +550,15 @@ impl InnerBuilder {
         let schema = inverted_list_schema(self.with_position);
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let producer = spawn_cpu(move || {
             for posting_list in posting_lists {
-                let batch =
-                    posting_list.to_batch_with_docs(&docs_for_batches, schema_for_batches.clone());
-                let is_err = batch.is_err();
-                if tx.blocking_send(batch).is_err() {
-                    break;
-                }
-                if is_err {
-                    break;
+                let batch = posting_list
+                    .to_batch_with_docs(&docs_for_batches, schema_for_batches.clone())?;
+                if let Err(err) = tx.send(batch) {
+                    return Err(Error::execution(format!(
+                        "failed to send posting list batch to writer: {err}"
+                    )));
                 }
             }
             Ok(())
@@ -570,10 +567,14 @@ impl InnerBuilder {
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
         while let Some(batch) = rx.recv().await {
-            let batch = batch?;
             num_posting_lists += 1;
             let start = std::time::Instant::now();
-            writer.write_record_batch(batch).await?;
+            if let Err(err) = writer.write_record_batch(batch).await {
+                drop(rx);
+                // Wait for producer to stop; preserve the write error as the primary failure.
+                let _ = producer.await;
+                return Err(err);
+            }
             write_duration += start.elapsed();
 
             if num_posting_lists % 500_000 == 0 {
@@ -585,10 +586,9 @@ impl InnerBuilder {
                 );
             }
         }
-
-        // Errors from batch generation are sent through the channel and surfaced via `batch?`.
-        // Awaiting the producer here is just to propagate panics/cancellation.
+        drop(rx);
         producer.await?;
+
         writer.finish().await?;
         Ok(())
     }
