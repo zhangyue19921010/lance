@@ -5,8 +5,7 @@ use std::sync::Arc;
 
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::optimize::{
-    build_compaction_candidacy, collect_metrics, finalize_candidate_bins,
-    get_indices_containing_frag, load_index_fragmaps, CandidateBin,
+    CandidateBin, build_compaction_candidacy, collect_metrics, finalize_candidate_bins, get_indices_containing_frag, load_index_fragmaps
 };
 use crate::Error;
 
@@ -65,7 +64,7 @@ impl BoundedCompactionPlanner {
         mut bounded_compaction_planner_options: BoundedCompactionPlannerOptions,
     ) -> Self {
         options.validate();
-        let _ = bounded_compaction_planner_options.validate();
+        let _ = bounded_compaction_planner_options.validate().unwrap();
 
         Self {
             options,
@@ -93,38 +92,7 @@ impl CompactionPlanner for BoundedCompactionPlanner {
             match (candidacy, &mut current_bin) {
                 (None, None) => {}
                 (Some(candidacy), None) => {
-                    self.update_usage(&mut usage, fragment);
-                    if !candidate_bins.is_empty() && self.out_of_usage(&mut usage) {
-                        break;
-                    }
-                    current_bin = Some(CandidateBin {
-                        fragments: vec![fragment.clone()],
-                        pos_range: position..(position + 1),
-                        candidacy: vec![candidacy],
-                        row_counts: vec![metrics.num_rows()],
-                        indices,
-                    });
-                }
-                (Some(candidacy), Some(bin)) => {
-                    if bin.indices == indices {
-                        self.update_usage(&mut usage, fragment);
-                        if self.out_of_usage(&mut usage)  {
-                            // ignore current loop and return
-                            candidate_bins.push(current_bin.take().unwrap());
-                            break;
-                        }
-                        bin.fragments.push(fragment.clone());
-                        bin.pos_range.end += 1;
-                        bin.candidacy.push(candidacy);
-                        bin.row_counts.push(metrics.num_rows());
-                    } else {
-                        // Index set is different.  Complete previous bin and start new one
-                        candidate_bins.push(current_bin.take().unwrap());
-
-                        self.update_usage(&mut usage, fragment);
-                        if self.out_of_usage(&mut usage)  {
-                            break;
-                        }
+                    if candidate_bins.is_empty() || self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows) {
                         current_bin = Some(CandidateBin {
                             fragments: vec![fragment.clone()],
                             pos_range: position..(position + 1),
@@ -132,14 +100,43 @@ impl CompactionPlanner for BoundedCompactionPlanner {
                             row_counts: vec![metrics.num_rows()],
                             indices,
                         });
+                    } else {
+                        candidate_bins.push(current_bin.take().unwrap());
+                        break;
+                    }
+                }
+                (Some(candidacy), Some(bin)) => {
+                    if bin.indices == indices {
+                        if self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows) {
+                            bin.fragments.push(fragment.clone());
+                            bin.pos_range.end += 1;
+                            bin.candidacy.push(candidacy);
+                            bin.row_counts.push(metrics.num_rows());
+                        } else {
+                            // ignore current loop and return
+                            candidate_bins.push(current_bin.take().unwrap());
+                            break;
+                        };
+                    } else {
+                        // Index set is different.  Complete previous bin and try to start new one
+                        candidate_bins.push(current_bin.take().unwrap());
+
+                        if candidate_bins.is_empty() && self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows) {
+                            current_bin = Some(CandidateBin {
+                                fragments: vec![fragment.clone()],
+                                pos_range: position..(position + 1),
+                                candidacy: vec![candidacy],
+                                row_counts: vec![metrics.num_rows()],
+                                indices,
+                            });
+                        } else {
+                            break;
+                        };
                     }
                 }
                 (None, Some(_)) => {
                     // current bin is completed
-                    let bin = current_bin.take().unwrap();
-                    if !bin.is_noop() {
-                        candidate_bins.push(bin);
-                    }
+                    candidate_bins.push(current_bin.take().unwrap());
                 }
             }
         }
@@ -162,24 +159,9 @@ impl CompactionPlanner for BoundedCompactionPlanner {
 
 impl BoundedCompactionPlanner {
     /// Check if the usage exceeds the max compaction size or max compaction rows.
-    fn out_of_usage(&self, usage: &mut BoundUsage) -> bool {
-        match (
-            self.bounded_compaction_planner_options.max_compaction_size,
-            self.bounded_compaction_planner_options.max_compaction_rows,
-        ) {
-            (None, None) => false,
-            (Some(max_compaction_size), None) => usage.input_bytes > max_compaction_size as u64,
-            (None, Some(max_compaction_rows)) => usage.input_rows > max_compaction_rows,
-            (Some(max_compaction_size), Some(max_compaction_rows)) => {
-                usage.input_bytes > max_compaction_size as u64
-                    || usage.input_rows > max_compaction_rows
-            }
-        }
-    }
-
-    /// Update the usage with the fragment.
-    fn update_usage(&self, usage: &mut BoundUsage, fragment: &Fragment) {
-        usage.input_bytes += fragment
+    /// If not, update the usage with the fragment.
+    fn check_and_update_usage(&self, usage: &mut BoundUsage, fragment: &Fragment, current_rows: usize) -> bool {
+        let current_bytes = fragment
             .files
             .iter()
             .map(|data_file| {
@@ -190,7 +172,39 @@ impl BoundedCompactionPlanner {
                     .unwrap_or(0)
             })
             .sum::<u64>();
-        usage.input_rows += fragment.num_rows().unwrap_or(0);
+        let max_compaction_size = self.bounded_compaction_planner_options.max_compaction_size;
+        let max_compaction_rows = self.bounded_compaction_planner_options.max_compaction_rows;
+
+        let res = match (max_compaction_size, max_compaction_rows) {
+            (None, None) => false,
+            (Some(max_compaction_size), None) => {
+                if usage.input_bytes + current_bytes <= max_compaction_size as u64 {
+                    usage.input_bytes += current_bytes;
+                    true
+                } else {
+                    false
+                }
+            }
+            (None, Some(max_compaction_rows)) => {
+                if usage.input_rows + current_rows <= max_compaction_rows {
+                    usage.input_rows += current_rows;
+                    true
+                } else {
+                    false
+                }
+            }
+            (Some(max_compaction_size), Some(max_compaction_rows)) => {
+                if usage.input_bytes + current_bytes <= max_compaction_size as u64
+                    && usage.input_rows + current_rows <= max_compaction_rows
+                {
+                    usage.input_bytes += current_bytes;
+                    usage.input_rows += current_rows;
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        res
     }
 }
-

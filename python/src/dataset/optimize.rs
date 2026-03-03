@@ -16,15 +16,38 @@ use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
         commit_compaction, compact_files, plan_compaction, CompactionMetrics, CompactionOptions,
-        CompactionPlan, CompactionTask, RewriteResult,
+        CompactionPlan, CompactionPlannerType, CompactionTask, RewriteResult,
     },
 };
 use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple};
 
 use super::*;
 
+fn parse_compaction_planner_name(planner: &str) -> PyResult<CompactionPlannerType> {
+    match planner.trim().to_ascii_lowercase().as_str() {
+        "bounded" => Ok(CompactionPlannerType::Bounded),
+        _ => Ok(CompactionPlannerType::Default),
+    }
+}
+
+fn resolve_compaction_planner(
+    opts: &mut CompactionOptions,
+    planner: Option<String>,
+) -> PyResult<()> {
+    let has_limit = opts.max_compaction_rows.is_some() || opts.max_compaction_bytes.is_some();
+    let planner = match planner {
+        Some(planner) => parse_compaction_planner_name(&planner)?,
+        None if has_limit => CompactionPlannerType::Bounded,
+        _ => CompactionPlannerType::Default,
+    };
+
+    opts.compaction_planner_type = planner;
+    Ok(())
+}
+
 fn parse_compaction_options(options: &Bound<'_, PyDict>) -> PyResult<CompactionOptions> {
     let mut opts = CompactionOptions::default();
+    let mut planner: Option<String> = None;
 
     for (key, value) in options.into_iter() {
         let key: String = key.extract()?;
@@ -45,6 +68,15 @@ fn parse_compaction_options(options: &Bound<'_, PyDict>) -> PyResult<CompactionO
             "materialize_deletions_threshold" => {
                 opts.materialize_deletions_threshold = value.extract()?;
             }
+            "planner" => {
+                planner = value.extract()?;
+            }
+            "max_compaction_rows" => {
+                opts.max_compaction_rows = value.extract()?;
+            }
+            "max_compaction_bytes" => {
+                opts.max_compaction_bytes = value.extract()?;
+            }
             "num_threads" => {
                 opts.num_threads = value.extract()?;
             }
@@ -59,6 +91,8 @@ fn parse_compaction_options(options: &Bound<'_, PyDict>) -> PyResult<CompactionO
             }
         }
     }
+
+    resolve_compaction_planner(&mut opts, planner)?;
 
     Ok(opts)
 }

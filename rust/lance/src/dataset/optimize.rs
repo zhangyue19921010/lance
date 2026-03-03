@@ -92,7 +92,7 @@ use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
 use super::utils::make_rowid_capture_stream;
 use super::{write_fragments_internal, WriteMode, WriteParams};
 use crate::dataset::optimize::compaction_planner::{
-    BoundedCompactionPlanner, BoundedCompactionPlannerOptions, CompactionPlannerType,
+    BoundedCompactionPlanner, BoundedCompactionPlannerOptions,
 };
 use crate::dataset::utils::CapturedRowIds;
 use crate::io::commit::{commit_transaction, migrate_fragments};
@@ -120,6 +120,7 @@ pub mod remapping;
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 use binary_copy::rewrite_files_binary_copy;
+pub use compaction_planner::CompactionPlannerType;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Options to be passed to [compact_files].
