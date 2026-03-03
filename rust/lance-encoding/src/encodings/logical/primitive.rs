@@ -65,7 +65,12 @@ use crate::{
 };
 use lance_core::{Result, datatypes::Field, utils::tokio::spawn_cpu};
 
-use crate::constants::{DICT_DIVISOR_META_KEY, DICT_SIZE_RATIO_META_KEY};
+use crate::constants::{
+    COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
+    DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_ENV_VAR,
+    DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
+    DICT_VALUES_COMPRESSION_META_KEY,
+};
 use crate::version::LanceFileVersion;
 use crate::{
     EncodingsIo,
@@ -93,6 +98,7 @@ const FILL_BYTE: u8 = 0xFE;
 const DEFAULT_DICT_DIVISOR: u64 = 2;
 const DEFAULT_DICT_MAX_CARDINALITY: u64 = 100_000;
 const DEFAULT_DICT_SIZE_RATIO: f64 = 0.8;
+const DEFAULT_DICT_VALUES_COMPRESSION: &str = "lz4";
 
 struct PageLoadTask {
     decoder_fut: BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>,
@@ -4333,6 +4339,45 @@ impl PrimitiveStructuralEncoder {
         Ok(Some(scalar))
     }
 
+    fn resolve_dict_values_compression_metadata(
+        field_metadata: &HashMap<String, String>,
+        env_compression: Option<String>,
+        env_compression_level: Option<String>,
+    ) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+
+        let compression = field_metadata
+            .get(DICT_VALUES_COMPRESSION_META_KEY)
+            .cloned()
+            .or(env_compression)
+            .unwrap_or_else(|| DEFAULT_DICT_VALUES_COMPRESSION.to_string());
+        metadata.insert(COMPRESSION_META_KEY.to_string(), compression);
+
+        if let Some(compression_level) = field_metadata
+            .get(DICT_VALUES_COMPRESSION_LEVEL_META_KEY)
+            .cloned()
+            .or(env_compression_level)
+        {
+            metadata.insert(COMPRESSION_LEVEL_META_KEY.to_string(), compression_level);
+        }
+
+        metadata
+    }
+
+    fn build_dict_values_compressor_field(field: &Field) -> Result<Field> {
+        // This is an internal synthetic field used only to feed metadata into
+        // `create_block_compressor` for dictionary values. The concrete type/name here
+        // are not semantically meaningful; we rely on explicit metadata below to control
+        // general compression selection for dictionary values.
+        let mut dict_values_field = Field::new_arrow("", DataType::UInt16, false)?;
+        dict_values_field.metadata = Self::resolve_dict_values_compression_metadata(
+            &field.metadata,
+            env::var(DICT_VALUES_COMPRESSION_ENV_VAR).ok(),
+            env::var(DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR).ok(),
+        );
+        Ok(dict_values_field)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode_miniblock(
         column_idx: u32,
@@ -4412,11 +4457,10 @@ impl PrimitiveStructuralEncoder {
 
         if let Some(dictionary_data) = dictionary_data {
             let num_dictionary_items = dictionary_data.num_values();
-            // field in `create_block_compressor` is not used currently.
-            let dummy_dictionary_field = Field::new_arrow("", DataType::UInt16, false)?;
+            let dict_values_field = Self::build_dict_values_compressor_field(field)?;
 
             let (compressor, dictionary_encoding) = compression_strategy
-                .create_block_compressor(&dummy_dictionary_field, &dictionary_data)?;
+                .create_block_compressor(&dict_values_field, &dictionary_data)?;
             let dictionary_buffer = compressor.compress(dictionary_data)?;
 
             data.push(dictionary_buffer);
@@ -5259,7 +5303,11 @@ mod tests {
     };
     use crate::buffer::LanceBuffer;
     use crate::compression::DefaultDecompressionStrategy;
-    use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
+    use crate::constants::{
+        COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
+        DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY,
+        STRUCTURAL_ENCODING_MINIBLOCK,
+    };
     use crate::data::BlockInfo;
     use crate::decoder::PageEncoding;
     use crate::encodings::logical::primitive::{
@@ -6489,6 +6537,197 @@ mod tests {
             }));
 
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
+    }
+
+    fn dictionary_encoding_from_page(
+        page: &crate::encoder::EncodedPage,
+    ) -> &crate::format::pb21::CompressiveEncoding {
+        let PageEncoding::Structural(layout) = &page.description else {
+            panic!("Expected structural page encoding");
+        };
+        let pb21::page_layout::Layout::MiniBlockLayout(layout) = layout.layout.as_ref().unwrap()
+        else {
+            panic!("Expected mini-block layout");
+        };
+        layout
+            .dictionary
+            .as_ref()
+            .unwrap_or_else(|| panic!("Expected dictionary encoding"))
+    }
+
+    async fn encode_variable_dict_page(
+        metadata: HashMap<String, String>,
+    ) -> crate::encoder::EncodedPage {
+        use arrow_array::types::Int32Type;
+        use arrow_array::{ArrayRef, DictionaryArray, Int32Array, StringArray};
+
+        let values = Arc::new(StringArray::from(
+            (0..128)
+                .map(|i| format!("value_{i:04}_{}", "x".repeat(256)))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let keys = Int32Array::from_iter_values((0..20_000).map(|i| i % 128));
+        let dict_array =
+            Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap()) as ArrayRef;
+
+        let field = arrow_schema::Field::new(
+            "dict_col",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )
+        .with_metadata(metadata);
+
+        encode_first_page(field, dict_array, LanceFileVersion::V2_2).await
+    }
+
+    async fn encode_auto_fixed_dict_page(
+        metadata: HashMap<String, String>,
+    ) -> crate::encoder::EncodedPage {
+        use arrow_array::{ArrayRef, Decimal128Array};
+
+        // 128-bit fixed-width values with low cardinality to trigger dictionary encoding.
+        let values = (0..20_000)
+            .map(|i| match i % 3 {
+                0 => 10_i128,
+                1 => 20_i128,
+                _ => 30_i128,
+            })
+            .collect::<Vec<_>>();
+        let decimal = Decimal128Array::from_iter_values(values)
+            .with_precision_and_scale(38, 0)
+            .unwrap();
+        let decimal = Arc::new(decimal) as ArrayRef;
+
+        let mut field_metadata = metadata;
+        // Strongly encourage dictionary encoding for this synthetic test data.
+        field_metadata.insert(
+            "lance-encoding:dict-size-ratio".to_string(),
+            "0.99".to_string(),
+        );
+        let field = arrow_schema::Field::new("fixed_col", DataType::Decimal128(38, 0), false)
+            .with_metadata(field_metadata);
+
+        encode_first_page(field, decimal, LanceFileVersion::V2_2).await
+    }
+
+    #[tokio::test]
+    async fn test_dict_values_general_compression_default_lz4_for_variable_dict_values() {
+        let page = encode_variable_dict_page(HashMap::new()).await;
+        let dictionary_encoding = dictionary_encoding_from_page(&page);
+        let Some(Compression::General(general)) = dictionary_encoding.compression.as_ref() else {
+            panic!("Expected General compression for dictionary values");
+        };
+        let compression = general.compression.as_ref().unwrap();
+        assert_eq!(
+            compression.scheme(),
+            pb21::CompressionScheme::CompressionAlgorithmLz4
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dict_values_general_compression_default_lz4_for_fixed_dict_values() {
+        let page = encode_auto_fixed_dict_page(HashMap::new()).await;
+        let dictionary_encoding = dictionary_encoding_from_page(&page);
+        let Some(Compression::General(general)) = dictionary_encoding.compression.as_ref() else {
+            panic!("Expected General compression for dictionary values");
+        };
+        let compression = general.compression.as_ref().unwrap();
+        assert_eq!(
+            compression.scheme(),
+            pb21::CompressionScheme::CompressionAlgorithmLz4
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dict_values_general_compression_zstd() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            DICT_VALUES_COMPRESSION_META_KEY.to_string(),
+            "zstd".to_string(),
+        );
+        let page = encode_variable_dict_page(metadata).await;
+        let dictionary_encoding = dictionary_encoding_from_page(&page);
+        let Some(Compression::General(general)) = dictionary_encoding.compression.as_ref() else {
+            panic!("Expected General compression for dictionary values");
+        };
+        let compression = general.compression.as_ref().unwrap();
+        assert_eq!(
+            compression.scheme(),
+            pb21::CompressionScheme::CompressionAlgorithmZstd
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dict_values_general_compression_none() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            DICT_VALUES_COMPRESSION_META_KEY.to_string(),
+            "none".to_string(),
+        );
+        let page = encode_variable_dict_page(metadata).await;
+        let dictionary_encoding = dictionary_encoding_from_page(&page);
+        assert!(
+            !matches!(
+                dictionary_encoding.compression.as_ref(),
+                Some(Compression::General(_))
+            ),
+            "Expected dictionary values to avoid General compression"
+        );
+    }
+
+    #[test]
+    fn test_resolve_dict_values_compression_metadata_defaults_to_lz4() {
+        let metadata = PrimitiveStructuralEncoder::resolve_dict_values_compression_metadata(
+            &HashMap::new(),
+            None,
+            None,
+        );
+        assert_eq!(metadata.get(COMPRESSION_META_KEY), Some(&"lz4".to_string()),);
+        assert!(!metadata.contains_key(COMPRESSION_LEVEL_META_KEY));
+    }
+
+    #[test]
+    fn test_resolve_dict_values_compression_metadata_metadata_overrides_env() {
+        let field_metadata = HashMap::from([
+            (
+                DICT_VALUES_COMPRESSION_META_KEY.to_string(),
+                "none".to_string(),
+            ),
+            (
+                DICT_VALUES_COMPRESSION_LEVEL_META_KEY.to_string(),
+                "7".to_string(),
+            ),
+        ]);
+        let metadata = PrimitiveStructuralEncoder::resolve_dict_values_compression_metadata(
+            &field_metadata,
+            Some("zstd".to_string()),
+            Some("3".to_string()),
+        );
+        assert_eq!(
+            metadata.get(COMPRESSION_META_KEY),
+            Some(&"none".to_string()),
+        );
+        assert_eq!(
+            metadata.get(COMPRESSION_LEVEL_META_KEY),
+            Some(&"7".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_resolve_dict_values_compression_metadata_env_fallback() {
+        let metadata = PrimitiveStructuralEncoder::resolve_dict_values_compression_metadata(
+            &HashMap::new(),
+            Some("zstd".to_string()),
+            Some("9".to_string()),
+        );
+        assert_eq!(
+            metadata.get(COMPRESSION_META_KEY),
+            Some(&"zstd".to_string()),
+        );
+        assert_eq!(
+            metadata.get(COMPRESSION_LEVEL_META_KEY),
+            Some(&"9".to_string()),
+        );
     }
 
     #[tokio::test]
