@@ -377,7 +377,10 @@ impl<'a> CleanupTask<'a> {
                     "delete_rate_limit enable, limit {} ops/sec during cleanup",
                     rate
                 );
-                let duration = Duration::from_secs_f64(1.0 / rate);
+                let duration = Duration::try_from_secs_f64(1.0 / rate)
+                    .map_err(|e| Error::Cleanup {
+                        message: format!("delete_rate_limit {} is too small: {}", rate, e),
+                    })?;
                 let mut ticker = interval(duration);
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 IntervalStream::new(ticker)
