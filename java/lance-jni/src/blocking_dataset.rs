@@ -2645,12 +2645,18 @@ fn inner_cleanup_with_policy<'local>(
         })?
         .unwrap_or(false);
 
+    let delete_rate_limit = env
+        .get_optional_from_method(&jpolicy, "getDeleteRateLimit", |env, obj| {
+            Ok(env.call_method(obj, "doubleValue", "()D", &[])?.d()?)
+        })?;
+
     let policy = CleanupPolicy {
         before_timestamp,
         before_version,
         delete_unverified,
         error_if_tagged_old_versions,
         clean_referenced_branches,
+        delete_rate_limit,
     };
 
     let stats = {

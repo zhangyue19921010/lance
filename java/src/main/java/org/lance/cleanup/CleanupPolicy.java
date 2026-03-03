@@ -27,18 +27,21 @@ public class CleanupPolicy {
   private final Optional<Boolean> deleteUnverified;
   private final Optional<Boolean> errorIfTaggedOldVersions;
   private final Optional<Boolean> cleanReferencedBranches;
+  private final Optional<Double> deleteRateLimit;
 
   private CleanupPolicy(
       Optional<Long> beforeTimestampMillis,
       Optional<Long> beforeVersion,
       Optional<Boolean> deleteUnverified,
       Optional<Boolean> errorIfTaggedOldVersions,
-      Optional<Boolean> cleanReferencedBranches) {
+      Optional<Boolean> cleanReferencedBranches,
+      Optional<Double> deleteRateLimit) {
     this.beforeTimestampMillis = beforeTimestampMillis;
     this.beforeVersion = beforeVersion;
     this.deleteUnverified = deleteUnverified;
     this.errorIfTaggedOldVersions = errorIfTaggedOldVersions;
     this.cleanReferencedBranches = cleanReferencedBranches;
+    this.deleteRateLimit = deleteRateLimit;
   }
 
   public static Builder builder() {
@@ -65,6 +68,10 @@ public class CleanupPolicy {
     return cleanReferencedBranches;
   }
 
+  public Optional<Double> getDeleteRateLimit() {
+    return deleteRateLimit;
+  }
+
   /** Builder for CleanupPolicy. */
   public static class Builder {
     private Optional<Long> beforeTimestampMillis = Optional.empty();
@@ -72,6 +79,7 @@ public class CleanupPolicy {
     private Optional<Boolean> deleteUnverified = Optional.empty();
     private Optional<Boolean> errorIfTaggedOldVersions = Optional.empty();
     private Optional<Boolean> cleanReferencedBranches = Optional.empty();
+    private Optional<Double> deleteRateLimit = Optional.empty();
 
     private Builder() {}
 
@@ -105,13 +113,20 @@ public class CleanupPolicy {
       return this;
     }
 
+    /** Set the maximum number of delete operations per second. */
+    public Builder withDeleteRateLimit(double deleteRateLimit) {
+      this.deleteRateLimit = Optional.of(deleteRateLimit);
+      return this;
+    }
+
     public CleanupPolicy build() {
       return new CleanupPolicy(
           beforeTimestampMillis,
           beforeVersion,
           deleteUnverified,
           errorIfTaggedOldVersions,
-          cleanReferencedBranches);
+          cleanReferencedBranches,
+          deleteRateLimit);
     }
   }
 }

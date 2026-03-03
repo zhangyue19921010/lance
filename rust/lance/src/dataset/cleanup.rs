@@ -39,6 +39,7 @@ use crate::{utils::temporal::utc_now, Dataset};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
 use futures::future::try_join_all;
+use futures::stream::BoxStream;
 use futures::{stream, StreamExt, TryStreamExt};
 use humantime::parse_duration;
 use lance_core::{
@@ -63,7 +64,10 @@ use std::{
     collections::{HashMap, HashSet},
     future,
     sync::{Mutex, MutexGuard},
+    time::Duration,
 };
+use tokio::time::{interval, MissedTickBehavior};
+use tokio_stream::wrappers::IntervalStream;
 use tracing::{debug, info, instrument, Span};
 
 #[derive(Clone, Debug, Default)]
@@ -367,10 +371,27 @@ impl<'a> CleanupTask<'a> {
         let all_paths_to_remove =
             stream::iter(vec![unreferenced_paths, old_manifests_stream]).flatten();
 
+        let paths_to_delete: BoxStream<Result<Path>> =
+            if let Some(rate) = self.policy.delete_rate_limit {
+                info!(
+                    "delete_rate_limit enable, limit {} ops/sec during cleanup",
+                    rate
+                );
+                let duration = Duration::from_secs_f64(1.0 / rate);
+                let mut ticker = interval(duration);
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                IntervalStream::new(ticker)
+                    .zip(all_paths_to_remove)
+                    .map(|(_, path)| path)
+                    .boxed()
+            } else {
+                all_paths_to_remove.boxed()
+            };
+
         let delete_fut = self
             .dataset
             .object_store
-            .remove_stream(all_paths_to_remove.boxed())
+            .remove_stream(paths_to_delete)
             .try_for_each(|_| future::ready(Ok(())));
 
         delete_fut.await?;
@@ -796,6 +817,11 @@ pub struct CleanupPolicy {
     pub error_if_tagged_old_versions: bool,
     /// If clean the referenced branches
     pub clean_referenced_branches: bool,
+    /// Maximum number of delete operations per second. If None, no rate limiting is applied.
+    ///
+    /// Use this to avoid hitting S3 (or other object store) request rate limits during cleanup.
+    /// For example, `Some(100.0)` limits deletions to 100 files per second.
+    pub delete_rate_limit: Option<f64>,
 }
 
 impl CleanupPolicy {
@@ -819,6 +845,7 @@ impl Default for CleanupPolicy {
             delete_unverified: false,
             error_if_tagged_old_versions: true,
             clean_referenced_branches: false,
+            delete_rate_limit: None,
         }
     }
 }
@@ -870,6 +897,27 @@ impl CleanupPolicyBuilder {
     pub fn error_if_tagged_old_versions(mut self, error: bool) -> Self {
         self.policy.error_if_tagged_old_versions = error;
         self
+    }
+
+    /// Limit the number of delete operations per second during cleanup.
+    ///
+    /// By default (None), deletions run at full speed. Set this to a positive value to
+    /// throttle deletions and avoid hitting object store request rate limits (e.g. S3 HTTP 503).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `rate` is not a positive finite number.
+    pub fn delete_rate_limit(mut self, rate: f64) -> Result<Self> {
+        if !rate.is_finite() || rate <= 0.0 {
+            return Err(Error::Cleanup {
+                message: format!(
+                    "delete_rate_limit must be a positive finite number, got {}",
+                    rate
+                ),
+            });
+        }
+        self.policy.delete_rate_limit = Some(rate);
+        Ok(self)
     }
 
     pub fn build(self) -> CleanupPolicy {
@@ -997,6 +1045,23 @@ pub async fn build_cleanup_policy(
         };
         // Map config to policy flag controlling whether referenced branches are cleaned
         builder = builder.clean_referenced_branches(clean_referenced);
+    }
+    if let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit") {
+        let rate: f64 = match delete_rate_limit.parse() {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(Error::Cleanup {
+                    message: format!(
+                        "Error encountered while parsing lance.auto_cleanup.delete_rate_limit as f64: {}",
+                        e
+                    ),
+                });
+            }
+        };
+        builder = match builder.delete_rate_limit(rate) {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
     }
 
     Ok(Some(builder.build()))
@@ -3356,5 +3421,43 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
         assert_eq!(setup.branch4.counts.num_index_files, 4);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_with_rate_limit() {
+        // Create multiple versions with data files that will be deleted.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        // Create several old versions
+        for _ in 0..4 {
+            fixture.overwrite_some_data().await.unwrap();
+        }
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+
+        // Set rate limit to 1 ops/second so cleanup of several files must take at least ~1s
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now() - TimeDelta::try_days(8).unwrap())
+            .delete_rate_limit(1.0)
+            .unwrap()
+            .build();
+
+        let start = std::time::Instant::now();
+        let db = fixture.open().await.unwrap();
+        let stats = cleanup_old_versions(&db, policy).await.unwrap();
+        let elapsed = start.elapsed();
+
+        // We deleted old versions, so there should be removed files
+        assert!(
+            stats.old_versions > 0,
+            "expected some old versions to be removed"
+        );
+        // With rate=1 and multiple files, it must take at least 2s
+        // (even just 2 deletions at 1/s means ≥2s)
+        assert!(
+            elapsed.as_millis() >= 2000,
+            "expected cleanup to be rate-limited (elapsed: {:?})",
+            elapsed
+        );
     }
 }
