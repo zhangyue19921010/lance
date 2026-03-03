@@ -2666,8 +2666,8 @@ fn inner_cleanup_with_policy<'local>(
         })?
         .unwrap_or(false);
 
-    let delete_rate_limit = env
-        .get_optional_from_method(&jpolicy, "getDeleteRateLimit", |env, obj| {
+    let delete_rate_limit =
+        env.get_optional_from_method(&jpolicy, "getDeleteRateLimit", |env, obj| {
             Ok(env.call_method(obj, "doubleValue", "()D", &[])?.d()?)
         })?;
 
