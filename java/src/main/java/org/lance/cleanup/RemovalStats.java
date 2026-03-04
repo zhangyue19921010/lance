@@ -17,10 +17,10 @@ package org.lance.cleanup;
 public class RemovalStats {
   private final long bytesRemoved;
   private final long oldVersions;
-  private final long removedDataFiles;
-  private final long removedTransactionFiles;
-  private final long removedIndexFiles;
-  private final long removedDeletionFiles;
+  private final long dataFilesRemoved;
+  private final long transactionFilesRemoved;
+  private final long indexFilesRemoved;
+  private final long deletionFilesRemoved;
 
   public RemovalStats(long bytesRemoved, long oldVersions) {
     this(bytesRemoved, oldVersions, 0L, 0L, 0L, 0L);
@@ -29,16 +29,16 @@ public class RemovalStats {
   public RemovalStats(
       long bytesRemoved,
       long oldVersions,
-      long removedDataFiles,
-      long removedTransactionFiles,
-      long removedIndexFiles,
-      long removedDeletionFiles) {
+      long dataFilesRemoved,
+      long transactionFilesRemoved,
+      long indexFilesRemoved,
+      long deletionFilesRemoved) {
     this.bytesRemoved = bytesRemoved;
     this.oldVersions = oldVersions;
-    this.removedDataFiles = removedDataFiles;
-    this.removedTransactionFiles = removedTransactionFiles;
-    this.removedIndexFiles = removedIndexFiles;
-    this.removedDeletionFiles = removedDeletionFiles;
+    this.dataFilesRemoved = dataFilesRemoved;
+    this.transactionFilesRemoved = transactionFilesRemoved;
+    this.indexFilesRemoved = indexFilesRemoved;
+    this.deletionFilesRemoved = deletionFilesRemoved;
   }
 
   public long getBytesRemoved() {
@@ -49,19 +49,19 @@ public class RemovalStats {
     return oldVersions;
   }
 
-  public long getRemovedDataFiles() {
-    return removedDataFiles;
+  public long getDataFilesRemoved() {
+    return dataFilesRemoved;
   }
 
-  public long getRemovedTransactionFiles() {
-    return removedTransactionFiles;
+  public long getTransactionFilesRemoved() {
+    return transactionFilesRemoved;
   }
 
-  public long getRemovedIndexFiles() {
-    return removedIndexFiles;
+  public long getIndexFilesRemoved() {
+    return indexFilesRemoved;
   }
 
-  public long getRemovedDeletionFiles() {
-    return removedDeletionFiles;
+  public long getDeletionFilesRemoved() {
+    return deletionFilesRemoved;
   }
 }

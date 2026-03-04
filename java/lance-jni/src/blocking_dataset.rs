@@ -2704,10 +2704,10 @@ fn inner_cleanup_with_policy<'local>(
         &[
             JValue::Long(stats.bytes_removed as i64),
             JValue::Long(stats.old_versions as i64),
-            JValue::Long(stats.removed_data_files as i64),
-            JValue::Long(stats.removed_transaction_files as i64),
-            JValue::Long(stats.removed_index_files as i64),
-            JValue::Long(stats.removed_deletion_files as i64),
+            JValue::Long(stats.data_files_removed as i64),
+            JValue::Long(stats.transaction_files_removed as i64),
+            JValue::Long(stats.index_files_removed as i64),
+            JValue::Long(stats.deletion_files_removed as i64),
         ],
     )?;
 

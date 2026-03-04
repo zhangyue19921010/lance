@@ -78,10 +78,10 @@ struct ReferencedFiles {
 pub struct RemovalStats {
     pub bytes_removed: u64,
     pub old_versions: u64,
-    pub removed_data_files: u64,
-    pub removed_transaction_files: u64,
-    pub removed_index_files: u64,
-    pub removed_deletion_files: u64,
+    pub data_files_removed: u64,
+    pub transaction_files_removed: u64,
+    pub index_files_removed: u64,
+    pub deletion_files_removed: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -181,10 +181,10 @@ impl<'a> CleanupTask<'a> {
         let stats = self.delete_unreferenced_files(inspection).await?;
         final_stats.bytes_removed += stats.bytes_removed;
         final_stats.old_versions += stats.old_versions;
-        final_stats.removed_data_files += stats.removed_data_files;
-        final_stats.removed_transaction_files += stats.removed_transaction_files;
-        final_stats.removed_index_files += stats.removed_index_files;
-        final_stats.removed_deletion_files += stats.removed_deletion_files;
+        final_stats.data_files_removed += stats.data_files_removed;
+        final_stats.transaction_files_removed += stats.transaction_files_removed;
+        final_stats.index_files_removed += stats.index_files_removed;
+        final_stats.deletion_files_removed += stats.deletion_files_removed;
         Ok(final_stats)
     }
 
@@ -304,10 +304,10 @@ impl<'a> CleanupTask<'a> {
         fields(
             old_versions = inspection.old_manifests.len(),
             bytes_removed = tracing::field::Empty,
-            removed_data_files = tracing::field::Empty,
-            removed_transaction_files = tracing::field::Empty,
-            removed_index_files = tracing::field::Empty,
-            removed_deletion_files = tracing::field::Empty
+            data_files_removed = tracing::field::Empty,
+            transaction_files_removed = tracing::field::Empty,
+            index_files_removed = tracing::field::Empty,
+            deletion_files_removed = tracing::field::Empty
         )
     )]
     async fn delete_unreferenced_files(
@@ -360,12 +360,12 @@ impl<'a> CleanupTask<'a> {
                         stats.bytes_removed += obj_meta.size;
                         if let Some(file_type) = file_type {
                             match file_type {
-                                RemovedFileType::Data => stats.removed_data_files += 1,
+                                RemovedFileType::Data => stats.data_files_removed += 1,
                                 RemovedFileType::Transaction => {
-                                    stats.removed_transaction_files += 1
+                                    stats.transaction_files_removed += 1
                                 }
-                                RemovedFileType::Index => stats.removed_index_files += 1,
-                                RemovedFileType::Deletion => stats.removed_deletion_files += 1,
+                                RemovedFileType::Index => stats.index_files_removed += 1,
+                                RemovedFileType::Deletion => stats.deletion_files_removed += 1,
                             }
                         }
                     }
@@ -427,15 +427,15 @@ impl<'a> CleanupTask<'a> {
 
         let span = Span::current();
         span.record("bytes_removed", removal_stats.bytes_removed);
-        span.record("removed_data_files", removal_stats.removed_data_files);
+        span.record("data_files_removed", removal_stats.data_files_removed);
         span.record(
-            "removed_transaction_files",
-            removal_stats.removed_transaction_files,
+            "transaction_files_removed",
+            removal_stats.transaction_files_removed,
         );
-        span.record("removed_index_files", removal_stats.removed_index_files);
+        span.record("index_files_removed", removal_stats.index_files_removed);
         span.record(
-            "removed_deletion_files",
-            removal_stats.removed_deletion_files,
+            "deletion_files_removed",
+            removal_stats.deletion_files_removed,
         );
 
         Ok(removal_stats)
@@ -721,11 +721,11 @@ impl<'a> CleanupTask<'a> {
                             let mut stats_guard = final_stats.lock().unwrap();
                             stats_guard.bytes_removed += stats.bytes_removed;
                             stats_guard.old_versions += stats.old_versions;
-                            stats_guard.removed_data_files += stats.removed_data_files;
-                            stats_guard.removed_transaction_files +=
-                                stats.removed_transaction_files;
-                            stats_guard.removed_index_files += stats.removed_index_files;
-                            stats_guard.removed_deletion_files += stats.removed_deletion_files;
+                            stats_guard.data_files_removed += stats.data_files_removed;
+                            stats_guard.transaction_files_removed +=
+                                stats.transaction_files_removed;
+                            stats_guard.index_files_removed += stats.index_files_removed;
+                            stats_guard.deletion_files_removed += stats.deletion_files_removed;
                         }
                     }
                     Ok::<(), Error>(())
@@ -1117,7 +1117,7 @@ mod tests {
     };
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::RenameCommitHandler;
-    use lance_testing::datagen::{BatchGenerator, IncrementingInt32, some_batch, RandomVector};
+    use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
 
     #[derive(Debug)]
@@ -1488,7 +1488,7 @@ mod tests {
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(removed.old_versions, 1);
-        assert_eq!(removed.removed_data_files, 1);
+        assert_eq!(removed.data_files_removed, 1);
         assert_eq!(
             removed.bytes_removed,
             before_count.num_bytes - after_count.num_bytes
@@ -2060,22 +2060,22 @@ mod tests {
             .unwrap();
         let after_count = fixture.count_files().await.unwrap();
 
-        let removed_data_files = (before_count.num_data_files - after_count.num_data_files) as u64;
-        let removed_transaction_files =
+        let data_files_removed = (before_count.num_data_files - after_count.num_data_files) as u64;
+        let transaction_files_removed =
             (before_count.num_tx_files - after_count.num_tx_files) as u64;
-        let removed_index_files =
+        let index_files_removed =
             (before_count.num_index_files - after_count.num_index_files) as u64;
-        let removed_deletion_files =
+        let deletion_files_removed =
             (before_count.num_delete_files - after_count.num_delete_files) as u64;
 
-        assert_eq!(removed.removed_data_files, removed_data_files);
-        assert_eq!(removed.removed_transaction_files, removed_transaction_files);
-        assert_eq!(removed.removed_index_files, removed_index_files);
-        assert_eq!(removed.removed_deletion_files, removed_deletion_files);
-        assert_gt!(removed.removed_data_files, 0);
-        assert_gt!(removed.removed_transaction_files, 0);
-        assert_gt!(removed.removed_index_files, 0);
-        assert_gt!(removed.removed_deletion_files, 0);
+        assert_eq!(removed.data_files_removed, data_files_removed);
+        assert_eq!(removed.transaction_files_removed, transaction_files_removed);
+        assert_eq!(removed.index_files_removed, index_files_removed);
+        assert_eq!(removed.deletion_files_removed, deletion_files_removed);
+        assert_gt!(removed.data_files_removed, 0);
+        assert_gt!(removed.transaction_files_removed, 0);
+        assert_gt!(removed.index_files_removed, 0);
+        assert_gt!(removed.deletion_files_removed, 0);
     }
 
     #[tokio::test]
@@ -2126,7 +2126,7 @@ mod tests {
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(removed.old_versions, 0);
-        assert_eq!(removed.removed_data_files, 1);
+        assert_eq!(removed.data_files_removed, 1);
         assert_eq!(
             removed.bytes_removed,
             before_count.num_bytes - after_count.num_bytes
@@ -2160,7 +2160,7 @@ mod tests {
 
         assert_eq!(removed.old_versions, 0);
         assert_eq!(removed.bytes_removed, 0);
-        assert_eq!(removed.removed_data_files, 0);
+        assert_eq!(removed.data_files_removed, 0);
 
         let after_count = fixture.count_files().await.unwrap();
         assert_eq!(before_count, after_count);
