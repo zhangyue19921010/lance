@@ -41,7 +41,6 @@ class CompactionPlannerConfig:
         return CompactionPlannerConfig(planner="bounded", parameters=parameters)
 
 
-
 def _resolve_compaction_planner(
     planner: str | None,
     *,

@@ -114,9 +114,7 @@ impl CompactionPlanner for BoundedCompactionPlanner {
             match (candidacy, &mut current_bin) {
                 (None, None) => {}
                 (Some(candidacy), None) => {
-                    if self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows)
-                        || candidate_bins.is_empty()
-                    {
+                    if self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows) {
                         current_bin = Some(CandidateBin {
                             fragments: vec![fragment.clone()],
                             pos_range: position..(position + 1),
@@ -124,6 +122,15 @@ impl CompactionPlanner for BoundedCompactionPlanner {
                             row_counts: vec![metrics.num_rows()],
                             indices,
                         });
+                    } else if candidate_bins.is_empty() {
+                        candidate_bins.push(CandidateBin {
+                            fragments: vec![fragment.clone()],
+                            pos_range: position..(position + 1),
+                            candidacy: vec![candidacy],
+                            row_counts: vec![metrics.num_rows()],
+                            indices,
+                        });
+                        break;
                     } else {
                         break;
                     }
