@@ -669,7 +669,6 @@ impl Planner {
                 Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => encode_jsonb(s),
                 _ => Err(Error::invalid_input(
                     "Expected a string value for JSONB literal",
-                    location!(),
                 )),
             },
             // For example, DATE '2020-01-01'
@@ -758,7 +757,6 @@ impl Planner {
                 }) => encode_jsonb(s),
                 _ => Err(Error::invalid_input(
                     "CAST to JSONB only supports string literals",
-                    location!(),
                 )),
             },
             SQLExpr::Cast {
