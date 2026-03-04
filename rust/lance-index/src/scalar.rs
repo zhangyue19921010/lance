@@ -18,13 +18,11 @@ use std::{any::Any, ops::Bound, sync::Arc};
 use datafusion_expr::Expr;
 use datafusion_expr::expr::ScalarFunction;
 use deepsize::DeepSizeOf;
-use futures::{FutureExt, Stream, future::BoxFuture};
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::Serialize;
-use snafu::location;
 
 use crate::metrics::MetricsCollector;
 use crate::scalar::registry::TrainingCriteria;
@@ -96,10 +94,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
             IndexType::RTree => Ok(Self::RTree),
-            _ => Err(Error::Index {
-                message: "Invalid index type".to_string(),
-                location: location!(),
-            }),
+            _ => Err(Error::index("Invalid index type".to_string())),
         }
     }
 }
@@ -203,58 +198,6 @@ pub trait IndexReader: Send + Sync {
     fn num_rows(&self) -> usize;
     /// Return the metadata of the file
     fn schema(&self) -> &lance_core::datatypes::Schema;
-}
-
-/// A stream that reads the original training data back out of the index
-#[allow(dead_code)]
-struct IndexReaderStream {
-    reader: Arc<dyn IndexReader>,
-    batch_size: u64,
-    offset: u64,
-    limit: u64,
-}
-
-#[allow(dead_code)]
-impl IndexReaderStream {
-    async fn new(reader: Arc<dyn IndexReader>, batch_size: u64) -> Self {
-        let limit = reader.num_rows() as u64;
-        Self::new_with_limit(reader, batch_size, limit).await
-    }
-
-    async fn new_with_limit(reader: Arc<dyn IndexReader>, batch_size: u64, limit: u64) -> Self {
-        Self {
-            reader,
-            batch_size,
-            offset: 0,
-            limit,
-        }
-    }
-}
-
-impl Stream for IndexReaderStream {
-    type Item = BoxFuture<'static, Result<RecordBatch>>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.offset >= this.limit {
-            return std::task::Poll::Ready(None);
-        }
-        let read_start = this.offset;
-        let read_end = this.limit.min(this.offset + this.batch_size);
-        this.offset = read_end;
-        let reader_copy = this.reader.clone();
-
-        let read_task = async move {
-            reader_copy
-                .read_range(read_start as usize..read_end as usize, None)
-                .await
-        }
-        .boxed();
-        std::task::Poll::Ready(Some(read_task))
-    }
 }
 
 /// Trait abstracting I/O away from index logic

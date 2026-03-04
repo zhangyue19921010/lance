@@ -53,7 +53,6 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
@@ -113,9 +112,7 @@ use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_namespace::models::{
-    CreateEmptyTableRequest, DeclareTableRequest, DeclareTableResponse, DescribeTableRequest,
-};
+use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
@@ -595,11 +592,7 @@ impl Dataset {
             object_store.open(&manifest_location.path).await
         };
         let object_reader = object_reader.map_err(|e| match &e {
-            Error::NotFound { uri, .. } => Error::DatasetNotFound {
-                path: uri.clone(),
-                source: box_error(e),
-                location: location!(),
-            },
+            Error::NotFound { uri, .. } => Error::dataset_not_found(uri.clone(), box_error(e)),
             _ => e,
         })?;
 
@@ -607,15 +600,10 @@ impl Dataset {
             read_last_block(object_reader.as_ref())
                 .await
                 .map_err(|err| match err {
-                    object_store::Error::NotFound { path, source } => Error::DatasetNotFound {
-                        path,
-                        source,
-                        location: location!(),
-                    },
-                    _ => Error::IO {
-                        source: err.into(),
-                        location: location!(),
-                    },
+                    object_store::Error::NotFound { path, source } => {
+                        Error::dataset_not_found(path, source)
+                    }
+                    _ => Error::io_source(err.into()),
                 })?;
         let offset = read_metadata_offset(&last_block)?;
 
@@ -638,10 +626,7 @@ impl Dataset {
                  Please upgrade Lance to read this dataset.\n Flags: {}",
                 manifest.reader_feature_flags
             );
-            return Err(Error::NotSupported {
-                source: message.into(),
-                location: location!(),
-            });
+            return Err(Error::not_supported_source(message.into()));
         }
 
         // If indices were also in the last block, we can take the opportunity to
@@ -760,7 +745,7 @@ impl Dataset {
 
     /// Write into a namespace-managed table with automatic credential vending.
     ///
-    /// For CREATE mode, calls create_empty_table() to initialize the table.
+    /// For CREATE mode, calls declare_table() to initialize the table.
     /// For other modes, calls describe_table() and opens dataset with namespace credentials.
     ///
     /// # Arguments
@@ -783,45 +768,15 @@ impl Dataset {
                     id: Some(table_id.clone()),
                     ..Default::default()
                 };
-                // Try declare_table first, fall back to deprecated create_empty_table
-                // for backward compatibility with older namespace implementations.
-                // create_empty_table support will be removed in 3.0.0.
-                #[allow(deprecated)]
-                let response = match namespace.declare_table(declare_request).await {
-                    Ok(resp) => resp,
-                    Err(Error::NotSupported { .. }) => {
-                        let fallback_request = CreateEmptyTableRequest {
-                            id: Some(table_id.clone()),
-                            ..Default::default()
-                        };
-                        let fallback_resp = namespace
-                            .create_empty_table(fallback_request)
-                            .await
-                            .map_err(|e| Error::Namespace {
-                                source: Box::new(e),
-                                location: location!(),
-                            })?;
-                        DeclareTableResponse {
-                            transaction_id: fallback_resp.transaction_id,
-                            location: fallback_resp.location,
-                            storage_options: fallback_resp.storage_options,
-                            properties: fallback_resp.properties,
-                            managed_versioning: None,
-                        }
-                    }
-                    Err(e) => {
-                        return Err(Error::Namespace {
-                            source: Box::new(e),
-                            location: location!(),
-                        });
-                    }
-                };
+                let response = namespace
+                    .declare_table(declare_request)
+                    .await
+                    .map_err(|e| Error::namespace_source(Box::new(e)))?;
 
-                let uri = response.location.ok_or_else(|| Error::Namespace {
-                    source: Box::new(std::io::Error::other(
+                let uri = response.location.ok_or_else(|| {
+                    Error::namespace_source(Box::new(std::io::Error::other(
                         "Table location not found in declare_table response",
-                    )),
-                    location: location!(),
+                    )))
                 })?;
 
                 // Set up commit handler when managed_versioning is enabled
@@ -870,20 +825,15 @@ impl Dataset {
                     id: Some(table_id.clone()),
                     ..Default::default()
                 };
-                let response =
-                    namespace
-                        .describe_table(request)
-                        .await
-                        .map_err(|e| Error::Namespace {
-                            source: Box::new(e),
-                            location: location!(),
-                        })?;
+                let response = namespace
+                    .describe_table(request)
+                    .await
+                    .map_err(|e| Error::namespace_source(Box::new(e)))?;
 
-                let uri = response.location.ok_or_else(|| Error::Namespace {
-                    source: Box::new(std::io::Error::other(
+                let uri = response.location.ok_or_else(|| {
+                    Error::namespace_source(Box::new(std::io::Error::other(
                         "Table location not found in describe_table response",
-                    )),
-                    location: location!(),
+                    )))
                 })?;
 
                 // Set up commit handler when managed_versioning is enabled
@@ -1749,13 +1699,10 @@ impl Dataset {
                 })?;
 
                 if !base_path.is_dataset_root {
-                    return Err(Error::Internal {
-                        message: format!(
-                            "base_path id {} is not a dataset root for deletion_file {:?}",
-                            base_id, deletion_file
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::internal(format!(
+                        "base_path id {} is not a dataset root for deletion_file {:?}",
+                        base_id, deletion_file
+                    )));
                 }
                 base_path.extract_path(self.session.store_registry())
             }
@@ -2075,7 +2022,6 @@ impl Dataset {
                         "Duplicate fragment id {} found in dataset {:?}",
                         id, self.base
                     ),
-                    location!(),
                 ));
             }
         }
@@ -2087,14 +2033,10 @@ impl Dataset {
             .map(|f| f.id)
             .try_fold(0, |prev, id| {
                 if id < prev {
-                    Err(Error::corrupt_file(
-                        self.base.clone(),
-                        format!(
-                            "Fragment ids are not sorted in increasing fragment-id order. Found {} after {} in dataset {:?}",
-                            id, prev, self.base
-                        ),
-                        location!(),
-                    ))
+                    Err(Error::corrupt_file(self.base.clone(), format!(
+                        "Fragment ids are not sorted in increasing fragment-id order. Found {} after {} in dataset {:?}",
+                        id, prev, self.base
+                    )))
                 } else {
                     Ok(id)
                 }
@@ -2125,7 +2067,6 @@ impl Dataset {
                         "Duplicate index id {} found in dataset {:?}",
                         &index.uuid, self.base
                     ),
-                    location!(),
                 ));
             }
         }
@@ -2142,7 +2083,6 @@ impl Dataset {
             return Err(Error::corrupt_file(
                 self.manifest_location.path.clone(),
                 message,
-                location!(),
             ));
         };
 
@@ -2257,10 +2197,7 @@ impl Dataset {
             .await
             .is_ok()
         {
-            return Err(Error::DatasetAlreadyExists {
-                uri: target_path.to_string(),
-                location: location!(),
-            });
+            return Err(Error::dataset_already_exists(target_path.to_string()));
         }
 
         let build_absolute_path = |relative_path: &str, base: &Path| -> Path {
@@ -2347,24 +2284,17 @@ impl Dataset {
         let mut file_paths: Vec<(String, Path)> = Vec::new();
         for fragment in self.manifest.fragments.iter() {
             if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
-                return Err(Error::Internal {
-                    message: format!(
-                        "External row_id_meta is not supported yet. external file path: {}",
-                        external_file.path
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::internal(format!(
+                    "External row_id_meta is not supported yet. external file path: {}",
+                    external_file.path
+                )));
             }
             for data_file in fragment.files.iter() {
                 let base_root = if let Some(base_id) = data_file.base_id {
                     let base_path =
-                        self.manifest
-                            .base_paths
-                            .get(&base_id)
-                            .ok_or_else(|| Error::Internal {
-                                message: format!("base_id {} not found", base_id),
-                                location: location!(),
-                            })?;
+                        self.manifest.base_paths.get(&base_id).ok_or_else(|| {
+                            Error::internal(format!("base_id {} not found", base_id))
+                        })?;
                     Path::parse(base_path.path.as_str())?
                 } else {
                     self.base.clone()
@@ -2377,13 +2307,9 @@ impl Dataset {
             if let Some(deletion_file) = &fragment.deletion_file {
                 let base_root = if let Some(base_id) = deletion_file.base_id {
                     let base_path =
-                        self.manifest
-                            .base_paths
-                            .get(&base_id)
-                            .ok_or_else(|| Error::Internal {
-                                message: format!("base_id {} not found", base_id),
-                                location: location!(),
-                            })?;
+                        self.manifest.base_paths.get(&base_id).ok_or_else(|| {
+                            Error::internal(format!("base_id {} not found", base_id))
+                        })?;
                     Path::parse(base_path.path.as_str())?
                 } else {
                     self.base.clone()
@@ -2404,14 +2330,11 @@ impl Dataset {
 
         for index in &indices {
             let base_root = if let Some(base_id) = index.base_id {
-                let base_path =
-                    self.manifest
-                        .base_paths
-                        .get(&base_id)
-                        .ok_or_else(|| Error::Internal {
-                            message: format!("base_id {} not found", base_id),
-                            location: location!(),
-                        })?;
+                let base_path = self
+                    .manifest
+                    .base_paths
+                    .get(&base_id)
+                    .ok_or_else(|| Error::internal(format!("base_id {} not found", base_id)))?;
                 Path::parse(base_path.path.as_str())?
             } else {
                 self.base.clone()
@@ -2543,13 +2466,10 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                     )?;
                     let loaded =
                         Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
-                            Error::Internal {
-                                message: format!(
-                                    "Dataset version {} does not have a transaction file",
-                                    manifest_copy.version
-                                ),
-                                location: location!(),
-                            }
+                            Error::internal(format!(
+                                "Dataset version {} does not have a transaction file",
+                                manifest_copy.version
+                            ))
                         })?);
                     dataset
                         .metadata_cache
@@ -2777,13 +2697,10 @@ impl Dataset {
                 .await?;
                 Ok(())
             }
-            _ => Err(Error::InvalidInput {
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Unsupported index type (patched): {}", index_type),
-                )),
-                location: location!(),
-            }),
+            _ => Err(Error::invalid_input_source(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Unsupported index type (patched): {}", index_type),
+            )))),
         }
     }
 }

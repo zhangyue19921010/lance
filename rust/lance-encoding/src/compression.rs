@@ -67,7 +67,6 @@ use arrow_array::{cast::AsArray, types::UInt64Type};
 use arrow_schema::DataType;
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::{Error, Result, datatypes::Field, error::LanceOptionExt};
-use snafu::location;
 use std::{str::FromStr, sync::Arc};
 
 /// Default threshold for RLE compression selection when the user explicitly provides a threshold.
@@ -347,10 +346,14 @@ fn try_general_compression(
     field_params: &CompressionFieldParams,
     data: &DataBlock,
 ) -> Result<Option<(Box<dyn BlockCompressor>, CompressionConfig)>> {
+    // Explicitly disable general compression.
+    if field_params.compression.as_deref() == Some("none") {
+        return Ok(None);
+    }
+
     // User-requested compression (unused today but perhaps still used
     // in the future someday)
     if let Some(compression_scheme) = &field_params.compression
-        && compression_scheme != "none"
         && version >= LanceFileVersion::V2_2
     {
         let scheme: CompressionScheme = compression_scheme.parse()?;
@@ -556,14 +559,13 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 // sophisticated approach.
                 Ok(Box::new(ValueEncoder::default()))
             }
-            _ => Err(Error::NotSupported {
-                source: format!(
+            _ => Err(Error::not_supported_source(
+                format!(
                     "Mini-block compression not yet supported for block type {}",
                     data.name()
                 )
                 .into(),
-                location: location!(),
-            }),
+            )),
         }
     }
 
@@ -586,10 +588,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 let has_variable_child = struct_block.has_variable_width_child();
                 if has_variable_child {
                     if self.version < LanceFileVersion::V2_2 {
-                        return Err(Error::NotSupported {
-                            source: "Variable packed struct encoding requires Lance file version 2.2 or later".into(),
-                            location: location!(),
-                        });
+                        return Err(Error::not_supported_source("Variable packed struct encoding requires Lance file version 2.2 or later".into()));
                     }
                     Ok(Box::new(PackedStructVariablePerValueEncoder::new(
                         self.clone(),
@@ -772,10 +771,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(InlineBitpacking::from_description(description)))
             }
             #[cfg(not(feature = "bitpacking"))]
-            Compression::InlineBitpacking(_) => Err(Error::NotSupported {
-                source: "this runtime was not built with bitpacking support".into(),
-                location: location!(),
-            }),
+            Compression::InlineBitpacking(_) => Err(Error::not_supported_source(
+                "this runtime was not built with bitpacking support".into(),
+            )),
             Compression::Variable(variable) => {
                 let Compression::Flat(offsets) = variable
                     .offsets
@@ -804,10 +802,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::PackedStruct(description) => Ok(Box::new(
                 PackedStructFixedWidthMiniBlockDecompressor::new(description),
             )),
-            Compression::VariablePackedStruct(_) => Err(Error::NotSupported {
-                source: "variable packed struct decoding is not yet implemented".into(),
-                location: location!(),
-            }),
+            Compression::VariablePackedStruct(_) => Err(Error::not_supported_source(
+                "variable packed struct decoding is not yet implemented".into(),
+            )),
             Compression::FixedSizeList(fsl) => {
                 // In the future, we might need to do something more complex here if FSL supports
                 // compression.
@@ -973,10 +970,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 {
                     Compression::Flat(flat) => flat.bits_per_value,
                     _ => {
-                        return Err(Error::InvalidInput {
-                            location: location!(),
-                            source: "OutOfLineBitpacking values must use Flat encoding".into(),
-                        });
+                        return Err(Error::invalid_input_source(
+                            "OutOfLineBitpacking values must use Flat encoding".into(),
+                        ));
                     }
                 };
                 Ok(Box::new(OutOfLineBitpacking::new(
@@ -1813,6 +1809,37 @@ mod tests {
         assert!(
             !matches!(encoding.compression.as_ref(), Some(Compression::General(_))),
             "general compression should not be selected for V2.1"
+        );
+    }
+
+    #[test]
+    fn test_none_compression_disables_auto_general_block_compression() {
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "dict_values".to_string(),
+            CompressionFieldParams {
+                compression: Some("none".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let strategy =
+            DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_2);
+        let field = create_test_field("dict_values", DataType::FixedSizeBinary(3));
+        let data = create_fixed_width_block(24, 20_000);
+
+        assert!(
+            data.data_size() > MIN_BLOCK_SIZE_FOR_GENERAL_COMPRESSION,
+            "test requires block size above automatic general compression threshold"
+        );
+
+        let (_compressor, encoding) = strategy
+            .create_block_compressor(&field, &data)
+            .expect("block compressor selection should succeed");
+
+        assert!(
+            !matches!(encoding.compression.as_ref(), Some(Compression::General(_))),
+            "compression=none should disable automatic block general compression"
         );
     }
 
