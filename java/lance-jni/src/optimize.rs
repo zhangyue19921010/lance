@@ -365,7 +365,9 @@ impl IntoJava for &CompactionOptions {
         let num_threads_opt = to_java_optional(env, num_threads)?;
         let batch_size = to_java_long_obj(env, self.batch_size.map(|v| v as i64))?;
         let batch_size_opt = to_java_optional(env, batch_size)?;
-        let planner_obj = env.new_string(self.compaction_planner_type.as_str())?.into();
+        let planner_obj = env
+            .new_string(self.compaction_planner_type.as_str())?
+            .into();
         let planner_opt = to_java_optional(env, planner_obj)?;
         let max_compaction_rows =
             to_java_long_obj(env, self.max_compaction_rows.map(|v| v as i64))?;
