@@ -2,23 +2,21 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::Arc;
-
+use arrow_array::RecordBatchIterator;
 use crate::dataset::fragment::FileFragment;
-use crate::dataset::optimize::{
-    build_compaction_candidacy, collect_metrics, finalize_candidate_bins,
-    get_indices_containing_frag, load_index_fragmaps, CandidateBin,
-};
+use crate::dataset::optimize::{build_compaction_candidacy, collect_metrics, compact_files, finalize_candidate_bins, get_indices_containing_frag, load_index_fragmaps, plan_compaction, CandidateBin, CompactionPlannerType};
 use crate::Error;
 
 use lance_table::format::Fragment;
 use serde::{Deserialize, Serialize};
 use snafu::location;
-
+use uuid::Uuid;
 use crate::Result;
 use crate::{
     dataset::optimize::{CompactionOptions, CompactionPlan, CompactionPlanner},
     Dataset,
 };
+use crate::dataset::WriteParams;
 
 /// Options for [`BoundedCompactionPlanner`].
 ///
@@ -104,8 +102,8 @@ impl CompactionPlanner for BoundedCompactionPlanner {
             match (candidacy, &mut current_bin) {
                 (None, None) => {}
                 (Some(candidacy), None) => {
-                    if candidate_bins.is_empty()
-                        || self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows)
+                    if self.check_and_update_usage(&mut usage, fragment, metrics.physical_rows)
+                        || candidate_bins.is_empty()
                     {
                         current_bin = Some(CandidateBin {
                             fragments: vec![fragment.clone()],
@@ -115,7 +113,6 @@ impl CompactionPlanner for BoundedCompactionPlanner {
                             indices,
                         });
                     } else {
-                        candidate_bins.push(current_bin.take().unwrap());
                         break;
                     }
                 }
@@ -230,3 +227,123 @@ impl BoundedCompactionPlanner {
     }
 }
 
+#[tokio::test]
+async fn test_bounded_compaction_planner_with_row_limit() {
+    let test_uri = format!("memory://test/{}", Uuid::new_v4());
+    let data = crate::dataset::optimize::tests::sample_data().slice(0, 5000);
+    let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 1000,
+            ..Default::default()
+        }),
+    )
+        .await
+        .unwrap();
+
+    assert_eq!(dataset.get_fragments().len(), 5);
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 5000,
+        compaction_planner_type: CompactionPlannerType::Bounded,
+        max_compaction_rows: Some(2500),
+        ..Default::default()
+    };
+
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    assert_eq!(plan.num_tasks(), 1);
+    assert_eq!(
+        plan.tasks()[0]
+            .fragments
+            .iter()
+            .map(|frag| frag.id)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        plan.tasks()[0]
+            .fragments
+            .iter()
+            .map(|frag| frag.physical_rows.unwrap())
+            .sum::<usize>(),
+        2000
+    );
+
+    let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(metrics.fragments_added, 1);
+    assert_eq!(metrics.files_removed, 2);
+    assert_eq!(metrics.files_added, 1);
+}
+
+#[tokio::test]
+async fn test_bounded_compaction_planner_with_bytes_limit() {
+    let test_uri = format!("memory://test/{}", Uuid::new_v4());
+    let data = crate::dataset::optimize::tests::sample_data().slice(0, 5000);
+    let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 1000,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(dataset.get_fragments().len(), 5);
+
+    let first_two_fragment_bytes = dataset.manifest.fragments[0..2]
+        .iter()
+        .flat_map(|fragment| fragment.files.iter())
+        .map(|data_file| {
+            data_file
+                .file_size_bytes
+                .get()
+                .map(|file_size| file_size.get())
+                .unwrap_or(0)
+        })
+        .sum::<u64>();
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 5000,
+        compaction_planner_type: CompactionPlannerType::Bounded,
+        max_compaction_bytes: Some(first_two_fragment_bytes as usize + 1),
+        ..Default::default()
+    };
+
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    assert_eq!(plan.num_tasks(), 1);
+    assert_eq!(
+        plan.tasks()[0]
+            .fragments
+            .iter()
+            .map(|frag| frag.id)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        plan.tasks()[0]
+            .fragments
+            .iter()
+            .flat_map(|fragment| fragment.files.iter())
+            .map(|data_file| {
+                data_file
+                    .file_size_bytes
+                    .get()
+                    .map(|file_size| file_size.get())
+                    .unwrap_or(0)
+            })
+            .sum::<u64>(),
+        first_two_fragment_bytes
+    );
+
+    let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(metrics.fragments_added, 1);
+    assert_eq!(metrics.files_removed, 2);
+    assert_eq!(metrics.files_added, 1);
+}

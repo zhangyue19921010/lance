@@ -1541,7 +1541,7 @@ mod tests {
         assert_eq!(split[2].pos_range, 5..8);
     }
 
-    fn sample_data() -> RecordBatch {
+    pub fn sample_data() -> RecordBatch {
         let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
 
         RecordBatch::try_new(
