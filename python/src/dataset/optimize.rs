@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::*;
+use lance::dataset::optimize::CompactionPlannerType;
 use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
@@ -20,13 +22,10 @@ use lance::dataset::{
     },
 };
 use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple};
-use lance::dataset::optimize::CompactionPlannerType;
-use super::*;
 
 fn parse_compaction_planner_name(planner: &str) -> PyResult<CompactionPlannerType> {
-    CompactionPlannerType::from_str_name(planner).ok_or_else(|| {
-        PyValueError::new_err(format!("Invalid compaction planner: {}", planner))
-    })
+    CompactionPlannerType::from_str_name(planner)
+        .ok_or_else(|| PyValueError::new_err(format!("Invalid compaction planner: {}", planner)))
 }
 
 fn resolve_compaction_planner(
