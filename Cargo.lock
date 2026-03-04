@@ -3443,7 +3443,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -4630,9 +4630,9 @@ dependencies = [
 
 [[package]]
 name = "jiff"
-version = "0.2.22"
+version = "0.2.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819b44bc7c87d9117eb522f14d46e918add69ff12713c475946b0a29363ed1c2"
+checksum = "1a3546dc96b6d42c5f24902af9e2538e82e39ad350b0c766eb3fbf2d8f3d8359"
 dependencies = [
  "jiff-static",
  "jiff-tzdb-platform",
@@ -4645,9 +4645,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-static"
-version = "0.2.22"
+version = "0.2.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "470252db18ecc35fd766c0891b1e3ec6cbbcd62507e85276c01bf75d8e94d4a1"
+checksum = "2a8c8b344124222efd714b73bb41f8b5120b27a7cc1c75593a6ff768d9d05aa4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4656,9 +4656,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-tzdb"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68971ebff725b9e2ca27a601c5eb38a4c5d64422c4cbab0c535f248087eda5c2"
+checksum = "c900ef84826f1338a557697dc8fc601df9ca9af4ac137c7fb61d4c6f2dfd3076"
 
 [[package]]
 name = "jiff-tzdb-platform"
@@ -4735,7 +4735,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4830,7 +4830,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4850,7 +4850,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrayref",
  "paste",
@@ -4859,7 +4859,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4899,7 +4899,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4932,7 +4932,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4952,7 +4952,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4999,7 +4999,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -5025,7 +5025,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -5068,7 +5068,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -5082,7 +5082,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "approx",
  "arrow",
@@ -5162,7 +5162,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -5210,7 +5210,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "approx",
  "arrow-array",
@@ -5231,7 +5231,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5245,7 +5245,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5263,7 +5263,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -5321,7 +5321,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5367,7 +5367,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5376,7 +5376,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5387,7 +5387,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "4.0.0-beta.6"
+version = "4.0.0-beta.7"
 dependencies = [
  "clap",
  "lance-core",
@@ -7176,9 +7176,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.44"
+version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21b2ebcf727b7760c461f091f9f0f539b77b8e87f2fd88131e7f1b433b3cece4"
+checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
 ]
