@@ -177,7 +177,7 @@ impl Index for PQIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        // TODO: Investigate
+        // Nothing is lazily loaded in PQ index, so we can return immediately.
         Ok(())
     }
 
