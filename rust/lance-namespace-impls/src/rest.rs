@@ -18,9 +18,8 @@ use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
-    CountTableRowsRequest, CreateEmptyTableRequest, CreateEmptyTableResponse,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
-    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    CountTableRowsRequest, CreateNamespaceRequest, CreateNamespaceResponse,
+    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
     CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
     CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
     DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest,
@@ -835,18 +834,6 @@ impl LanceNamespace for RestNamespace {
             query.push(("mode", mode_str.as_str()));
         }
         self.post_binary_json(&path, &query, request_data.to_vec(), "create_table", &id)
-            .await
-    }
-
-    async fn create_empty_table(
-        &self,
-        request: CreateEmptyTableRequest,
-    ) -> Result<CreateEmptyTableResponse> {
-        let id = object_id_str(&request.id, &self.delimiter)?;
-        let encoded_id = urlencode(&id);
-        let path = format!("/v1/table/{}/create-empty", encoded_id);
-        let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "create_empty_table", &id)
             .await
     }
 
