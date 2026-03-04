@@ -6,7 +6,7 @@ use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct FtsSearchParams {
@@ -719,22 +719,22 @@ impl FtsQueryNode for BooleanQuery {
 #[derive(Clone)]
 pub struct Tokens {
     tokens: Vec<String>,
-    tokens_set: HashSet<String>,
+    tokens_map: HashMap<String, usize>,
     token_type: DocType,
 }
 
 impl Tokens {
     pub fn new(tokens: Vec<String>, token_type: DocType) -> Self {
         let mut tokens_vec = vec![];
-        let mut tokens_set = HashSet::new();
-        for token in tokens.into_iter() {
+        let mut tokens_map = HashMap::new();
+        for (idx, token) in tokens.into_iter().enumerate() {
             tokens_vec.push(token.clone());
-            tokens_set.insert(token);
+            tokens_map.insert(token, idx);
         }
 
         Self {
             tokens: tokens_vec,
-            tokens_set,
+            tokens_map,
             token_type,
         }
     }
@@ -752,7 +752,15 @@ impl Tokens {
     }
 
     pub fn contains(&self, token: &str) -> bool {
-        self.tokens_set.contains(token)
+        self.tokens_map.contains_key(token)
+    }
+
+    pub fn token_index(&self, token: &str) -> Option<usize> {
+        self.tokens_map.get(token).copied()
+    }
+
+    pub fn get_token(&self, index: usize) -> &str {
+        &self.tokens[index]
     }
 }
 
@@ -774,42 +782,28 @@ impl<'a> IntoIterator for &'a Tokens {
     }
 }
 
-pub fn collect_query_tokens(
-    text: &str,
-    tokenizer: &mut Box<dyn LanceTokenizer>,
-    inclusive: Option<&HashSet<String>>,
-) -> Tokens {
+pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>) -> Tokens {
     let token_type = tokenizer.doc_type();
     let mut stream = tokenizer.token_stream_for_search(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
-        if let Some(inclusive) = inclusive
-            && !inclusive.contains(&token.text)
-        {
-            continue;
-        }
         tokens.push(token.text.clone());
     }
     Tokens::new(tokens, token_type)
 }
 
-pub fn collect_doc_tokens(
+pub fn has_query_token(
     text: &str,
     tokenizer: &mut Box<dyn LanceTokenizer>,
-    inclusive: Option<&Tokens>,
-) -> Tokens {
-    let token_type = tokenizer.doc_type();
+    query_tokens: &Tokens,
+) -> bool {
     let mut stream = tokenizer.token_stream_for_doc(text);
-    let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
-        if let Some(inclusive) = inclusive
-            && !inclusive.contains(&token.text)
-        {
-            continue;
+        if query_tokens.contains(&token.text) {
+            return true;
         }
-        tokens.push(token.text.clone());
     }
-    Tokens::new(tokens, token_type)
+    false
 }
 
 pub fn fill_fts_query_column(

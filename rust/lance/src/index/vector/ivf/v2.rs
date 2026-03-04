@@ -19,6 +19,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, TryStreamExt};
+use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::tokio::spawn_cpu;
@@ -27,7 +28,7 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
-use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
+use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
@@ -116,6 +117,8 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     index_cache: WeakLanceCache,
 
+    io_parallelism: usize,
+
     _marker: PhantomData<(S, Q)>,
 }
 
@@ -140,6 +143,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
     ) -> Result<Self> {
+        let io_parallelism = object_store.io_parallelism();
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
@@ -210,6 +214,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             sub_index_metadata,
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
+            io_parallelism,
             _marker: PhantomData,
         })
     }
@@ -329,8 +334,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     }
 
     async fn prewarm(&self) -> Result<()> {
-        // TODO: We should prewarm the IVF index by loading the partitions into memory
-        Ok(())
+        futures::stream::iter(0..self.ivf.num_partitions())
+            .map(Ok)
+            .try_for_each_concurrent(Some(self.io_parallelism), |part_id| {
+                self.load_partition(part_id, true, &NoOpMetricsCollector)
+                    .map_ok(|_| ())
+            })
+            .await
     }
 
     fn index_type(&self) -> IndexType {
@@ -482,7 +492,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 pre_filter,
                 &local_metrics,
             )?;
-            Ok((batch, local_metrics))
+            Result::Ok((batch, local_metrics))
         })
         .await?;
 
@@ -589,6 +599,7 @@ pub type IvfHnswPqIndex = IVFIndex<HNSW, ProductQuantizer>;
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::iter::repeat_n;
     use std::{ops::Range, sync::Arc};
 
     use all_asserts::{assert_ge, assert_le, assert_lt};
@@ -3438,5 +3449,65 @@ mod tests {
                 "Multivector search should return results with remaining data"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_ivf_pq() {
+        use lance_io::assert_io_eq;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            PQBuildParams::default(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("my_idx".to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Reset IO stats after index creation
+        dataset.object_store().io_stats_incremental();
+
+        // Prewarm should perform IO to load all partitions into cache
+        dataset.prewarm_index("my_idx").await.unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert!(
+            stats.read_iops > 0,
+            "prewarm should have read from disk, but read_iops was 0"
+        );
+
+        // Can query index without IO
+        let q = Float32Array::from_iter_values(repeat_n(0.0, DIM));
+        dataset
+            .scan()
+            .nearest("vector", &q, 10)
+            .unwrap()
+            .project(&["_rowid"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
+            0,
+            "query should not perform IO after prewarm"
+        );
+
+        // Second prewarm should not need IO (already cached)
+        dataset.prewarm_index("my_idx").await.unwrap();
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 }

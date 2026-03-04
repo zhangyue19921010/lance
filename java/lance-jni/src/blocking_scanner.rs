@@ -214,6 +214,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     with_row_address: jboolean,       // boolean
     batch_readahead: jint,            // int
     column_orderings: JObject,        // Optional<List<ColumnOrdering>>
+    use_scalar_index: jboolean,       // boolean
     substrait_aggregate_obj: JObject, // Optional<ByteBuffer>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -234,6 +235,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             with_row_address,
             batch_readahead,
             column_orderings,
+            use_scalar_index,
             substrait_aggregate_obj
         )
     )
@@ -256,6 +258,7 @@ fn inner_create_scanner<'local>(
     with_row_address: jboolean,
     batch_readahead: jint,
     column_orderings: JObject,
+    use_scalar_index: jboolean,
     substrait_aggregate_obj: JObject,
 ) -> Result<JObject<'local>> {
     let fragment_ids_opt = env.get_ints_opt(&fragment_ids_obj)?;
@@ -312,6 +315,8 @@ fn inner_create_scanner<'local>(
     if with_row_address == JNI_TRUE {
         scanner.with_row_address();
     }
+
+    scanner.use_scalar_index(use_scalar_index == JNI_TRUE);
 
     env.get_optional(&query_obj, |env, java_obj| {
         // Set column and key for nearest search
