@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
-use arrow_array::RecordBatchIterator;
 use crate::dataset::fragment::FileFragment;
-use crate::dataset::optimize::{build_compaction_candidacy, collect_metrics, compact_files, finalize_candidate_bins, get_indices_containing_frag, load_index_fragmaps, plan_compaction, CandidateBin, CompactionPlannerType};
+use crate::dataset::optimize::{
+    build_compaction_candidacy, collect_metrics, commit_compaction, compact_files,
+    finalize_candidate_bins, get_indices_containing_frag, load_index_fragmaps, plan_compaction,
+    CandidateBin, CompactionPlannerType, IgnoreRemap,
+};
 use crate::Error;
-
-use lance_table::format::Fragment;
-use serde::{Deserialize, Serialize};
-use snafu::location;
-use uuid::Uuid;
+use arrow_array::RecordBatchIterator;
+use crate::dataset::WriteParams;
 use crate::Result;
 use crate::{
     dataset::optimize::{CompactionOptions, CompactionPlan, CompactionPlanner},
     Dataset,
 };
-use crate::dataset::WriteParams;
+use futures::StreamExt;
+use lance_table::format::Fragment;
+use serde::{Deserialize, Serialize};
+use snafu::location;
+use std::sync::Arc;
+use uuid::Uuid;
 
 /// Options for [`BoundedCompactionPlanner`].
 ///
@@ -240,8 +244,8 @@ async fn test_bounded_compaction_planner_with_row_limit() {
             ..Default::default()
         }),
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     assert_eq!(dataset.get_fragments().len(), 5);
 
@@ -325,25 +329,25 @@ async fn test_bounded_compaction_planner_with_bytes_limit() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
-    assert_eq!(
-        plan.tasks()[0]
-            .fragments
-            .iter()
-            .flat_map(|fragment| fragment.files.iter())
-            .map(|data_file| {
-                data_file
-                    .file_size_bytes
-                    .get()
-                    .map(|file_size| file_size.get())
-                    .unwrap_or(0)
-            })
-            .sum::<u64>(),
-        first_two_fragment_bytes
-    );
+    let dataset_ref = &dataset;
+    let results = futures::stream::iter(plan.compaction_tasks())
+        .then(|task| async move { task.execute(dataset_ref).await.unwrap() })
+        .collect::<Vec<_>>()
+        .await;
 
-    let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+    let metrics = commit_compaction(
+        &mut dataset,
+        results,
+        Arc::new(IgnoreRemap::default()),
+        &options,
+    )
+    .await
+    .unwrap();
     assert_eq!(metrics.fragments_removed, 2);
     assert_eq!(metrics.fragments_added, 1);
     assert_eq!(metrics.files_removed, 2);
     assert_eq!(metrics.files_added, 1);
+    assert_eq!(dataset.get_fragments().len(), 4);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 5000);
 }
+
