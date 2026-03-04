@@ -110,11 +110,13 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 mod binary_copy;
+mod compaction_planner;
 pub mod remapping;
 
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 use binary_copy::rewrite_files_binary_copy;
+use compaction_planner::{BoundedCompactionPlanner, BoundedCompactionPlannerOptions};
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Controls how data is rewritten during compaction.
@@ -200,6 +202,12 @@ pub struct CompactionOptions {
     /// Controls how much data is read at once when performing binary copy.
     /// Defaults to 16MB (16 * 1024 * 1024).
     pub binary_copy_read_batch_bytes: Option<usize>,
+    /// The type of compaction planner to use. Defaults to [`CompactionPlannerType::Default`].
+    pub compaction_planner_type: CompactionPlannerType,
+    /// The maximum number of bytes to compact in a single compaction operation.
+    pub max_compaction_bytes: Option<usize>,
+    /// The maximum number of rows to compact in a single compaction operation.
+    pub max_compaction_rows: Option<usize>,
 }
 
 #[allow(deprecated)]
@@ -219,6 +227,9 @@ impl Default for CompactionOptions {
             enable_binary_copy: false,
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
+            compaction_planner_type: CompactionPlannerType::Default,
+            max_compaction_bytes: None,
+            max_compaction_rows: None,
         }
     }
 }
@@ -431,6 +442,33 @@ pub trait CompactionPlanner: Send + Sync {
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan>;
 }
 
+#[derive(Debug, PartialEq, Eq, Copy, Hash, Clone, serde::Deserialize, serde::Serialize)]
+pub enum CompactionPlannerType {
+    Default = 0,
+    Bounded = 1,
+}
+
+impl CompactionPlannerType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Bounded => "bounded",
+        }
+    }
+
+    pub fn from_str_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "default" => Some(Self::Default),
+            "bounded" => Some(Self::Bounded),
+            _ => None,
+        }
+    }
+
+    pub const fn requires_limits(self) -> bool {
+        matches!(self, Self::Bounded)
+    }
+}
+
 /// Formulate a plan to compact the files in a dataset
 ///
 /// The compaction plan will contain a list of tasks to execute. Each task
@@ -472,14 +510,6 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             .buffered(dataset.object_store().io_parallelism());
 
         let index_fragmaps = load_index_fragmaps(dataset).await?;
-        let indices_containing_frag = |frag_id: u32| {
-            index_fragmaps
-                .iter()
-                .enumerate()
-                .filter(|(_, bitmap)| bitmap.contains(frag_id))
-                .map(|(pos, _)| pos)
-                .collect::<Vec<_>>()
-        };
 
         let mut candidate_bins: Vec<CandidateBin> = Vec::new();
         let mut current_bin: Option<CandidateBin> = None;
@@ -487,21 +517,9 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         while let Some(res) = fragment_metrics.next().await {
             let (fragment, metrics) = res?;
+            let candidacy = build_compaction_candidacy(&self.options, &metrics);
 
-            let candidacy = if self.options.materialize_deletions
-                && metrics.deletion_percentage() > self.options.materialize_deletions_threshold
-            {
-                Some(CompactionCandidacy::CompactItself)
-            } else if metrics.physical_rows < self.options.target_rows_per_fragment {
-                // Only want to compact if their are neighbors to compact such that
-                // we can get a larger fragment.
-                Some(CompactionCandidacy::CompactWithNeighbors)
-            } else {
-                // Not a candidate
-                None
-            };
-
-            let indices = indices_containing_frag(fragment.id as u32);
+            let indices = get_indices_containing_frag(&index_fragmaps, fragment.id as u32);
 
             match (candidacy, &mut current_bin) {
                 (None, None) => {} // keep searching
@@ -550,19 +568,41 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let final_bins = candidate_bins
-            .into_iter()
-            .filter(|bin| !bin.is_noop())
-            .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
-            .map(|bin| TaskData {
-                fragments: bin.fragments,
-            });
-
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
-        compaction_plan.extend_tasks(final_bins);
+        compaction_plan.extend_tasks(finalize_candidate_bins(
+            candidate_bins,
+            self.options.target_rows_per_fragment,
+        ));
 
         Ok(compaction_plan)
+    }
+}
+
+pub fn get_indices_containing_frag(index_fragmaps: &[RoaringBitmap], frag_id: u32) -> Vec<usize> {
+    index_fragmaps
+        .iter()
+        .enumerate()
+        .filter(|(_, bitmap)| bitmap.contains(frag_id))
+        .map(|(pos, _)| pos)
+        .collect::<Vec<_>>()
+}
+
+fn build_compaction_candidacy(
+    options: &CompactionOptions,
+    metrics: &FragmentMetrics,
+) -> Option<CompactionCandidacy> {
+    if options.materialize_deletions
+        && metrics.deletion_percentage() > options.materialize_deletions_threshold
+    {
+        Some(CompactionCandidacy::CompactItself)
+    } else if metrics.physical_rows < options.target_rows_per_fragment {
+        // Only want to compact if their are neighbors to compact such that
+        // we can get a larger fragment.
+        Some(CompactionCandidacy::CompactWithNeighbors)
+    } else {
+        // Not a candidate
+        None
     }
 }
 
@@ -582,8 +622,22 @@ pub async fn compact_files(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
-    let planner = DefaultCompactionPlanner::new(options);
-    compact_files_with_planner(dataset, remap_options, &planner).await
+    let planner = build_compaction_planner(options)?;
+    compact_files_with_planner(dataset, remap_options, planner.as_ref()).await
+}
+
+/// Build a compaction planner based on the given options.
+pub fn build_compaction_planner(options: CompactionOptions) -> Result<Box<dyn CompactionPlanner>> {
+    match options.compaction_planner_type {
+        CompactionPlannerType::Bounded => {
+            let bounded_options = BoundedCompactionPlannerOptions::from(&options);
+            Ok(Box::new(BoundedCompactionPlanner::new(
+                options,
+                bounded_options,
+            )?))
+        }
+        _ => Ok(Box::new(DefaultCompactionPlanner::new(options))),
+    }
 }
 
 pub async fn compact_files_with_planner(
@@ -875,6 +929,20 @@ impl CandidateBin {
     }
 }
 
+fn finalize_candidate_bins(
+    candidate_bins: Vec<CandidateBin>,
+    target_rows_per_fragment: usize,
+) -> Vec<TaskData> {
+    candidate_bins
+        .into_iter()
+        .filter(|bin| !bin.is_noop())
+        .flat_map(|bin| bin.split_for_size(target_rows_per_fragment))
+        .map(|bin| TaskData {
+            fragments: bin.fragments,
+        })
+        .collect()
+}
+
 async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
     let indices = dataset.load_indices().await?;
     let mut index_fragmaps = Vec::with_capacity(indices.len());
@@ -894,7 +962,7 @@ pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
 ) -> Result<CompactionPlan> {
-    let planner = DefaultCompactionPlanner::new(options.clone());
+    let planner = build_compaction_planner(options.clone())?;
     planner.plan(dataset).await
 }
 
@@ -1529,7 +1597,7 @@ mod tests {
         assert_eq!(split[2].pos_range, 5..8);
     }
 
-    fn sample_data() -> RecordBatch {
+    pub fn sample_data() -> RecordBatch {
         let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
 
         RecordBatch::try_new(

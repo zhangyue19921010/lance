@@ -130,6 +130,47 @@ public class CompactionTest {
     }
   }
 
+  @Test
+  public void testCompactionWithBoundedPlanner(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("test_dataset_for_bounded_compaction").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      testDataset.createEmptyDataset().close();
+
+      testDataset.write(1, 10).close();
+      testDataset.write(2, 10).close();
+      try (Dataset dataset = testDataset.write(3, 10)) {
+        CompactionOptions compactionOptions =
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(100)
+                .withMaxCompactionRows(25)
+                .build();
+
+        CompactionPlan compactionPlan = Compaction.planCompaction(dataset, compactionOptions);
+
+        assertEquals("bounded", compactionPlan.getCompactionOptions().getPlanner().get());
+
+        CompactionTask task = compactionPlan.getCompactionTasks().get(0);
+        assertEquals(2, task.getTaskData().getFragments().size());
+
+        task = serializeAndDeserialize(task);
+        RewriteResult result = task.execute(dataset);
+        assertEquals(2, result.getMetrics().getFragmentsRemoved());
+        assertEquals(1, result.getMetrics().getFragmentsAdded());
+
+        result = serializeAndDeserialize(result);
+        Compaction.commitCompaction(
+            dataset, Collections.singletonList(result), compactionPlan.getCompactionOptions());
+
+        dataset.checkoutLatest();
+        assertEquals(2, dataset.getFragments().size());
+        assertEquals(30, dataset.countRows());
+      }
+    }
+  }
+
   private static <T> T serializeAndDeserialize(T object)
       throws IOException, ClassNotFoundException {
     ByteArrayOutputStream outputStream = new ByteArrayOutputStream();

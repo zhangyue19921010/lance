@@ -42,6 +42,9 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
+    planner: JObject,                         // Optional<String>
+    max_compaction_rows: JObject,             // Optional<Long>
+    max_compaction_bytes: JObject,            // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
@@ -58,6 +61,9 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             materialize_deletions_threshold,
             num_threads,
             batch_size,
+            planner,
+            max_compaction_rows,
+            max_compaction_bytes,
             defer_index_remap,
             compaction_mode,
             binary_copy_read_batch_bytes
@@ -77,6 +83,9 @@ fn inner_plan_compaction<'local>(
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
+    planner: JObject,                         // Optional<String>
+    max_compaction_rows: JObject,             // Optional<Long>
+    max_compaction_bytes: JObject,            // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
@@ -90,6 +99,9 @@ fn inner_plan_compaction<'local>(
         &materialize_deletions_threshold,
         &num_threads,
         &batch_size,
+        &planner,
+        &max_compaction_rows,
+        &max_compaction_bytes,
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
@@ -116,6 +128,9 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompacti
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
+    planner: JObject,                         // Optional<String>
+    max_compaction_rows: JObject,             // Optional<Long>
+    max_compaction_bytes: JObject,            // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
@@ -133,6 +148,9 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativeCommitCompacti
             materialize_deletions_threshold,
             num_threads,
             batch_size,
+            planner,
+            max_compaction_rows,
+            max_compaction_bytes,
             defer_index_remap,
             compaction_mode,
             binary_copy_read_batch_bytes,
@@ -153,6 +171,9 @@ fn inner_commit_compaction<'local>(
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
+    planner: JObject,                         // Optional<String>
+    max_compaction_rows: JObject,             // Optional<Long>
+    max_compaction_bytes: JObject,            // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
@@ -166,6 +187,9 @@ fn inner_commit_compaction<'local>(
         &materialize_deletions_threshold,
         &num_threads,
         &batch_size,
+        &planner,
+        &max_compaction_rows,
+        &max_compaction_bytes,
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
@@ -201,6 +225,9 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
+    planner: JObject,                         // Optional<String>
+    max_compaction_rows: JObject,             // Optional<Long>
+    max_compaction_bytes: JObject,            // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
@@ -219,6 +246,9 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
             materialize_deletions_threshold,
             num_threads,
             batch_size,
+            planner,
+            max_compaction_rows,
+            max_compaction_bytes,
             defer_index_remap,
             compaction_mode,
             binary_copy_read_batch_bytes
@@ -240,6 +270,9 @@ fn inner_execute_task<'local>(
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
+    planner: JObject,                         // Optional<String>
+    max_compaction_rows: JObject,             // Optional<Long>
+    max_compaction_bytes: JObject,            // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
     compaction_mode: JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: JObject,    // Optional<Long>
@@ -254,6 +287,9 @@ fn inner_execute_task<'local>(
         &materialize_deletions_threshold,
         &num_threads,
         &batch_size,
+        &planner,
+        &max_compaction_rows,
+        &max_compaction_bytes,
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
@@ -282,7 +318,7 @@ const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
 const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;JLjava/util/Map;[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -329,6 +365,14 @@ impl IntoJava for &CompactionOptions {
         let num_threads_opt = to_java_optional(env, num_threads)?;
         let batch_size = to_java_long_obj(env, self.batch_size.map(|v| v as i64))?;
         let batch_size_opt = to_java_optional(env, batch_size)?;
+        let planner_obj = env.new_string(self.compaction_planner_type.as_str())?.into();
+        let planner_opt = to_java_optional(env, planner_obj)?;
+        let max_compaction_rows =
+            to_java_long_obj(env, self.max_compaction_rows.map(|v| v as i64))?;
+        let max_compaction_rows_opt = to_java_optional(env, max_compaction_rows)?;
+        let max_compaction_bytes =
+            to_java_long_obj(env, self.max_compaction_bytes.map(|v| v as i64))?;
+        let max_compaction_bytes_opt = to_java_optional(env, max_compaction_bytes)?;
         let defer_index_remap = to_java_boolean_obj(env, Some(self.defer_index_remap))?;
         let defer_index_remap_opt = to_java_optional(env, defer_index_remap)?;
         let compaction_mode_str = self.compaction_mode.as_ref().map(|mode| match mode {
@@ -356,6 +400,9 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&materialize_deletions_threshold_opt),
                 JValueGen::Object(&num_threads_opt),
                 JValueGen::Object(&batch_size_opt),
+                JValueGen::Object(&planner_opt),
+                JValueGen::Object(&max_compaction_rows_opt),
+                JValueGen::Object(&max_compaction_bytes_opt),
                 JValueGen::Object(&defer_index_remap_opt),
                 JValueGen::Object(&compaction_mode_opt),
                 JValueGen::Object(&binary_copy_read_batch_bytes_opt),

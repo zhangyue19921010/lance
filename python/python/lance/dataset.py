@@ -65,6 +65,7 @@ from .lance import (
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
+from .optimize import CompactionPlannerConfig, _resolve_compaction_planner
 from .query import FullTextQuery
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
@@ -5297,6 +5298,9 @@ class DatasetOptimizer:
         materialize_deletions_threshold: float = 0.1,
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
+        planner: str | CompactionPlannerConfig | None = None,
+        max_compaction_rows: Optional[int] = None,
+        max_compaction_bytes: Optional[int] = None,
         compaction_mode: Optional[
             Literal["reencode", "try_binary_copy", "force_binary_copy"]
         ] = None,
@@ -5348,6 +5352,18 @@ class DatasetOptimizer:
             to reduce this if you are running out of memory during compaction.
 
             The default will use the same default from ``scanner``.
+        planner: str or CompactionPlannerConfig, optional
+            The compaction planner to use. Supported values are ``"default"``
+            and ``"bounded"``. Planner names are case-insensitive. If this is
+            omitted and either ``max_compaction_rows`` or
+            ``max_compaction_bytes`` is provided, the bounded planner is
+            selected automatically.
+        max_compaction_rows: int, optional
+            Bounded-planner-only limit on the total number of input rows that
+            can be included in a compaction plan.
+        max_compaction_bytes: int, optional
+            Bounded-planner-only limit on the total number of input bytes that
+            can be included in a compaction plan.
         compaction_mode: str, optional
             The compaction mode. Valid values:
 
@@ -5370,6 +5386,32 @@ class DatasetOptimizer:
         --------
         lance.optimize.Compaction
         """
+        planner_name: str | None
+        planner_parameters: Dict[str, Any] = {}
+        if isinstance(planner, CompactionPlannerConfig):
+            planner_name = planner.planner
+            planner_parameters = dict(planner.parameters)
+        elif isinstance(planner, str) or planner is None:
+            planner_name = planner
+        else:
+            raise TypeError(
+                "planner must be a string, CompactionPlannerConfig, or None"
+            )
+
+        resolved_max_compaction_rows = planner_parameters.get("max_compaction_rows")
+        if max_compaction_rows is not None:
+            resolved_max_compaction_rows = max_compaction_rows
+
+        resolved_max_compaction_bytes = planner_parameters.get("max_compaction_bytes")
+        if max_compaction_bytes is not None:
+            resolved_max_compaction_bytes = max_compaction_bytes
+
+        planner_name = _resolve_compaction_planner(
+            planner_name,
+            max_compaction_rows=resolved_max_compaction_rows,
+            max_compaction_bytes=resolved_max_compaction_bytes,
+        )
+
         opts = dict(
             target_rows_per_fragment=target_rows_per_fragment,
             max_rows_per_group=max_rows_per_group,
@@ -5381,6 +5423,11 @@ class DatasetOptimizer:
             compaction_mode=compaction_mode,
             binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
         )
+        opts.update(planner_parameters)
+        opts["max_compaction_rows"] = resolved_max_compaction_rows
+        opts["max_compaction_bytes"] = resolved_max_compaction_bytes
+        if planner_name is not None:
+            opts["planner"] = planner_name
         return Compaction.execute(self._dataset, opts)
 
     def optimize_indices(self, **kwargs):

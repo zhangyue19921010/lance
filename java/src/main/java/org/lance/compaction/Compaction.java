@@ -41,6 +41,9 @@ public class Compaction {
         compactionOptions.getMaterializeDeletionsThreshold(),
         compactionOptions.getNumThreads(),
         compactionOptions.getBatchSize(),
+        compactionOptions.getPlanner(),
+        compactionOptions.getMaxCompactionRows(),
+        compactionOptions.getMaxCompactionBytes(),
         compactionOptions.getDeferIndexRemap(),
         compactionOptions.getCompactionMode(),
         compactionOptions.getBinaryCopyReadBatchBytes());
@@ -61,6 +64,9 @@ public class Compaction {
         compactionOptions.getMaterializeDeletionsThreshold(),
         compactionOptions.getNumThreads(),
         compactionOptions.getBatchSize(),
+        compactionOptions.getPlanner(),
+        compactionOptions.getMaxCompactionRows(),
+        compactionOptions.getMaxCompactionBytes(),
         compactionOptions.getDeferIndexRemap(),
         compactionOptions.getCompactionMode(),
         compactionOptions.getBinaryCopyReadBatchBytes());
@@ -76,6 +82,9 @@ public class Compaction {
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
       Optional<Long> batchSize,
+      Optional<String> planner,
+      Optional<Long> maxCompactionRows,
+      Optional<Long> maxCompactionBytes,
       Optional<Boolean> deferIndexRemap,
       Optional<String> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes);
@@ -89,6 +98,9 @@ public class Compaction {
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
       Optional<Long> batchSize,
+      Optional<String> planner,
+      Optional<Long> maxCompactionRows,
+      Optional<Long> maxCompactionBytes,
       Optional<Boolean> deferIndexRemap,
       Optional<String> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes);

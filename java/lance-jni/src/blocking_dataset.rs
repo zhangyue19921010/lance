@@ -2603,6 +2603,25 @@ fn convert_java_compaction_options_to_rust(
     let batch_size = env
         .call_method(&java_options, "getBatchSize", "()Ljava/util/Optional;", &[])?
         .l()?;
+    let planner = env
+        .call_method(&java_options, "getPlanner", "()Ljava/util/Optional;", &[])?
+        .l()?;
+    let max_compaction_rows = env
+        .call_method(
+            &java_options,
+            "getMaxCompactionRows",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let max_compaction_bytes = env
+        .call_method(
+            &java_options,
+            "getMaxCompactionBytes",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
     let defer_index_remap = env
         .call_method(
             &java_options,
@@ -2637,6 +2656,9 @@ fn convert_java_compaction_options_to_rust(
         &materialize_deletions_threshold,
         &num_threads,
         &batch_size,
+        &planner,
+        &max_compaction_rows,
+        &max_compaction_bytes,
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
