@@ -55,7 +55,7 @@ use lance_core::{Error, Result};
 /// Encode a JSON string into a JSONB `LargeBinary` literal expression.
 fn encode_jsonb(json_str: &str) -> Result<Expr> {
     let bytes = lance_arrow::json::encode_json(json_str)
-        .map_err(|e| Error::invalid_input(format!("Failed to encode JSONB: {e}"), location!()))?;
+        .map_err(|e| Error::invalid_input(format!("Failed to encode JSONB: {e}")))?;
     Ok(Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), None))
 }
 
@@ -669,7 +669,6 @@ impl Planner {
                 Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => encode_jsonb(s),
                 _ => Err(Error::invalid_input(
                     "Expected a string value for JSONB literal",
-                    location!(),
                 )),
             },
             // For example, DATE '2020-01-01'
@@ -758,7 +757,6 @@ impl Planner {
                 }) => encode_jsonb(s),
                 _ => Err(Error::invalid_input(
                     "CAST to JSONB only supports string literals",
-                    location!(),
                 )),
             },
             SQLExpr::Cast {
