@@ -3,23 +3,31 @@
 
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::optimize::{
-    build_compaction_candidacy, collect_metrics, commit_compaction, compact_files,
-    finalize_candidate_bins, get_indices_containing_frag, load_index_fragmaps, plan_compaction,
-    CandidateBin, CompactionPlannerType, IgnoreRemap,
+    build_compaction_candidacy, collect_metrics, finalize_candidate_bins,
+    get_indices_containing_frag, load_index_fragmaps, CandidateBin,
 };
 use crate::Error;
-use arrow_array::RecordBatchIterator;
-use crate::dataset::WriteParams;
 use crate::Result;
 use crate::{
     dataset::optimize::{CompactionOptions, CompactionPlan, CompactionPlanner},
     Dataset,
 };
-use futures::StreamExt;
 use lance_table::format::Fragment;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::sync::Arc;
+
+#[cfg(test)]
+use crate::dataset::optimize::{
+    commit_compaction, compact_files, plan_compaction, CompactionPlannerType, IgnoreRemap,
+};
+#[cfg(test)]
+use crate::dataset::WriteParams;
+#[cfg(test)]
+use arrow_array::RecordBatchIterator;
+#[cfg(test)]
+use futures::StreamExt;
+#[cfg(test)]
 use uuid::Uuid;
 
 /// Options for [`BoundedCompactionPlanner`].
@@ -350,4 +358,3 @@ async fn test_bounded_compaction_planner_with_bytes_limit() {
     assert_eq!(dataset.get_fragments().len(), 4);
     assert_eq!(dataset.count_rows(None).await.unwrap(), 5000);
 }
-

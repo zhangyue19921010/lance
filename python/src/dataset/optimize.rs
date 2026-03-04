@@ -24,10 +24,7 @@ use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple
 use super::*;
 
 fn parse_compaction_planner_name(planner: &str) -> PyResult<CompactionPlannerType> {
-    match planner.trim().to_ascii_lowercase().as_str() {
-        "bounded" => Ok(CompactionPlannerType::Bounded),
-        _ => Ok(CompactionPlannerType::Default),
-    }
+    Ok(CompactionPlannerType::from_str_name(planner).unwrap_or(CompactionPlannerType::Default))
 }
 
 fn resolve_compaction_planner(

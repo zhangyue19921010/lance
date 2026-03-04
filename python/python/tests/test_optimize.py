@@ -145,6 +145,35 @@ def test_optimize_max_bytes(tmp_path: Path):
     assert num_frags == 2
 
 
+def test_compaction_auto_selects_bounded_planner(tmp_path: Path):
+    base_dir = tmp_path / "bounded_planner_dataset"
+    data = pa.table({"a": range(30), "b": range(30)})
+
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=10)
+    assert len(dataset.get_fragments()) == 3
+
+    plan = Compaction.plan(
+        dataset,
+        options=dict(
+            target_rows_per_fragment=100,
+            max_compaction_rows=25,
+        ),
+    )
+
+    assert plan.num_tasks() == 1
+    assert len(plan.tasks[0].fragments) == 2
+
+    results = [task.execute(dataset) for task in plan.tasks]
+    metrics = Compaction.commit(dataset, results)
+
+    assert metrics.fragments_removed == 2
+    assert metrics.fragments_added == 1
+    assert metrics.files_removed == 2
+    assert metrics.files_added == 1
+    assert len(dataset.get_fragments()) == 2
+    assert dataset.count_rows() == 30
+
+
 def create_table(min, max, nvec, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     tbl = vec_to_table(data=mat)

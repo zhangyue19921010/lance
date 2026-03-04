@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
+import java.util.Locale;
 import java.util.Optional;
 
 /**
@@ -36,6 +37,9 @@ public class CompactionOptions implements Serializable {
   private Optional<Float> materializeDeletionsThreshold;
   private Optional<Long> numThreads;
   private Optional<Long> batchSize;
+  private Optional<String> planner;
+  private Optional<Long> maxCompactionRows;
+  private Optional<Long> maxCompactionBytes;
   private Optional<Boolean> deferIndexRemap;
 
   private CompactionOptions(
@@ -46,6 +50,9 @@ public class CompactionOptions implements Serializable {
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
       Optional<Long> batchSize,
+      Optional<String> planner,
+      Optional<Long> maxCompactionRows,
+      Optional<Long> maxCompactionBytes,
       Optional<Boolean> deferIndexRemap) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
@@ -54,6 +61,9 @@ public class CompactionOptions implements Serializable {
     this.materializeDeletionsThreshold = materializeDeletionsThreshold;
     this.numThreads = numThreads;
     this.batchSize = batchSize;
+    this.planner = planner;
+    this.maxCompactionRows = maxCompactionRows;
+    this.maxCompactionBytes = maxCompactionBytes;
     this.deferIndexRemap = deferIndexRemap;
   }
 
@@ -71,6 +81,18 @@ public class CompactionOptions implements Serializable {
 
   public Optional<Long> getBatchSize() {
     return batchSize;
+  }
+
+  public Optional<String> getPlanner() {
+    return planner;
+  }
+
+  public Optional<Long> getMaxCompactionRows() {
+    return maxCompactionRows;
+  }
+
+  public Optional<Long> getMaxCompactionBytes() {
+    return maxCompactionBytes;
   }
 
   public Optional<Long> getMaxBytesPerFile() {
@@ -103,6 +125,9 @@ public class CompactionOptions implements Serializable {
         .add("materializeDeletionsThreshold", materializeDeletionsThreshold.orElse(null))
         .add("numThreads", numThreads.orElse(null))
         .add("batchSize", batchSize.orElse(null))
+        .add("planner", planner.orElse(null))
+        .add("maxCompactionRows", maxCompactionRows.orElse(null))
+        .add("maxCompactionBytes", maxCompactionBytes.orElse(null))
         .add("deferIndexRemap", deferIndexRemap.orElse(null))
         .toString();
   }
@@ -115,6 +140,9 @@ public class CompactionOptions implements Serializable {
     output.writeObject(materializeDeletionsThreshold.orElse(null));
     output.writeObject(numThreads.orElse(null));
     output.writeObject(batchSize.orElse(null));
+    output.writeObject(planner.orElse(null));
+    output.writeObject(maxCompactionRows.orElse(null));
+    output.writeObject(maxCompactionBytes.orElse(null));
     output.writeObject(deferIndexRemap.orElse(null));
   }
 
@@ -126,6 +154,9 @@ public class CompactionOptions implements Serializable {
     this.materializeDeletionsThreshold = Optional.ofNullable((Float) input.readObject());
     this.numThreads = Optional.ofNullable((Long) input.readObject());
     this.batchSize = Optional.ofNullable((Long) input.readObject());
+    this.planner = Optional.ofNullable((String) input.readObject());
+    this.maxCompactionRows = Optional.ofNullable((Long) input.readObject());
+    this.maxCompactionBytes = Optional.ofNullable((Long) input.readObject());
     this.deferIndexRemap = Optional.ofNullable((Boolean) input.readObject());
   }
 
@@ -138,6 +169,9 @@ public class CompactionOptions implements Serializable {
     private Optional<Float> materializeDeletionsThreshold = Optional.empty();
     private Optional<Long> numThreads = Optional.empty();
     private Optional<Long> batchSize = Optional.empty();
+    private Optional<String> planner = Optional.empty();
+    private Optional<Long> maxCompactionRows = Optional.empty();
+    private Optional<Long> maxCompactionBytes = Optional.empty();
     private Optional<Boolean> deferIndexRemap = Optional.empty();
 
     private Builder() {}
@@ -177,6 +211,21 @@ public class CompactionOptions implements Serializable {
       return this;
     }
 
+    public Builder withPlanner(String planner) {
+      this.planner = Optional.of(planner.trim().toLowerCase(Locale.ROOT));
+      return this;
+    }
+
+    public Builder withMaxCompactionRows(long maxCompactionRows) {
+      this.maxCompactionRows = Optional.of(maxCompactionRows);
+      return this;
+    }
+
+    public Builder withMaxCompactionBytes(long maxCompactionBytes) {
+      this.maxCompactionBytes = Optional.of(maxCompactionBytes);
+      return this;
+    }
+
     public Builder withDeferIndexRemap(boolean deferIndexRemap) {
       this.deferIndexRemap = Optional.of(deferIndexRemap);
       return this;
@@ -191,6 +240,9 @@ public class CompactionOptions implements Serializable {
           materializeDeletionsThreshold,
           numThreads,
           batchSize,
+          planner,
+          maxCompactionRows,
+          maxCompactionBytes,
           deferIndexRemap);
     }
   }

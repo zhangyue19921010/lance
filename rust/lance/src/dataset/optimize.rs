@@ -408,6 +408,27 @@ pub enum CompactionPlannerType {
     Bounded = 1,
 }
 
+impl CompactionPlannerType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Bounded => "bounded",
+        }
+    }
+
+    pub fn from_str_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "default" => Some(Self::Default),
+            "bounded" => Some(Self::Bounded),
+            _ => None,
+        }
+    }
+
+    pub const fn requires_limits(self) -> bool {
+        matches!(self, Self::Bounded)
+    }
+}
+
 /// Formulate a plan to compact the files in a dataset
 ///
 /// The compaction plan will contain a list of tasks to execute. Each task

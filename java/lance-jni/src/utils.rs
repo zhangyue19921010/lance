@@ -8,7 +8,7 @@ use arrow_schema::{DataType, Field};
 use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jfloat, jlong};
 use jni::JNIEnv;
-use lance::dataset::optimize::CompactionOptions;
+use lance::dataset::optimize::{CompactionOptions, CompactionPlannerType};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
@@ -138,6 +138,9 @@ pub fn build_compaction_options(
     materialize_deletions_threshold: &JObject, // Optional<Float>
     num_threads: &JObject,                     // Optional<Long>
     batch_size: &JObject,                      // Optional<Long>
+    planner: &JObject,                         // Optional<String>
+    max_compaction_rows: &JObject,             // Optional<Long>
+    max_compaction_bytes: &JObject,            // Optional<Long>
     defer_index_remap: &JObject,               // Optional<Boolean>
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::default();
@@ -165,11 +168,45 @@ pub fn build_compaction_options(
     if let Some(batch_size_val) = env.get_long_opt(batch_size)? {
         compaction_options.batch_size = Some(batch_size_val as usize);
     }
+    if let Some(max_compaction_rows_val) = env.get_long_opt(max_compaction_rows)? {
+        compaction_options.max_compaction_rows = Some(max_compaction_rows_val as usize);
+    }
+    if let Some(max_compaction_bytes_val) = env.get_long_opt(max_compaction_bytes)? {
+        compaction_options.max_compaction_bytes = Some(max_compaction_bytes_val as usize);
+    }
     if let Some(defer_index_remap_val) = env.get_boolean_opt(defer_index_remap)? {
         compaction_options.defer_index_remap = defer_index_remap_val;
     }
 
+    resolve_compaction_planner(&mut compaction_options, env.get_string_opt(planner)?)?;
+
     Ok(compaction_options)
+}
+
+fn parse_compaction_planner_name(planner: &str) -> Result<CompactionPlannerType> {
+    CompactionPlannerType::from_str_name(planner)
+        .ok_or_else(|| Error::input_error(format!("Invalid compaction planner: {}", planner)))
+}
+
+fn resolve_compaction_planner(opts: &mut CompactionOptions, planner: Option<String>) -> Result<()> {
+    let has_limit = opts.max_compaction_rows.is_some() || opts.max_compaction_bytes.is_some();
+    let planner = match planner {
+        Some(planner) => {
+            let planner_type = parse_compaction_planner_name(&planner)?;
+            if planner_type.requires_limits() && !has_limit {
+                return Err(Error::input_error(format!(
+                    "planner='{}' requires at least one of max_compaction_rows or max_compaction_bytes.",
+                    planner_type.as_str()
+                )));
+            }
+            planner_type
+        }
+        None if has_limit => CompactionPlannerType::Bounded,
+        None => CompactionPlannerType::Default,
+    };
+
+    opts.compaction_planner_type = planner;
+    Ok(())
 }
 
 // Convert from Java Optional<Query> to Rust Option<Query>
