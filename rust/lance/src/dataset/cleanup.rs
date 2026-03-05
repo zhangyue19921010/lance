@@ -825,18 +825,6 @@ fn calculate_duration(scheme: String, rate: u64) -> Duration {
     Duration::from_nanos(duration_ns)
 }
 
-/// quick get the object_store delete batch size based on different storage type.
-fn delete_stream_batch_size(object_store: &lance_io::object_store::ObjectStore) -> u64 {
-    let scheme = object_store.scheme().to_lowercase();
-    if scheme.contains("s3") {
-        S3_DELETE_STREAM_BATCH_SIZE
-    } else if scheme.contains("az") {
-        AZURE_DELETE_STREAM_BATCH_SIZE
-    } else {
-        1
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct CleanupPolicy {
     /// If not none, cleanup all versions before the specified timestamp.
