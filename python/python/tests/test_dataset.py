@@ -1531,21 +1531,22 @@ def test_cleanup_with_rate_limit(tmp_path):
     base_dir = tmp_path / "test"
 
     lance.write_dataset(table, base_dir, mode="create")
-    time.sleep(1)
     lance.write_dataset(table, base_dir, mode="overwrite")
-    time.sleep(1)
     lance.write_dataset(table, base_dir, mode="overwrite")
-    time.sleep(1)
-
-    moment = datetime.now()
     lance.write_dataset(table, base_dir, mode="overwrite")
 
     dataset = lance.dataset(base_dir)
+    latest_version_timestamp = dataset.versions()[-1]["timestamp"]
+    now = (
+        datetime.now(latest_version_timestamp.tzinfo)
+        if latest_version_timestamp.tzinfo is not None
+        else datetime.now()
+    )
 
     start = time.time_ns()
     # Cleanup with a rate limit should still remove old versions correctly
     stats = dataset.cleanup_old_versions(
-        older_than=(datetime.now() - moment), delete_rate_limit=1
+        older_than=(now - latest_version_timestamp), delete_rate_limit=1
     )
     finished = time.time_ns()
 

@@ -23,6 +23,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -122,12 +123,12 @@ public class CleanupTest {
 
       testDataset.createEmptyDataset().close();
       testDataset.write(1, 100).close();
-      Thread.sleep(1000L);
       testDataset.write(2, 100).close();
-      Thread.sleep(100L);
-
-      long beforeTimestampMillis = System.currentTimeMillis();
       try (Dataset dataset = testDataset.write(3, 100)) {
+        List<Version> versions = dataset.listVersions();
+        assertEquals(4, versions.size());
+        long beforeTimestampMillis =
+            versions.get(versions.size() - 1).getDataTime().toInstant().toEpochMilli() + 1;
         long start = System.nanoTime();
         RemovalStats stats =
             dataset.cleanupWithPolicy(

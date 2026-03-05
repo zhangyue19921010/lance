@@ -117,6 +117,8 @@ struct CleanupInspection {
 /// If a file cannot be verified then it will only be deleted if it is at least
 /// this many days old.
 const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
+const S3_DELETE_STREAM_BATCH_SIZE: u64 = 1_000;
+const AZURE_DELETE_STREAM_BATCH_SIZE: u64 = 256;
 
 impl<'a> CleanupTask<'a> {
     fn new(dataset: &'a Dataset, policy: CleanupPolicy) -> Self {
@@ -374,22 +376,16 @@ impl<'a> CleanupTask<'a> {
         let paths_to_delete: BoxStream<Result<Path>> = if let Some(rate) =
             self.policy.delete_rate_limit
         {
+            let batch_size = delete_stream_batch_size(self.dataset.object_store.as_ref());
+            let effective_rate = rate.max(1);
+            let path_rate = effective_rate * batch_size;
             info!(
-                "delete_rate_limit enable, limit {} delete operation per sec during cleanup",
-                rate
+                "delete_rate_limit enabled: limit {} delete requests/sec",
+                effective_rate
             );
-            let duration =
-                Duration::try_from_secs_f64(1.0 / (rate as f64)).map_err(|e| Error::Cleanup {
-                    message: format!("delete_rate_limit {} is invalid: {}", rate, e),
-                })?;
-            if duration.is_zero() {
-                return Err(Error::Cleanup {
-                    message: format!(
-                        "delete_rate_limit {} is too large; minimum supported interval is 1ns",
-                        rate
-                    ),
-                });
-            }
+            // convert user given op/s to the rate of issuing paths
+            let duration_ns = 1_000_000_000u64.div_ceil(path_rate).max(1);
+            let duration = Duration::from_nanos(duration_ns);
             let mut ticker = interval(duration);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
             IntervalStream::new(ticker)
@@ -819,6 +815,18 @@ impl<'a> CleanupTask<'a> {
     }
 }
 
+/// quick get the object_store delete batch size based on different storage type.
+fn delete_stream_batch_size(object_store: &lance_io::object_store::ObjectStore) -> u64 {
+    let scheme = object_store.scheme().to_lowercase();
+    if scheme.contains("s3") {
+        S3_DELETE_STREAM_BATCH_SIZE
+    } else if scheme.contains("az") {
+        AZURE_DELETE_STREAM_BATCH_SIZE
+    } else {
+        1
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CleanupPolicy {
     /// If not none, cleanup all versions before the specified timestamp.
@@ -831,10 +839,11 @@ pub struct CleanupPolicy {
     pub error_if_tagged_old_versions: bool,
     /// If clean the referenced branches
     pub clean_referenced_branches: bool,
-    /// Maximum number of delete operations per second. If None, no rate limiting is applied.
+    /// Maximum number of delete requests per second. If None, no rate limiting is applied.
     ///
     /// Use this to avoid hitting S3 (or other object store) request rate limits during cleanup.
-    /// For example, `Some(100)` limits deletions to 100 operations per second.
+    /// On stores with bulk delete, each request can include multiple paths.
+    /// For example, `Some(100)` limits deletions to 100 delete requests per second.
     pub delete_rate_limit: Option<u64>,
 }
 
@@ -913,10 +922,11 @@ impl CleanupPolicyBuilder {
         self
     }
 
-    /// Limit the number of delete operations per second during cleanup.
+    /// Limit the number of delete requests per second during cleanup.
     ///
     /// By default (None), deletions run at full speed. Set this to a positive value to
     /// throttle deletions and avoid hitting object store request rate limits (e.g. S3 HTTP 503).
+    /// On backends with bulk delete APIs, effective path throughput scales with batch size.
     ///
     /// # Errors
     ///
