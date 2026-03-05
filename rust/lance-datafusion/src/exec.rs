@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     fmt::{self, Formatter},
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -19,44 +19,43 @@ use datafusion::{
     catalog::streaming::StreamingTable,
     dataframe::DataFrame,
     execution::{
+        TaskContext,
         context::{SessionConfig, SessionContext},
         disk_manager::DiskManagerBuilder,
         memory_pool::FairSpillPool,
         runtime_env::RuntimeEnvBuilder,
-        TaskContext,
     },
     physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
         analyze::AnalyzeExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, CardinalityEffect, EmissionType},
         metrics::MetricValue,
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use lance_arrow::SchemaExt;
 use lance_core::{
+    Error, Result,
     utils::{
         futures::FinallyStreamExt,
-        tracing::{StreamTracingExt, EXECUTION_PLAN_RUN, TRACE_EXECUTION},
+        tracing::{EXECUTION_PLAN_RUN, StreamTracingExt, TRACE_EXECUTION},
     },
-    Error, Result,
 };
 use log::{debug, info, warn};
-use snafu::location;
 use tracing::Span;
 
 use crate::udf::register_functions;
 use crate::{
     chunker::StrictBatchSizeStream,
     utils::{
-        MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
-        IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+        BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
+        MetricsExt, PARTS_LOADED_METRIC, REQUESTS_METRIC,
     },
 };
 
@@ -385,28 +384,79 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     ctx
 }
 
-static DEFAULT_SESSION_CONTEXT: LazyLock<SessionContext> =
-    LazyLock::new(|| new_session_context(&LanceExecutionOptions::default()));
+/// Cache key for session contexts based on resolved configuration values.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SessionContextCacheKey {
+    mem_pool_size: u64,
+    max_temp_directory_size: u64,
+    target_partition: Option<usize>,
+    use_spilling: bool,
+}
 
-static DEFAULT_SESSION_CONTEXT_WITH_SPILLING: LazyLock<SessionContext> = LazyLock::new(|| {
-    new_session_context(&LanceExecutionOptions {
-        use_spilling: true,
-        ..Default::default()
+impl SessionContextCacheKey {
+    fn from_options(options: &LanceExecutionOptions) -> Self {
+        Self {
+            mem_pool_size: options.mem_pool_size(),
+            max_temp_directory_size: options.max_temp_directory_size(),
+            target_partition: options.target_partition,
+            use_spilling: options.use_spilling(),
+        }
+    }
+}
+
+struct CachedSessionContext {
+    context: SessionContext,
+    last_access: std::time::Instant,
+}
+
+fn get_session_cache() -> &'static Mutex<HashMap<SessionContextCacheKey, CachedSessionContext>> {
+    static SESSION_CACHE: OnceLock<Mutex<HashMap<SessionContextCacheKey, CachedSessionContext>>> =
+        OnceLock::new();
+    SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_max_cache_size() -> usize {
+    const DEFAULT_CACHE_SIZE: usize = 4;
+    static MAX_CACHE_SIZE: OnceLock<usize> = OnceLock::new();
+    *MAX_CACHE_SIZE.get_or_init(|| {
+        std::env::var("LANCE_SESSION_CACHE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_CACHE_SIZE)
     })
-});
+}
 
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
-    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE
-        && options.max_temp_directory_size() == DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE
-        && options.target_partition.is_none()
-    {
-        return if options.use_spilling() {
-            DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone()
-        } else {
-            DEFAULT_SESSION_CONTEXT.clone()
-        };
+    let key = SessionContextCacheKey::from_options(options);
+    let mut cache = get_session_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // If key exists, update access time and return
+    if let Some(entry) = cache.get_mut(&key) {
+        entry.last_access = std::time::Instant::now();
+        return entry.context.clone();
     }
-    new_session_context(options)
+
+    // Evict least recently used entry if cache is full
+    if cache.len() >= get_max_cache_size()
+        && let Some(lru_key) = cache
+            .iter()
+            .min_by_key(|(_, v)| v.last_access)
+            .map(|(k, _)| k.clone())
+    {
+        cache.remove(&lru_key);
+    }
+
+    let context = new_session_context(options);
+    cache.insert(
+        key,
+        CachedSessionContext {
+            context: context.clone(),
+            last_access: std::time::Instant::now(),
+        },
+    );
+    context
 }
 
 fn get_task_context(
@@ -441,7 +491,7 @@ pub struct ExecutionSummaryCounts {
     pub all_counts: HashMap<String, usize>,
 }
 
-fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
+pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
         for (metric_name, count) in metrics.iter_counts() {
             match metric_name.as_ref() {
@@ -471,7 +521,7 @@ fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
         }
     }
     for child in node.children() {
-        visit_node(child.as_ref(), counts);
+        collect_execution_metrics(child.as_ref(), counts);
     }
 }
 
@@ -481,7 +531,7 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
         .map(|m| m.output_rows().unwrap_or(0))
         .unwrap_or(0);
     let mut counts = ExecutionSummaryCounts::default();
-    visit_node(plan, &mut counts);
+    collect_execution_metrics(plan, &mut counts);
     tracing::info!(
         target: TRACE_EXECUTION,
         r#type = EXECUTION_PLAN_RUN,
@@ -583,12 +633,7 @@ pub async fn analyze_plan(
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);
     let mut stream = analyze
         .execute(0, get_task_context(&session_ctx, &options))
-        .map_err(|err| {
-            Error::io(
-                format!("Failed to execute analyze plan: {}", err),
-                location!(),
-            )
-        })?;
+        .map_err(|err| Error::io(format!("Failed to execute analyze plan: {}", err)))?;
 
     // fully execute the plan
     while (stream.next().await).is_some() {}
@@ -756,7 +801,7 @@ pub trait SessionContextExt {
     ) -> datafusion::common::Result<DataFrame>;
 }
 
-struct OneShotPartitionStream {
+pub struct OneShotPartitionStream {
     data: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     schema: Arc<ArrowSchema>,
 }
@@ -772,7 +817,7 @@ impl std::fmt::Debug for OneShotPartitionStream {
 }
 
 impl OneShotPartitionStream {
-    fn new(data: SendableRecordBatchStream) -> Self {
+    pub fn new(data: SendableRecordBatchStream) -> Self {
         let schema = data.schema();
         Self {
             data: Arc::new(Mutex::new(Some(data))),
@@ -887,5 +932,113 @@ impl ExecutionPlan for StrictBatchSizeExec {
 
     fn supports_limit_pushdown(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Serialize cache tests since they share global state
+    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_session_context_cache() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let cache = get_session_cache();
+
+        // Clear any existing entries from other tests
+        cache.lock().unwrap().clear();
+
+        // Create first session with default options
+        let opts1 = LanceExecutionOptions::default();
+        let _ctx1 = get_session_context(&opts1);
+
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 1);
+        }
+
+        // Same options should reuse cached session (no new entry)
+        let _ctx1_again = get_session_context(&opts1);
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 1);
+        }
+
+        // Different options should create new entry
+        let opts2 = LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        };
+        let _ctx2 = get_session_context(&opts2);
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_session_context_cache_lru_eviction() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let cache = get_session_cache();
+
+        // Clear any existing entries from other tests
+        cache.lock().unwrap().clear();
+
+        // Create 4 different configurations to fill the cache
+        let configs: Vec<LanceExecutionOptions> = (0..4)
+            .map(|i| LanceExecutionOptions {
+                mem_pool_size: Some((i + 1) as u64 * 1024 * 1024),
+                ..Default::default()
+            })
+            .collect();
+
+        for config in &configs {
+            let _ctx = get_session_context(config);
+        }
+
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 4);
+        }
+
+        // Access config[0] to make it more recently used than config[1]
+        // (config[0] was inserted first, so without this access it would be evicted)
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let _ctx = get_session_context(&configs[0]);
+
+        // Add a 5th configuration - should evict config[1] (now least recently used)
+        let opts5 = LanceExecutionOptions {
+            mem_pool_size: Some(5 * 1024 * 1024),
+            ..Default::default()
+        };
+        let _ctx5 = get_session_context(&opts5);
+
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 4);
+
+            // config[0] should still be present (was accessed recently)
+            let key0 = SessionContextCacheKey::from_options(&configs[0]);
+            assert!(
+                cache_guard.contains_key(&key0),
+                "config[0] should still be cached after recent access"
+            );
+
+            // config[1] should be evicted (was least recently used)
+            let key1 = SessionContextCacheKey::from_options(&configs[1]);
+            assert!(
+                !cache_guard.contains_key(&key1),
+                "config[1] should have been evicted"
+            );
+
+            // New config should be present
+            let key5 = SessionContextCacheKey::from_options(&opts5);
+            assert!(
+                cache_guard.contains_key(&key5),
+                "new config should be cached"
+            );
+        }
     }
 }

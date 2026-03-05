@@ -17,11 +17,15 @@ import org.lance.JniLoader;
 import org.lance.namespace.model.*;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.arrow.memory.BufferAllocator;
 
 import java.io.Closeable;
+import java.lang.reflect.Constructor;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * DirectoryNamespace implementation that provides Lance namespace functionality for directory-based
@@ -139,7 +143,13 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
     JniLoader.ensureLoaded();
   }
 
-  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+  private static final ObjectMapper OBJECT_MAPPER = createObjectMapper();
+
+  private static ObjectMapper createObjectMapper() {
+    ObjectMapper mapper = new ObjectMapper();
+    mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+    return mapper;
+  }
 
   private long nativeDirectoryNamespaceHandle;
   private BufferAllocator allocator;
@@ -149,11 +159,43 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
 
   @Override
   public void initialize(Map<String, String> configProperties, BufferAllocator allocator) {
+    initialize(configProperties, allocator, null);
+  }
+
+  /**
+   * Initialize with a dynamic context provider.
+   *
+   * <p>If contextProvider is null and the properties contain {@code dynamic_context_provider.impl},
+   * the provider will be loaded from the class path. The class must implement {@link
+   * DynamicContextProvider} and have a constructor accepting {@code Map<String, String>}.
+   *
+   * @param configProperties Configuration properties for the namespace
+   * @param allocator Arrow buffer allocator
+   * @param contextProvider Optional provider for per-request context (e.g., dynamic auth headers)
+   */
+  public void initialize(
+      Map<String, String> configProperties,
+      BufferAllocator allocator,
+      DynamicContextProvider contextProvider) {
     if (this.nativeDirectoryNamespaceHandle != 0) {
       throw new IllegalStateException("DirectoryNamespace already initialized");
     }
     this.allocator = allocator;
-    this.nativeDirectoryNamespaceHandle = createNative(configProperties);
+
+    // If no explicit provider, try to create from properties
+    DynamicContextProvider provider = contextProvider;
+    if (provider == null) {
+      provider = createProviderFromProperties(configProperties).orElse(null);
+    }
+
+    // Filter out provider properties before passing to native layer
+    Map<String, String> filteredProperties = filterProviderProperties(configProperties);
+
+    if (provider != null) {
+      this.nativeDirectoryNamespaceHandle = createNativeWithProvider(filteredProperties, provider);
+    } else {
+      this.nativeDirectoryNamespaceHandle = createNative(filteredProperties);
+    }
   }
 
   @Override
@@ -265,14 +307,6 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public CreateEmptyTableResponse createEmptyTable(CreateEmptyTableRequest request) {
-    ensureInitialized();
-    String requestJson = toJson(request);
-    String responseJson = createEmptyTableNative(nativeDirectoryNamespaceHandle, requestJson);
-    return fromJson(responseJson, CreateEmptyTableResponse.class);
-  }
-
-  @Override
   public DeclareTableResponse declareTable(DeclareTableRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
@@ -365,12 +399,57 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
     return fromJson(responseJson, AlterTransactionResponse.class);
   }
 
+  // Table version operations
+
+  @Override
+  public ListTableVersionsResponse listTableVersions(ListTableVersionsRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = listTableVersionsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, ListTableVersionsResponse.class);
+  }
+
+  @Override
+  public CreateTableVersionResponse createTableVersion(CreateTableVersionRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = createTableVersionNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, CreateTableVersionResponse.class);
+  }
+
+  @Override
+  public DescribeTableVersionResponse describeTableVersion(DescribeTableVersionRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = describeTableVersionNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, DescribeTableVersionResponse.class);
+  }
+
+  @Override
+  public BatchDeleteTableVersionsResponse batchDeleteTableVersions(
+      BatchDeleteTableVersionsRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson =
+        batchDeleteTableVersionsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, BatchDeleteTableVersionsResponse.class);
+  }
+
   @Override
   public void close() {
     if (nativeDirectoryNamespaceHandle != 0) {
       releaseNative(nativeDirectoryNamespaceHandle);
       nativeDirectoryNamespaceHandle = 0;
     }
+  }
+
+  /**
+   * Returns the native handle for this namespace. Used internally for passing to Dataset.open() for
+   * namespace commit handler support.
+   */
+  public long getNativeHandle() {
+    ensureInitialized();
+    return nativeDirectoryNamespaceHandle;
   }
 
   private void ensureInitialized() {
@@ -398,6 +477,9 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
 
   // Native methods
   private native long createNative(Map<String, String> properties);
+
+  private native long createNativeWithProvider(
+      Map<String, String> properties, DynamicContextProvider contextProvider);
 
   private native void releaseNative(long handle);
 
@@ -429,8 +511,6 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
 
   private native String createTableNative(long handle, String requestJson, byte[] requestData);
 
-  private native String createEmptyTableNative(long handle, String requestJson);
-
   private native String declareTableNative(long handle, String requestJson);
 
   private native String insertIntoTableNative(long handle, String requestJson, byte[] requestData);
@@ -453,4 +533,85 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   private native String describeTransactionNative(long handle, String requestJson);
 
   private native String alterTransactionNative(long handle, String requestJson);
+
+  private native String listTableVersionsNative(long handle, String requestJson);
+
+  private native String createTableVersionNative(long handle, String requestJson);
+
+  private native String describeTableVersionNative(long handle, String requestJson);
+
+  private native String batchDeleteTableVersionsNative(long handle, String requestJson);
+
+  // ==========================================================================
+  // Provider loading helpers
+  // ==========================================================================
+
+  private static final String PROVIDER_PREFIX = "dynamic_context_provider.";
+  private static final String IMPL_KEY = "dynamic_context_provider.impl";
+
+  /**
+   * Create a context provider from properties if configured.
+   *
+   * <p>Loads the class specified by {@code dynamic_context_provider.impl} from the class path and
+   * instantiates it with the extracted provider properties.
+   */
+  private static Optional<DynamicContextProvider> createProviderFromProperties(
+      Map<String, String> properties) {
+    String className = properties.get(IMPL_KEY);
+    if (className == null || className.isEmpty()) {
+      return Optional.empty();
+    }
+
+    // Extract provider-specific properties (strip prefix, exclude impl key)
+    Map<String, String> providerProps = new HashMap<>();
+    for (Map.Entry<String, String> entry : properties.entrySet()) {
+      String key = entry.getKey();
+      if (key.startsWith(PROVIDER_PREFIX) && !key.equals(IMPL_KEY)) {
+        String propName = key.substring(PROVIDER_PREFIX.length());
+        providerProps.put(propName, entry.getValue());
+      }
+    }
+
+    try {
+      Class<?> providerClass = Class.forName(className);
+      if (!DynamicContextProvider.class.isAssignableFrom(providerClass)) {
+        throw new IllegalArgumentException(
+            String.format(
+                "Class '%s' does not implement DynamicContextProvider interface", className));
+      }
+
+      @SuppressWarnings("unchecked")
+      Class<? extends DynamicContextProvider> typedClass =
+          (Class<? extends DynamicContextProvider>) providerClass;
+
+      Constructor<? extends DynamicContextProvider> constructor =
+          typedClass.getConstructor(Map.class);
+      return Optional.of(constructor.newInstance(providerProps));
+
+    } catch (ClassNotFoundException e) {
+      throw new IllegalArgumentException(
+          String.format("Failed to load context provider class '%s': %s", className, e), e);
+    } catch (NoSuchMethodException e) {
+      throw new IllegalArgumentException(
+          String.format(
+              "Context provider class '%s' must have a public constructor "
+                  + "that accepts Map<String, String>",
+              className),
+          e);
+    } catch (ReflectiveOperationException e) {
+      throw new IllegalArgumentException(
+          String.format("Failed to instantiate context provider '%s': %s", className, e), e);
+    }
+  }
+
+  /** Filter out dynamic_context_provider.* properties from the map. */
+  private static Map<String, String> filterProviderProperties(Map<String, String> properties) {
+    Map<String, String> filtered = new HashMap<>();
+    for (Map.Entry<String, String> entry : properties.entrySet()) {
+      if (!entry.getKey().startsWith(PROVIDER_PREFIX)) {
+        filtered.put(entry.getKey(), entry.getValue());
+      }
+    }
+    return filtered;
+  }
 }

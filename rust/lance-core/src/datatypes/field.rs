@@ -4,34 +4,33 @@
 //! Lance Schema Field
 
 use std::{
-    cmp::{max, Ordering},
+    cmp::{Ordering, max},
     collections::{HashMap, VecDeque},
     fmt,
     sync::Arc,
 };
 
 use arrow_array::{
+    ArrayRef,
     cast::AsArray,
     types::{
-        Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
     },
-    ArrayRef,
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
 use lance_arrow::{
+    ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME, DataTypeExt,
     json::{is_arrow_json_field, is_json_field},
-    DataTypeExt, ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME,
 };
-use snafu::location;
 
 use super::{
-    schema::{compare_fields, explain_fields_difference},
     Dictionary, LogicalType, Projection,
+    schema::{compare_fields, explain_fields_difference},
 };
 use crate::{
-    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
     Error, Result,
+    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
 };
 
 /// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
@@ -48,6 +47,10 @@ pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-
 /// When not specified, primary key fields are ordered by their schema field id.
 pub const LANCE_UNENFORCED_PRIMARY_KEY_POSITION: &str =
     "lance-schema:unenforced-primary-key:position";
+
+/// Use this config key in Arrow field metadata to specify the field id of the lance field.
+/// The value should be non-negative i32 value. Any negative value will be seen as -1.
+pub const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
 
 fn has_blob_v2_extension(field: &ArrowField) -> bool {
     field
@@ -99,25 +102,6 @@ pub enum BlobVersion {
     /// Blob v2 struct format.
     V2,
 }
-
-impl BlobVersion {
-    /// Convert a persisted string value (e.g. table config) into a blob version
-    pub fn from_config_value(value: &str) -> Option<Self> {
-        match value {
-            "1" => Some(Self::V1),
-            "2" => Some(Self::V2),
-            _ => None,
-        }
-    }
-
-    /// Persistable string representation for table config.
-    pub fn config_value(self) -> &'static str {
-        match self {
-            Self::V1 => "1",
-            Self::V2 => "2",
-        }
-    }
-}
 /// Encoding enum.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub enum Encoding {
@@ -151,7 +135,7 @@ pub struct Field {
     pub encoding: Option<Encoding>,
     pub nullable: bool,
 
-    pub children: Vec<Field>,
+    pub children: Vec<Self>,
 
     /// Dictionary value array if this field is dictionary.
     pub dictionary: Option<Dictionary>,
@@ -302,11 +286,7 @@ impl Field {
         } else {
             let mut new_field = self.clone();
             new_field.children = children;
-            Some(
-                projection
-                    .blob_handling
-                    .unload_if_needed(new_field, projection.blob_version),
-            )
+            Some(projection.blob_handling.unload_if_needed(new_field))
         }
     }
 
@@ -562,28 +542,6 @@ impl Field {
         }
     }
 
-    /// If the field is a blob, return a new field with the same name and id
-    /// but with the data type set to a struct of the blob description fields.
-    ///
-    /// If the field is not a blob, return the field itself.
-    pub fn into_unloaded_with_version(mut self, version: BlobVersion) -> Self {
-        if self.is_blob() {
-            match version {
-                BlobVersion::V2 => {
-                    self.logical_type = BLOB_V2_DESC_LANCE_FIELD.logical_type.clone();
-                    self.children = BLOB_V2_DESC_LANCE_FIELD.children.clone();
-                    self.metadata = BLOB_V2_DESC_LANCE_FIELD.metadata.clone();
-                }
-                BlobVersion::V1 => {
-                    self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
-                    self.children = BLOB_DESC_LANCE_FIELD.children.clone();
-                    self.metadata = BLOB_DESC_LANCE_FIELD.metadata.clone();
-                }
-            }
-        }
-        self
-    }
-
     pub fn project(&self, path_components: &[&str]) -> Result<Self> {
         let mut f = Self {
             name: self.name.clone(),
@@ -676,13 +634,10 @@ impl Field {
     ///
     pub fn project_by_field(&self, other: &Self, on_type_mismatch: OnTypeMismatch) -> Result<Self> {
         if self.name != other.name {
-            return Err(Error::Schema {
-                message: format!(
-                    "Attempt to project field by different names: {} and {}",
-                    self.name, other.name,
-                ),
-                location: location!(),
-            });
+            return Err(Error::schema(format!(
+                "Attempt to project field by different names: {} and {}",
+                self.name, other.name,
+            )));
         };
 
         match (self.data_type(), other.data_type()) {
@@ -692,13 +647,10 @@ impl Field {
                     || (dt.is_binary_like() && other_dt.is_binary_like()) =>
             {
                 if dt != other_dt {
-                    return Err(Error::Schema {
-                        message: format!(
-                            "Attempt to project field by different types: {} and {}",
-                            dt, other_dt,
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(format!(
+                        "Attempt to project field by different types: {} and {}",
+                        dt, other_dt,
+                    )));
                 }
                 Ok(self.clone())
             }
@@ -712,13 +664,10 @@ impl Field {
                 let mut fields = vec![];
                 for other_field in other.children.iter() {
                     let Some(child) = self.child(&other_field.name) else {
-                        return Err(Error::Schema {
-                            message: format!(
-                                "Attempt to project non-existed field: {} on {}",
-                                other_field.name, self,
-                            ),
-                            location: location!(),
-                        });
+                        return Err(Error::schema(format!(
+                            "Attempt to project non-existed field: {} on {}",
+                            other_field.name, self,
+                        )));
                     };
                     fields.push(child.project_by_field(other_field, on_type_mismatch)?);
                 }
@@ -751,13 +700,10 @@ impl Field {
                 Ok(self.clone())
             }
             _ => match on_type_mismatch {
-                OnTypeMismatch::Error => Err(Error::Schema {
-                    message: format!(
-                        "Attempt to project incompatible fields: {} and {}",
-                        self, other
-                    ),
-                    location: location!(),
-                }),
+                OnTypeMismatch::Error => Err(Error::schema(format!(
+                    "Attempt to project incompatible fields: {} and {}",
+                    self, other
+                ))),
                 OnTypeMismatch::TakeSelf => Ok(self.clone()),
             },
         }
@@ -809,23 +755,17 @@ impl Field {
 
     pub(crate) fn do_intersection(&self, other: &Self, ignore_types: bool) -> Result<Self> {
         if self.name != other.name {
-            return Err(Error::Arrow {
-                message: format!(
-                    "Attempt to intersect different fields: {} and {}",
-                    self.name, other.name,
-                ),
-                location: location!(),
-            });
+            return Err(Error::arrow(format!(
+                "Attempt to intersect different fields: {} and {}",
+                self.name, other.name,
+            )));
         }
 
         if self.is_blob() != other.is_blob() {
-            return Err(Error::Arrow {
-                message: format!(
-                    "Attempt to intersect blob and non-blob field: {}",
-                    self.name
-                ),
-                location: location!(),
-            });
+            return Err(Error::arrow(format!(
+                "Attempt to intersect blob and non-blob field: {}",
+                self.name
+            )));
         }
 
         let self_type = self.data_type();
@@ -872,13 +812,10 @@ impl Field {
         }
 
         if (!ignore_types && self_type != other_type) || self.name != other.name {
-            return Err(Error::Arrow {
-                message: format!(
-                    "Attempt to intersect different fields: ({}, {}) and ({}, {})",
-                    self.name, self_type, other.name, other_type
-                ),
-                location: location!(),
-            });
+            return Err(Error::arrow(format!(
+                "Attempt to intersect different fields: ({}, {}) and ({}, {})",
+                self.name, self_type, other.name, other_type
+            )));
         }
 
         Ok(if self.id >= 0 {
@@ -963,13 +900,10 @@ impl Field {
             }
             _ => {
                 if self.data_type() != other.data_type() {
-                    return Err(Error::Schema {
-                        message: format!(
-                            "Attempt to merge incompatible fields: {} and {}",
-                            self, other
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(format!(
+                        "Attempt to merge incompatible fields: {} and {}",
+                        self, other
+                    )));
                 }
             }
         }
@@ -1095,6 +1029,14 @@ impl TryFrom<&ArrowField> for Field {
 
     fn try_from(field: &ArrowField) -> Result<Self> {
         let mut metadata = field.metadata().clone();
+        let id = match metadata.remove(LANCE_FIELD_ID_KEY) {
+            Some(val) => val
+                .parse::<i32>()
+                .map_err(|e| Error::invalid_input(e.to_string()))?
+                .max(-1),
+            None => -1,
+        };
+
         let children = match field.data_type() {
             DataType::Struct(children) => children
                 .iter()
@@ -1110,34 +1052,27 @@ impl TryFrom<&ArrowField> for Field {
                 //  because converting a rust arrow map field to the python arrow field will
                 //  lose the keys_sorted property.
                 if *keys_sorted {
-                    return Err(Error::Schema {
-                        message: "Unsupported map field with keys_sorted=true".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(
+                        "Unsupported map field with keys_sorted=true".to_string(),
+                    ));
                 }
                 // Validate Map entries follow Arrow specification
                 let DataType::Struct(struct_fields) = entries.data_type() else {
-                    return Err(Error::Schema {
-                        message: "Map entries field must be a Struct<key, value>".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(
+                        "Map entries field must be a Struct<key, value>".to_string(),
+                    ));
                 };
                 if struct_fields.len() < 2 {
-                    return Err(Error::Schema {
-                        message: "Map entries struct must contain both key and value fields"
-                            .to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(
+                        "Map entries struct must contain both key and value fields".to_string(),
+                    ));
                 }
                 let key_field = &struct_fields[0];
                 if key_field.is_nullable() {
-                    return Err(Error::Schema {
-                        message: format!(
-                            "Map key field '{}' must be non-nullable according to Arrow Map specification",
-                            key_field.name()
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::schema(format!(
+                        "Map key field '{}' must be non-nullable according to Arrow Map specification",
+                        key_field.name()
+                    )));
                 }
                 vec![Self::try_from(entries.as_ref())?]
             }
@@ -1171,7 +1106,7 @@ impl TryFrom<&ArrowField> for Field {
         };
 
         Ok(Self {
-            id: -1,
+            id,
             parent_id: -1,
             name: field.name().clone(),
             logical_type,
@@ -1233,6 +1168,25 @@ mod tests {
     use arrow_schema::{Fields, TimeUnit};
     use lance_arrow::BLOB_META_KEY;
     use std::collections::HashMap;
+
+    #[test]
+    fn arrow_field_to_field_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert(LANCE_FIELD_ID_KEY.to_string(), "42".to_string());
+        metadata.insert("custom".to_string(), "value".to_string());
+
+        let arrow_field =
+            ArrowField::new("a", DataType::Int32, false).with_metadata(metadata.clone());
+        let field = Field::try_from(&arrow_field).unwrap();
+
+        assert_eq!(field.id, 42);
+        assert!(!field.metadata.contains_key(LANCE_FIELD_ID_KEY));
+        assert_eq!(
+            field.metadata.get("custom").map(String::as_str),
+            Some("value")
+        );
+    }
+
     #[test]
     fn arrow_field_to_field() {
         for (name, data_type) in [
@@ -1806,14 +1760,34 @@ mod tests {
     }
 
     #[test]
-    fn blob_into_unloaded_selects_v2_layout() {
+    fn blob_unloaded_mut_selects_layout_from_metadata() {
         let metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
-        let field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
+        let mut field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
             .with_metadata(metadata)
             .try_into()
             .unwrap();
-        let unloaded = field.into_unloaded_with_version(BlobVersion::V2);
-        assert_eq!(unloaded.children.len(), 5);
-        assert_eq!(unloaded.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+        field.unloaded_mut();
+        assert_eq!(field.children.len(), 2);
+        assert_eq!(field.logical_type, BLOB_DESC_LANCE_FIELD.logical_type);
+
+        let metadata =
+            HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]);
+        let mut field: Field = ArrowField::new(
+            "blob",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("data", DataType::LargeBinary, true),
+                    ArrowField::new("uri", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        )
+        .with_metadata(metadata)
+        .try_into()
+        .unwrap();
+        field.unloaded_mut();
+        assert_eq!(field.children.len(), 5);
+        assert_eq!(field.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
     }
 }

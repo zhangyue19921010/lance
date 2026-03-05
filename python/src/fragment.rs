@@ -19,11 +19,12 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use futures::TryFutureExt;
+use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform};
-use lance::Error;
+use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
     DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
@@ -34,13 +35,12 @@ use pyo3::basic::CompareOp;
 use pyo3::types::PyTuple;
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
-use snafu::location;
 
-use crate::dataset::{get_write_params, transforms_from_python, PyWriteDest};
+use crate::dataset::{PyWriteDest, get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;
-use crate::schema::{logical_schema_from_lance, LanceSchema};
-use crate::utils::{export_vec, extract_vec, PyLance};
-use crate::{rt, Dataset, Scanner};
+use crate::schema::{LanceSchema, logical_schema_from_lance};
+use crate::utils::{PyLance, export_vec, extract_vec};
+use crate::{Dataset, Scanner, rt};
 
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]
@@ -196,7 +196,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, order_by=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -208,6 +208,7 @@ impl FileFragment {
         with_row_id: Option<bool>,
         with_row_address: Option<bool>,
         batch_readahead: Option<usize>,
+        blob_handling: Option<Bound<PyAny>>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
@@ -252,6 +253,24 @@ impl FileFragment {
         }
         if let Some(batch_readahead) = batch_readahead {
             scanner.batch_readahead(batch_readahead);
+        }
+        if let Some(blob_handling) = blob_handling {
+            let handling = if let Ok(handling) = blob_handling.extract::<String>() {
+                match handling.as_str() {
+                    "all_binary" => BlobHandling::AllBinary,
+                    "blobs_descriptions" => BlobHandling::BlobsDescriptions,
+                    "all_descriptions" => BlobHandling::AllDescriptions,
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "Invalid blob_handling: {other}. Expected one of: all_binary, blobs_descriptions, all_descriptions"
+                        )));
+                    }
+                }
+            } else {
+                return Err(PyTypeError::new_err("blob_handling must be a str"));
+            };
+
+            scanner.blob_handling(handling);
         }
         if let Some(orderings) = order_by {
             let col_orderings = Some(orderings.into_iter().map(|co| co.0).collect());
@@ -428,10 +447,7 @@ pub fn write_fragments(
     let get_fragments = |operation| match operation {
         Operation::Overwrite { fragments, .. } => Ok(fragments),
         Operation::Append { fragments, .. } => Ok(fragments),
-        _ => Err(Error::Internal {
-            message: "Unexpected operation".into(),
-            location: location!(),
-        }),
+        _ => Err(Error::internal("Unexpected operation")),
     };
     let fragments =
         get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
@@ -488,7 +504,7 @@ impl PyDeletionFile {
                 return Err(PyValueError::new_err(format!(
                     "file_type must be either 'array' or 'bitmap', got '{}'",
                     file_type
-                )))
+                )));
             }
         };
         Ok(Self(DeletionFile {

@@ -3,12 +3,12 @@
 
 use core::slice;
 
+use crate::Error;
 use crate::error::Result;
 use crate::utils::{get_query, get_vector_index_params};
-use crate::Error;
 use jni::objects::{JByteBuffer, JFloatArray, JObjectArray, JString};
 use jni::sys::jobjectArray;
-use jni::{objects::JObject, JNIEnv};
+use jni::{JNIEnv, objects::JObject};
 use lance_index::scalar::inverted::query::{Occur, Operator};
 
 /// Extend JNIEnv with helper functions.
@@ -296,7 +296,7 @@ impl JNIEnvExt for JNIEnv<'_> {
             .l()?;
         let operator_str = self.get_string_from_method(&operator_obj, "name")?;
         Operator::try_from(operator_str.as_str())
-            .map_err(|e| Error::io_error(format!("Invalid operator: {:?}", e)))
+            .map_err(|e| Error::input_error(format!("Invalid operator: {:?}", e)))
     }
 
     fn get_occur_from_method(&mut self, obj: &JObject) -> Result<Occur> {
@@ -310,7 +310,7 @@ impl JNIEnvExt for JNIEnv<'_> {
             .l()?;
         let occur_str = self.get_string_from_method(&occur_obj, "name")?;
         Occur::try_from(occur_str.as_str())
-            .map_err(|e| Error::io_error(format!("Invalid occur: {:?}", e)))
+            .map_err(|e| Error::input_error(format!("Invalid occur: {:?}", e)))
     }
 
     fn get_string_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<String> {
@@ -388,7 +388,7 @@ impl JNIEnvExt for JNIEnv<'_> {
         self.get_optional_from_method(obj, method_name, |env, inner_jobj| {
             let inner_value = env.call_method(&inner_jobj, "intValue", "()I", &[])?.i()?;
             T::try_from(inner_value).map_err(|e| {
-                Error::io_error(format!("Failed to convert from i32 to rust type: {:?}", e))
+                Error::input_error(format!("Failed to convert from i32 to rust type: {:?}", e))
             })
         })
     }
@@ -421,7 +421,7 @@ impl JNIEnvExt for JNIEnv<'_> {
         self.get_optional_from_method(obj, method_name, |env, inner_jobj| {
             let inner_value = env.call_method(&inner_jobj, "longValue", "()J", &[])?.j()?;
             T::try_from(inner_value).map_err(|e| {
-                Error::io_error(format!("Failed to convert from i32 to rust type: {:?}", e))
+                Error::input_error(format!("Failed to convert from i32 to rust type: {:?}", e))
             })
         })
     }
@@ -473,7 +473,7 @@ impl JNIEnvExt for JNIEnv<'_> {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseInts(
     mut env: JNIEnv,
     _obj: JObject,
@@ -482,7 +482,7 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseInts(
     ok_or_throw_without_return!(env, env.get_integers(&list_obj));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseLongs(
     mut env: JNIEnv,
     _obj: JObject,
@@ -491,7 +491,7 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseLongs(
     ok_or_throw_without_return!(env, env.get_longs(&list_obj));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseIntsOpt(
     mut env: JNIEnv,
     _obj: JObject,
@@ -500,7 +500,7 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseIntsOpt(
     ok_or_throw_without_return!(env, env.get_ints_opt(&list_obj));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseQuery(
     mut env: JNIEnv,
     _obj: JObject,
@@ -509,7 +509,7 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseQuery(
     ok_or_throw_without_return!(env, get_query(&mut env, query_opt));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_test_JniTestHelper_parseIndexParams(
     mut env: JNIEnv,
     _obj: JObject,

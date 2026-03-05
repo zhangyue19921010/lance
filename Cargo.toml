@@ -13,21 +13,23 @@ members = [
     "rust/lance-linalg",
     "rust/lance-namespace",
     "rust/lance-namespace-impls",
+    "rust/lance-namespace-datafusion",
     "rust/lance-table",
     "rust/lance-test-macros",
     "rust/lance-testing",
     "rust/lance-tools",
     "rust/compression/fsst",
     "rust/compression/bitpacking",
+    "rust/arrow-scalar",
 ]
 exclude = ["python", "java/lance-jni"]
 # Python package needs to be built by maturin.
-resolver = "2"
+resolver = "3"
 
 
 [workspace.package]
-version = "2.0.0-beta.6"
-edition = "2021"
+version = "4.0.0-beta.7"
+edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
 repository = "https://github.com/lance-format/lance"
@@ -46,30 +48,32 @@ categories = [
     "development-tools",
     "science",
 ]
-rust-version = "1.82.0"
+rust-version = "1.91.0"
 
 [workspace.dependencies]
 libc = "0.2.176"
-lance = { version = "=2.0.0-beta.6", path = "./rust/lance", default-features = false }
-lance-arrow = { version = "=2.0.0-beta.6", path = "./rust/lance-arrow" }
-lance-core = { version = "=2.0.0-beta.6", path = "./rust/lance-core" }
-lance-datafusion = { version = "=2.0.0-beta.6", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=2.0.0-beta.6", path = "./rust/lance-datagen" }
-lance-encoding = { version = "=2.0.0-beta.6", path = "./rust/lance-encoding" }
-lance-file = { version = "=2.0.0-beta.6", path = "./rust/lance-file" }
-lance-geo = { version = "=2.0.0-beta.6", path = "./rust/lance-geo" }
-lance-index = { version = "=2.0.0-beta.6", path = "./rust/lance-index" }
-lance-io = { version = "=2.0.0-beta.6", path = "./rust/lance-io", default-features = false }
-lance-linalg = { version = "=2.0.0-beta.6", path = "./rust/lance-linalg" }
-lance-namespace = { version = "=2.0.0-beta.6", path = "./rust/lance-namespace" }
-lance-namespace-impls = { version = "=2.0.0-beta.6", path = "./rust/lance-namespace-impls" }
-lance-namespace-reqwest-client = { version = "=0.4.5" }
-lance-table = { version = "=2.0.0-beta.6", path = "./rust/lance-table" }
-lance-test-macros = { version = "=2.0.0-beta.6", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=2.0.0-beta.6", path = "./rust/lance-testing" }
+lance = { version = "=4.0.0-beta.7", path = "./rust/lance", default-features = false }
+lance-arrow = { version = "=4.0.0-beta.7", path = "./rust/lance-arrow" }
+lance-core = { version = "=4.0.0-beta.7", path = "./rust/lance-core" }
+lance-datafusion = { version = "=4.0.0-beta.7", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=4.0.0-beta.7", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=4.0.0-beta.7", path = "./rust/lance-encoding" }
+lance-file = { version = "=4.0.0-beta.7", path = "./rust/lance-file" }
+lance-geo = { version = "=4.0.0-beta.7", path = "./rust/lance-geo" }
+lance-index = { version = "=4.0.0-beta.7", path = "./rust/lance-index" }
+lance-io = { version = "=4.0.0-beta.7", path = "./rust/lance-io", default-features = false }
+lance-linalg = { version = "=4.0.0-beta.7", path = "./rust/lance-linalg" }
+lance-namespace = { version = "=4.0.0-beta.7", path = "./rust/lance-namespace" }
+lance-namespace-impls = { version = "=4.0.0-beta.7", path = "./rust/lance-namespace-impls" }
+lance-namespace-datafusion = { version = "=4.0.0-beta.7", path = "./rust/lance-namespace-datafusion" }
+lance-namespace-reqwest-client = "0.5.2"
+lance-table = { version = "=4.0.0-beta.7", path = "./rust/lance-table" }
+lance-test-macros = { version = "=4.0.0-beta.7", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=4.0.0-beta.7", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "57.0.0", optional = false, features = ["prettyprint"] }
+arrow-scalar = { version = "=57.0.0", path = "./rust/arrow-scalar" }
 arrow-arith = "57.0.0"
 arrow-array = "57.0.0"
 arrow-buffer = "57.0.0"
@@ -91,9 +95,9 @@ half = { "version" = "2.1", default-features = false, features = [
     "num-traits",
     "std",
 ] }
-lance-bitpacking = { version = "=2.0.0-beta.6", path = "./rust/compression/bitpacking" }
+lance-bitpacking = { version = "=4.0.0-beta.7", path = "./rust/compression/bitpacking" }
 bitvec = "1"
-bytes = "1.4"
+bytes = "1.11.1"
 byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4.41", default-features = false, features = [
@@ -107,35 +111,36 @@ criterion = { version = "0.5", features = [
     "html_reports",
 ] }
 crossbeam-queue = "0.3"
-datafusion = { version = "51.0.0", default-features = false, features = [
+crossbeam-skiplist = "0.1"
+datafusion = { version = "52.1.0", default-features = false, features = [
+    "crypto_expressions",
+    "datetime_expressions",
+    "encoding_expressions",
     "nested_expressions",
     "regex_expressions",
-    "unicode_expressions",
-    "crypto_expressions",
-    "encoding_expressions",
-    "datetime_expressions",
     "sql",
     "string_expressions",
+    "unicode_expressions",
 ] }
-datafusion-common = "51.0.0"
-datafusion-functions = { version = "51.0.0", features = ["regex_expressions"] }
-datafusion-sql = "51.0.0"
-datafusion-expr = "51.0.0"
-datafusion-ffi = "51.0.0"
-datafusion-execution = "51.0.0"
-datafusion-optimizer = "51.0.0"
-datafusion-physical-expr = "51.0.0"
-datafusion-physical-plan = "51.0.0"
-datafusion-substrait = "51.0.0"
+datafusion-common = "52.1.0"
+datafusion-functions = { version = "52.1.0", features = ["regex_expressions"] }
+datafusion-sql = "52.1.0"
+datafusion-expr = "52.1.0"
+datafusion-ffi = "52.1.0"
+datafusion-execution = "52.1.0"
+datafusion-optimizer = "52.1.0"
+datafusion-physical-expr = "52.1.0"
+datafusion-physical-plan = "52.1.0"
+datafusion-substrait = "52.1.0"
 deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=2.0.0-beta.6", path = "./rust/compression/fsst" }
+fsst = { version = "=4.0.0-beta.7", path = "./rust/compression/fsst" }
 futures = "0.3"
 geoarrow-array = "0.7"
 geoarrow-schema = "0.7"
-geodatafusion = "0.2.0"
+geodatafusion = "0.3.0"
 geo-traits = "0.3.0"
 geo-types = "0.7.16"
 http = "1.1.0"
@@ -166,14 +171,14 @@ rand_distr = { version = "0.5.1" }
 rand_xoshiro = "0.7.0"
 rangemap = { version = "1.0" }
 rayon = "1.10"
-roaring = "0.10.1"
+roaring = "0.11"
 rstest = "0.23.0"
 rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 semver = "1.0"
-shellexpand = "3.0"
-snafu = "0.8"
+slatedb = "0.3"
+snafu = "0.9"
 strum = "0.26"
 tantivy = { version = "0.24.1", features = ["stopwords"] }
 lindera = { version = "0.44.0" }
@@ -191,6 +196,7 @@ tokio-util = { version = "0.7.16" }
 tower = "0.5"
 tower-http = "0.5"
 tracing = "0.1"
+tracing-mock = { version = "=0.1.0-beta.3" }
 url = "2.5.7"
 uuid = { version = "1.2", features = ["v4", "serde"] }
 wiremock = "0.6"
@@ -217,6 +223,7 @@ incremental = false
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+unsafe_op_in_unsafe_fn = "allow"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
@@ -228,7 +235,6 @@ redundant_pub_crate = "deny"
 string_add_assign = "deny"
 string_add = "deny"
 string_lit_as_bytes = "deny"
-string_to_string = "deny"
 use_self = "deny"
 dbg_macro = "deny"
 trait_duplication_in_bounds = "deny"
@@ -241,3 +247,4 @@ multiple-crate-versions = "allow"
 # We use Vec<Range<u64>> in a lot of places and it is very common to use a single range in the vec.
 single_range_in_vec_init = "allow"
 large_futures = "deny"
+disallowed_macros = "deny"

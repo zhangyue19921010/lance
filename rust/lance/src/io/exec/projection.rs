@@ -7,8 +7,8 @@ use arrow_schema::{DataType, Field, FieldRef, Fields, Schema as ArrowSchema};
 use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::ScalarUDF;
-use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::scalar::ScalarValue;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_functions::core::named_struct::NamedStructFunc;
@@ -152,7 +152,7 @@ pub enum Selection<'a> {
     /// Selects this fields and all subfields
     FullField(&'a str),
     /// For a struct, selections of subfields
-    StructProjection(&'a str, Vec<Selection<'a>>),
+    StructProjection(&'a str, Vec<Self>),
 }
 
 impl Selection<'_> {

@@ -17,6 +17,7 @@ import org.lance.fragment.FragmentMergeResult;
 import org.lance.fragment.FragmentUpdateResult;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import org.apache.arrow.c.ArrowArrayStream;
@@ -365,7 +366,31 @@ public class TestUtils {
                     FieldType.nullable(new ArrowType.Struct()),
                     Arrays.asList(
                         Field.nullable("field1", ArrowType.Utf8.INSTANCE),
-                        Field.nullable("field2", new ArrowType.Int(16, true))))));
+                        Field.nullable("field2", new ArrowType.Int(16, true)))),
+
+                // fixed size list type
+                new Field(
+                    "fixed_size_list_col",
+                    FieldType.nullable(new ArrowType.FixedSizeList(3)),
+                    Collections.singletonList(Field.nullable("item", new ArrowType.Int(32, true)))),
+
+                // fixed bfloat16 list type
+                new Field(
+                    "bfloat16_fixed_size_list_col",
+                    FieldType.nullable(new ArrowType.FixedSizeList(3)),
+                    Collections.singletonList(
+                        new Field(
+                            "item",
+                            new FieldType(
+                                true,
+                                new ArrowType.FixedSizeBinary(2),
+                                null,
+                                ImmutableMap.of(
+                                    "ARROW:extension:name",
+                                    "lance.bfloat16",
+                                    "ARROW:extension:metadata",
+                                    "")),
+                            Collections.emptyList())))));
 
     public ComplexTestDataset(BufferAllocator allocator, String datasetPath) {
       super(allocator, datasetPath);
@@ -735,14 +760,16 @@ public class TestUtils {
           fragments.add(createBlobFragment(batchRows, Integer.MAX_VALUE));
         }
 
-        Transaction txn =
-            ds.newTransactionBuilder()
+        try (Transaction txn =
+            new Transaction.Builder()
+                .readVersion(ds.version())
                 .operation(org.lance.operation.Append.builder().fragments(fragments).build())
-                .build();
-        Dataset newDs = txn.commit();
-        Preconditions.checkArgument(
-            newDs.countRows() == totalRows, "dataset row count mismatch after append");
-        return newDs;
+                .build()) {
+          Dataset newDs = new CommitBuilder(ds).execute(txn);
+          Preconditions.checkArgument(
+              newDs.countRows() == totalRows, "dataset row count mismatch after append");
+          return newDs;
+        }
       }
     }
   }

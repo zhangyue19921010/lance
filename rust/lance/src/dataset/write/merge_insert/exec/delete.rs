@@ -3,15 +3,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{Array, RecordBatch, UInt64Array, UInt8Array};
+use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use datafusion::common::Result as DFResult;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_plan::{
+        DisplayAs, ExecutionPlan, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
-        DisplayAs, ExecutionPlan, PlanProperties,
     },
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
@@ -19,12 +19,12 @@ use futures::StreamExt;
 use lance_core::ROW_ADDR;
 use roaring::RoaringTreemap;
 
+use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::write::merge_insert::assign_action::Action;
-use crate::dataset::write::merge_insert::{MergeInsertParams, MergeStats, MERGE_ACTION_COLUMN};
-use crate::Dataset;
+use crate::dataset::write::merge_insert::{MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats};
 
-use super::{apply_deletions, MergeInsertMetrics};
+use super::{MergeInsertMetrics, apply_deletions};
 
 /// Specialized physical execution node for delete-only merge insert operations.
 ///
@@ -260,7 +260,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
-        let mem_wal_to_merge = self.params.mem_wal_to_merge.clone();
+        let merged_generations = self.params.merged_generations.clone();
 
         let result_stream = futures::stream::once(async move {
             let delete_row_addrs = Self::collect_deletions(input_stream, metrics).await?;
@@ -275,7 +275,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                 updated_fragments,
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_merge,
+                merged_generations,
                 fields_for_preserving_frag_bitmap: dataset
                     .schema()
                     .fields

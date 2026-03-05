@@ -11,12 +11,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.lance;
+package org.lance.index;
 
-import org.lance.index.Index;
-import org.lance.index.IndexOptions;
-import org.lance.index.IndexParams;
-import org.lance.index.IndexType;
+import org.lance.CommitBuilder;
+import org.lance.Dataset;
+import org.lance.Fragment;
+import org.lance.TestUtils;
+import org.lance.Transaction;
+import org.lance.WriteParams;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
@@ -53,14 +55,13 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ScalarIndexTest {
 
-  @TempDir Path tempDir;
-
   @Test
-  public void testCreateBTreeIndex() throws Exception {
+  public void testCreateBTreeIndex(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("btree_test").toString();
     Schema schema =
         new Schema(
@@ -79,12 +80,18 @@ public class ScalarIndexTest {
         IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
 
         // Create BTree index on 'id' column
-        dataset.createIndex(
-            Collections.singletonList("id"),
-            IndexType.BTREE,
-            Optional.of("btree_id_index"),
-            indexParams,
-            true);
+        Index index =
+            dataset.createIndex(
+                Collections.singletonList("id"),
+                IndexType.BTREE,
+                Optional.of("btree_id_index"),
+                indexParams,
+                true);
+
+        // Verify the returned Index object
+        assertEquals("btree_id_index", index.name());
+        assertNotNull(index.uuid());
+        assertFalse(index.fields().isEmpty());
 
         // Verify index was created and is in the list
         assertTrue(
@@ -100,7 +107,7 @@ public class ScalarIndexTest {
   }
 
   @Test
-  public void testCreateBTreeIndexDistributedly() throws Exception {
+  public void testCreateBTreeIndexDistributively(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("build_index_distributedly").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -161,20 +168,23 @@ public class ScalarIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        Transaction createIndexTx =
-            dataset.newTransactionBuilder().operation(createIndexOp).build();
-
-        try (Dataset newDataset = createIndexTx.commit()) {
-          // new dataset should contain that index
-          assertEquals(datasetVersion + 1, newDataset.version());
-          assertTrue(newDataset.listIndexes().contains("test_index"));
+        try (Transaction createIndexTx =
+            new Transaction.Builder()
+                .readVersion(datasetVersion)
+                .operation(createIndexOp)
+                .build()) {
+          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
+            // new dataset should contain that index
+            assertEquals(datasetVersion + 1, newDataset.version());
+            assertTrue(newDataset.listIndexes().contains("test_index"));
+          }
         }
       }
     }
   }
 
   @Test
-  public void testRangedBTreeIndex() throws Exception {
+  public void testRangedBTreeIndex(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("ranged_btree_map").toString();
     UUID indexUUID = UUID.randomUUID();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -238,30 +248,33 @@ public class ScalarIndexTest {
         CreateIndex createIndexOp =
             CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
 
-        Transaction createIndexTx =
-            dataset.newTransactionBuilder().operation(createIndexOp).build();
+        try (Transaction createIndexTx =
+            new Transaction.Builder()
+                .readVersion(datasetVersion)
+                .operation(createIndexOp)
+                .build()) {
+          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
+            // new dataset should contain that index
+            assertEquals(datasetVersion + 1, newDataset.version());
+            assertTrue(newDataset.listIndexes().contains("test_index"));
 
-        try (Dataset newDataset = createIndexTx.commit()) {
-          // new dataset should contain that index
-          assertEquals(datasetVersion + 1, newDataset.version());
-          assertTrue(newDataset.listIndexes().contains("test_index"));
-
-          // 7. compare results
-          // force use index should get the right value
-          ScanOptions scanOptions =
-              new ScanOptions.Builder().withRowId(true).filter("id in (10, 20, 30)").build();
-          try (LanceScanner scanner = newDataset.newScan(scanOptions);
-              ArrowReader arrowReader = scanner.scanBatches(); ) {
-            List<Integer> ids = new ArrayList<>();
-            while (arrowReader.loadNextBatch()) {
-              VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
-              IntVector idVec = (IntVector) root.getVector("id");
-              for (int i = 0; i < idVec.getValueCount(); i++) {
-                ids.add(idVec.get(i));
+            // 7. compare results
+            // force use index should get the right value
+            ScanOptions scanOptions =
+                new ScanOptions.Builder().withRowId(true).filter("id in (10, 20, 30)").build();
+            try (LanceScanner scanner = newDataset.newScan(scanOptions);
+                ArrowReader arrowReader = scanner.scanBatches(); ) {
+              List<Integer> ids = new ArrayList<>();
+              while (arrowReader.loadNextBatch()) {
+                VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
+                IntVector idVec = (IntVector) root.getVector("id");
+                for (int i = 0; i < idVec.getValueCount(); i++) {
+                  ids.add(idVec.get(i));
+                }
               }
+              Collections.sort(ids);
+              Assertions.assertIterableEquals(Arrays.asList(10, 20, 30), ids);
             }
-            Collections.sort(ids);
-            Assertions.assertIterableEquals(Arrays.asList(10, 20, 30), ids);
           }
         }
       }
@@ -323,7 +336,7 @@ public class ScalarIndexTest {
   }
 
   @Test
-  public void testCreateZonemapIndex() throws Exception {
+  public void testCreateZonemapIndex(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("zonemap_test").toString();
     Schema schema =
         new Schema(
@@ -343,12 +356,17 @@ public class ScalarIndexTest {
         IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
 
         // Create Zonemap index on 'value' column
-        dataset.createIndex(
-            Collections.singletonList("value"),
-            IndexType.ZONEMAP,
-            Optional.of("zonemap_value_index"),
-            indexParams,
-            true);
+        Index index =
+            dataset.createIndex(
+                Collections.singletonList("value"),
+                IndexType.ZONEMAP,
+                Optional.of("zonemap_value_index"),
+                indexParams,
+                true);
+
+        // Verify the returned Index object
+        assertEquals("zonemap_value_index", index.name());
+        assertNotNull(index.uuid());
 
         // Verify index was created
         assertTrue(
