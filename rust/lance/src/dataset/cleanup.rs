@@ -376,16 +376,7 @@ impl<'a> CleanupTask<'a> {
         let paths_to_delete: BoxStream<Result<Path>> = if let Some(rate) =
             self.policy.delete_rate_limit
         {
-            let batch_size = delete_stream_batch_size(self.dataset.object_store.as_ref());
-            let effective_rate = rate.max(1);
-            let path_rate = effective_rate * batch_size;
-            info!(
-                "delete_rate_limit enabled: limit {} delete requests/sec",
-                effective_rate
-            );
-            // convert user given op/s to the rate of issuing paths
-            let duration_ns = 1_000_000_000u64.div_ceil(path_rate).max(1);
-            let duration = Duration::from_nanos(duration_ns);
+            let duration = calculate_duration(self.dataset.object_store.scheme().to_string(), rate);
             let mut ticker = interval(duration);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
             IntervalStream::new(ticker)
@@ -815,6 +806,25 @@ impl<'a> CleanupTask<'a> {
     }
 }
 
+fn calculate_duration(scheme: String, rate: u64) -> Duration {
+    let batch_size = if scheme.to_lowercase().contains("s3") {
+        S3_DELETE_STREAM_BATCH_SIZE
+    } else if scheme.to_lowercase().contains("az") {
+        AZURE_DELETE_STREAM_BATCH_SIZE
+    } else {
+        1
+    };
+    let effective_rate = rate.max(1);
+    let path_rate = effective_rate * batch_size;
+    info!(
+        "delete_rate_limit enabled: limit {} delete requests/sec",
+        effective_rate
+    );
+    // convert user given op/s to the rate of issuing paths
+    let duration_ns = 1_000_000_000u64.div_ceil(path_rate).max(1);
+    Duration::from_nanos(duration_ns)
+}
+
 /// quick get the object_store delete batch size based on different storage type.
 fn delete_stream_batch_size(object_store: &lance_io::object_store::ObjectStore) -> u64 {
     let scheme = object_store.scheme().to_lowercase();
@@ -1121,6 +1131,8 @@ mod tests {
 
     use super::*;
     use crate::blob::{BlobArrayBuilder, blob_field};
+    #[cfg(feature = "dynamodb_tests")]
+    use crate::io::StorageOptionsAccessor;
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
         index::vector::VectorIndexParams,
@@ -1131,6 +1143,10 @@ mod tests {
         Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    #[cfg(feature = "dynamodb_tests")]
+    use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
+    #[cfg(feature = "dynamodb_tests")]
+    use aws_sdk_s3::{Client as S3Client, config::Credentials};
     use datafusion::common::assert_contains;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
@@ -1142,6 +1158,86 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, some_batch};
     use mock_instant::thread_local::MockClock;
+    #[cfg(feature = "dynamodb_tests")]
+    use uuid::Uuid;
+
+    #[cfg(feature = "dynamodb_tests")]
+    const S3_TEST_CONFIG: &[(&str, &str)] = &[
+        ("access_key_id", "ACCESS_KEY"),
+        ("secret_access_key", "SECRET_KEY"),
+        ("endpoint", "http://127.0.0.1:4566"),
+        ("allow_http", "true"),
+        ("region", "us-east-1"),
+    ];
+
+    #[cfg(feature = "dynamodb_tests")]
+    async fn s3_test_aws_config() -> SdkConfig {
+        let credentials = Credentials::new(
+            S3_TEST_CONFIG[0].1,
+            S3_TEST_CONFIG[1].1,
+            None,
+            None,
+            "static",
+        );
+        ConfigLoader::default()
+            .credentials_provider(credentials)
+            .endpoint_url(S3_TEST_CONFIG[2].1)
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new(S3_TEST_CONFIG[4].1))
+            .load()
+            .await
+    }
+
+    #[cfg(feature = "dynamodb_tests")]
+    struct S3Bucket(String);
+
+    #[cfg(feature = "dynamodb_tests")]
+    impl S3Bucket {
+        async fn new(bucket: &str) -> Self {
+            let config = s3_test_aws_config().await;
+            let client = S3Client::new(&config);
+            Self::delete_bucket(client.clone(), bucket).await;
+            client.create_bucket().bucket(bucket).send().await.unwrap();
+            Self(bucket.to_string())
+        }
+
+        async fn delete_bucket(client: S3Client, bucket: &str) {
+            let res = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .send()
+                .await
+                .map_err(|err| err.into_service_error());
+            match res {
+                Err(e) if e.is_no_such_bucket() => return,
+                Err(e) => panic!("Failed to list objects in bucket: {}", e),
+                _ => {}
+            }
+            let objects = res.unwrap().contents.unwrap_or_default();
+            for object in objects {
+                client
+                    .delete_object()
+                    .bucket(bucket)
+                    .key(object.key.unwrap())
+                    .send()
+                    .await
+                    .unwrap();
+            }
+            client.delete_bucket().bucket(bucket).send().await.unwrap();
+        }
+    }
+
+    #[cfg(feature = "dynamodb_tests")]
+    impl Drop for S3Bucket {
+        fn drop(&mut self) {
+            let bucket_name = self.0.clone();
+            tokio::task::spawn(async move {
+                let config = s3_test_aws_config().await;
+                let client = S3Client::new(&config);
+                S3Bucket::delete_bucket(client, &bucket_name).await;
+            });
+        }
+    }
 
     #[derive(Debug)]
     struct MockObjectStore {
@@ -3437,6 +3533,29 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
         assert_eq!(setup.branch4.counts.num_index_files, 4);
+    }
+
+    #[test]
+    fn test_calculate_duration_s3() {
+        // Normal case: duration is computed from S3 batch size and configured rate.
+        let normal_rate = 100;
+        let expected_duration_ns =
+            1_000_000_000u64.div_ceil(normal_rate * S3_DELETE_STREAM_BATCH_SIZE);
+        assert_eq!(
+            calculate_duration("s3".to_string(), normal_rate),
+            Duration::from_nanos(expected_duration_ns)
+        );
+
+        // Edge case: rate too small should be clamped to 1.
+        let min_rate_duration = calculate_duration("s3".to_string(), 1);
+        assert_eq!(calculate_duration("s3".to_string(), 0), min_rate_duration);
+
+        // Edge case: computed duration_ns too small should be clamped to at least 1ns.
+        let very_large_rate = 2_000_000;
+        assert_eq!(
+            calculate_duration("s3".to_string(), very_large_rate),
+            Duration::from_nanos(1)
+        );
     }
 
     #[tokio::test]
