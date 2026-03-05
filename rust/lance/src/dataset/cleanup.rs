@@ -1131,8 +1131,6 @@ mod tests {
 
     use super::*;
     use crate::blob::{BlobArrayBuilder, blob_field};
-    #[cfg(feature = "dynamodb_tests")]
-    use crate::io::StorageOptionsAccessor;
     use crate::{
         dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
         index::vector::VectorIndexParams,
@@ -1143,10 +1141,6 @@ mod tests {
         Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    #[cfg(feature = "dynamodb_tests")]
-    use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
-    #[cfg(feature = "dynamodb_tests")]
-    use aws_sdk_s3::{Client as S3Client, config::Credentials};
     use datafusion::common::assert_contains;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
@@ -1158,86 +1152,6 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, some_batch};
     use mock_instant::thread_local::MockClock;
-    #[cfg(feature = "dynamodb_tests")]
-    use uuid::Uuid;
-
-    #[cfg(feature = "dynamodb_tests")]
-    const S3_TEST_CONFIG: &[(&str, &str)] = &[
-        ("access_key_id", "ACCESS_KEY"),
-        ("secret_access_key", "SECRET_KEY"),
-        ("endpoint", "http://127.0.0.1:4566"),
-        ("allow_http", "true"),
-        ("region", "us-east-1"),
-    ];
-
-    #[cfg(feature = "dynamodb_tests")]
-    async fn s3_test_aws_config() -> SdkConfig {
-        let credentials = Credentials::new(
-            S3_TEST_CONFIG[0].1,
-            S3_TEST_CONFIG[1].1,
-            None,
-            None,
-            "static",
-        );
-        ConfigLoader::default()
-            .credentials_provider(credentials)
-            .endpoint_url(S3_TEST_CONFIG[2].1)
-            .behavior_version(BehaviorVersion::latest())
-            .region(Region::new(S3_TEST_CONFIG[4].1))
-            .load()
-            .await
-    }
-
-    #[cfg(feature = "dynamodb_tests")]
-    struct S3Bucket(String);
-
-    #[cfg(feature = "dynamodb_tests")]
-    impl S3Bucket {
-        async fn new(bucket: &str) -> Self {
-            let config = s3_test_aws_config().await;
-            let client = S3Client::new(&config);
-            Self::delete_bucket(client.clone(), bucket).await;
-            client.create_bucket().bucket(bucket).send().await.unwrap();
-            Self(bucket.to_string())
-        }
-
-        async fn delete_bucket(client: S3Client, bucket: &str) {
-            let res = client
-                .list_objects_v2()
-                .bucket(bucket)
-                .send()
-                .await
-                .map_err(|err| err.into_service_error());
-            match res {
-                Err(e) if e.is_no_such_bucket() => return,
-                Err(e) => panic!("Failed to list objects in bucket: {}", e),
-                _ => {}
-            }
-            let objects = res.unwrap().contents.unwrap_or_default();
-            for object in objects {
-                client
-                    .delete_object()
-                    .bucket(bucket)
-                    .key(object.key.unwrap())
-                    .send()
-                    .await
-                    .unwrap();
-            }
-            client.delete_bucket().bucket(bucket).send().await.unwrap();
-        }
-    }
-
-    #[cfg(feature = "dynamodb_tests")]
-    impl Drop for S3Bucket {
-        fn drop(&mut self) {
-            let bucket_name = self.0.clone();
-            tokio::task::spawn(async move {
-                let config = s3_test_aws_config().await;
-                let client = S3Client::new(&config);
-                S3Bucket::delete_bucket(client, &bucket_name).await;
-            });
-        }
-    }
 
     #[derive(Debug)]
     struct MockObjectStore {
