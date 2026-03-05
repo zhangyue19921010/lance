@@ -27,7 +27,7 @@ public class CleanupPolicy {
   private final Optional<Boolean> deleteUnverified;
   private final Optional<Boolean> errorIfTaggedOldVersions;
   private final Optional<Boolean> cleanReferencedBranches;
-  private final Optional<Double> deleteRateLimit;
+  private final Optional<Long> deleteRateLimit;
 
   private CleanupPolicy(
       Optional<Long> beforeTimestampMillis,
@@ -35,7 +35,7 @@ public class CleanupPolicy {
       Optional<Boolean> deleteUnverified,
       Optional<Boolean> errorIfTaggedOldVersions,
       Optional<Boolean> cleanReferencedBranches,
-      Optional<Double> deleteRateLimit) {
+      Optional<Long> deleteRateLimit) {
     this.beforeTimestampMillis = beforeTimestampMillis;
     this.beforeVersion = beforeVersion;
     this.deleteUnverified = deleteUnverified;
@@ -68,7 +68,7 @@ public class CleanupPolicy {
     return cleanReferencedBranches;
   }
 
-  public Optional<Double> getDeleteRateLimit() {
+  public Optional<Long> getDeleteRateLimit() {
     return deleteRateLimit;
   }
 
@@ -79,7 +79,7 @@ public class CleanupPolicy {
     private Optional<Boolean> deleteUnverified = Optional.empty();
     private Optional<Boolean> errorIfTaggedOldVersions = Optional.empty();
     private Optional<Boolean> cleanReferencedBranches = Optional.empty();
-    private Optional<Double> deleteRateLimit = Optional.empty();
+    private Optional<Long> deleteRateLimit = Optional.empty();
 
     private Builder() {}
 
@@ -114,7 +114,7 @@ public class CleanupPolicy {
     }
 
     /** Set the maximum number of delete operations per second. */
-    public Builder withDeleteRateLimit(double deleteRateLimit) {
+    public Builder withDeleteRateLimit(long deleteRateLimit) {
       this.deleteRateLimit = Optional.of(deleteRateLimit);
       return this;
     }

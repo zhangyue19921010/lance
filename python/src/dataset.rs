@@ -1565,7 +1565,7 @@ impl Dataset {
         retain_versions: Option<usize>,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
-        delete_rate_limit: Option<f64>,
+        delete_rate_limit: Option<u64>,
     ) -> PyResult<CleanupStats> {
         let cleanup_stats = rt()
             .block_on(None, async {

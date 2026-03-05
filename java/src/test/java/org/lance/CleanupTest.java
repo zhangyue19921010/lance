@@ -133,7 +133,7 @@ public class CleanupTest {
             dataset.cleanupWithPolicy(
                 CleanupPolicy.builder()
                     .withBeforeTimestampMillis(beforeTimestampMillis)
-                    .withDeleteRateLimit(1.0)
+                    .withDeleteRateLimit(1L)
                     .build());
         long elapsed = System.nanoTime() - start;
 

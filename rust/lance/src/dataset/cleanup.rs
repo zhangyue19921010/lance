@@ -375,12 +375,21 @@ impl<'a> CleanupTask<'a> {
             self.policy.delete_rate_limit
         {
             info!(
-                "delete_rate_limit enable, limit {} ops/sec during cleanup",
+                "delete_rate_limit enable, limit {} delete operation per sec during cleanup",
                 rate
             );
-            let duration = Duration::try_from_secs_f64(1.0 / rate).map_err(|e| Error::Cleanup {
-                message: format!("delete_rate_limit {} is too small: {}", rate, e),
-            })?;
+            let duration =
+                Duration::try_from_secs_f64(1.0 / (rate as f64)).map_err(|e| Error::Cleanup {
+                    message: format!("delete_rate_limit {} is invalid: {}", rate, e),
+                })?;
+            if duration.is_zero() {
+                return Err(Error::Cleanup {
+                    message: format!(
+                        "delete_rate_limit {} is too large; minimum supported interval is 1ns",
+                        rate
+                    ),
+                });
+            }
             let mut ticker = interval(duration);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
             IntervalStream::new(ticker)
@@ -825,8 +834,8 @@ pub struct CleanupPolicy {
     /// Maximum number of delete operations per second. If None, no rate limiting is applied.
     ///
     /// Use this to avoid hitting S3 (or other object store) request rate limits during cleanup.
-    /// For example, `Some(100.0)` limits deletions to 100 files per second.
-    pub delete_rate_limit: Option<f64>,
+    /// For example, `Some(100)` limits deletions to 100 operations per second.
+    pub delete_rate_limit: Option<u64>,
 }
 
 impl CleanupPolicy {
@@ -911,14 +920,11 @@ impl CleanupPolicyBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if `rate` is not a positive finite number.
-    pub fn delete_rate_limit(mut self, rate: f64) -> Result<Self> {
-        if !rate.is_finite() || rate <= 0.0 {
+    /// Returns an error if `rate` is zero.
+    pub fn delete_rate_limit(mut self, rate: u64) -> Result<Self> {
+        if rate == 0 {
             return Err(Error::Cleanup {
-                message: format!(
-                    "delete_rate_limit must be a positive finite number, got {}",
-                    rate
-                ),
+                message: format!("delete_rate_limit must be greater than 0, got {}", rate),
             });
         }
         self.policy.delete_rate_limit = Some(rate);
@@ -1052,12 +1058,12 @@ pub async fn build_cleanup_policy(
         builder = builder.clean_referenced_branches(clean_referenced);
     }
     if let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit") {
-        let rate: f64 = match delete_rate_limit.parse() {
+        let rate: u64 = match delete_rate_limit.parse() {
             Ok(r) => r,
             Err(e) => {
                 return Err(Error::Cleanup {
                     message: format!(
-                        "Error encountered while parsing lance.auto_cleanup.delete_rate_limit as f64: {}",
+                        "Error encountered while parsing lance.auto_cleanup.delete_rate_limit as u64: {}",
                         e
                     ),
                 });
@@ -3438,7 +3444,7 @@ mod tests {
         // Set rate limit to 1 ops/second so cleanup of several files must take at least ~1s
         let policy = CleanupPolicyBuilder::default()
             .before_timestamp(utc_now() - TimeDelta::try_days(8).unwrap())
-            .delete_rate_limit(1.0)
+            .delete_rate_limit(1)
             .unwrap()
             .build();
 

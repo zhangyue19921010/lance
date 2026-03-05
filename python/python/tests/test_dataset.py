@@ -1545,7 +1545,7 @@ def test_cleanup_with_rate_limit(tmp_path):
     start = time.time_ns()
     # Cleanup with a rate limit should still remove old versions correctly
     stats = dataset.cleanup_old_versions(
-        older_than=(datetime.now() - moment), delete_rate_limit=1.0
+        older_than=(datetime.now() - moment), delete_rate_limit=1
     )
     finished = time.time_ns()
 
