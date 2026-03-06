@@ -317,8 +317,8 @@ def test_defer_index_remap(tmp_path: Path):
     dataset.optimize.compact_files(**options)
 
     dataset = lance.dataset(base_dir)
-    indices = dataset.list_indices()
-    assert any(idx["name"] == "__lance_frag_reuse" for idx in indices)
+    indices = dataset.describe_indices()
+    assert any(idx.name == "__lance_frag_reuse" for idx in indices)
 
 
 def test_dataset_distributed_optimize(tmp_path: Path):
