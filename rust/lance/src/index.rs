@@ -426,7 +426,7 @@ struct IndexDescriptionImpl {
 }
 
 impl IndexDescriptionImpl {
-    fn try_new(segments: Vec<IndexMetadata>, dataset: &Dataset) -> Result<Self> {
+    async fn try_new(segments: Vec<IndexMetadata>, dataset: &Dataset) -> Result<Self> {
         if segments.is_empty() {
             return Err(Error::index("Index metadata is empty".to_string()));
         }
@@ -447,7 +447,7 @@ impl IndexDescriptionImpl {
                 "Index fields should be identical across all segments".to_string(),
             ));
         }
-        let field_ids = field_ids.iter().map(|id| *id as u32).collect();
+        let field_ids_vec: Vec<u32> = field_ids.iter().map(|id| *id as u32).collect();
 
         // This should not fail as we have already filtered out indexes without index details.
         let index_details = example_metadata.index_details.as_ref().ok_or(Error::index("Index details are required for index description.  This index must be retrained to support this method."
@@ -468,10 +468,40 @@ impl IndexDescriptionImpl {
         let details = IndexDetails(index_details.clone());
         let mut rows_indexed = 0;
 
-        let index_type = details
-            .get_plugin()
-            .map(|p| p.name().to_string())
-            .unwrap_or_else(|_| "Unknown".to_string());
+        // Vector indices need to be opened to get the correct type
+        let index_type = if details.is_vector() {
+            let column = field_ids
+                .first()
+                .and_then(|id| dataset.schema().field_by_id(*id))
+                .map(|f| f.name.clone())
+                .ok_or_else(|| {
+                    Error::index("Cannot determine column name for vector index".to_string())
+                })?;
+
+            match dataset
+                .open_generic_index(
+                    &column,
+                    &example_metadata.uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await
+            {
+                Ok(idx) => idx.index_type().to_string(),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to open vector index {} to determine type: {}",
+                        name,
+                        e
+                    );
+                    "Unknown".to_string()
+                }
+            }
+        } else {
+            details
+                .get_plugin()
+                .map(|p| p.name().to_string())
+                .unwrap_or_else(|_| "Unknown".to_string())
+        };
 
         for shard in &segments {
             let fragment_bitmap = shard
@@ -488,7 +518,7 @@ impl IndexDescriptionImpl {
 
         Ok(Self {
             name,
-            field_ids,
+            field_ids: field_ids_vec,
             index_type,
             segments,
             details,
@@ -661,16 +691,19 @@ impl DatasetIndexExt for Dataset {
         };
         indices.sort_by_key(|idx| &idx.name);
 
-        indices
+        let grouped: Vec<Vec<IndexMetadata>> = indices
             .into_iter()
-            .chunk_by(|idx| &idx.name)
+            .chunk_by(|idx| idx.name.clone())
             .into_iter()
-            .map(|(_, segments)| {
-                let segments = segments.cloned().collect::<Vec<_>>();
-                let desc = IndexDescriptionImpl::try_new(segments, self)?;
-                Ok(Arc::new(desc) as Arc<dyn IndexDescription>)
-            })
-            .collect::<Result<Vec<_>>>()
+            .map(|(_, segments)| segments.cloned().collect::<Vec<_>>())
+            .collect();
+
+        let mut results = Vec::with_capacity(grouped.len());
+        for segments in grouped {
+            let desc = IndexDescriptionImpl::try_new(segments, self).await?;
+            results.push(Arc::new(desc) as Arc<dyn IndexDescription>);
+        }
+        Ok(results)
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
@@ -5240,5 +5273,56 @@ mod tests {
             field_path2.contains('.'),
             "Field path should contain '.' for nested field"
         );
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_returns_correct_vector_index_type() {
+        const DIM: i32 = 8;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+                true,
+            ),
+        ]));
+
+        let data = generate_random_array(256 * DIM as usize);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..256)),
+                Arc::new(FixedSizeListArray::try_new_from_values(data, DIM).unwrap()),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = TempStrDir::default();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+
+        // Create IVF_FLAT index
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Reload dataset and call describe_indices
+        let dataset = Dataset::open(&test_dir).await.unwrap();
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+
+        assert_eq!(descriptions.len(), 1);
+        let desc = &descriptions[0];
+        assert_eq!(desc.name(), "vector_idx");
+        // This should be "IVF_FLAT", not "Unknown"
+        assert_eq!(desc.index_type(), "IVF_FLAT");
+        assert!(!desc.field_ids().is_empty());
     }
 }
