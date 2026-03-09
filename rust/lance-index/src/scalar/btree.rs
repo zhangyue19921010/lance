@@ -12,7 +12,7 @@ use std::{
 
 use super::{
     AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
-    SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
+    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
 };
 use crate::{Index, IndexType};
 use crate::{
@@ -1298,14 +1298,14 @@ impl BTreeIndex {
         self,
         new_data: SendableRecordBatchStream,
         chunk_size: u64,
-        valid_old_fragments: Option<RoaringBitmap>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<SendableRecordBatchStream> {
         let value_column_index = new_data.schema().index_of(VALUE_COLUMN_NAME)?;
 
         let new_input = Arc::new(OneShotExec::new(new_data));
         let old_stream = self.into_data_stream().await?;
-        let old_stream = match valid_old_fragments {
-            Some(valid_frags) => filter_row_ids_by_fragments(old_stream, valid_frags),
+        let old_stream = match old_data_filter {
+            Some(filter) => filter_row_ids(old_stream, filter),
             None => old_stream,
         };
         let old_input = Arc::new(OneShotExec::new(old_stream));
@@ -1337,12 +1337,11 @@ impl BTreeIndex {
     }
 }
 
-/// Filter a stream of record batches to only include rows whose row address
-/// belongs to a fragment in `valid_fragments`. Row addresses encode the fragment
-/// ID in the upper 32 bits.
-fn filter_row_ids_by_fragments(
+/// Filter a stream of record batches using the selection semantics encapsulated
+/// by `old_data_filter`.
+fn filter_row_ids(
     stream: SendableRecordBatchStream,
-    valid_fragments: RoaringBitmap,
+    old_data_filter: OldIndexDataFilter,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
     let filtered = stream.map(move |batch_result| {
@@ -1350,11 +1349,8 @@ fn filter_row_ids_by_fragments(
         let row_ids = batch[ROW_ID]
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
-            .expect("expected UInt64Array for row_id column");
-        let mask: arrow_array::BooleanArray = row_ids
-            .iter()
-            .map(|id| id.map(|id| valid_fragments.contains((id >> 32) as u32)))
-            .collect();
+            .ok_or_else(|| Error::internal("expected UInt64Array for row_id column"))?;
+        let mask = old_data_filter.filter_row_ids(row_ids);
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
@@ -1639,12 +1635,12 @@ impl ScalarIndex for BTreeIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        valid_old_fragments: Option<&RoaringBitmap>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         // Merge the existing index data with the new data and then retrain the index on the merged stream
         let merged_data_source = self
             .clone()
-            .combine_old_new(new_data, self.batch_size, valid_old_fragments.cloned())
+            .combine_old_new(new_data, self.batch_size, old_data_filter)
             .await?;
         train_btree_index(merged_data_source, dest_store, self.batch_size, None, None).await?;
 
@@ -2632,7 +2628,7 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
-            IndexStore, SargableQuery, ScalarIndex, SearchResult,
+            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchResult,
             btree::{BTREE_PAGES_NAME, BTreeIndex},
             lance_format::LanceIndexStore,
         },
@@ -4072,6 +4068,86 @@ mod tests {
                 panic!("Btree search result should always be Exact.");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_update_with_exact_row_id_filter() {
+        let old_tmpdir = TempObjDir::default();
+        let old_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            old_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let new_tmpdir = TempObjDir::default();
+        let new_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            new_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let old_data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(512), BatchCount::from(2));
+        let old_data_source = Box::pin(RecordBatchStreamAdapter::new(old_data.schema(), old_data));
+        train_btree_index(
+            old_data_source,
+            old_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index = BTreeIndex::load(old_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let new_data = gen_batch()
+            .col("value", array::step_custom::<Int32Type>(2000, 1))
+            .col("_rowid", array::step_custom::<UInt64Type>(2000, 1))
+            .into_df_stream(RowCount::from(100), BatchCount::from(1));
+        let new_data_source = Box::pin(RecordBatchStreamAdapter::new(new_data.schema(), new_data));
+
+        let mut retained_old_rows = RowAddrTreeMap::new();
+        retained_old_rows.insert_range(0..64);
+        retained_old_rows.insert_range(300..364);
+
+        index
+            .update(
+                new_data_source,
+                new_store.as_ref(),
+                Some(OldIndexDataFilter::RowIds(retained_old_rows)),
+            )
+            .await
+            .unwrap();
+
+        let updated_index = BTreeIndex::load(new_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let present = |value: i32| {
+            let updated_index = updated_index.clone();
+            async move {
+                let query = SargableQuery::Equals(ScalarValue::Int32(Some(value)));
+                match updated_index
+                    .search(&query, &NoOpMetricsCollector)
+                    .await
+                    .unwrap()
+                {
+                    SearchResult::Exact(row_id_map) => row_id_map.selected(value as u64),
+                    _ => unreachable!("Btree search result should always be Exact"),
+                }
+            }
+        };
+
+        assert!(present(12).await);
+        assert!(present(320).await);
+        assert!(!present(120).await);
+        assert!(!present(420).await);
+        assert!(present(2005).await);
     }
 
     /// Rust equivalent of Python test `test_btree_remap_big_deletions`

@@ -4,7 +4,7 @@
 //! Scalar indices for metadata search & filtering
 
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow_array::{ListArray, RecordBatch};
+use arrow_array::{BooleanArray, ListArray, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use datafusion::functions::string::contains::ContainsFunc;
@@ -19,7 +19,7 @@ use datafusion_expr::Expr;
 use datafusion_expr::expr::ScalarFunction;
 use deepsize::DeepSizeOf;
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
+use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -799,6 +799,41 @@ pub struct UpdateCriteria {
     pub data_criteria: TrainingCriteria,
 }
 
+/// Filter used when merging existing scalar-index rows during update.
+///
+/// The caller must pick a filter mode that matches the row-id semantics of the
+/// dataset:
+/// - address-style row IDs: fragment filtering is valid
+/// - stable row IDs: use exact row-id membership instead
+#[derive(Debug, Clone)]
+pub enum OldIndexDataFilter {
+    /// Keep old rows whose row-address fragment is in this bitmap.
+    ///
+    /// This is valid for address-style row IDs.
+    Fragments(RoaringBitmap),
+    /// Keep old rows whose row IDs are in this exact allow-list.
+    ///
+    /// This is required for stable row IDs, where row IDs are opaque and
+    /// should not be interpreted as encoded row addresses.
+    RowIds(RowAddrTreeMap),
+}
+
+impl OldIndexDataFilter {
+    /// Build a boolean mask that keeps only row IDs selected by this filter.
+    pub fn filter_row_ids(&self, row_ids: &UInt64Array) -> BooleanArray {
+        match self {
+            Self::Fragments(valid_fragments) => row_ids
+                .iter()
+                .map(|id| id.map(|id| valid_fragments.contains((id >> 32) as u32)))
+                .collect(),
+            Self::RowIds(valid_row_ids) => row_ids
+                .iter()
+                .map(|id| id.map(|id| valid_row_ids.contains(id)))
+                .collect(),
+        }
+    }
+}
+
 impl UpdateCriteria {
     pub fn requires_old_data(data_criteria: TrainingCriteria) -> Self {
         Self {
@@ -839,13 +874,13 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
     ///
-    /// If `valid_old_fragments` is provided, old index data for fragments not in the bitmap
-    /// will be filtered out during the merge.
+    /// If `old_data_filter` is provided, old index data will be filtered before
+    /// merge according to the chosen filter mode.
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        valid_old_fragments: Option<&RoaringBitmap>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex>;
 
     /// Returns the criteria that will be used to update the index
