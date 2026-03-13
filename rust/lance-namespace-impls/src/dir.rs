@@ -755,6 +755,18 @@ impl DirectoryNamespace {
         version: Option<i64>,
         operation: &str,
     ) -> Result<Dataset> {
+        if let Some(version) = version
+            && version < 0
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Table version for {} must be non-negative, got {}",
+                    operation, version
+                )
+                .into(),
+            ));
+        }
+
         let mut builder = DatasetBuilder::from_uri(table_uri);
         if let Some(opts) = &self.storage_options {
             builder = builder.with_storage_options(opts.clone());
@@ -774,15 +786,6 @@ impl DirectoryNamespace {
         })?;
 
         if let Some(version) = version {
-            if version < 0 {
-                return Err(Error::invalid_input_source(
-                    format!(
-                        "Table version for {} must be non-negative, got {}",
-                        operation, version
-                    )
-                    .into(),
-                ));
-            }
             return dataset.checkout_version(version as u64).await.map_err(|e| {
                 Error::namespace_source(
                     format!(
@@ -903,26 +906,24 @@ impl DirectoryNamespace {
             }
             IndexType::IvfFlat => DirectoryIndexParams::Vector {
                 index_type,
-                params: VectorIndexParams::ivf_flat(
-                    1,
+                params: VectorIndexParams::with_ivf_flat_params(
                     Self::parse_metric_type(request.distance_type.as_deref())?,
+                    IvfBuildParams::default(),
                 ),
             },
             IndexType::IvfPq => DirectoryIndexParams::Vector {
                 index_type,
-                params: VectorIndexParams::ivf_pq(
-                    1,
-                    8,
-                    1,
+                params: VectorIndexParams::with_ivf_pq_params(
                     Self::parse_metric_type(request.distance_type.as_deref())?,
-                    50,
+                    IvfBuildParams::default(),
+                    PQBuildParams::default(),
                 ),
             },
             IndexType::IvfSq => DirectoryIndexParams::Vector {
                 index_type,
                 params: VectorIndexParams::with_ivf_sq_params(
                     Self::parse_metric_type(request.distance_type.as_deref())?,
-                    IvfBuildParams::new(1),
+                    IvfBuildParams::default(),
                     SQBuildParams::default(),
                 ),
             },
@@ -930,7 +931,7 @@ impl DirectoryNamespace {
                 index_type,
                 params: VectorIndexParams::with_ivf_rq_params(
                     Self::parse_metric_type(request.distance_type.as_deref())?,
-                    IvfBuildParams::new(1),
+                    IvfBuildParams::default(),
                     RQBuildParams::default(),
                 ),
             },
@@ -938,7 +939,7 @@ impl DirectoryNamespace {
                 index_type,
                 params: VectorIndexParams::ivf_hnsw(
                     Self::parse_metric_type(request.distance_type.as_deref())?,
-                    IvfBuildParams::new(1),
+                    IvfBuildParams::default(),
                     HnswBuildParams::default(),
                 ),
             },
@@ -946,7 +947,7 @@ impl DirectoryNamespace {
                 index_type,
                 params: VectorIndexParams::with_ivf_hnsw_sq_params(
                     Self::parse_metric_type(request.distance_type.as_deref())?,
-                    IvfBuildParams::new(1),
+                    IvfBuildParams::default(),
                     HnswBuildParams::default(),
                     SQBuildParams::default(),
                 ),
@@ -955,9 +956,9 @@ impl DirectoryNamespace {
                 index_type,
                 params: VectorIndexParams::with_ivf_hnsw_pq_params(
                     Self::parse_metric_type(request.distance_type.as_deref())?,
-                    IvfBuildParams::new(1),
+                    IvfBuildParams::default(),
                     HnswBuildParams::default(),
-                    PQBuildParams::new(1, 8),
+                    PQBuildParams::default(),
                 ),
             },
             other => {
@@ -991,41 +992,6 @@ impl DirectoryNamespace {
         {
             indices.truncate(limit as usize);
         }
-    }
-
-    fn stats_field_as_i64(stats: &serde_json::Value, key: &str) -> Option<i64> {
-        stats
-            .get(key)
-            .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|v| v as i64)))
-    }
-
-    fn stats_field_as_i32(stats: &serde_json::Value, key: &str) -> Option<i32> {
-        Self::stats_field_as_i64(stats, key).and_then(|value| i32::try_from(value).ok())
-    }
-
-    fn stats_field_as_string(stats: &serde_json::Value, key: &str) -> Option<String> {
-        stats
-            .get(key)
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-    }
-
-    fn stats_distance_type(stats: &serde_json::Value) -> Option<String> {
-        Self::stats_field_as_string(stats, "distance_type")
-            .or_else(|| Self::stats_field_as_string(stats, "metric_type"))
-            .or_else(|| {
-                stats
-                    .get("indices")
-                    .and_then(|value| value.as_array())
-                    .and_then(|indices| indices.first())
-                    .and_then(|first| {
-                        first
-                            .get("distance_type")
-                            .and_then(|value| value.as_str())
-                            .or_else(|| first.get("metric_type").and_then(|value| value.as_str()))
-                    })
-                    .map(str::to_string)
-            })
     }
 
     fn transaction_operation_name(transaction: &Transaction) -> String {
@@ -1067,12 +1033,38 @@ impl DirectoryNamespace {
         }
     }
 
-    async fn find_transaction(
-        &self,
-        dataset: &Dataset,
-        transaction_id: &str,
-    ) -> Result<(u64, Transaction)> {
-        if let Ok(version) = transaction_id.parse::<u64>() {
+    fn describe_table_index_stats_response(
+        stats: &serde_json::Value,
+    ) -> DescribeTableIndexStatsResponse {
+        let get_i64 = |key: &str| {
+            stats.get(key).and_then(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok()))
+            })
+        };
+
+        DescribeTableIndexStatsResponse {
+            distance_type: stats
+                .get("distance_type")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            index_type: stats
+                .get("index_type")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            num_indexed_rows: get_i64("num_indexed_rows"),
+            num_unindexed_rows: get_i64("num_unindexed_rows"),
+            num_indices: get_i64("num_indices").and_then(|value| i32::try_from(value).ok()),
+        }
+    }
+
+    /// When transaction_id is not parseable as a version number (i.e. it's a UUID),
+    /// find_transaction iterates through every version in reverse, reading each
+    /// transaction file from storage. For tables with many versions this will
+    /// be extremely slow — each iteration is a separate I/O call.
+    async fn find_transaction(&self, dataset: &Dataset, id: &str) -> Result<(u64, Transaction)> {
+        if let Ok(version) = id.parse::<u64>() {
             let transaction = dataset
                 .read_transaction_by_version(version)
                 .await
@@ -1093,7 +1085,7 @@ impl DirectoryNamespace {
             Error::namespace_source(
                 format!(
                     "Failed to list table versions while resolving transaction '{}': {}",
-                    transaction_id, e
+                    id, e
                 )
                 .into(),
             )
@@ -1107,19 +1099,19 @@ impl DirectoryNamespace {
                     Error::namespace_source(
                         format!(
                             "Failed to read transaction for version {} while resolving '{}': {}",
-                            version.version, transaction_id, e
+                            version.version, id, e
                         )
                         .into(),
                     )
                 })?
-                && transaction.uuid == transaction_id
+                && transaction.uuid == id
             {
                 return Ok((version.version, transaction));
             }
         }
 
         Err(Error::namespace_source(
-            format!("Transaction not found: {}", transaction_id).into(),
+            format!("Transaction not found: {}", id).into(),
         ))
     }
 
@@ -2396,13 +2388,7 @@ impl LanceNamespace for DirectoryNamespace {
             )
         })?;
 
-        Ok(DescribeTableIndexStatsResponse {
-            distance_type: Self::stats_distance_type(&stats),
-            index_type: Self::stats_field_as_string(&stats, "index_type"),
-            num_indexed_rows: Self::stats_field_as_i64(&stats, "num_indexed_rows"),
-            num_unindexed_rows: Self::stats_field_as_i64(&stats, "num_unindexed_rows"),
-            num_indices: Self::stats_field_as_i32(&stats, "num_indices"),
-        })
+        Ok(Self::describe_table_index_stats_response(&stats))
     }
 
     async fn describe_transaction(
@@ -2424,13 +2410,13 @@ impl LanceNamespace for DirectoryNamespace {
             ));
         }
 
-        let transaction_id = request_id.pop().expect("request_id len checked above");
+        let id = request_id.pop().expect("request_id len checked above");
         let table_id = Some(request_id);
         let table_uri = self.resolve_table_location(&table_id).await?;
         let dataset = self
             .load_dataset(&table_uri, None, "describe_transaction")
             .await?;
-        let (version, transaction) = self.find_transaction(&dataset, &transaction_id).await?;
+        let (version, transaction) = self.find_transaction(&dataset, &id).await?;
 
         Ok(Self::transaction_response(version, &transaction))
     }
@@ -2637,7 +2623,7 @@ mod tests {
         ]));
         let vector_field = Arc::new(Field::new("item", DataType::Float32, true));
         let vectors = FixedSizeListArray::try_new(
-            vector_field.clone(),
+            vector_field,
             2,
             Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6])),
             None,
