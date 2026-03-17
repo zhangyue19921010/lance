@@ -973,7 +973,7 @@ impl DirectoryNamespace {
         indices: &mut Vec<IndexContent>,
         page_token: Option<String>,
         limit: Option<i32>,
-    ) {
+    ) -> Option<String> {
         indices.sort_by(|a, b| a.index_name.cmp(&b.index_name));
 
         if let Some(start_after) = page_token {
@@ -987,10 +987,20 @@ impl DirectoryNamespace {
             }
         }
 
+        let mut next_page_token = None;
         if let Some(limit) = limit
             && limit >= 0
         {
-            indices.truncate(limit as usize);
+            let limit = limit as usize;
+            if limit > 0 && indices.len() > limit {
+                next_page_token = Some(indices[limit - 1].index_name.clone());
+            }
+            indices.truncate(limit);
+        }
+        if indices.is_empty() {
+            None
+        } else {
+            next_page_token
         }
     }
 
@@ -2328,10 +2338,10 @@ impl LanceNamespace for DirectoryNamespace {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Self::paginate_indices(&mut indices, request.page_token, request.limit);
+        let page_token = Self::paginate_indices(&mut indices, request.page_token, request.limit);
         Ok(ListTableIndicesResponse {
             indexes: indices,
-            page_token: None,
+            page_token,
         })
     }
 
@@ -2885,6 +2895,8 @@ mod tests {
 
         let (namespace, _temp_dir) = create_test_namespace().await;
         create_scalar_table(&namespace, "users").await;
+        create_scalar_index(&namespace, "users", "a_idx").await;
+        create_scalar_index(&namespace, "users", "b_idx").await;
         let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
 
         let response = namespace
@@ -2895,10 +2907,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.indexes.len(), 1);
-        assert_eq!(response.indexes[0].index_name, "users_id_idx");
-        assert_eq!(response.indexes[0].columns, vec!["id"]);
-        assert_eq!(response.indexes[0].status, "SUCCEEDED");
+        assert_eq!(response.indexes.len(), 3);
+        assert_eq!(response.indexes[0].index_name, "a_idx");
+        assert_eq!(response.indexes[1].index_name, "b_idx");
+        assert_eq!(response.indexes[2].index_name, "users_id_idx");
+        assert!(response.page_token.is_none());
+        let users_id_idx = response
+            .indexes
+            .iter()
+            .find(|index| index.index_name == "users_id_idx")
+            .unwrap();
+        assert_eq!(users_id_idx.columns, vec!["id"]);
+        assert_eq!(users_id_idx.status, "SUCCEEDED");
 
         let dataset = open_dataset(&namespace, "users").await;
         let expected_transaction_id = dataset
@@ -2915,6 +2935,34 @@ mod tests {
                 .count(),
             1
         );
+
+        let first_page = namespace
+            .list_table_indices(ListTableIndicesRequest {
+                id: Some(vec!["users".to_string()]),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first_page.indexes.len(), 2);
+        assert_eq!(first_page.indexes[0].index_name, "a_idx");
+        assert_eq!(first_page.indexes[1].index_name, "b_idx");
+        assert_eq!(first_page.page_token.as_deref(), Some("b_idx"));
+
+        let second_page = namespace
+            .list_table_indices(ListTableIndicesRequest {
+                id: Some(vec!["users".to_string()]),
+                page_token: first_page.page_token.clone(),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(second_page.indexes.len(), 1);
+        assert_eq!(second_page.indexes[0].index_name, "users_id_idx");
+        assert!(second_page.page_token.is_none());
     }
 
     #[tokio::test]
