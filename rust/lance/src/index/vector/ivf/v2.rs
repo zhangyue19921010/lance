@@ -653,7 +653,7 @@ mod tests {
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
     };
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::{DatasetIndexExt, IndexSegment, IndexType};
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
@@ -1467,7 +1467,16 @@ mod tests {
             .unwrap();
 
         dataset
-            .commit_existing_index(index_name, "vector", shared_uuid)
+            .commit_existing_index_segments(
+                index_name,
+                "vector",
+                vec![IndexSegment::new(
+                    shared_uuid,
+                    dataset.fragment_bitmap.as_ref().clone(),
+                    Arc::new(crate::index::vector_index_details()),
+                    IndexType::IvfPq.version(),
+                )],
+            )
             .await
             .unwrap();
     }

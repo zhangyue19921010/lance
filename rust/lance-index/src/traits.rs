@@ -7,9 +7,8 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{Error, Result};
 
-use crate::{IndexParams, IndexType, optimize::OptimizeOptions};
+use crate::{IndexParams, IndexType, optimize::OptimizeOptions, types::IndexSegment};
 use lance_table::format::IndexMetadata;
-use uuid::Uuid;
 
 /// A set of criteria used to filter potential indices to use for a query
 #[derive(Debug, Default)]
@@ -275,11 +274,12 @@ pub trait DatasetIndexExt {
     /// If the index does not exist, return Error.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
 
-    async fn commit_existing_index(
+    /// Commit one or more existing physical index segments as a logical index.
+    async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,
         column: &str,
-        index_id: Uuid,
+        segments: Vec<IndexSegment>,
     ) -> Result<()>;
 
     async fn read_index_partition(

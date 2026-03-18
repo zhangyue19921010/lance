@@ -42,7 +42,7 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
-use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription};
+use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription, IndexSegment};
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
 use lance_index::{
     IndexCriteria, is_system_index,
@@ -774,38 +774,58 @@ impl DatasetIndexExt for Dataset {
         }
     }
 
-    async fn commit_existing_index(
+    async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,
         column: &str,
-        index_id: Uuid,
+        segments: Vec<IndexSegment>,
     ) -> Result<()> {
+        if segments.is_empty() {
+            return Err(Error::invalid_input(
+                "CreateIndex: at least one index segment is required".to_string(),
+            ));
+        }
+
         let Some(field) = self.schema().field(column) else {
             return Err(Error::index(format!(
                 "CreateIndex: column '{column}' does not exist"
             )));
         };
 
-        // TODO: We will need some way to determine the index details here.  Perhaps
-        // we can load the index itself and get the details that way.
+        let mut seen_segment_ids = HashSet::with_capacity(segments.len());
+        for segment in &segments {
+            if !seen_segment_ids.insert(segment.uuid()) {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: duplicate segment uuid {} for index '{}'",
+                    segment.uuid(),
+                    index_name
+                )));
+            }
+        }
 
-        let new_idx = IndexMetadata {
-            uuid: index_id,
-            name: index_name.to_string(),
-            fields: vec![field.id],
-            dataset_version: self.manifest.version,
-            fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
-            index_details: None,
-            index_version: 0,
-            created_at: Some(chrono::Utc::now()),
-            base_id: None, // New indices don't have base_id (they're not from shallow clone)
-            files: None,   // File info will be populated when index is created
-        };
+        let new_indices = segments
+            .into_iter()
+            .map(|segment| {
+                let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
+                IndexMetadata {
+                    uuid,
+                    name: index_name.to_string(),
+                    fields: vec![field.id],
+                    dataset_version: self.manifest.version,
+                    fragment_bitmap: Some(fragment_bitmap),
+                    index_details: Some(index_details),
+                    index_version,
+                    created_at: Some(chrono::Utc::now()),
+                    base_id: None,
+                    files: None, // File info will be populated when index is created
+                }
+            })
+            .collect();
 
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::CreateIndex {
-                new_indices: vec![new_idx],
+                new_indices,
                 removed_indices: vec![],
             },
             None,
@@ -5155,6 +5175,145 @@ mod tests {
                 .to_string()
                 .contains("does not exist in the schema")
         );
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_commits_multiple_segments() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let seg0 = IndexSegment::new(
+            Uuid::new_v4(),
+            std::iter::once(0_u32),
+            Arc::new(vector_index_details()),
+            IndexType::Vector.version(),
+        );
+        let seg1 = IndexSegment::new(
+            Uuid::new_v4(),
+            std::iter::once(1_u32),
+            Arc::new(vector_index_details()),
+            IndexType::Vector.version(),
+        );
+
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![seg0.clone(), seg1.clone()],
+            )
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(committed.len(), 2);
+        let committed_uuids = committed.iter().map(|idx| idx.uuid).collect::<HashSet<_>>();
+        assert_eq!(
+            committed_uuids,
+            HashSet::from([seg0.uuid(), seg1.uuid()]),
+            "all committed segment uuids should be preserved"
+        );
+        assert_eq!(
+            committed
+                .iter()
+                .map(|idx| idx
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>())
+                .collect::<HashSet<_>>(),
+            HashSet::from([vec![0], vec![1]]),
+            "each committed segment should preserve its fragment coverage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_duplicate_segment_ids() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let base = IndexSegment::new(
+            Uuid::new_v4(),
+            std::iter::once(0_u32),
+            Arc::new(vector_index_details()),
+            IndexType::Vector.version(),
+        );
+
+        let err = dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![
+                    base.clone(),
+                    IndexSegment::new(
+                        base.uuid(),
+                        std::iter::once(1_u32),
+                        Arc::new(vector_index_details()),
+                        IndexType::Vector.version(),
+                    ),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate segment uuid"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_empty_segments() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let err = dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("at least one index segment"));
     }
 
     #[tokio::test]
