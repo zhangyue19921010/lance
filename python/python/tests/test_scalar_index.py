@@ -849,7 +849,12 @@ def test_fts_ngram_tokenizer(tmp_path):
 
 def test_fts_stats(dataset):
     dataset.create_scalar_index(
-        "doc", index_type="INVERTED", with_position=False, remove_stop_words=True
+        "doc",
+        index_type="INVERTED",
+        with_position=False,
+        remove_stop_words=True,
+        memory_limit=4096,
+        num_workers=2,
     )
     stats = dataset.stats.index_stats("doc_idx")
     assert stats["index_type"] == "Inverted"
@@ -864,6 +869,8 @@ def test_fts_stats(dataset):
     assert params["stem"] is True
     assert params["remove_stop_words"] is True
     assert params["ascii_folding"] is True
+    assert "memory_limit" not in params
+    assert "num_workers" not in params
 
 
 def test_fts_score(tmp_path):
@@ -4254,7 +4261,9 @@ def test_json_inverted_match_query(tmp_path):
     assert results.num_rows == 1
 
 
-def test_describe_indices(tmp_path):
+@pytest.mark.parametrize("fts_format_version", ["1", "2"])
+def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
+    monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", fts_format_version)
     data = pa.table(
         {
             "id": range(100),
@@ -4284,9 +4293,13 @@ def test_describe_indices(tmp_path):
     assert indices[0].segments[0].uuid is not None
     assert indices[0].segments[0].fragment_ids == {0}
     assert indices[0].segments[0].dataset_version_at_last_update == 1
-    assert indices[0].segments[0].index_version == 1
+    assert indices[0].segments[0].index_version == int(fts_format_version)
     assert indices[0].segments[0].created_at is not None
     assert isinstance(indices[0].segments[0].created_at, datetime)
+    assert indices[0].segments[0].size_bytes is not None
+    assert indices[0].segments[0].size_bytes > 0
+    assert indices[0].total_size_bytes is not None
+    assert indices[0].total_size_bytes > 0
 
     details = indices[0].details
     assert details is not None and len(details) > 0
@@ -4367,6 +4380,10 @@ def test_describe_indices(tmp_path):
         assert indices[i].segments[0].index_version == 0
         assert indices[i].segments[0].created_at is not None
         assert isinstance(indices[i].segments[0].created_at, datetime)
+        assert indices[i].segments[0].size_bytes is not None
+        assert indices[i].segments[0].size_bytes > 0
+        assert indices[i].total_size_bytes is not None
+        assert indices[i].total_size_bytes > 0
         assert indices[i].details == json.loads(details[i])
 
     ds.delete("id < 50")

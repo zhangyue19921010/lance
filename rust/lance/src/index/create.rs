@@ -5,7 +5,7 @@ use crate::{
     Error, Result,
     dataset::{
         Dataset,
-        transaction::{Operation, Transaction},
+        transaction::{Operation, TransactionBuilder},
     },
     index::{
         DatasetIndexExt, DatasetIndexInternalExt,
@@ -25,8 +25,8 @@ use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
 };
-use lance_table::format::IndexMetadata;
-use std::{future::IntoFuture, sync::Arc};
+use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
+use std::{collections::HashMap, future::IntoFuture, sync::Arc};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -56,6 +56,8 @@ pub struct CreateIndexBuilder<'a> {
     index_uuid: Option<String>,
     preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     progress: Arc<dyn IndexBuildProgress>,
+    /// Transaction properties to store with this commit.
+    transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -77,6 +79,7 @@ impl<'a> CreateIndexBuilder<'a> {
             index_uuid: None,
             preprocessed_data: None,
             progress: Arc::new(NoopIndexBuildProgress),
+            transaction_properties: None,
         }
     }
 
@@ -115,6 +118,16 @@ impl<'a> CreateIndexBuilder<'a> {
 
     pub fn progress(mut self, p: Arc<dyn IndexBuildProgress>) -> Self {
         self.progress = p;
+        self
+    }
+
+    /// Set transaction properties to store with this commit.
+    ///
+    /// These key-value pairs are stored in the transaction file
+    /// and can be read later to identify the source of the commit
+    /// (e.g., job_id for tracking completed index jobs).
+    pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.transaction_properties = Some(Arc::new(properties));
         self
     }
 
@@ -171,19 +184,24 @@ impl<'a> CreateIndexBuilder<'a> {
             }
             candidate
         };
-        if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
-            if idx.fields == [field.id] && !self.replace {
-                return Err(Error::index(format!(
-                    "Index name '{index_name} already exists, \
-                    please specify a different name or use replace=True"
-                )));
-            };
-            if idx.fields != [field.id] {
-                return Err(Error::index(format!(
-                    "Index name '{index_name} already exists with different fields, \
-                    please specify a different name"
-                )));
-            }
+        let existing_named_indices = indices
+            .iter()
+            .filter(|idx| idx.name == index_name)
+            .collect::<Vec<_>>();
+        if existing_named_indices
+            .iter()
+            .any(|idx| idx.fields != [field.id])
+        {
+            return Err(Error::index(format!(
+                "Index name '{index_name}' already exists with different fields, \
+                please specify a different name"
+            )));
+        }
+        if !existing_named_indices.is_empty() && !self.replace {
+            return Err(Error::index(format!(
+                "Index name '{index_name}' already exists, \
+                please specify a different name or use replace=True"
+            )));
         }
 
         let index_id = match &self.index_uuid {
@@ -278,8 +296,8 @@ impl<'a> CreateIndexBuilder<'a> {
                         )
                     })?;
 
-                let params =
-                    ScalarIndexParams::new("inverted".to_string()).with_params(inverted_params);
+                let params = ScalarIndexParams::new("inverted".to_string())
+                    .with_params(&inverted_params.to_training_json()?);
                 build_scalar_index(
                     self.dataset,
                     column,
@@ -315,7 +333,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
                 if train {
                     // Check if this is distributed indexing (fragment-level)
-                    if self.fragments.is_some() {
+                    if let Some(fragments) = &self.fragments {
                         // For distributed indexing, build only on specified fragments
                         // This creates temporary index metadata without committing
                         Box::pin(build_distributed_vector_index(
@@ -325,7 +343,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             &index_id.to_string(),
                             vec_params,
                             fri,
-                            self.fragments.as_ref().unwrap(),
+                            fragments,
                             self.progress.clone(),
                         ))
                         .await?;
@@ -353,9 +371,14 @@ impl<'a> CreateIndexBuilder<'a> {
                     )
                     .await?;
                 }
+                // Capture file sizes after vector index creation
+                let index_dir = self.dataset.indices_dir().child(index_id.to_string());
+                let files =
+                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
                     index_details: vector_index_details(),
                     index_version,
+                    files: Some(files),
                 }
             }
             // Can't use if let Some(...) here because it's not stable yet.
@@ -387,9 +410,14 @@ impl<'a> CreateIndexBuilder<'a> {
                 } else {
                     todo!("create empty vector index when train=false");
                 }
+                // Capture file sizes after vector index creation
+                let index_dir = self.dataset.indices_dir().child(index_id.to_string());
+                let files =
+                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
                     index_details: vector_index_details(),
                     index_version: self.index_type.version() as u32,
+                    files: Some(files),
                 }
             }
             (IndexType::FragmentReuse, _) => {
@@ -412,13 +440,7 @@ impl<'a> CreateIndexBuilder<'a> {
             fragment_bitmap: if train {
                 match &self.fragments {
                     Some(fragment_ids) => Some(fragment_ids.iter().collect()),
-                    None => Some(
-                        self.dataset
-                            .get_fragments()
-                            .iter()
-                            .map(|f| f.id() as u32)
-                            .collect(),
-                    ),
+                    None => Some(self.dataset.fragment_bitmap.as_ref().clone()),
                 }
             } else {
                 // Empty bitmap for untrained indices
@@ -428,6 +450,7 @@ impl<'a> CreateIndexBuilder<'a> {
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            files: created_index.files,
         })
     }
 
@@ -435,14 +458,26 @@ impl<'a> CreateIndexBuilder<'a> {
     async fn execute(mut self) -> Result<IndexMetadata> {
         let new_idx = self.execute_uncommitted().await?;
         let index_uuid = new_idx.uuid;
-        let transaction = Transaction::new(
+        let removed_indices = if self.replace {
+            self.dataset
+                .load_indices()
+                .await?
+                .iter()
+                .filter(|idx| idx.name == new_idx.name)
+                .cloned()
+                .collect()
+        } else {
+            vec![]
+        };
+        let transaction = TransactionBuilder::new(
             new_idx.dataset_version,
             Operation::CreateIndex {
                 new_indices: vec![new_idx],
-                removed_indices: vec![],
+                removed_indices,
             },
-            None,
-        );
+        )
+        .transaction_properties(self.transaction_properties.clone())
+        .build();
 
         self.dataset
             .apply_commit(transaction, &Default::default(), &Default::default())
@@ -488,6 +523,22 @@ mod tests {
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_linalg::distance::MetricType;
     use std::sync::Arc;
+
+    #[test]
+    fn test_inverted_training_params_include_build_only_fields() {
+        let params = InvertedIndexParams::default()
+            .memory_limit_mb(4096)
+            .num_workers(7);
+        let scalar_params = ScalarIndexParams::new("inverted".to_string())
+            .with_params(&params.to_training_json().unwrap());
+        let json: serde_json::Value =
+            serde_json::from_str(scalar_params.params.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            json.get("memory_limit"),
+            Some(&serde_json::Value::from(4096))
+        );
+        assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(7)));
+    }
 
     #[test]
     fn test_default_index_name() {
@@ -610,6 +661,92 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_create_index_same_name_returns_retryable_conflict() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let reader = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(100),
+                lance_datagen::BatchCount::from(1),
+            );
+        let dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let read_version = dataset.manifest.version;
+        let mut reader1 = dataset.checkout_version(read_version).await.unwrap();
+        let mut reader2 = dataset.checkout_version(read_version).await.unwrap();
+
+        let first = CreateIndexBuilder::new(&mut reader1, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .execute()
+            .await;
+        assert!(
+            first.is_ok(),
+            "first create_index should succeed: {first:?}"
+        );
+
+        let second = CreateIndexBuilder::new(&mut reader2, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .execute()
+            .await;
+        assert!(
+            matches!(second, Err(Error::RetryableCommitConflict { .. })),
+            "second concurrent create_index should be retryable, got {second:?}"
+        );
+
+        let latest_indices = reader1.load_indices_by_name("a_idx").await.unwrap();
+        assert_eq!(latest_indices.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_replace_index_same_name_returns_retryable_conflict() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let reader = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(100),
+                lance_datagen::BatchCount::from(1),
+            );
+        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let original = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .execute()
+            .await
+            .unwrap();
+
+        let read_version = dataset.manifest.version;
+        let mut reader1 = dataset.checkout_version(read_version).await.unwrap();
+        let mut reader2 = dataset.checkout_version(read_version).await.unwrap();
+
+        let replacement = CreateIndexBuilder::new(&mut reader1, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .replace(true)
+            .execute()
+            .await
+            .unwrap();
+        assert_ne!(replacement.uuid, original.uuid);
+
+        let second = CreateIndexBuilder::new(&mut reader2, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .replace(true)
+            .execute()
+            .await;
+        assert!(
+            matches!(second, Err(Error::RetryableCommitConflict { .. })),
+            "second concurrent replace should be retryable, got {second:?}"
+        );
+
+        let latest_indices = reader1.load_indices_by_name("a_idx").await.unwrap();
+        assert_eq!(latest_indices.len(), 1);
+        assert_eq!(latest_indices[0].uuid, replacement.uuid);
+        assert_ne!(latest_indices[0].uuid, original.uuid);
     }
 
     // Helper function to create test data with text field suitable for inverted index
