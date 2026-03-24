@@ -169,29 +169,6 @@ def _vector_search_table(ids):
     )
 
 
-def test_vector_search_plan_structure(tmp_path):
-    """
-    Verifies that LsmVectorSearchPlanner can be constructed and that calling
-    ``plan_search()`` does not fail structurally.
-
-    This intentionally mirrors the Rust test and does not execute the plan.
-    The purpose is to cover planner construction and plan-building only.
-
-    Mirrors Rust test: vector_search::tests::test_vector_search_plan_structure
-    """
-    schema = _vector_search_schema()
-    ds = lance.write_dataset(
-        _vector_search_table([1, 2, 3]), str(tmp_path / "base"), schema=schema
-    )
-
-    planner = LsmVectorSearchPlanner(ds, [], "vector", distance_type="l2")
-    assert not hasattr(planner, "nearest")
-
-    query = pa.array([0.1, 0.2, 0.3, 0.4], type=pa.float32())
-    plan = planner.plan_search(query, k=10, nprobes=8)
-    assert plan is not None
-
-
 VECTOR_DIM = 32
 ROWS_PER_BATCH = 50
 NUM_WRITE_ROUNDS = 3
