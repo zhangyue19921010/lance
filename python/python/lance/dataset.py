@@ -4094,7 +4094,7 @@ class LanceDataset(pa.dataset.Dataset):
         With a region spec for automatic routing by ``tenant_id``:
 
         from lance.mem_wal import RegionField, RegionSpec
-        spec = RegionSpec( SKIP
+        spec = RegionSpec(
         ...     spec_id=1,
         ...     fields=[RegionField(field_id="tenant_id", source_ids=[0],
         ...                        result_type="int64")],
