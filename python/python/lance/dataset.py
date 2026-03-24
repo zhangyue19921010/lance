@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 
     from lance.namespace import LanceNamespace
 
+    from . import mem_wal
     from .commit import CommitLock
     from .io import StorageOptionsProvider
     from .lance.indices import IndexDescription
@@ -412,7 +413,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
     def mark_generations_as_merged(
-        self, generations: "List[lance.mem_wal.MergedGeneration]"
+        self, generations: "List[mem_wal.MergedGeneration]"
     ) -> "MergeInsertBuilder":
         """Mark MemWAL generations as merged into the base table.
 
@@ -4044,7 +4045,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         *,
         maintained_indexes: Optional[List[str]] = None,
-        region_spec: Optional["lance.mem_wal.RegionSpec"] = None,
+        region_spec: Optional["mem_wal.RegionSpec"] = None,
     ) -> None:
         """Initialize MemWAL on this dataset.
 
@@ -4121,10 +4122,10 @@ class LanceDataset(pa.dataset.Dataset):
         async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
-    ) -> "lance.mem_wal.RegionWriter":
+    ) -> "mem_wal.RegionWriter":
         """Get a RegionWriter for the specified region.
 
-        initialize_mem_wal` must be called before using this method.
+        `initialize_mem_wal` must be called before using this method.
         Each *region* is an independent write shard; use different region IDs
         to achieve parallel ingestion without writer contention.
 
@@ -4178,28 +4179,29 @@ class LanceDataset(pa.dataset.Dataset):
         """
         import lance.mem_wal as _mw
 
-        kwargs = {}
-        for name, val in [
-            ("durable_write", durable_write),
-            ("sync_indexed_write", sync_indexed_write),
-            ("max_wal_buffer_size", max_wal_buffer_size),
-            ("max_wal_flush_interval_ms", max_wal_flush_interval_ms),
-            ("max_memtable_size", max_memtable_size),
-            ("max_memtable_rows", max_memtable_rows),
-            ("max_memtable_batches", max_memtable_batches),
-            ("max_unflushed_memtable_bytes", max_unflushed_memtable_bytes),
-            (
-                "ivf_index_partition_capacity_safety_factor",
-                ivf_index_partition_capacity_safety_factor,
-            ),
-            ("manifest_scan_batch_size", manifest_scan_batch_size),
-            ("async_index_buffer_rows", async_index_buffer_rows),
-            ("async_index_interval_ms", async_index_interval_ms),
-            ("backpressure_log_interval_ms", backpressure_log_interval_ms),
-            ("stats_log_interval_ms", stats_log_interval_ms),
-        ]:
-            if val is not None:
-                kwargs[name] = val
+        kwargs = {
+            name: val
+            for name, val in [
+                ("durable_write", durable_write),
+                ("sync_indexed_write", sync_indexed_write),
+                ("max_wal_buffer_size", max_wal_buffer_size),
+                ("max_wal_flush_interval_ms", max_wal_flush_interval_ms),
+                ("max_memtable_size", max_memtable_size),
+                ("max_memtable_rows", max_memtable_rows),
+                ("max_memtable_batches", max_memtable_batches),
+                ("max_unflushed_memtable_bytes", max_unflushed_memtable_bytes),
+                (
+                    "ivf_index_partition_capacity_safety_factor",
+                    ivf_index_partition_capacity_safety_factor,
+                ),
+                ("manifest_scan_batch_size", manifest_scan_batch_size),
+                ("async_index_buffer_rows", async_index_buffer_rows),
+                ("async_index_interval_ms", async_index_interval_ms),
+                ("backpressure_log_interval_ms", backpressure_log_interval_ms),
+                ("stats_log_interval_ms", stats_log_interval_ms),
+            ]
+            if val is not None
+        }
         raw = self._ds.mem_wal_writer(region_id, **kwargs)
         return _mw.RegionWriter(raw)
 

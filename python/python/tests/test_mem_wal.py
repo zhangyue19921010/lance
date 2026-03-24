@@ -7,14 +7,11 @@ import uuid
 
 import lance
 import pyarrow as pa
-
 from lance.mem_wal import (
     LsmPointLookupPlanner,
     LsmScanner,
-    LsmVectorSearchPlanner,
     RegionSnapshot,
 )
-
 
 _PK_META = {"lance-schema:unenforced-primary-key": "true"}
 _LOOKUP_SCHEMA = pa.schema(
@@ -142,7 +139,7 @@ _VDIM = 4  # matches Rust test fixture dimension
 
 
 def _vector_search_schema():
-    """Schema for vector-search tests: id (int32 PK) + vector (FixedSizeList<4 float32>)."""
+    """Schema for vector-search tests: id (int32 PK) + vector column."""
     pk_meta = {"lance-schema:unenforced-primary-key": "true"}
     return pa.schema(
         [

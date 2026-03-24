@@ -40,8 +40,8 @@ from .mem_wal import (
     LsmVectorSearchPlanner,
     MergedGeneration,
     RegionField,
-    RegionSpec,
     RegionSnapshot,
+    RegionSpec,
     RegionWriter,
 )
 from .namespace import (
