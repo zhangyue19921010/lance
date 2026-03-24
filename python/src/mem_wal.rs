@@ -6,17 +6,15 @@ use std::sync::Arc;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchReader, StructArray,
-    make_array,
+    Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    StructArray, make_array,
 };
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use datafusion::common::ScalarValue;
-use datafusion::physical_plan::{
-    ExecutionPlan, SendableRecordBatchStream, collect, displayable, execute_stream,
-};
+use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
-use futures::{StreamExt, TryStreamExt, lock::Mutex as FuturesMutex};
+use futures::TryStreamExt;
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
     LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
@@ -345,35 +343,6 @@ impl PyRegionWriter {
     }
 }
 
-struct ExecutionPlanReader {
-    schema: Arc<ArrowSchema>,
-    stream: Arc<FuturesMutex<SendableRecordBatchStream>>,
-}
-
-impl Iterator for ExecutionPlanReader {
-    type Item = Result<RecordBatch, arrow::error::ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let stream = self.stream.clone();
-        rt().spawn(None, async move {
-            let mut stream = stream.lock().await;
-            stream.next().await
-        })
-        .transpose()
-        .map(|result| match result {
-            Ok(Ok(batch)) => Ok(batch),
-            Ok(Err(err)) => Err(err.into()),
-            Err(err) => Err(arrow::error::ArrowError::ExternalError(Box::new(err))),
-        })
-    }
-}
-
-impl RecordBatchReader for ExecutionPlanReader {
-    fn schema(&self) -> Arc<ArrowSchema> {
-        self.schema.clone()
-    }
-}
-
 /// Python wrapper around a DataFusion physical execution plan.
 #[pyclass(name = "_ExecutionPlan", module = "_lib")]
 #[derive(Clone)]
@@ -429,13 +398,19 @@ impl PyExecutionPlan {
     }
 
     fn to_reader<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let ctx = SessionContext::new();
-        let stream = execute_stream(self.plan.clone(), ctx.task_ctx())
+        let plan = self.plan.clone();
+        let batches = rt()
+            .block_on(Some(py), async move {
+                let ctx = SessionContext::new();
+                collect(plan, ctx.task_ctx()).await
+            })?
             .map_err(|e| PyIOError::new_err(format!("Plan execution failed: {}", e)))?;
-        let reader: Box<dyn RecordBatchReader + Send> = Box::new(ExecutionPlanReader {
-            schema: stream.schema().clone(),
-            stream: Arc::new(FuturesMutex::new(stream)),
-        });
+
+        let schema = self.plan.schema().clone();
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema,
+        ));
         reader.into_pyarrow(py)
     }
 }
