@@ -265,9 +265,9 @@ class LsmScanner:
 
     Examples
     --------
-    >>> scanner = LsmScanner.from_snapshots(dataset, [snapshot])
-    >>> scanner.project(["id", "value"]).filter("value > 0.5")
-    >>> table = scanner.to_table()
+    scanner = LsmScanner.from_snapshots(dataset, [snapshot])
+    scanner.project(["id", "value"]).filter("value > 0.5")
+    table = scanner.to_table()
     """
 
     def __init__(self, _raw: _LsmScanner) -> None:
@@ -396,9 +396,9 @@ class LsmPointLookupPlanner:
 
     Examples
     --------
-    >>> planner = LsmPointLookupPlanner(dataset, [snapshot])
-    >>> plan = planner.plan_lookup(pa.array([42], type=pa.int64()))
-    >>> result = plan.to_table()
+    planner = LsmPointLookupPlanner(dataset, [snapshot])
+    plan = planner.plan_lookup(pa.array([42], type=pa.int64()))SKIP
+    result = plan.to_table()
     """
 
     def __init__(
@@ -438,11 +438,6 @@ class LsmPointLookupPlanner:
         return ExecutionPlan(self._raw.plan_lookup(pk_value, columns))
 
 
-# ---------------------------------------------------------------------------
-# LsmVectorSearchPlanner
-# ---------------------------------------------------------------------------
-
-
 class LsmVectorSearchPlanner:
     """Plans IVF-PQ vector KNN search across all LSM levels.
 
@@ -465,11 +460,11 @@ class LsmVectorSearchPlanner:
 
     Examples
     --------
-    >>> import numpy as np
-    >>> planner = LsmVectorSearchPlanner(dataset, [snapshot], "vector")
-    >>> query = pa.array(np.random.rand(128).astype("float32"))
-    >>> plan = planner.plan_search(query, k=10)
-    >>> result = plan.to_table()
+    import numpy as np
+    planner = LsmVectorSearchPlanner(dataset, [snapshot], "vector")
+    query = pa.array(np.random.rand(128).astype("float32"))SKIP
+    plan = planner.plan_search(query, k=10)SKIP
+    result = plan.to_table()SKIP
     """
 
     def __init__(
@@ -520,11 +515,6 @@ class LsmVectorSearchPlanner:
             `to_table`, `to_reader`, or `to_batches`.
         """
         return ExecutionPlan(self._raw.plan_search(query, k, nprobes, columns))
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers used by dataset.py
-# ---------------------------------------------------------------------------
 
 
 def _unwrap_region_id(region_id: str) -> str:

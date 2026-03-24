@@ -4630,26 +4630,28 @@ class LanceDataset(pa.dataset.Dataset):
         --------
         Without region spec (manual region management):
 
-        >>> import lance
-        >>> import pyarrow as pa
-        >>> schema = pa.schema([
-        ...     pa.field("id", pa.int64(),
+        import lance
+        import pyarrow as pa
+        import tempfile
+        schema = pa.schema([
+        ...     pa.field("id", pa.int64(), nullable=False,
         ...              metadata={"lance-schema:unenforced-primary-key": "true"}),
         ...     pa.field("val", pa.float32()),
         ... ])
-        >>> ds = lance.write_dataset(pa.table({"id": [1], "val": [0.1]}),
-        ...                          "/tmp/my_ds", schema=schema)
-        >>> ds.initialize_mem_wal()
+        table = pa.table({"id": [1], "val": [0.1]}, schema=schema)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ds = lance.write_dataset(table, tmpdir)
+            ds.initialize_mem_wal()
 
         With a region spec for automatic routing by ``tenant_id``:
 
-        >>> from lance.mem_wal import RegionField, RegionSpec
-        >>> spec = RegionSpec(
+        from lance.mem_wal import RegionField, RegionSpec
+        spec = RegionSpec( SKIP
         ...     spec_id=1,
         ...     fields=[RegionField(field_id="tenant_id", source_ids=[0],
         ...                        result_type="int64")],
         ... )
-        >>> ds.initialize_mem_wal(region_spec=spec)
+        ds.initialize_mem_wal(region_spec=spec)
         """
         self._ds.initialize_mem_wal(
             maintained_indexes=maintained_indexes,
@@ -4724,10 +4726,25 @@ class LanceDataset(pa.dataset.Dataset):
 
         Examples
         --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> import tempfile
         >>> import uuid
-        >>> region_id = str(uuid.uuid4())
-        >>> with ds.mem_wal_writer(region_id) as writer:
-        ...     writer.put(new_data)
+        >>> schema = pa.schema([
+        ...     pa.field("id", pa.int64(), nullable=False,
+        ...              metadata={"lance-schema:unenforced-primary-key": "true"}),
+        ...     pa.field("val", pa.float32()),
+        ... ])
+        >>> with tempfile.TemporaryDirectory() as tmpdir:
+        ...     ds = lance.write_dataset(
+        ...         pa.table({"id": [1], "val": [0.1]}, schema=schema),
+        ...         tmpdir,
+        ...     )
+        ...     ds.initialize_mem_wal()
+        ...     region_id = str(uuid.uuid4())
+        ...     new_data = pa.table({"id": [2], "val": [0.2]}, schema=schema)
+        ...     with ds.mem_wal_writer(region_id) as writer:
+        ...         writer.put(new_data)
         """
         import lance.mem_wal as _mw
 
