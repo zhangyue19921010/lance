@@ -397,7 +397,7 @@ class LsmPointLookupPlanner:
     Examples
     --------
     planner = LsmPointLookupPlanner(dataset, [snapshot])
-    plan = planner.plan_lookup(pa.array([42], type=pa.int64()))SKIP
+    plan = planner.plan_lookup(pa.array([42], type=pa.int64()))
     result = plan.to_table()
     """
 
@@ -462,9 +462,9 @@ class LsmVectorSearchPlanner:
     --------
     import numpy as np
     planner = LsmVectorSearchPlanner(dataset, [snapshot], "vector")
-    query = pa.array(np.random.rand(128).astype("float32"))SKIP
-    plan = planner.plan_search(query, k=10)SKIP
-    result = plan.to_table()SKIP
+    query = pa.array(np.random.rand(128).astype("float32"))
+    plan = planner.plan_search(query, k=10)
+    result = plan.to_table()
     """
 
     def __init__(
