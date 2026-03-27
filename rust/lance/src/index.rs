@@ -1160,7 +1160,9 @@ async fn index_statistics_scalar(
         "index_type": index_type,
         "name": index_name,
         "num_indices": num_indices,
-        "indices": indices_stats,
+        "num_segments": num_indices,
+        "indices": indices_stats.clone(),
+        "segments": indices_stats,
         "num_indexed_fragments": num_indexed_fragments,
         "num_indexed_rows": num_indexed_rows,
         "num_unindexed_fragments": num_unindexed_fragments,
@@ -2408,8 +2410,13 @@ mod tests {
         fn get_bitmap(meta: &IndexMetadata) -> Vec<u32> {
             meta.fragment_bitmap.as_ref().unwrap().iter().collect()
         }
+        fn assert_segment_aliases(stats: &serde_json::Value) {
+            assert_eq!(stats["num_segments"], stats["num_indices"]);
+            assert_eq!(stats["segments"], stats["indices"]);
+        }
 
         let stats = get_stats(&dataset, "vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 512);
         assert_eq!(stats["num_indexed_fragments"], 1);
@@ -2422,6 +2429,7 @@ mod tests {
             RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
         dataset.append(reader, None).await.unwrap();
         let stats = get_stats(&dataset, "vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 512);
         assert_eq!(stats["num_indexed_rows"], 512);
         assert_eq!(stats["num_indexed_fragments"], 1);
@@ -2436,6 +2444,7 @@ mod tests {
             .await
             .unwrap();
         let stats = get_stats(&dataset, "vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 512);
         assert_eq!(stats["num_indexed_rows"], 512);
         assert_eq!(stats["num_indexed_fragments"], 1);
@@ -2453,6 +2462,7 @@ mod tests {
             .await
             .unwrap();
         let stats = get_stats(&dataset, "vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 512);
         assert_eq!(stats["num_indexed_rows"], 512);
         assert_eq!(stats["num_indexed_fragments"], 1);
@@ -2463,6 +2473,7 @@ mod tests {
         assert_eq!(get_bitmap(&meta[0]), vec![0]);
 
         let stats = get_stats(&dataset, "other_vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 1024);
         assert_eq!(stats["num_indexed_fragments"], 2);
@@ -2479,6 +2490,7 @@ mod tests {
             .unwrap();
 
         let stats = get_stats(&dataset, "vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 1024);
         assert_eq!(stats["num_indexed_fragments"], 2);
@@ -2493,6 +2505,7 @@ mod tests {
             .await
             .unwrap();
         let stats = get_stats(&dataset, "other_vec_idx").await;
+        assert_segment_aliases(&stats);
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 1024);
         assert_eq!(stats["num_indexed_fragments"], 2);
