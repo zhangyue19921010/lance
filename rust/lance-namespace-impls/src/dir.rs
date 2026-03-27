@@ -56,7 +56,7 @@ use lance_namespace::models::{
     UpdateTableSchemaMetadataResponse,
 };
 
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::schema::arrow_schema_to_json;
