@@ -8,12 +8,14 @@
 
 pub mod manifest;
 
+use arrow::array::Float32Array;
 use arrow::record_batch::RecordBatchIterator;
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::scanner::Scanner;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
@@ -49,7 +51,8 @@ use lance_namespace::models::{
     FragmentSummary, GetTableStatsRequest, GetTableStatsResponse, Identity, IndexContent,
     ListNamespacesRequest, ListNamespacesResponse, ListTableIndicesRequest,
     ListTableIndicesResponse, ListTableVersionsRequest, ListTableVersionsResponse,
-    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, RestoreTableRequest,
+    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest,
+    QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest,
     RestoreTableResponse, TableExistsRequest, TableVersion, UpdateTableSchemaMetadataRequest,
     UpdateTableSchemaMetadataResponse,
 };
@@ -1432,6 +1435,142 @@ impl DirectoryNamespace {
             }
         }
         Ok(deleted_count)
+    }
+
+    /// Apply all query parameters from a `QueryTableRequest`-like source onto a `Scanner`.
+    ///
+    /// This covers vector search, filters, column projection, limits, and ANN tuning knobs so
+    /// that `explain_table_query_plan` / `analyze_table_query_plan` produce an accurate plan.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_query_params_to_scanner(
+        scanner: &mut Scanner,
+        filter: Option<&str>,
+        columns: Option<&QueryTableRequestColumns>,
+        vector_column: Option<&str>,
+        vector: &QueryTableRequestVector,
+        k: i32,
+        offset: Option<i32>,
+        prefilter: Option<bool>,
+        bypass_vector_index: Option<bool>,
+        nprobes: Option<i32>,
+        ef: Option<i32>,
+        refine_factor: Option<i32>,
+        distance_type: Option<&str>,
+        fast_search_flag: Option<bool>,
+        with_row_id: Option<bool>,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        operation: &str,
+    ) -> Result<()> {
+        // prefilter must be set before nearest() so the fragment-scan guard sees it.
+        if let Some(pf) = prefilter {
+            scanner.prefilter(pf);
+        }
+
+        if let Some(filter) = filter {
+            scanner.filter(filter).map_err(|e| {
+                Error::invalid_input_source(
+                    format!("Invalid filter expression for {}: {}", operation, e).into(),
+                )
+            })?;
+        }
+
+        if let Some(cols) = columns {
+            if let Some(ref names) = cols.column_names {
+                scanner.project(names.as_slice()).map_err(|e| {
+                    Error::invalid_input_source(
+                        format!("Invalid column projection for {}: {}", operation, e).into(),
+                    )
+                })?;
+            } else if let Some(ref aliases) = cols.column_aliases {
+                // aliases maps output_alias -> source_column
+                let pairs: Vec<(&str, &str)> = aliases
+                    .iter()
+                    .map(|(alias, src)| (alias.as_str(), src.as_str()))
+                    .collect();
+                scanner.project_with_transform(&pairs).map_err(|e| {
+                    Error::invalid_input_source(
+                        format!("Invalid column aliases for {}: {}", operation, e).into(),
+                    )
+                })?;
+            }
+        }
+
+        // Resolve query vector: prefer single_vector, fall back to first row of multi_vector.
+        let query_vec: Option<Vec<f32>> = vector
+            .single_vector
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .or_else(|| {
+                vector
+                    .multi_vector
+                    .as_ref()
+                    .and_then(|mv| mv.first())
+                    .filter(|v| !v.is_empty())
+                    .cloned()
+            });
+
+        if let Some(q_vec) = query_vec {
+            let col = vector_column.unwrap_or("vector");
+            let q = Arc::new(Float32Array::from(q_vec));
+            scanner
+                .nearest(col, q.as_ref(), k.max(1) as usize)
+                .map_err(|e| {
+                    Error::invalid_input_source(
+                        format!("Invalid vector query for {}: {}", operation, e).into(),
+                    )
+                })?;
+
+            // ANN parameters — must be applied after nearest().
+            if let Some(n) = nprobes {
+                scanner.nprobes(n.max(1) as usize);
+            }
+            if let Some(e) = ef {
+                scanner.ef(e.max(1) as usize);
+            }
+            if let Some(rf) = refine_factor {
+                scanner.refine(rf.max(0) as u32);
+            }
+            // bypass_vector_index and fast_search are mutually exclusive; apply in order.
+            if let Some(true) = bypass_vector_index {
+                scanner.use_index(false);
+            }
+            if let Some(true) = fast_search_flag {
+                scanner.fast_search();
+            }
+            if lower_bound.is_some() || upper_bound.is_some() {
+                scanner.distance_range(lower_bound, upper_bound);
+            }
+            if let Some(dt) = distance_type {
+                let metric = Self::parse_metric_type(Some(dt))?;
+                scanner.distance_metric(metric);
+            }
+            // Apply offset on top of the k nearest results.
+            if let Some(off) = offset.filter(|&o| o > 0) {
+                scanner.limit(None, Some(off as i64)).map_err(|e| {
+                    Error::invalid_input_source(
+                        format!("Invalid offset for {}: {}", operation, e).into(),
+                    )
+                })?;
+            }
+        } else {
+            // Scalar (non-vector) query: treat k as a row LIMIT.
+            let limit = if k > 0 { Some(k as i64) } else { None };
+            scanner
+                .limit(limit, offset.map(|o| o as i64))
+                .map_err(|e| {
+                    Error::invalid_input_source(
+                        format!("Invalid limit/offset for {}: {}", operation, e).into(),
+                    )
+                })?;
+        }
+
+        if let Some(true) = with_row_id {
+            scanner.with_row_id();
+        }
+
+        Ok(())
     }
 }
 
@@ -2841,8 +2980,9 @@ impl LanceNamespace for DirectoryNamespace {
         let num_fragments = fragment_row_counts.len() as i64;
         let num_rows: i64 = fragment_row_counts.iter().sum();
 
-        // Fragments with fewer than 1024 rows are considered "small"
-        const SMALL_FRAGMENT_THRESHOLD: i64 = 1024;
+        // Fragments with fewer rows than the compaction target are considered "small",
+        // consistent with CompactionOptions::target_rows_per_fragment default.
+        const SMALL_FRAGMENT_THRESHOLD: i64 = 1024 * 1024;
         let num_small_fragments = fragment_row_counts
             .iter()
             .filter(|&&r| r < SMALL_FRAGMENT_THRESHOLD)
@@ -2888,18 +3028,31 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<String> {
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, None, "explain_table_query_plan")
+            .load_dataset(&table_uri, request.query.version, "explain_table_query_plan")
             .await?;
         let verbose = request.verbose.unwrap_or(false);
 
         let mut scanner = dataset.scan();
-        if let Some(ref filter) = request.query.filter {
-            scanner.filter(filter).map_err(|e| {
-                Error::invalid_input_source(
-                    format!("Invalid filter expression for explain_table_query_plan: {}", e).into(),
-                )
-            })?;
-        }
+        Self::apply_query_params_to_scanner(
+            &mut scanner,
+            request.query.filter.as_deref(),
+            request.query.columns.as_deref(),
+            request.query.vector_column.as_deref(),
+            &request.query.vector,
+            request.query.k,
+            request.query.offset,
+            request.query.prefilter,
+            request.query.bypass_vector_index,
+            request.query.nprobes,
+            request.query.ef,
+            request.query.refine_factor,
+            request.query.distance_type.as_deref(),
+            request.query.fast_search,
+            request.query.with_row_id,
+            request.query.lower_bound,
+            request.query.upper_bound,
+            "explain_table_query_plan",
+        )?;
 
         scanner.explain_plan(verbose).await.map_err(|e| {
             Error::namespace_source(
@@ -2918,21 +3071,30 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<String> {
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, None, "analyze_table_query_plan")
+            .load_dataset(&table_uri, request.version, "analyze_table_query_plan")
             .await?;
 
         let mut scanner = dataset.scan();
-        if let Some(ref filter) = request.filter {
-            scanner.filter(filter).map_err(|e| {
-                Error::invalid_input_source(
-                    format!(
-                        "Invalid filter expression for analyze_table_query_plan: {}",
-                        e
-                    )
-                    .into(),
-                )
-            })?;
-        }
+        Self::apply_query_params_to_scanner(
+            &mut scanner,
+            request.filter.as_deref(),
+            request.columns.as_deref(),
+            request.vector_column.as_deref(),
+            &request.vector,
+            request.k,
+            request.offset,
+            request.prefilter,
+            request.bypass_vector_index,
+            request.nprobes,
+            request.ef,
+            request.refine_factor,
+            request.distance_type.as_deref(),
+            request.fast_search,
+            request.with_row_id,
+            request.lower_bound,
+            request.upper_bound,
+            "analyze_table_query_plan",
+        )?;
 
         scanner.analyze_plan().await.map_err(|e| {
             Error::namespace_source(
@@ -6922,5 +7084,118 @@ mod tests {
 
         let result = namespace.analyze_table_query_plan(req).await;
         assert!(result.is_err());
+    }
+
+    // ── multi-vector tests ────────────────────────────────────────────────────
+    // The vector table has a FixedSizeList<Float32, 2> "vector" column.
+    // `single_vector` maps directly; `multi_vector` falls back to the first
+    // sub-vector so both should produce a valid (non-empty) plan string.
+
+    #[tokio::test]
+    async fn test_explain_table_query_plan_with_single_vector() {
+        use lance_namespace::models::{ExplainTableQueryPlanRequest, QueryTableRequest};
+        use lance_namespace::models::QueryTableRequestVector;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_vector_table(&namespace, "vecs").await;
+
+        let mut vec_input = QueryTableRequestVector::new();
+        // dim=2 matches the vector column created by create_vector_table_ipc_data
+        vec_input.single_vector = Some(vec![0.1, 0.2]);
+
+        let mut query = QueryTableRequest::new(2, vec_input);
+        query.vector_column = Some("vector".to_string());
+
+        let mut req = ExplainTableQueryPlanRequest::new(query);
+        req.id = Some(vec!["vecs".to_string()]);
+
+        let plan_str = namespace.explain_table_query_plan(req).await.unwrap();
+        assert!(!plan_str.is_empty(), "plan string should not be empty");
+        // The plan should reference the vector column, confirming KNN is applied.
+        assert!(
+            plan_str.to_lowercase().contains("vector") || plan_str.to_lowercase().contains("knn"),
+            "plan should reflect vector search, got: {plan_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explain_table_query_plan_with_multi_vector() {
+        // multi_vector: our implementation uses the first sub-vector for nearest().
+        use lance_namespace::models::{ExplainTableQueryPlanRequest, QueryTableRequest};
+        use lance_namespace::models::QueryTableRequestVector;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_vector_table(&namespace, "vecs").await;
+
+        let mut vec_input = QueryTableRequestVector::new();
+        vec_input.multi_vector = Some(vec![
+            vec![0.1, 0.2], // used for nearest()
+            vec![0.3, 0.4], // additional vectors are ignored by explain/analyze
+        ]);
+
+        let mut query = QueryTableRequest::new(2, vec_input);
+        query.vector_column = Some("vector".to_string());
+
+        let mut req = ExplainTableQueryPlanRequest::new(query);
+        req.id = Some(vec!["vecs".to_string()]);
+
+        let plan_str = namespace.explain_table_query_plan(req).await.unwrap();
+        assert!(!plan_str.is_empty(), "plan string should not be empty");
+        assert!(
+            plan_str.to_lowercase().contains("vector") || plan_str.to_lowercase().contains("knn"),
+            "plan should reflect vector search, got: {plan_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_analyze_table_query_plan_with_single_vector() {
+        use lance_namespace::models::AnalyzeTableQueryPlanRequest;
+        use lance_namespace::models::QueryTableRequestVector;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_vector_table(&namespace, "vecs").await;
+
+        let mut vec_input = QueryTableRequestVector::new();
+        vec_input.single_vector = Some(vec![0.1, 0.2]);
+
+        let mut req = AnalyzeTableQueryPlanRequest::new(2, vec_input);
+        req.id = Some(vec!["vecs".to_string()]);
+        req.vector_column = Some("vector".to_string());
+
+        let analysis_str = namespace.analyze_table_query_plan(req).await.unwrap();
+        assert!(!analysis_str.is_empty(), "analysis string should not be empty");
+        assert!(
+            analysis_str.to_lowercase().contains("vector")
+                || analysis_str.to_lowercase().contains("knn"),
+            "analysis should reflect vector search, got: {analysis_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_analyze_table_query_plan_with_multi_vector() {
+        // multi_vector: our implementation uses the first sub-vector for nearest().
+        use lance_namespace::models::AnalyzeTableQueryPlanRequest;
+        use lance_namespace::models::QueryTableRequestVector;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_vector_table(&namespace, "vecs").await;
+
+        let mut vec_input = QueryTableRequestVector::new();
+        vec_input.multi_vector = Some(vec![
+            vec![0.1, 0.2], // used for nearest()
+            vec![0.3, 0.4], // additional vectors are ignored by explain/analyze
+        ]);
+
+        let mut req = AnalyzeTableQueryPlanRequest::new(2, vec_input);
+        req.id = Some(vec!["vecs".to_string()]);
+        req.vector_column = Some("vector".to_string());
+
+        let analysis_str = namespace.analyze_table_query_plan(req).await.unwrap();
+        assert!(!analysis_str.is_empty(), "analysis string should not be empty");
+        assert!(
+            analysis_str.to_lowercase().contains("vector")
+                || analysis_str.to_lowercase().contains("knn"),
+            "analysis should reflect vector search, got: {analysis_str}"
+        );
     }
 }
