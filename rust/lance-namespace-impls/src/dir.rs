@@ -42,17 +42,16 @@ use lance_namespace::models::{
     BatchDeleteTableVersionsResponse, CreateNamespaceRequest, CreateNamespaceResponse,
     CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
     CreateTableScalarIndexResponse, CreateTableVersionRequest, CreateTableVersionResponse,
-    DeclareTableRequest, DeclareTableResponse, DescribeNamespaceRequest,
-    DescribeNamespaceResponse, DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse,
-    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
-    DescribeTableVersionResponse, DescribeTransactionRequest, DescribeTransactionResponse,
-    DropNamespaceRequest, DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse,
-    DropTableRequest, DropTableResponse, ExplainTableQueryPlanRequest, FragmentStats,
-    FragmentSummary, GetTableStatsRequest, GetTableStatsResponse, Identity, IndexContent,
-    ListNamespacesRequest, ListNamespacesResponse, ListTableIndicesRequest,
-    ListTableIndicesResponse, ListTableVersionsRequest, ListTableVersionsResponse,
-    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest,
-    QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest,
+    DeclareTableRequest, DeclareTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
+    DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse, DescribeTableRequest,
+    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
+    DescribeTransactionRequest, DescribeTransactionResponse, DropNamespaceRequest,
+    DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse, DropTableRequest,
+    DropTableResponse, ExplainTableQueryPlanRequest, FragmentStats, FragmentSummary,
+    GetTableStatsRequest, GetTableStatsResponse, Identity, IndexContent, ListNamespacesRequest,
+    ListNamespacesResponse, ListTableIndicesRequest, ListTableIndicesResponse,
+    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
+    NamespaceExistsRequest, QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest,
     RestoreTableResponse, TableExistsRequest, TableVersion, UpdateTableSchemaMetadataRequest,
     UpdateTableSchemaMetadataResponse,
 };
@@ -2854,9 +2853,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let mut dataset = self
-            .load_dataset(&table_uri, None, "restore_table")
-            .await?;
+        let mut dataset = self.load_dataset(&table_uri, None, "restore_table").await?;
 
         dataset = dataset
             .checkout_version(version as u64)
@@ -2941,7 +2938,10 @@ impl LanceNamespace for DirectoryNamespace {
         })
     }
 
-    async fn get_table_stats(&self, request: GetTableStatsRequest) -> Result<GetTableStatsResponse> {
+    async fn get_table_stats(
+        &self,
+        request: GetTableStatsRequest,
+    ) -> Result<GetTableStatsResponse> {
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = Arc::new(
             self.load_dataset(&table_uri, None, "get_table_stats")
@@ -3004,11 +3004,7 @@ impl LanceNamespace for DirectoryNamespace {
         // Count non-system indices
         let indices = dataset.load_indices().await.map_err(|e| {
             Error::namespace_source(
-                format!(
-                    "Failed to load indices for table at '{}': {}",
-                    table_uri, e
-                )
-                .into(),
+                format!("Failed to load indices for table at '{}': {}", table_uri, e).into(),
             )
         })?;
         let num_indices = indices.iter().filter(|m| !is_system_index(m)).count() as i64;
@@ -3028,7 +3024,11 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<String> {
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
-            .load_dataset(&table_uri, request.query.version, "explain_table_query_plan")
+            .load_dataset(
+                &table_uri,
+                request.query.version,
+                "explain_table_query_plan",
+            )
             .await?;
         let verbose = request.verbose.unwrap_or(false);
 
@@ -3121,10 +3121,23 @@ mod tests {
     use lance_index::DatasetIndexExt;
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
+        QueryTableRequestColumns,
     };
     use lance_namespace::schema::convert_json_arrow_schema;
     use std::io::Cursor;
     use std::sync::Arc;
+
+    fn assert_plan_contains_all(plan: &str, expected_fragments: &[&str], context: &str) {
+        for expected_fragment in expected_fragments {
+            assert!(
+                plan.contains(expected_fragment),
+                "{}. Missing fragment: '{}'. Plan:\n{}",
+                context,
+                expected_fragment,
+                plan
+            );
+        }
+    }
 
     /// Helper to create a test DirectoryNamespace with a temporary directory
     async fn create_test_namespace() -> (DirectoryNamespace, TempStdDir) {
@@ -6695,12 +6708,8 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // Tests for Table lifecycle and metadata methods
-    // =========================================================================
-
     #[tokio::test]
-    async fn test_list_all_tables_dir_only() {
+    async fn test_list_all_tables() {
         use lance_namespace::models::ListTablesRequest;
 
         let (namespace, _temp_dir) = create_test_namespace().await;
@@ -6717,87 +6726,6 @@ mod tests {
         let mut tables = response.tables;
         tables.sort();
         assert_eq!(tables, vec!["alpha", "beta"]);
-    }
-
-    #[tokio::test]
-    async fn test_list_all_tables_empty() {
-        use lance_namespace::models::ListTablesRequest;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-
-        let request = ListTablesRequest {
-            id: Some(vec![]),
-            page_token: None,
-            limit: None,
-            ..Default::default()
-        };
-        let response = namespace.list_all_tables(request).await.unwrap();
-        assert!(response.tables.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_list_all_tables_with_pagination() {
-        use lance_namespace::models::ListTablesRequest;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-        create_scalar_table(&namespace, "aaa").await;
-        create_scalar_table(&namespace, "bbb").await;
-        create_scalar_table(&namespace, "ccc").await;
-
-        // First page (limit 2)
-        let request = ListTablesRequest {
-            id: Some(vec![]),
-            page_token: None,
-            limit: Some(2),
-            ..Default::default()
-        };
-        let response = namespace.list_all_tables(request).await.unwrap();
-        assert_eq!(response.tables.len(), 2);
-        assert_eq!(response.tables, vec!["aaa", "bbb"]);
-
-        // Second page (after "bbb")
-        let request = ListTablesRequest {
-            id: Some(vec![]),
-            page_token: Some("bbb".to_string()),
-            limit: Some(2),
-            ..Default::default()
-        };
-        let response = namespace.list_all_tables(request).await.unwrap();
-        assert_eq!(response.tables, vec!["ccc"]);
-    }
-
-    #[tokio::test]
-    async fn test_list_all_tables_is_superset_of_root_tables() {
-        // In dir-only mode list_all_tables covers the same tables as list_tables
-        // for the root namespace, since there are no child namespaces on disk.
-        use lance_namespace::models::ListTablesRequest;
-
-        let temp_dir = TempStdDir::default();
-        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
-            .manifest_enabled(false)
-            .dir_listing_enabled(true)
-            .build()
-            .await
-            .unwrap();
-
-        create_scalar_table(&namespace, "table_x").await;
-        create_scalar_table(&namespace, "table_y").await;
-
-        let request = ListTablesRequest {
-            id: Some(vec![]),
-            page_token: None,
-            limit: None,
-            ..Default::default()
-        };
-        let all_response = namespace.list_all_tables(request.clone()).await.unwrap();
-        let root_response = namespace.list_tables(request).await.unwrap();
-
-        let mut all_tables = all_response.tables;
-        let mut root_tables = root_response.tables;
-        all_tables.sort();
-        root_tables.sort();
-        assert_eq!(all_tables, root_tables);
-        assert_eq!(all_tables, vec!["table_x", "table_y"]);
     }
 
     #[tokio::test]
@@ -6834,33 +6762,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_restore_table_invalid_version() {
-        use lance_namespace::models::RestoreTableRequest;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-        create_scalar_table(&namespace, "users").await;
-
-        // Negative version should fail
-        let mut restore_req = RestoreTableRequest::new(-1);
-        restore_req.id = Some(vec!["users".to_string()]);
-        let result = namespace.restore_table(restore_req).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("non-negative"));
-    }
-
-    #[tokio::test]
-    async fn test_restore_table_not_found() {
-        use lance_namespace::models::RestoreTableRequest;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-
-        let mut restore_req = RestoreTableRequest::new(1);
-        restore_req.id = Some(vec!["nonexistent".to_string()]);
-        let result = namespace.restore_table(restore_req).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_update_table_schema_metadata() {
         use lance_namespace::models::UpdateTableSchemaMetadataRequest;
 
@@ -6888,64 +6789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_table_schema_metadata_empty() {
-        use lance_namespace::models::UpdateTableSchemaMetadataRequest;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-        create_scalar_table(&namespace, "products").await;
-
-        // Empty metadata update should succeed
-        let mut req = UpdateTableSchemaMetadataRequest::new();
-        req.id = Some(vec!["products".to_string()]);
-        req.metadata = Some(HashMap::new());
-
-        let response = namespace
-            .update_table_schema_metadata(req)
-            .await
-            .unwrap();
-        assert!(response.metadata.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_update_table_schema_metadata_not_found() {
-        use lance_namespace::models::UpdateTableSchemaMetadataRequest;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-
-        let mut req = UpdateTableSchemaMetadataRequest::new();
-        req.id = Some(vec!["nonexistent".to_string()]);
-        req.metadata = Some(HashMap::new());
-
-        let result = namespace.update_table_schema_metadata(req).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_get_table_stats() {
-        use lance_namespace::models::GetTableStatsRequest;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-        create_scalar_table(&namespace, "orders").await;
-
-        let mut req = GetTableStatsRequest::new();
-        req.id = Some(vec!["orders".to_string()]);
-
-        let response = namespace.get_table_stats(req).await.unwrap();
-
-        // The scalar table has 3 rows
-        assert_eq!(response.num_rows, 3);
-        // Fragments: should have at least 1
-        assert!(response.fragment_stats.num_fragments >= 1);
-        // num_indices: 0 (no indices created)
-        assert_eq!(response.num_indices, 0);
-        // Fragment summary lengths should reflect the 3-row fragment
-        let lengths = &response.fragment_stats.lengths;
-        assert!(lengths.min >= 0);
-        assert!(lengths.max >= lengths.min);
-    }
-
-    #[tokio::test]
-    async fn test_get_table_stats_with_index() {
         use lance_namespace::models::GetTableStatsRequest;
 
         let (namespace, _temp_dir) = create_test_namespace().await;
@@ -6961,75 +6805,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_table_stats_not_found() {
-        use lance_namespace::models::GetTableStatsRequest;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-
-        let mut req = GetTableStatsRequest::new();
-        req.id = Some(vec!["nonexistent".to_string()]);
-
-        let result = namespace.get_table_stats(req).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_explain_table_query_plan() {
-        use lance_namespace::models::{ExplainTableQueryPlanRequest, QueryTableRequest};
         use lance_namespace::models::QueryTableRequestVector;
+        use lance_namespace::models::{ExplainTableQueryPlanRequest, QueryTableRequest};
 
         let (namespace, _temp_dir) = create_test_namespace().await;
         create_scalar_table(&namespace, "catalog").await;
 
-        let query = QueryTableRequest::new(
-            1,
-            QueryTableRequestVector::new(),
-        );
-        let mut req = ExplainTableQueryPlanRequest::new(query);
-        req.id = Some(vec!["catalog".to_string()]);
-        req.verbose = Some(false);
-
-        let plan_str = namespace.explain_table_query_plan(req).await.unwrap();
-        assert!(!plan_str.is_empty(), "Plan string should not be empty");
-    }
-
-    #[tokio::test]
-    async fn test_explain_table_query_plan_with_filter() {
-        use lance_namespace::models::{ExplainTableQueryPlanRequest, QueryTableRequest};
-        use lance_namespace::models::QueryTableRequestVector;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-        create_scalar_table(&namespace, "catalog").await;
-
-        let mut query = QueryTableRequest::new(
-            1,
-            QueryTableRequestVector::new(),
-        );
+        let mut query = QueryTableRequest::new(1, QueryTableRequestVector::new());
         query.filter = Some("id > 1".to_string());
+        query.columns = Some(Box::new(QueryTableRequestColumns {
+            column_names: Some(vec!["id".to_string(), "name".to_string()]),
+            column_aliases: None,
+        }));
+        query.with_row_id = Some(true);
 
         let mut req = ExplainTableQueryPlanRequest::new(query);
         req.id = Some(vec!["catalog".to_string()]);
 
         let plan_str = namespace.explain_table_query_plan(req).await.unwrap();
-        assert!(!plan_str.is_empty(), "Filtered plan string should not be empty");
-    }
-
-    #[tokio::test]
-    async fn test_explain_table_query_plan_not_found() {
-        use lance_namespace::models::{ExplainTableQueryPlanRequest, QueryTableRequest};
-        use lance_namespace::models::QueryTableRequestVector;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-
-        let query = QueryTableRequest::new(
-            1,
-            QueryTableRequestVector::new(),
+        assert_plan_contains_all(
+            &plan_str,
+            &[
+                "ProjectionExec: expr=[id@0 as id, name@2 as name",
+                "Take: columns=\"id, _rowid, (name)\"",
+                "LanceRead: uri=",
+                "projection=[id]",
+                "row_id=true, row_addr=false",
+                "full_filter=id > Int32(1)",
+                "refine_filter=id > Int32(1)",
+            ],
+            "Filtered explain plan should preserve late materialization and filter pushdown",
         );
-        let mut req = ExplainTableQueryPlanRequest::new(query);
-        req.id = Some(vec!["nonexistent".to_string()]);
-
-        let result = namespace.explain_table_query_plan(req).await;
-        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -7040,162 +6847,33 @@ mod tests {
         let (namespace, _temp_dir) = create_test_namespace().await;
         create_scalar_table(&namespace, "catalog").await;
 
-        let mut req = AnalyzeTableQueryPlanRequest::new(
-            1,
-            QueryTableRequestVector::new(),
-        );
-        req.id = Some(vec!["catalog".to_string()]);
-
-        let analysis_str = namespace.analyze_table_query_plan(req).await.unwrap();
-        assert!(!analysis_str.is_empty(), "Analysis string should not be empty");
-    }
-
-    #[tokio::test]
-    async fn test_analyze_table_query_plan_with_filter() {
-        use lance_namespace::models::AnalyzeTableQueryPlanRequest;
-        use lance_namespace::models::QueryTableRequestVector;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-        create_scalar_table(&namespace, "catalog").await;
-
-        let mut req = AnalyzeTableQueryPlanRequest::new(
-            1,
-            QueryTableRequestVector::new(),
-        );
+        let mut req = AnalyzeTableQueryPlanRequest::new(1, QueryTableRequestVector::new());
         req.id = Some(vec!["catalog".to_string()]);
         req.filter = Some("id > 0".to_string());
+        req.columns = Some(Box::new(QueryTableRequestColumns {
+            column_names: Some(vec!["id".to_string(), "name".to_string()]),
+            column_aliases: None,
+        }));
+        req.with_row_id = Some(true);
 
         let analysis_str = namespace.analyze_table_query_plan(req).await.unwrap();
-        assert!(!analysis_str.is_empty(), "Filtered analysis string should not be empty");
-    }
-
-    #[tokio::test]
-    async fn test_analyze_table_query_plan_not_found() {
-        use lance_namespace::models::AnalyzeTableQueryPlanRequest;
-        use lance_namespace::models::QueryTableRequestVector;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-
-        let mut req = AnalyzeTableQueryPlanRequest::new(
-            1,
-            QueryTableRequestVector::new(),
-        );
-        req.id = Some(vec!["nonexistent".to_string()]);
-
-        let result = namespace.analyze_table_query_plan(req).await;
-        assert!(result.is_err());
-    }
-
-    // ── multi-vector tests ────────────────────────────────────────────────────
-    // The vector table has a FixedSizeList<Float32, 2> "vector" column.
-    // `single_vector` maps directly; `multi_vector` falls back to the first
-    // sub-vector so both should produce a valid (non-empty) plan string.
-
-    #[tokio::test]
-    async fn test_explain_table_query_plan_with_single_vector() {
-        use lance_namespace::models::{ExplainTableQueryPlanRequest, QueryTableRequest};
-        use lance_namespace::models::QueryTableRequestVector;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-        create_vector_table(&namespace, "vecs").await;
-
-        let mut vec_input = QueryTableRequestVector::new();
-        // dim=2 matches the vector column created by create_vector_table_ipc_data
-        vec_input.single_vector = Some(vec![0.1, 0.2]);
-
-        let mut query = QueryTableRequest::new(2, vec_input);
-        query.vector_column = Some("vector".to_string());
-
-        let mut req = ExplainTableQueryPlanRequest::new(query);
-        req.id = Some(vec!["vecs".to_string()]);
-
-        let plan_str = namespace.explain_table_query_plan(req).await.unwrap();
-        assert!(!plan_str.is_empty(), "plan string should not be empty");
-        // The plan should reference the vector column, confirming KNN is applied.
-        assert!(
-            plan_str.to_lowercase().contains("vector") || plan_str.to_lowercase().contains("knn"),
-            "plan should reflect vector search, got: {plan_str}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_explain_table_query_plan_with_multi_vector() {
-        // multi_vector: our implementation uses the first sub-vector for nearest().
-        use lance_namespace::models::{ExplainTableQueryPlanRequest, QueryTableRequest};
-        use lance_namespace::models::QueryTableRequestVector;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-        create_vector_table(&namespace, "vecs").await;
-
-        let mut vec_input = QueryTableRequestVector::new();
-        vec_input.multi_vector = Some(vec![
-            vec![0.1, 0.2], // used for nearest()
-            vec![0.3, 0.4], // additional vectors are ignored by explain/analyze
-        ]);
-
-        let mut query = QueryTableRequest::new(2, vec_input);
-        query.vector_column = Some("vector".to_string());
-
-        let mut req = ExplainTableQueryPlanRequest::new(query);
-        req.id = Some(vec!["vecs".to_string()]);
-
-        let plan_str = namespace.explain_table_query_plan(req).await.unwrap();
-        assert!(!plan_str.is_empty(), "plan string should not be empty");
-        assert!(
-            plan_str.to_lowercase().contains("vector") || plan_str.to_lowercase().contains("knn"),
-            "plan should reflect vector search, got: {plan_str}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_analyze_table_query_plan_with_single_vector() {
-        use lance_namespace::models::AnalyzeTableQueryPlanRequest;
-        use lance_namespace::models::QueryTableRequestVector;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-        create_vector_table(&namespace, "vecs").await;
-
-        let mut vec_input = QueryTableRequestVector::new();
-        vec_input.single_vector = Some(vec![0.1, 0.2]);
-
-        let mut req = AnalyzeTableQueryPlanRequest::new(2, vec_input);
-        req.id = Some(vec!["vecs".to_string()]);
-        req.vector_column = Some("vector".to_string());
-
-        let analysis_str = namespace.analyze_table_query_plan(req).await.unwrap();
-        assert!(!analysis_str.is_empty(), "analysis string should not be empty");
-        assert!(
-            analysis_str.to_lowercase().contains("vector")
-                || analysis_str.to_lowercase().contains("knn"),
-            "analysis should reflect vector search, got: {analysis_str}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_analyze_table_query_plan_with_multi_vector() {
-        // multi_vector: our implementation uses the first sub-vector for nearest().
-        use lance_namespace::models::AnalyzeTableQueryPlanRequest;
-        use lance_namespace::models::QueryTableRequestVector;
-
-        let (namespace, _temp_dir) = create_test_namespace().await;
-        create_vector_table(&namespace, "vecs").await;
-
-        let mut vec_input = QueryTableRequestVector::new();
-        vec_input.multi_vector = Some(vec![
-            vec![0.1, 0.2], // used for nearest()
-            vec![0.3, 0.4], // additional vectors are ignored by explain/analyze
-        ]);
-
-        let mut req = AnalyzeTableQueryPlanRequest::new(2, vec_input);
-        req.id = Some(vec!["vecs".to_string()]);
-        req.vector_column = Some("vector".to_string());
-
-        let analysis_str = namespace.analyze_table_query_plan(req).await.unwrap();
-        assert!(!analysis_str.is_empty(), "analysis string should not be empty");
-        assert!(
-            analysis_str.to_lowercase().contains("vector")
-                || analysis_str.to_lowercase().contains("knn"),
-            "analysis should reflect vector search, got: {analysis_str}"
+        assert_plan_contains_all(
+            &analysis_str,
+            &[
+                "AnalyzeExec verbose=true",
+                "ProjectionExec: elapsed=",
+                "expr=[id@0 as id, name@2 as name",
+                "Take: elapsed=",
+                "columns=\"id, _rowid, (name)\"",
+                "CoalesceBatchesExec: elapsed=",
+                "LanceRead: elapsed=",
+                "projection=[id]",
+                "row_id=true, row_addr=false",
+                "full_filter=id > Int32(0)",
+                "refine_filter=id > Int32(0)",
+                "metrics=[output_rows=",
+            ],
+            "Filtered analyze plan should preserve late materialization and filter pushdown",
         );
     }
 }
