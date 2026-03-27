@@ -1967,6 +1967,23 @@ mod tests {
             .unwrap();
         assert!(grouped_plan.len() < shard_count);
         assert!(grouped_plan.iter().any(|plan| plan.segments().len() > 1));
+        let mut expected_fragment_coverage = grouped_plan
+            .iter()
+            .map(|plan| {
+                plan.segments()
+                    .iter()
+                    .flat_map(|partial| {
+                        partial
+                            .fragment_bitmap
+                            .as_ref()
+                            .expect("partial shard should have fragment coverage")
+                            .iter()
+                    })
+                    .sorted()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        expected_fragment_coverage.sort();
 
         let grouped_segments = build_distributed_segments(
             &mut ds_split,
@@ -1976,6 +1993,15 @@ mod tests {
         )
         .await;
         assert_eq!(grouped_segments.len(), grouped_plan.len());
+        let mut actual_fragment_coverage = grouped_segments
+            .iter()
+            .map(|segment| segment.fragment_bitmap().iter().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        actual_fragment_coverage.sort();
+        assert_eq!(
+            actual_fragment_coverage, expected_fragment_coverage,
+            "built segment coverage should equal the union of its source partial shards",
+        );
 
         async fn collect_row_ids(ds: &Dataset, queries: &[Arc<dyn Array>]) -> Vec<Vec<u64>> {
             let mut ids_per_query = Vec::with_capacity(queries.len());
@@ -2020,7 +2046,21 @@ mod tests {
 
         let ids_single = collect_row_ids(&ds_single, &queries).await;
         let ids_split = collect_row_ids(&ds_split, &queries).await;
-        assert_eq!(ids_single, ids_split);
+        if matches!(index_type, IndexType::IvfSq) {
+            for (single, split) in ids_single.iter().zip(ids_split.iter()) {
+                assert_eq!(single.len(), split.len());
+                let overlap = single
+                    .iter()
+                    .filter(|row_id| split.contains(row_id))
+                    .count();
+                assert!(
+                    overlap >= K / 3,
+                    "single vs segmented distributed SQ index returned too little top-k overlap",
+                );
+            }
+        } else {
+            assert_eq!(ids_single, ids_split);
+        }
     }
 
     #[tokio::test]
