@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::index::{IndexParams, vector::VectorIndexParams};
@@ -35,19 +36,22 @@ use std::sync::Arc;
 
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
-    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
-    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableVersionRequest,
-    CreateTableVersionResponse, DeclareTableRequest, DeclareTableResponse,
-    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
-    DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
-    DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
-    DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
-    DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse, Identity,
-    IndexContent, ListNamespacesRequest, ListNamespacesResponse, ListTableIndicesRequest,
+    AnalyzeTableQueryPlanRequest, BatchDeleteTableVersionsRequest,
+    BatchDeleteTableVersionsResponse, CreateNamespaceRequest, CreateNamespaceResponse,
+    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    CreateTableScalarIndexResponse, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeclareTableRequest, DeclareTableResponse, DescribeNamespaceRequest,
+    DescribeNamespaceResponse, DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse,
+    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
+    DescribeTableVersionResponse, DescribeTransactionRequest, DescribeTransactionResponse,
+    DropNamespaceRequest, DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse,
+    DropTableRequest, DropTableResponse, ExplainTableQueryPlanRequest, FragmentStats,
+    FragmentSummary, GetTableStatsRequest, GetTableStatsResponse, Identity, IndexContent,
+    ListNamespacesRequest, ListNamespacesResponse, ListTableIndicesRequest,
     ListTableIndicesResponse, ListTableVersionsRequest, ListTableVersionsResponse,
-    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, TableExistsRequest,
-    TableVersion,
+    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, RestoreTableRequest,
+    RestoreTableResponse, TableExistsRequest, TableVersion, UpdateTableSchemaMetadataRequest,
+    UpdateTableSchemaMetadataResponse,
 };
 
 use lance_core::{Error, Result, box_error};
@@ -2688,6 +2692,257 @@ impl LanceNamespace for DirectoryNamespace {
             .map(|transaction| transaction.uuid);
 
         Ok(DropTableIndexResponse { transaction_id })
+    }
+
+    async fn list_all_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
+        // In dir-only mode there are no child namespaces, so all tables live in the
+        // root directory. This is equivalent to listing the root namespace.
+        let mut tables = self.list_directory_tables().await?;
+        Self::apply_pagination(&mut tables, request.page_token, request.limit);
+        Ok(ListTablesResponse::new(tables))
+    }
+
+    async fn restore_table(&self, request: RestoreTableRequest) -> Result<RestoreTableResponse> {
+        let version = request.version;
+        if version < 0 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Table version for restore_table must be non-negative, got {}",
+                    version
+                )
+                .into(),
+            ));
+        }
+
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let mut dataset = self
+            .load_dataset(&table_uri, None, "restore_table")
+            .await?;
+
+        dataset = dataset
+            .checkout_version(version as u64)
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to checkout version {} for restore at '{}': {}",
+                        version, table_uri, e
+                    )
+                    .into(),
+                )
+            })?;
+
+        dataset.restore().await.map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to restore table at '{}' to version {}: {}",
+                    table_uri, version, e
+                )
+                .into(),
+            )
+        })?;
+
+        let transaction_id = dataset
+            .read_transaction()
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to read transaction after restoring '{}': {}",
+                        table_uri, e
+                    )
+                    .into(),
+                )
+            })?
+            .map(|t| t.uuid);
+
+        Ok(RestoreTableResponse { transaction_id })
+    }
+
+    async fn update_table_schema_metadata(
+        &self,
+        request: UpdateTableSchemaMetadataRequest,
+    ) -> Result<UpdateTableSchemaMetadataResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let mut dataset = self
+            .load_dataset(&table_uri, None, "update_table_schema_metadata")
+            .await?;
+
+        let new_metadata = request.metadata.unwrap_or_default();
+        let updated_metadata = dataset
+            .update_schema_metadata(new_metadata.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to update schema metadata for table at '{}': {}",
+                        table_uri, e
+                    )
+                    .into(),
+                )
+            })?;
+
+        let transaction_id = dataset
+            .read_transaction()
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to read transaction after updating metadata for '{}': {}",
+                        table_uri, e
+                    )
+                    .into(),
+                )
+            })?
+            .map(|t| t.uuid);
+
+        Ok(UpdateTableSchemaMetadataResponse {
+            metadata: Some(updated_metadata),
+            transaction_id,
+        })
+    }
+
+    async fn get_table_stats(&self, request: GetTableStatsRequest) -> Result<GetTableStatsResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = Arc::new(
+            self.load_dataset(&table_uri, None, "get_table_stats")
+                .await?,
+        );
+
+        // Compute total bytes on disk using field-level statistics
+        let data_stats = dataset.calculate_data_stats().await.map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to calculate data statistics for table at '{}': {}",
+                    table_uri, e
+                )
+                .into(),
+            )
+        })?;
+        let total_bytes: i64 = data_stats
+            .fields
+            .iter()
+            .map(|f| f.bytes_on_disk as i64)
+            .sum();
+
+        // Collect per-fragment row counts
+        let fragment_row_futures: Vec<_> = dataset
+            .get_fragments()
+            .into_iter()
+            .map(|f| async move { f.physical_rows().await })
+            .collect();
+        let fragment_row_results = futures::future::join_all(fragment_row_futures).await;
+        let mut fragment_row_counts: Vec<i64> = fragment_row_results
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .map(|r| r as i64)
+            .collect();
+
+        let num_fragments = fragment_row_counts.len() as i64;
+        let num_rows: i64 = fragment_row_counts.iter().sum();
+
+        // Fragments with fewer than 1024 rows are considered "small"
+        const SMALL_FRAGMENT_THRESHOLD: i64 = 1024;
+        let num_small_fragments = fragment_row_counts
+            .iter()
+            .filter(|&&r| r < SMALL_FRAGMENT_THRESHOLD)
+            .count() as i64;
+
+        // Compute length summary statistics
+        fragment_row_counts.sort_unstable();
+        let lengths = if fragment_row_counts.is_empty() {
+            FragmentSummary::new(0, 0, 0, 0, 0, 0, 0)
+        } else {
+            let len = fragment_row_counts.len();
+            let min = fragment_row_counts[0];
+            let max = fragment_row_counts[len - 1];
+            let mean = num_rows / num_fragments;
+            let pct = |p: f64| fragment_row_counts[((len - 1) as f64 * p) as usize];
+            FragmentSummary::new(min, max, mean, pct(0.25), pct(0.50), pct(0.75), pct(0.99))
+        };
+
+        // Count non-system indices
+        let indices = dataset.load_indices().await.map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to load indices for table at '{}': {}",
+                    table_uri, e
+                )
+                .into(),
+            )
+        })?;
+        let num_indices = indices.iter().filter(|m| !is_system_index(m)).count() as i64;
+
+        let fragment_stats = FragmentStats::new(num_fragments, num_small_fragments, lengths);
+        Ok(GetTableStatsResponse::new(
+            total_bytes,
+            num_rows,
+            num_indices,
+            fragment_stats,
+        ))
+    }
+
+    async fn explain_table_query_plan(
+        &self,
+        request: ExplainTableQueryPlanRequest,
+    ) -> Result<String> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, None, "explain_table_query_plan")
+            .await?;
+        let verbose = request.verbose.unwrap_or(false);
+
+        let mut scanner = dataset.scan();
+        if let Some(ref filter) = request.query.filter {
+            scanner.filter(filter).map_err(|e| {
+                Error::invalid_input_source(
+                    format!("Invalid filter expression for explain_table_query_plan: {}", e).into(),
+                )
+            })?;
+        }
+
+        scanner.explain_plan(verbose).await.map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to explain query plan for table at '{}': {}",
+                    table_uri, e
+                )
+                .into(),
+            )
+        })
+    }
+
+    async fn analyze_table_query_plan(
+        &self,
+        request: AnalyzeTableQueryPlanRequest,
+    ) -> Result<String> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, None, "analyze_table_query_plan")
+            .await?;
+
+        let mut scanner = dataset.scan();
+        if let Some(ref filter) = request.filter {
+            scanner.filter(filter).map_err(|e| {
+                Error::invalid_input_source(
+                    format!(
+                        "Invalid filter expression for analyze_table_query_plan: {}",
+                        e
+                    )
+                    .into(),
+                )
+            })?;
+        }
+
+        scanner.analyze_plan().await.map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to analyze query plan for table at '{}': {}",
+                    table_uri, e
+                )
+                .into(),
+            )
+        })
     }
 
     fn namespace_id(&self) -> String {
@@ -6276,5 +6531,396 @@ mod tests {
             let (ver, _path) = &versions[0];
             assert_eq!(*ver, 2, "Recorded version should be 2");
         }
+    }
+
+    // =========================================================================
+    // Tests for Table lifecycle and metadata methods
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_list_all_tables_dir_only() {
+        use lance_namespace::models::ListTablesRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "alpha").await;
+        create_scalar_table(&namespace, "beta").await;
+
+        let request = ListTablesRequest {
+            id: Some(vec![]),
+            page_token: None,
+            limit: None,
+            ..Default::default()
+        };
+        let response = namespace.list_all_tables(request).await.unwrap();
+        let mut tables = response.tables;
+        tables.sort();
+        assert_eq!(tables, vec!["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_tables_empty() {
+        use lance_namespace::models::ListTablesRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let request = ListTablesRequest {
+            id: Some(vec![]),
+            page_token: None,
+            limit: None,
+            ..Default::default()
+        };
+        let response = namespace.list_all_tables(request).await.unwrap();
+        assert!(response.tables.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_tables_with_pagination() {
+        use lance_namespace::models::ListTablesRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "aaa").await;
+        create_scalar_table(&namespace, "bbb").await;
+        create_scalar_table(&namespace, "ccc").await;
+
+        // First page (limit 2)
+        let request = ListTablesRequest {
+            id: Some(vec![]),
+            page_token: None,
+            limit: Some(2),
+            ..Default::default()
+        };
+        let response = namespace.list_all_tables(request).await.unwrap();
+        assert_eq!(response.tables.len(), 2);
+        assert_eq!(response.tables, vec!["aaa", "bbb"]);
+
+        // Second page (after "bbb")
+        let request = ListTablesRequest {
+            id: Some(vec![]),
+            page_token: Some("bbb".to_string()),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let response = namespace.list_all_tables(request).await.unwrap();
+        assert_eq!(response.tables, vec!["ccc"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_tables_is_superset_of_root_tables() {
+        // In dir-only mode list_all_tables covers the same tables as list_tables
+        // for the root namespace, since there are no child namespaces on disk.
+        use lance_namespace::models::ListTablesRequest;
+
+        let temp_dir = TempStdDir::default();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        create_scalar_table(&namespace, "table_x").await;
+        create_scalar_table(&namespace, "table_y").await;
+
+        let request = ListTablesRequest {
+            id: Some(vec![]),
+            page_token: None,
+            limit: None,
+            ..Default::default()
+        };
+        let all_response = namespace.list_all_tables(request.clone()).await.unwrap();
+        let root_response = namespace.list_tables(request).await.unwrap();
+
+        let mut all_tables = all_response.tables;
+        let mut root_tables = root_response.tables;
+        all_tables.sort();
+        root_tables.sort();
+        assert_eq!(all_tables, root_tables);
+        assert_eq!(all_tables, vec!["table_x", "table_y"]);
+    }
+
+    #[tokio::test]
+    async fn test_restore_table() {
+        use lance_namespace::models::RestoreTableRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+
+        // Create a second version by creating a scalar index (this adds a new version)
+        create_scalar_index(&namespace, "users", "users_id_idx").await;
+
+        let dataset = open_dataset(&namespace, "users").await;
+        let current_version = dataset.version().version;
+        assert!(current_version >= 2, "Should have at least 2 versions");
+
+        // Restore to version 1
+        let mut restore_req = RestoreTableRequest::new(1);
+        restore_req.id = Some(vec!["users".to_string()]);
+        let response = namespace.restore_table(restore_req).await.unwrap();
+
+        // transaction_id should be present (the restore operation)
+        assert!(
+            response.transaction_id.is_some(),
+            "restore_table should return a transaction_id"
+        );
+
+        // Verify the dataset now has a new version (restore creates a new version)
+        let dataset_after = open_dataset(&namespace, "users").await;
+        assert!(
+            dataset_after.version().version > current_version,
+            "Restore should create a new version"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_table_invalid_version() {
+        use lance_namespace::models::RestoreTableRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+
+        // Negative version should fail
+        let mut restore_req = RestoreTableRequest::new(-1);
+        restore_req.id = Some(vec!["users".to_string()]);
+        let result = namespace.restore_table(restore_req).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("non-negative"));
+    }
+
+    #[tokio::test]
+    async fn test_restore_table_not_found() {
+        use lance_namespace::models::RestoreTableRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let mut restore_req = RestoreTableRequest::new(1);
+        restore_req.id = Some(vec!["nonexistent".to_string()]);
+        let result = namespace.restore_table(restore_req).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_table_schema_metadata() {
+        use lance_namespace::models::UpdateTableSchemaMetadataRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "products").await;
+
+        let mut metadata = HashMap::new();
+        metadata.insert("owner".to_string(), "team_a".to_string());
+        metadata.insert("version".to_string(), "1.0".to_string());
+
+        let mut req = UpdateTableSchemaMetadataRequest::new();
+        req.id = Some(vec!["products".to_string()]);
+        req.metadata = Some(metadata.clone());
+
+        let response = namespace.update_table_schema_metadata(req).await.unwrap();
+
+        assert!(response.metadata.is_some());
+        let returned = response.metadata.unwrap();
+        assert_eq!(returned.get("owner"), Some(&"team_a".to_string()));
+        assert_eq!(returned.get("version"), Some(&"1.0".to_string()));
+        assert!(
+            response.transaction_id.is_some(),
+            "update_table_schema_metadata should return a transaction_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_table_schema_metadata_empty() {
+        use lance_namespace::models::UpdateTableSchemaMetadataRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "products").await;
+
+        // Empty metadata update should succeed
+        let mut req = UpdateTableSchemaMetadataRequest::new();
+        req.id = Some(vec!["products".to_string()]);
+        req.metadata = Some(HashMap::new());
+
+        let response = namespace
+            .update_table_schema_metadata(req)
+            .await
+            .unwrap();
+        assert!(response.metadata.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_table_schema_metadata_not_found() {
+        use lance_namespace::models::UpdateTableSchemaMetadataRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let mut req = UpdateTableSchemaMetadataRequest::new();
+        req.id = Some(vec!["nonexistent".to_string()]);
+        req.metadata = Some(HashMap::new());
+
+        let result = namespace.update_table_schema_metadata(req).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_table_stats() {
+        use lance_namespace::models::GetTableStatsRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "orders").await;
+
+        let mut req = GetTableStatsRequest::new();
+        req.id = Some(vec!["orders".to_string()]);
+
+        let response = namespace.get_table_stats(req).await.unwrap();
+
+        // The scalar table has 3 rows
+        assert_eq!(response.num_rows, 3);
+        // Fragments: should have at least 1
+        assert!(response.fragment_stats.num_fragments >= 1);
+        // num_indices: 0 (no indices created)
+        assert_eq!(response.num_indices, 0);
+        // Fragment summary lengths should reflect the 3-row fragment
+        let lengths = &response.fragment_stats.lengths;
+        assert!(lengths.min >= 0);
+        assert!(lengths.max >= lengths.min);
+    }
+
+    #[tokio::test]
+    async fn test_get_table_stats_with_index() {
+        use lance_namespace::models::GetTableStatsRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "items").await;
+        create_scalar_index(&namespace, "items", "items_id_idx").await;
+
+        let mut req = GetTableStatsRequest::new();
+        req.id = Some(vec!["items".to_string()]);
+
+        let response = namespace.get_table_stats(req).await.unwrap();
+        assert_eq!(response.num_rows, 3);
+        assert_eq!(response.num_indices, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_table_stats_not_found() {
+        use lance_namespace::models::GetTableStatsRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let mut req = GetTableStatsRequest::new();
+        req.id = Some(vec!["nonexistent".to_string()]);
+
+        let result = namespace.get_table_stats(req).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_explain_table_query_plan() {
+        use lance_namespace::models::{ExplainTableQueryPlanRequest, QueryTableRequest};
+        use lance_namespace::models::QueryTableRequestVector;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "catalog").await;
+
+        let query = QueryTableRequest::new(
+            1,
+            QueryTableRequestVector::new(),
+        );
+        let mut req = ExplainTableQueryPlanRequest::new(query);
+        req.id = Some(vec!["catalog".to_string()]);
+        req.verbose = Some(false);
+
+        let plan_str = namespace.explain_table_query_plan(req).await.unwrap();
+        assert!(!plan_str.is_empty(), "Plan string should not be empty");
+    }
+
+    #[tokio::test]
+    async fn test_explain_table_query_plan_with_filter() {
+        use lance_namespace::models::{ExplainTableQueryPlanRequest, QueryTableRequest};
+        use lance_namespace::models::QueryTableRequestVector;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "catalog").await;
+
+        let mut query = QueryTableRequest::new(
+            1,
+            QueryTableRequestVector::new(),
+        );
+        query.filter = Some("id > 1".to_string());
+
+        let mut req = ExplainTableQueryPlanRequest::new(query);
+        req.id = Some(vec!["catalog".to_string()]);
+
+        let plan_str = namespace.explain_table_query_plan(req).await.unwrap();
+        assert!(!plan_str.is_empty(), "Filtered plan string should not be empty");
+    }
+
+    #[tokio::test]
+    async fn test_explain_table_query_plan_not_found() {
+        use lance_namespace::models::{ExplainTableQueryPlanRequest, QueryTableRequest};
+        use lance_namespace::models::QueryTableRequestVector;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let query = QueryTableRequest::new(
+            1,
+            QueryTableRequestVector::new(),
+        );
+        let mut req = ExplainTableQueryPlanRequest::new(query);
+        req.id = Some(vec!["nonexistent".to_string()]);
+
+        let result = namespace.explain_table_query_plan(req).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_analyze_table_query_plan() {
+        use lance_namespace::models::AnalyzeTableQueryPlanRequest;
+        use lance_namespace::models::QueryTableRequestVector;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "catalog").await;
+
+        let mut req = AnalyzeTableQueryPlanRequest::new(
+            1,
+            QueryTableRequestVector::new(),
+        );
+        req.id = Some(vec!["catalog".to_string()]);
+
+        let analysis_str = namespace.analyze_table_query_plan(req).await.unwrap();
+        assert!(!analysis_str.is_empty(), "Analysis string should not be empty");
+    }
+
+    #[tokio::test]
+    async fn test_analyze_table_query_plan_with_filter() {
+        use lance_namespace::models::AnalyzeTableQueryPlanRequest;
+        use lance_namespace::models::QueryTableRequestVector;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "catalog").await;
+
+        let mut req = AnalyzeTableQueryPlanRequest::new(
+            1,
+            QueryTableRequestVector::new(),
+        );
+        req.id = Some(vec!["catalog".to_string()]);
+        req.filter = Some("id > 0".to_string());
+
+        let analysis_str = namespace.analyze_table_query_plan(req).await.unwrap();
+        assert!(!analysis_str.is_empty(), "Filtered analysis string should not be empty");
+    }
+
+    #[tokio::test]
+    async fn test_analyze_table_query_plan_not_found() {
+        use lance_namespace::models::AnalyzeTableQueryPlanRequest;
+        use lance_namespace::models::QueryTableRequestVector;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let mut req = AnalyzeTableQueryPlanRequest::new(
+            1,
+            QueryTableRequestVector::new(),
+        );
+        req.id = Some(vec!["nonexistent".to_string()]);
+
+        let result = namespace.analyze_table_query_plan(req).await;
+        assert!(result.is_err());
     }
 }
