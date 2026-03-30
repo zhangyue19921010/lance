@@ -1296,7 +1296,6 @@ mod tests {
         .unwrap();
     }
 
-    #[allow(dead_code)]
     async fn ground_truth(
         dataset: &Dataset,
         column: &str,
@@ -1322,7 +1321,6 @@ mod tests {
             .collect()
     }
 
-    #[allow(dead_code)]
     fn multivec_ground_truth(
         vectors: &ListArray,
         query: &dyn Array,
