@@ -2739,6 +2739,7 @@ def test_merge_existing_index_segments_builds_vector_segment(tmp_path):
         )
         for fragment in frags[:2]
     ]
+    assert all(segment.index_details is not None for segment in segments)
 
     merged_segment = ds.merge_existing_index_segments(segments)
     assert merged_segment.fragment_ids is not None
