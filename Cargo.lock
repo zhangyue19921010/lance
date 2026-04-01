@@ -4721,6 +4721,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-arrow-stats"
+version = "57.0.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "arrow-select",
+ "half",
+ "lance-arrow-scalar",
+ "proptest",
+ "rstest",
+]
+
+[[package]]
 name = "lance-bitpacking"
 version = "5.0.0-beta.2"
 dependencies = [
