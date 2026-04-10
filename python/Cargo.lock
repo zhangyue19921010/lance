@@ -3877,6 +3877,7 @@ dependencies = [
  "arrow-arith",
  "arrow-array",
  "arrow-buffer",
+ "arrow-cast",
  "arrow-ipc",
  "arrow-ord",
  "arrow-row",
@@ -4010,6 +4011,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-buffer",
+ "arrow-cast",
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
@@ -5696,6 +5698,7 @@ version = "5.1.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
+ "arrow-cast",
  "arrow-data",
  "arrow-schema",
  "async-trait",
