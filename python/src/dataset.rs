@@ -800,7 +800,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -812,6 +812,7 @@ impl Dataset {
         offset: Option<i64>,
         nearest: Option<&Bound<PyDict>>,
         batch_size: Option<usize>,
+        batch_size_bytes: Option<u64>,
         io_buffer_size: Option<u64>,
         batch_readahead: Option<usize>,
         fragment_readahead: Option<usize>,
@@ -955,6 +956,9 @@ impl Dataset {
 
         if let Some(batch_size) = batch_size {
             scanner.batch_size(batch_size);
+        }
+        if let Some(batch_size_bytes) = batch_size_bytes {
+            scanner.batch_size_bytes(batch_size_bytes);
         }
         if let Some(io_buffer_size) = io_buffer_size {
             scanner.io_buffer_size(io_buffer_size);
