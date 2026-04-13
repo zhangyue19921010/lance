@@ -15,18 +15,31 @@ package org.lance.compaction;
 
 import org.lance.FragmentMetadata;
 
+import javax.annotation.Nullable;
+
 import java.io.Serializable;
 import java.util.List;
 
 /** Data of compaction task. */
 public class TaskData implements Serializable {
   private final List<FragmentMetadata> fragments;
+  @Nullable private final Boolean hasIndexedFragments;
 
   public TaskData(List<FragmentMetadata> fragments) {
+    this(fragments, null);
+  }
+
+  public TaskData(List<FragmentMetadata> fragments, @Nullable Boolean hasIndexedFragments) {
     this.fragments = fragments;
+    this.hasIndexedFragments = hasIndexedFragments;
   }
 
   public List<FragmentMetadata> getFragments() {
     return fragments;
+  }
+
+  @Nullable
+  public Boolean getHasIndexedFragments() {
+    return hasIndexedFragments;
   }
 }

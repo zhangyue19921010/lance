@@ -106,7 +106,7 @@ use lance_core::Error;
 use lance_core::datatypes::BlobHandling;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
-use lance_index::frag_reuse::FragReuseGroup;
+use lance_index::{frag_reuse::FragReuseGroup, is_system_index};
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
@@ -1026,8 +1026,7 @@ impl CandidateBin {
                     pos_range: self.pos_range.start..(self.pos_range.start + bin_len),
                     candidacy: self.candidacy.drain(0..bin_len).collect(),
                     row_counts: self.row_counts.drain(0..bin_len).collect(),
-                    // By the time we are splitting for size we are done considering indices
-                    indices: Vec::new(),
+                    indices: self.indices.clone(),
                 });
                 self.pos_range.start += bin_len;
             } else {
@@ -1123,6 +1122,32 @@ async fn reserve_fragment_ids(
     Ok(())
 }
 
+async fn needs_row_addr_capture(
+    dataset: &Dataset,
+    task: &TaskData,
+    options: &CompactionOptions,
+) -> Result<bool> {
+    if dataset.manifest.uses_stable_row_ids() {
+        return Ok(false);
+    }
+
+    let has_indexed_fragments = task.has_indexed_fragments.unwrap_or(true);
+    if has_indexed_fragments {
+        return Ok(true);
+    }
+
+    if !options.defer_index_remap {
+        return Ok(false);
+    }
+
+    let has_user_indices = dataset
+        .load_indices()
+        .await?
+        .iter()
+        .any(|index| !is_system_index(index));
+    Ok(has_user_indices)
+}
+
 /// Rewrite the files in a single task.
 ///
 /// This assumes that the dataset is the correct read version to be compacted.
@@ -1158,10 +1183,7 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
-    // If we aren't using stable row ids, then we only need to capture row
-    // addresses for tasks that actually affect at least one index.
-    let needs_row_addr_capture =
-        !dataset.manifest.uses_stable_row_ids() && task.has_indexed_fragments.unwrap_or(true);
+    let needs_row_addr_capture = needs_row_addr_capture(dataset.as_ref(), &task, options).await?;
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -1551,7 +1573,7 @@ pub async fn commit_compaction(
         rewrite_groups.push(rewrite_group);
     }
 
-    let rewritten_indices = if needs_remapping {
+    let rewritten_indices = if needs_remapping && !row_id_map.is_empty() {
         let index_remapper = remap_options.create_remapper(dataset)?;
         let affected_ids = rewrite_groups
             .iter()
@@ -2266,6 +2288,19 @@ mod tests {
         }
     }
 
+    async fn create_scalar_index(dataset: &mut Dataset) {
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
     #[rstest::rstest]
     #[tokio::test]
     async fn test_compact_distributed(
@@ -2490,6 +2525,7 @@ mod tests {
 
         // Delete a few rows from each fragment so compaction has something to do.
         dataset.delete("i % 1000 = 0").await.unwrap();
+        create_scalar_index(&mut dataset).await;
 
         compact_files(
             &mut dataset,
@@ -2858,6 +2894,7 @@ mod tests {
         )
         .await
         .unwrap();
+        create_scalar_index(&mut dataset).await;
 
         let options = CompactionOptions {
             target_rows_per_fragment: 2_000,
@@ -3230,6 +3267,7 @@ mod tests {
             .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
             .await
             .unwrap();
+        create_scalar_index(&mut dataset).await;
 
         let options = CompactionOptions {
             target_rows_per_fragment: 2_000,
@@ -3269,6 +3307,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(frag_reuse_details.versions.len(), 1);
+
+        remapping::remap_column_index(&mut dataset_clone, &["i"], Some("scalar".into()))
+            .await
+            .unwrap();
 
         // First commit the remaining 2 compaction tasks.
         let rewrite_result2 = rewrite_files(Cow::Borrowed(&dataset), tasks[1].clone(), &options)
@@ -3368,6 +3410,7 @@ mod tests {
             .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
             .await
             .unwrap();
+        create_scalar_index(&mut dataset).await;
 
         let options = CompactionOptions {
             target_rows_per_fragment: 2_000,
@@ -3408,7 +3451,10 @@ mod tests {
         assert_eq!(frag_reuse_details.versions.len(), 1);
 
         // First commit the frag_reuse_index cleanup
-        // Because there is no index, it should remove the first version.
+        // The scalar index is remapped first so cleanup can remove the first version.
+        remapping::remap_column_index(&mut dataset, &["i"], Some("scalar".into()))
+            .await
+            .unwrap();
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
 
         // Load and verify the fragment reuse index content
@@ -3478,6 +3524,7 @@ mod tests {
             .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
             .await
             .unwrap();
+        create_scalar_index(&mut dataset).await;
 
         let options = CompactionOptions {
             target_rows_per_fragment: 2_000,

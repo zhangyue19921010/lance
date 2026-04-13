@@ -302,7 +302,7 @@ fn inner_execute_task<'local>(
 }
 
 const TASK_DATA_CLASS: &str = "org/lance/compaction/TaskData";
-const TASK_DATA_CONSTRUCTOR_SIG: &str = "(Ljava/util/List;)V";
+const TASK_DATA_CONSTRUCTOR_SIG: &str = "(Ljava/util/List;Ljava/lang/Boolean;)V";
 const COMPACTION_METRICS_CLASS: &str = "org/lance/compaction/CompactionMetrics";
 const COMPACTION_METRICS_CONSTRUCTOR_SIG: &str = "(JJJJ)V";
 const COMPACTION_PLAN_CLASS: &str = "org/lance/compaction/CompactionPlan";
@@ -317,10 +317,14 @@ const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/uti
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let fragments = export_vec(env, &self.fragments)?;
+        let has_indexed_fragments = to_java_boolean_obj(env, self.has_indexed_fragments)?;
         Ok(env.new_object(
             TASK_DATA_CLASS,
             TASK_DATA_CONSTRUCTOR_SIG,
-            &[JValueGen::Object(&fragments)],
+            &[
+                JValueGen::Object(&fragments),
+                JValueGen::Object(&has_indexed_fragments),
+            ],
         )?)
     }
 }
@@ -462,8 +466,20 @@ impl FromJObjectWithEnv<TaskData> for JObject<'_> {
         let task_data = import_vec_from_method(env, self, "getFragments", |env, fragment| {
             fragment.extract_object(env)
         })?;
+        let has_indexed_fragments_obj = env
+            .call_method(self, "getHasIndexedFragments", "()Ljava/lang/Boolean;", &[])?
+            .l()?;
+        let has_indexed_fragments = if has_indexed_fragments_obj.is_null() {
+            None
+        } else {
+            Some(
+                env.call_method(&has_indexed_fragments_obj, "booleanValue", "()Z", &[])?
+                    .z()?,
+            )
+        };
         Ok(TaskData {
             fragments: task_data,
+            has_indexed_fragments,
         })
     }
 }
