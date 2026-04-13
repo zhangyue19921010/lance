@@ -704,6 +704,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
             .map(|bin| TaskData {
                 fragments: bin.fragments,
+                has_indexed_fragments: Some(!bin.indices.is_empty()),
             })
             .collect();
 
@@ -923,6 +924,9 @@ async fn prepare_reader(
 pub struct TaskData {
     /// The fragments to compact.
     pub fragments: Vec<Fragment>,
+    /// Whether any fragment in this task is covered by an index.
+    #[serde(default)]
+    pub has_indexed_fragments: Option<bool>,
 }
 
 /// A standalone task that can be serialized and sent to another machine for
@@ -1076,6 +1080,8 @@ pub struct RewriteResult {
     ///
     /// - `None` when configured with stable row IDs because the row ID
     ///   sequences are rechunked directly.
+    /// - `None` when the rewritten task did not affect any indexed fragments,
+    ///   and so no row address map is needed.
     /// - `Some` then these addresses are either (1) written to storage for
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
@@ -1152,8 +1158,10 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
-    // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids();
+    // If we aren't using stable row ids, then we only need to capture row
+    // addresses for tasks that actually affect at least one index.
+    let needs_row_addr_capture =
+        !dataset.manifest.uses_stable_row_ids() && task.has_indexed_fragments.unwrap_or(true);
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -1178,7 +1186,7 @@ async fn rewrite_files(
             &fragments,
             options.batch_size,
             true,
-            needs_remapping,
+            needs_row_addr_capture,
         )
         .await?;
         row_ids_rx = rx_initial;
@@ -1229,7 +1237,7 @@ async fn rewrite_files(
             ));
         }
 
-        if needs_remapping {
+        if needs_row_addr_capture {
             let (tx, rx) = std::sync::mpsc::channel();
             let mut addrs = RoaringTreemap::new();
             for frag in &fragments {
@@ -1490,12 +1498,13 @@ pub async fn commit_compaction(
 
     let mut completed_tasks = completed_tasks;
 
-    // Single reserve_fragment_ids for all address-style tasks
-    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
-    if has_address_style {
+    // Rewritten fragments need final ids before we can commit them. Address-style
+    // remapping also depends on these ids to transpose old row addresses into the
+    // rewritten fragments.
+    let has_new_fragments = completed_tasks.iter().any(|t| !t.new_fragments.is_empty());
+    if has_new_fragments {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
-            .filter(|t| t.row_addrs.is_some())
             .flat_map(|t| t.new_fragments.iter_mut())
             .collect();
         reserve_fragment_ids(dataset, frags.into_iter()).await?;
@@ -1526,12 +1535,9 @@ pub async fn commit_compaction(
                 );
                 row_id_map.extend(transposed);
             }
-        } else if options.defer_index_remap {
-            let changed_row_addrs = task.row_addrs.ok_or_else(|| {
-                Error::internal(
-                    "defer_index_remap requires row_addrs but none were provided".to_string(),
-                )
-            })?;
+        } else if options.defer_index_remap
+            && let Some(changed_row_addrs) = task.row_addrs
+        {
             frag_reuse_groups.push(FragReuseGroup {
                 changed_row_addrs,
                 old_frags: task.original_fragments.iter().map(|f| f.into()).collect(),
@@ -1565,21 +1571,11 @@ pub async fn commit_compaction(
                 new_index_files: rewritten.files,
             })
             .collect()
-    } else if !options.defer_index_remap && !has_address_style {
-        // We need to reserve fragment ids here so that the fragment bitmap
-        // can be updated for each index. Only needed for stable row IDs
-        // since address-style IDs were already reserved above.
-        let new_fragments = rewrite_groups
-            .iter_mut()
-            .flat_map(|group| group.new_fragments.iter_mut())
-            .collect::<Vec<_>>();
-        reserve_fragment_ids(dataset, new_fragments.into_iter()).await?;
-        Vec::new()
     } else {
         Vec::new()
     };
 
-    let frag_reuse_index = if options.defer_index_remap {
+    let frag_reuse_index = if options.defer_index_remap && !frag_reuse_groups.is_empty() {
         Some(build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?)
     } else {
         None
@@ -2520,6 +2516,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_compact_without_indices_skips_row_addrs_capture() {
+        let test_dir = TempStrDir::default();
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(6_000),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        assert_eq!(dataset.get_fragments().len(), 6);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 6_000);
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 3);
+        assert!(
+            plan.tasks()
+                .iter()
+                .all(|task| task.has_indexed_fragments == Some(false))
+        );
+
+        let mut rewrite_results = Vec::with_capacity(plan.tasks().len());
+        for task in plan.tasks() {
+            let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), task.clone(), &options)
+                .await
+                .unwrap();
+            assert!(rewrite_result.row_addrs.is_none());
+            rewrite_results.push(rewrite_result);
+        }
+
+        let metrics = commit_compaction(
+            &mut dataset,
+            rewrite_results,
+            Arc::new(IgnoreRemap::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        dataset.validate().await.unwrap();
+        assert_eq!(metrics.fragments_removed, 6);
+        assert_eq!(metrics.fragments_added, 3);
+        assert_eq!(dataset.get_fragments().len(), 3);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 6_000);
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn test_defer_index_remap() {
         let mut data_gen = BatchGenerator::new()
             .col(Box::new(
@@ -2642,7 +2701,9 @@ mod tests {
 
         // Build expected values by transposing using the immediate results
         for immediate_result in &immediate_results {
-            let row_addrs_bytes = immediate_result.row_addrs.as_ref().unwrap();
+            let Some(row_addrs_bytes) = immediate_result.row_addrs.as_ref() else {
+                continue;
+            };
             let row_addrs =
                 RoaringTreemap::deserialize_from(&mut Cursor::new(row_addrs_bytes)).unwrap();
             let transposed = transpose_row_addrs(
