@@ -2630,6 +2630,16 @@ mod tests {
             )
             .await
             .unwrap();
+        dataset2
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
 
         // Verify the initial state - no fragment reuse index should exist
         let initial_indices = dataset.load_indices().await.unwrap();
@@ -2670,19 +2680,26 @@ mod tests {
                     .await
                     .unwrap();
 
-            // Both should produce row_addrs (address-style row IDs)
-            assert!(deferred_result.row_addrs.is_some());
-            assert!(!deferred_result.row_addrs.as_ref().unwrap().is_empty());
-            assert!(!deferred_result.row_addrs.as_ref().unwrap().is_empty());
             assert!(!deferred_result.original_fragments.is_empty());
             assert!(!deferred_result.new_fragments.is_empty());
-
-            assert!(immediate_result.row_addrs.is_some());
             assert!(!immediate_result.original_fragments.is_empty());
             assert!(!immediate_result.new_fragments.is_empty());
+            assert_eq!(
+                task.has_indexed_fragments, task2.has_indexed_fragments,
+                "deferred and immediate plans should agree on indexed task coverage"
+            );
 
-            // Both should capture the same row addresses
-            assert_eq!(deferred_result.row_addrs, immediate_result.row_addrs);
+            if task.has_indexed_fragments == Some(true) {
+                assert!(deferred_result.row_addrs.is_some());
+                assert!(!deferred_result.row_addrs.as_ref().unwrap().is_empty());
+                assert!(immediate_result.row_addrs.is_some());
+                assert!(!immediate_result.row_addrs.as_ref().unwrap().is_empty());
+                // Both should capture the same row addresses
+                assert_eq!(deferred_result.row_addrs, immediate_result.row_addrs);
+            } else {
+                assert!(deferred_result.row_addrs.is_none());
+                assert!(immediate_result.row_addrs.is_none());
+            }
 
             deferred_results.push(deferred_result);
             immediate_results.push(immediate_result);
