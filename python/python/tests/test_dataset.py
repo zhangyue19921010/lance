@@ -4246,6 +4246,7 @@ def test_fast_search_scalar_index_skips_unindexed_fragments(tmp_path: Path):
 
     assert normal.num_rows == 15
     assert fast.num_rows == 5
+    assert "_rowid" not in fast.column_names
     assert sorted(fast.column("filter").to_pylist()) == list(range(95, 100))
 
 

@@ -40,6 +40,43 @@ public class ScanOptions {
   private final boolean fastSearch;
   private final Optional<ByteBuffer> substraitAggregate;
 
+  public ScanOptions(
+      Optional<List<Integer>> fragmentIds,
+      Optional<Long> batchSize,
+      Optional<List<String>> columns,
+      Optional<String> filter,
+      Optional<ByteBuffer> substraitFilter,
+      Optional<Long> limit,
+      Optional<Long> offset,
+      Optional<Query> nearest,
+      Optional<FullTextQuery> fullTextQuery,
+      boolean prefilter,
+      boolean withRowId,
+      boolean withRowAddress,
+      int batchReadahead,
+      Optional<List<ColumnOrdering>> columnOrderings,
+      boolean useScalarIndex,
+      Optional<ByteBuffer> substraitAggregate) {
+    this(
+        fragmentIds,
+        batchSize,
+        columns,
+        filter,
+        substraitFilter,
+        limit,
+        offset,
+        nearest,
+        fullTextQuery,
+        prefilter,
+        withRowId,
+        withRowAddress,
+        batchReadahead,
+        columnOrderings,
+        useScalarIndex,
+        false,
+        substraitAggregate);
+  }
+
   /**
    * Constructor for LanceScanOptions.
    *
