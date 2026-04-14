@@ -136,8 +136,7 @@ public class AsyncScannerTest {
   }
 
   @Test
-  void testFastSearchSkipsUnindexedFragments(@TempDir Path tempDir)
-      throws Exception {
+  void testFastSearchSkipsUnindexedFragments(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("async_scanner_fast_search_scalar_index").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
