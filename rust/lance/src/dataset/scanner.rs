@@ -2720,6 +2720,10 @@ impl Scanner {
             read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
         }
 
+        if self.fast_search && filter_plan.has_any_filter() {
+            read_options = read_options.with_only_indexed_fragments();
+        }
+
         let index_input = filter_plan.index_query.clone().map(|index_query| {
             Arc::new(ScalarIndexExec::new(self.dataset.clone(), index_query))
                 as Arc<dyn ExecutionPlan>
@@ -4526,12 +4530,13 @@ impl Scanner {
                 .partition_frags_by_coverage(index_query, fragments.clone())
                 .await?;
 
-            if missing_frags.is_empty() {
+            if missing_frags.is_empty() || self.fast_search {
                 log::trace!("prefilter entirely satisfied by exact index search");
                 // We can only avoid materializing the index for a prefilter if:
                 // 1. The search is indexed
                 // 2. The index search is an exact search with no recheck or refine
-                // 3. The indices cover at least the same fragments as the vector index
+                // 3. The indices cover at least the same fragments as the vector index,
+                //    unless fast_search allows skipping uncovered fragments.
                 return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(
                     ScalarIndexExec::new(self.dataset.clone(), index_query.clone()),
                 )));
@@ -9477,6 +9482,34 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         assert_eq!(normal_rows, 10);
         assert_eq!(fast_rows, 0);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fast_search_scalar_index_skips_unindexed_fragments(
+        #[values(LanceFileVersion::Stable)] data_storage_version: LanceFileVersion,
+    ) {
+        let mut dataset = TestVectorDataset::new(data_storage_version, false)
+            .await
+            .unwrap();
+        dataset.make_scalar_index().await.unwrap();
+        dataset.append_new_data().await.unwrap();
+
+        let mut scanner = dataset.dataset.scan();
+        scanner.filter("i >= 395").unwrap().project(&["i"]).unwrap();
+        let normal_batch = scanner.try_into_batch().await.unwrap();
+
+        let mut scanner = dataset.dataset.scan();
+        scanner
+            .filter("i >= 395")
+            .unwrap()
+            .fast_search()
+            .project(&["i"])
+            .unwrap();
+        let fast_batch = scanner.try_into_batch().await.unwrap();
+
+        assert_eq!(normal_batch.num_rows(), 15);
+        assert_eq!(fast_batch.num_rows(), 5);
     }
 
     #[rstest]

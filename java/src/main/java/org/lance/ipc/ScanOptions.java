@@ -37,6 +37,7 @@ public class ScanOptions {
   private final int batchReadahead;
   private final Optional<List<ColumnOrdering>> columnOrderings;
   private final boolean useScalarIndex;
+  private final boolean fastSearch;
   private final Optional<ByteBuffer> substraitAggregate;
 
   /**
@@ -58,6 +59,7 @@ public class ScanOptions {
    * @param batchReadahead Number of batches to read ahead.
    * @param columnOrderings (Optional) Column orderings for result sorting.
    * @param useScalarIndex Whether to use scalar indices for the scan. Default is true.
+   * @param fastSearch Whether to only search indexed fragments. Default is false.
    * @param substraitAggregate (Optional) Substrait aggregate expression for aggregate pushdown.
    */
   public ScanOptions(
@@ -76,6 +78,7 @@ public class ScanOptions {
       int batchReadahead,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
+      boolean fastSearch,
       Optional<ByteBuffer> substraitAggregate) {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
@@ -95,6 +98,7 @@ public class ScanOptions {
     this.batchReadahead = batchReadahead;
     this.columnOrderings = columnOrderings;
     this.useScalarIndex = useScalarIndex;
+    this.fastSearch = fastSearch;
     this.substraitAggregate = substraitAggregate;
   }
 
@@ -229,6 +233,15 @@ public class ScanOptions {
   }
 
   /**
+   * Get whether to only search indexed fragments.
+   *
+   * @return true if unindexed fragments should be skipped, false otherwise.
+   */
+  public boolean isFastSearch() {
+    return fastSearch;
+  }
+
+  /**
    * Get the substrait aggregate expression.
    *
    * @return Optional containing the substrait aggregate if specified, otherwise empty.
@@ -257,6 +270,7 @@ public class ScanOptions {
         .add("batchReadahead", batchReadahead)
         .add("columnOrdering", columnOrderings)
         .add("useScalarIndex", useScalarIndex)
+        .add("fastSearch", fastSearch)
         .add(
             "substraitAggregate",
             substraitAggregate.map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
@@ -280,6 +294,7 @@ public class ScanOptions {
     private int batchReadahead = 16;
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
     private boolean useScalarIndex = true;
+    private boolean fastSearch = false;
     private Optional<ByteBuffer> substraitAggregate = Optional.empty();
 
     public Builder() {}
@@ -305,6 +320,7 @@ public class ScanOptions {
       this.batchReadahead = options.getBatchReadahead();
       this.columnOrderings = options.getColumnOrderings();
       this.useScalarIndex = options.isUseScalarIndex();
+      this.fastSearch = options.isFastSearch();
       this.substraitAggregate = options.getSubstraitAggregate();
     }
 
@@ -472,6 +488,21 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether to only search indexed fragments.
+     *
+     * <p>This is a weak-consistency mode for vector search, full text search, and scalar-indexed
+     * filters. It can reduce latency by skipping recently appended fragments that are not covered
+     * by the relevant index.
+     *
+     * @param fastSearch true to skip unindexed fragments, false otherwise. Default is false.
+     * @return Builder instance for method chaining.
+     */
+    public Builder fastSearch(boolean fastSearch) {
+      this.fastSearch = fastSearch;
+      return this;
+    }
+
+    /**
      * Set the substrait aggregate expression.
      *
      * @param substraitAggregate Substrait aggregate expression.
@@ -504,6 +535,7 @@ public class ScanOptions {
           batchReadahead,
           columnOrderings,
           useScalarIndex,
+          fastSearch,
           substraitAggregate);
     }
   }
