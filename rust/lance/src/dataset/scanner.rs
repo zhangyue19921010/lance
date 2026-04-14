@@ -1526,6 +1526,9 @@ impl Scanner {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         });
+        if self.fast_search {
+            self.projection_plan.include_row_id();
+        }
         Ok(self)
     }
 
@@ -1627,9 +1630,9 @@ impl Scanner {
     pub fn fast_search(&mut self) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.use_index = true;
+            self.projection_plan.include_row_id();
         }
         self.fast_search = true;
-        self.projection_plan.include_row_id(); // fast search requires _rowid
         self
     }
 
@@ -9764,6 +9767,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         assert_eq!(normal_batch.num_rows(), 15);
         assert_eq!(fast_batch.num_rows(), 5);
+        assert!(fast_batch.schema().field_with_name(ROW_ID).is_err());
     }
 
     #[rstest]
