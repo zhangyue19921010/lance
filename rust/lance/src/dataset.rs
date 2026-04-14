@@ -29,14 +29,17 @@ use lance_core::utils::tracing::{
 };
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
-use lance_file::reader::FileReaderOptions;
+use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
-use lance_index::IndexType;
+use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider,
 };
-use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::{
+    CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
+};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
@@ -57,10 +60,10 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
+use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
 pub(crate) mod blob;
@@ -87,6 +90,8 @@ pub mod udtf;
 pub mod updater;
 mod utils;
 pub mod write;
+
+pub(crate) use take::row_offsets_to_row_addresses;
 
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
@@ -129,8 +134,8 @@ use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
-    AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, InsertBuilder, WriteDestination,
-    WriteMode, WriteParams, write_fragments,
+    AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, ExternalBlobMode, InsertBuilder,
+    WriteDestination, WriteMode, WriteParams, WriteProgressFn, WriteStats, write_fragments,
 };
 
 pub(crate) const INDICES_DIR: &str = "_indices";
@@ -252,6 +257,9 @@ pub struct ReadParams {
     /// File reader options to use when reading data files.
     ///
     /// This allows control over features like caching repetition indices and validation.
+    /// Options set here act as dataset-level defaults and can be overridden on a
+    /// per-scan basis via [`Scanner::batch_size_bytes`](crate::dataset::scanner::Scanner::batch_size_bytes) or
+    /// [`Scanner::with_file_reader_options`](crate::dataset::scanner::Scanner::with_file_reader_options).
     pub file_reader_options: Option<FileReaderOptions>,
 }
 
@@ -744,20 +752,20 @@ impl Dataset {
             .await
     }
 
-    /// Write into a namespace-managed table with automatic credential vending.
+    /// Write into a namespace client-managed table with automatic credential vending.
     ///
     /// For CREATE mode, calls declare_table() to initialize the table.
-    /// For other modes, calls describe_table() and opens dataset with namespace credentials.
+    /// For other modes, calls describe_table() and opens dataset with namespace client credentials.
     ///
     /// # Arguments
     ///
     /// * `batches` - The record batches to write
-    /// * `namespace` - The namespace to use for table management
+    /// * `namespace_client` - The namespace client to use for table management
     /// * `table_id` - The table identifier
     /// * `params` - Write parameters
     pub async fn write_into_namespace(
         batches: impl RecordBatchReader + Send + 'static,
-        namespace: Arc<dyn LanceNamespace>,
+        namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
         mut params: Option<WriteParams>,
     ) -> Result<Self> {
@@ -769,7 +777,7 @@ impl Dataset {
                     id: Some(table_id.clone()),
                     ..Default::default()
                 };
-                let response = namespace
+                let response = namespace_client
                     .declare_table(declare_request)
                     .await
                     .map_err(|e| Error::namespace_source(Box::new(e)))?;
@@ -783,7 +791,7 @@ impl Dataset {
                 // Set up commit handler when managed_versioning is enabled
                 if response.managed_versioning == Some(true) {
                     let external_store = LanceNamespaceExternalManifestStore::new(
-                        namespace.clone(),
+                        namespace_client.clone(),
                         table_id.clone(),
                     );
                     let commit_handler: Arc<dyn CommitHandler> =
@@ -793,13 +801,13 @@ impl Dataset {
                     write_params.commit_handler = Some(commit_handler);
                 }
 
-                // Set initial credentials and provider from namespace
+                // Set initial credentials and provider from namespace_client
                 if let Some(namespace_storage_options) = response.storage_options {
                     let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
-                        LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
+                        LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
                     );
 
-                    // Merge namespace storage options with any existing options
+                    // Merge namespace client storage options with any existing options
                     let mut merged_options = write_params
                         .store_params
                         .as_ref()
@@ -826,7 +834,7 @@ impl Dataset {
                     id: Some(table_id.clone()),
                     ..Default::default()
                 };
-                let response = namespace
+                let response = namespace_client
                     .describe_table(request)
                     .await
                     .map_err(|e| Error::namespace_source(Box::new(e)))?;
@@ -840,7 +848,7 @@ impl Dataset {
                 // Set up commit handler when managed_versioning is enabled
                 if response.managed_versioning == Some(true) {
                     let external_store = LanceNamespaceExternalManifestStore::new(
-                        namespace.clone(),
+                        namespace_client.clone(),
                         table_id.clone(),
                     );
                     let commit_handler: Arc<dyn CommitHandler> =
@@ -850,15 +858,15 @@ impl Dataset {
                     write_params.commit_handler = Some(commit_handler);
                 }
 
-                // Set initial credentials and provider from namespace
+                // Set initial credentials and provider from namespace_client
                 if let Some(namespace_storage_options) = response.storage_options {
                     let provider: Arc<dyn StorageOptionsProvider> =
                         Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                            namespace.clone(),
+                            namespace_client.clone(),
                             table_id.clone(),
                         ));
 
-                    // Merge namespace storage options with any existing options
+                    // Merge namespace client storage options with any existing options
                     let mut merged_options = write_params
                         .store_params
                         .as_ref()
@@ -1713,14 +1721,116 @@ impl Dataset {
     }
 
     pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {
-        match data_file.base_id.as_ref() {
+        self.data_file_dir_for_base(data_file.base_id)
+    }
+
+    /// Create a [`DataFile`] by reading metadata from an existing lance file.
+    ///
+    /// This reads the file's schema and version information, matches columns to
+    /// the dataset's schema to determine field IDs, and calculates column indices.
+    /// This is useful for constructing `DataFile` metadata needed for operations
+    /// like [`Operation::DataReplacement`].
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path to the data file, relative to the dataset's data directory.
+    /// * `base_id` - The base path ID if the file is outside the dataset directory.
+    pub async fn create_data_file(&self, path: &str, base_id: Option<u32>) -> Result<DataFile> {
+        let data_dir = self.data_file_dir_for_base(base_id)?;
+        let filepath = data_dir.child(path);
+
+        // Get file size
+        let file_size = self.object_store().size(&filepath).await?;
+
+        // Read file metadata
+        let scheduler = ScanScheduler::new(
+            self.object_store.clone(),
+            SchedulerConfig::new(2 * 1024 * 1024 * 1024),
+        );
+        let file = scheduler
+            .open_file(&filepath, &CachedFileSize::new(file_size))
+            .await?;
+        let file_metadata = FileReader::read_all_metadata(&file).await?;
+
+        let file_version = LanceFileVersion::try_from_major_minor(
+            file_metadata.major_version as u32,
+            file_metadata.minor_version as u32,
+        )?;
+
+        // Get top-level column names from file schema in file order
+        let column_names: Vec<&str> = file_metadata
+            .file_schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+
+        // Project dataset schema by file column names to get dataset field IDs
+        let projected_ds_schema = self.schema().project(&column_names)?;
+
+        // Walk both schemas in parallel to build fields and column_indices
+        let is_structural = file_version >= LanceFileVersion::V2_1;
+        let ds_fields: Vec<_> = projected_ds_schema.fields_pre_order().collect();
+        let file_fields: Vec<_> = file_metadata.file_schema.fields_pre_order().collect();
+
+        if ds_fields.len() != file_fields.len() {
+            return Err(Error::invalid_input(format!(
+                "Schema mismatch: dataset projection has {} fields but file has {} fields",
+                ds_fields.len(),
+                file_fields.len()
+            )));
+        }
+
+        let mut fields = Vec::new();
+        let mut column_indices = Vec::new();
+        let mut curr_column_idx: i32 = 0;
+        let mut packed_struct_fields_num: usize = 0;
+
+        for (ds_field, file_field) in ds_fields.iter().zip(file_fields.iter()) {
+            if ds_field.name != file_field.name {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: expected field '{}' but file has '{}'",
+                    ds_field.name, file_field.name
+                )));
+            }
+
+            if packed_struct_fields_num > 0 {
+                packed_struct_fields_num -= 1;
+                continue;
+            }
+
+            if file_field.is_packed_struct() {
+                fields.push(ds_field.id);
+                column_indices.push(curr_column_idx);
+                curr_column_idx += 1;
+                packed_struct_fields_num = file_field.children.len();
+            } else if file_field.children.is_empty() || !is_structural {
+                fields.push(ds_field.id);
+                column_indices.push(curr_column_idx);
+                curr_column_idx += 1;
+            }
+        }
+
+        let file_size_nz = NonZero::new(file_size);
+        Ok(DataFile::new(
+            path,
+            fields,
+            column_indices,
+            file_metadata.major_version as u32,
+            file_metadata.minor_version as u32,
+            file_size_nz,
+            base_id,
+        ))
+    }
+
+    /// Resolve the data directory for a given base_id.
+    ///
+    /// If `base_id` is `None`, returns the default data directory.
+    fn data_file_dir_for_base(&self, base_id: Option<u32>) -> Result<Path> {
+        match base_id {
             Some(base_id) => {
-                let base_paths = &self.manifest.base_paths;
-                let base_path = base_paths.get(base_id).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "base_path id {} not found for data_file {}",
-                        base_id, data_file.path
-                    ))
+                let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
+                    Error::invalid_input(format!("base_path id {} not found", base_id))
                 })?;
                 let path = base_path.extract_path(self.session.store_registry())?;
                 if base_path.is_dataset_root {
@@ -2758,12 +2868,14 @@ impl Dataset {
         self.merge_impl(stream, left_on, right_on).await
     }
 
-    /// Merge a distributed scalar index into a single root artifact.
+    /// Merge a distributed scalar index into a single root artifact and report
+    /// progress via the supplied callback.
     pub async fn merge_index_metadata(
         &self,
         index_uuid: &str,
         index_type: IndexType,
         batch_readhead: Option<usize>,
+        progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<()> {
         let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
         let index_dir = self.indices_dir().child(index_uuid);
@@ -2774,6 +2886,7 @@ impl Dataset {
                     self.object_store(),
                     &index_dir,
                     Arc::new(store),
+                    progress,
                 )
                 .await
             }
@@ -2784,13 +2897,14 @@ impl Dataset {
                     &index_dir,
                     Arc::new(store),
                     batch_readhead,
+                    progress,
                 )
                 .await
             }
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
                 Err(Error::invalid_input(
                     "Vector distributed indexing no longer supports merge_index_metadata; \
-                     build segments, use create_index_segment_builder(), \
+                     build segments, optionally merge groups with merge_existing_index_segments(...), \
                      and commit with commit_existing_index_segments(...)"
                         .to_string(),
                 ))

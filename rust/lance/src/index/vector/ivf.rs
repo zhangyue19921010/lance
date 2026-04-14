@@ -3,10 +3,14 @@
 
 //! IVF - Inverted File index.
 
-use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
+    LogicalIvfView,
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
+};
+use super::{
+    builder::{IvfIndexBuilder, index_type_string},
+    utils::PartitionLoadLock,
 };
 use crate::dataset::index::dataset_format_version;
 use crate::index::DatasetIndexInternalExt;
@@ -65,6 +69,7 @@ use lance_index::vector::v3::shuffler::create_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
+    MAX_PARTITION_SIZE_FACTOR, MIN_PARTITION_SIZE_PERCENT,
     optimize::OptimizeOptions,
     vector::{
         Query, VectorIndex,
@@ -89,23 +94,21 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, L2, MetricType};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl_owned};
-use lance_table::format::IndexMetadata as TableIndexMetadata;
+use lance_table::format::{IndexMetadata as TableIndexMetadata, list_index_files_with_sizes};
 use log::{info, warn};
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
-use std::collections::HashSet;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::instrument;
 use uuid::Uuid;
 
-use crate::index::{IndexSegment, IndexSegmentPlan};
-
 pub mod builder;
 pub mod io;
+mod partition_serde;
 pub mod v2;
 
 // Cache wrapper for vector index trait objects
@@ -126,6 +129,10 @@ impl UnsizedCacheKey for LegacyIVFPartitionKey {
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("ivf-{}", self.partition_id).into()
+    }
+
+    fn type_name() -> &'static str {
+        "LegacyIVFPartition"
     }
 }
 
@@ -268,6 +275,95 @@ impl std::fmt::Debug for IVFIndex {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SegmentRebalanceCandidate {
+    segment_id: Uuid,
+    score: usize,
+    created_at_ms: i64,
+}
+
+fn candidate_is_better(
+    candidate: SegmentRebalanceCandidate,
+    current_best: Option<SegmentRebalanceCandidate>,
+) -> bool {
+    match current_best {
+        None => true,
+        Some(current_best) => {
+            candidate.score > current_best.score
+                || (candidate.score == current_best.score
+                    && (candidate.created_at_ms, candidate.segment_id.as_bytes())
+                        < (
+                            current_best.created_at_ms,
+                            current_best.segment_id.as_bytes(),
+                        ))
+        }
+    }
+}
+
+fn index_type_for_segmented_optimize(index: &dyn VectorIndex) -> Result<IndexType> {
+    let (sub_index_type, quantization_type) = index.sub_index_type();
+    IndexType::try_from(index_type_string(sub_index_type, quantization_type).as_str())
+}
+
+pub(crate) fn select_segment_for_single_rebalance(
+    logical_index: &LogicalIvfView<'_>,
+) -> Result<Option<Uuid>> {
+    let mut best_split = None;
+    let mut best_join = None;
+
+    for (metadata, index) in logical_index.segments() {
+        let index_type = index_type_for_segmented_optimize(index.as_ref())?;
+        let split_threshold = MAX_PARTITION_SIZE_FACTOR * index_type.target_partition_size();
+        let join_threshold = MIN_PARTITION_SIZE_PERCENT * index_type.target_partition_size() / 100;
+        let num_partitions = index.ivf_model().num_partitions();
+        if num_partitions == 0 {
+            continue;
+        }
+
+        let mut split_partition_count = 0usize;
+        let mut join_partition_count = 0usize;
+        for partition_id in 0..num_partitions {
+            let partition_size = index.partition_size(partition_id);
+            if partition_size > split_threshold {
+                split_partition_count += 1;
+            }
+            if num_partitions > 1 && partition_size < join_threshold {
+                join_partition_count += 1;
+            }
+        }
+
+        let created_at_ms = metadata
+            .created_at
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(i64::MIN);
+
+        let split_candidate = (split_partition_count > 0).then_some(SegmentRebalanceCandidate {
+            segment_id: metadata.uuid,
+            score: split_partition_count,
+            created_at_ms,
+        });
+        if let Some(candidate) = split_candidate
+            && candidate_is_better(candidate, best_split)
+        {
+            best_split = Some(candidate);
+        }
+
+        let join_candidate = (join_partition_count > 0).then_some(SegmentRebalanceCandidate {
+            segment_id: metadata.uuid,
+            score: join_partition_count,
+            created_at_ms,
+        });
+        if let Some(candidate) = join_candidate
+            && candidate_is_better(candidate, best_join)
+        {
+            best_join = Some(candidate);
+        }
+    }
+
+    let selected = best_split.or(best_join);
+    Ok(selected.map(|candidate| candidate.segment_id))
+}
+
 // TODO: move to `lance-index` crate.
 ///
 /// Returns (new_uuid, num_indices_merged)
@@ -275,9 +371,10 @@ pub(crate) async fn optimize_vector_indices(
     dataset: Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
-    existing_indices: &[Arc<dyn Index>],
+    logical_index: &LogicalIvfView<'_>,
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize)> {
+    let existing_indices = logical_index.indices().cloned().collect::<Vec<_>>();
     // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::index(
@@ -292,7 +389,7 @@ pub(crate) async fn optimize_vector_indices(
             &dataset,
             unindexed,
             vector_column,
-            existing_indices,
+            &existing_indices,
             options,
         )
         .await;
@@ -319,7 +416,7 @@ pub(crate) async fn optimize_vector_indices(
             pq_index,
             vector_column,
             unindexed,
-            existing_indices,
+            &existing_indices,
             options,
             writer,
             dataset.version().version,
@@ -341,7 +438,7 @@ pub(crate) async fn optimize_vector_indices(
             hnsw_sq,
             vector_column,
             unindexed,
-            existing_indices,
+            &existing_indices,
             options,
             writer,
             aux_writer,
@@ -362,7 +459,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     dataset: &Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
-    existing_indices: &[Arc<dyn Index>],
+    existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize)> {
     // Sanity check the indices
@@ -371,11 +468,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             "optimizing vector index: no existing index found".to_string(),
         ));
     }
-    let existing_indices = existing_indices
-        .iter()
-        .cloned()
-        .map(|idx| idx.as_vector_index())
-        .collect::<Result<Vec<_>>>()?;
+    let existing_indices = existing_indices.to_vec();
 
     let new_uuid = Uuid::new_v4();
     let index_dir = dataset.indices_dir().child(new_uuid.to_string());
@@ -433,6 +526,26 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .build()
                 .await?
             }
+        }
+        // IVF_FLAT (binary vectors)
+        (SubIndexType::Flat, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(existing_indices.clone())
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?
         }
         // IVF_PQ
         (SubIndexType::Flat, QuantizationType::Product) => {
@@ -495,23 +608,43 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
         // IVF_HNSW_FLAT
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
-                dataset.clone(),
-                vector_column.to_owned(),
-                index_dir,
-                distance_type,
-                shuffler,
-                HnswBuildParams::default(),
-                frag_reuse_index,
-                options.clone(),
-            )?
-            .with_ivf(ivf_model.clone())
-            .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(existing_indices.clone())
-            .shuffle_data(unindexed)
-            .await?
-            .build()
-            .await?
+            if element_type == DataType::UInt8 {
+                IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
+                    dataset.clone(),
+                    vector_column.to_owned(),
+                    index_dir,
+                    distance_type,
+                    shuffler,
+                    HnswBuildParams::default(),
+                    frag_reuse_index,
+                    options.clone(),
+                )?
+                .with_ivf(ivf_model.clone())
+                .with_quantizer(quantizer.try_into()?)
+                .with_existing_indices(existing_indices.clone())
+                .shuffle_data(unindexed)
+                .await?
+                .build()
+                .await?
+            } else {
+                IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
+                    dataset.clone(),
+                    vector_column.to_owned(),
+                    index_dir,
+                    distance_type,
+                    shuffler,
+                    HnswBuildParams::default(),
+                    frag_reuse_index,
+                    options.clone(),
+                )?
+                .with_ivf(ivf_model.clone())
+                .with_quantizer(quantizer.try_into()?)
+                .with_existing_indices(existing_indices.clone())
+                .shuffle_data(unindexed)
+                .await?
+                .build()
+                .await?
+            }
         }
         // IVF_HNSW_SQ
         (SubIndexType::Hnsw, QuantizationType::Scalar) => {
@@ -571,7 +704,7 @@ async fn optimize_ivf_pq_indices(
     pq_index: &PQIndex,
     vector_column: &str,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
-    existing_indices: &[Arc<dyn Index>],
+    existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
     mut writer: Box<dyn Writer>,
     dataset_version: u64,
@@ -654,7 +787,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     hnsw_index: &HNSWIndex<Q>,
     vector_column: &str,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
-    existing_indices: &[Arc<dyn Index>],
+    existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
     writer: Box<dyn Writer>,
     aux_writer: Box<dyn Writer>,
@@ -1223,6 +1356,7 @@ pub async fn build_ivf_model(
     dim: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
+    fragment_ids: Option<&[u32]>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap();
@@ -1245,7 +1379,8 @@ pub async fn build_ivf_model(
         "Loading training data for IVF. Sample size: {}",
         sample_size_hint
     );
-    let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+    let training_data =
+        maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
     info!(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -1302,8 +1437,16 @@ async fn build_ivf_model_and_pq(
     get_vector_type(dataset.schema(), column)?;
     let dim = get_vector_dim(dataset.schema(), column)?;
 
-    let ivf_model =
-        build_ivf_model(dataset, column, dim, metric_type, ivf_params, progress).await?;
+    let ivf_model = build_ivf_model(
+        dataset,
+        column,
+        dim,
+        metric_type,
+        ivf_params,
+        None,
+        progress,
+    )
+    .await?;
 
     let ivf_residual = if matches!(metric_type, MetricType::Cosine | MetricType::L2) {
         Some(&ivf_model)
@@ -1537,6 +1680,13 @@ pub(crate) async fn remap_index_file_v3(
             .remap(mapping)
             .await
         }
+        (SubIndexType::Flat, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
             IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
@@ -1548,6 +1698,13 @@ pub(crate) async fn remap_index_file_v3(
             IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(dataset, column, index_dir, index)?
                 .remap(mapping)
                 .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
         }
         (SubIndexType::Hnsw, QuantizationType::Product) => {
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
@@ -1861,181 +2018,84 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
-/// Distributed vector segment build uses three storage-level concepts:
-///
-/// - A **segment** is a worker output written by `execute_uncommitted()`. It
-///   already lives at its final storage path under `indices/<segment_uuid>/`,
-///   but it is not yet published in the manifest.
-/// - A **physical segment** is an `IndexSegment` that can be committed into the
-///   manifest with `commit_existing_index_segments(...)`.
-/// - A **logical index** is the user-visible index identified by name; it may
-///   contain one or more physical segments.
-///
-/// The segment-build path is therefore:
-///
-/// 1. workers build segments
-/// 2. the caller groups those segments into one or more physical segments
-/// 3. each grouped segment is built from its selected inputs
-/// 4. the resulting physical segments are committed as one logical index
-///
-/// Each plan says:
-/// - which source segments should be consumed together
-/// - what the physical segment metadata should look like
-///
-/// The planner returns a `Vec<IndexSegmentPlan>` so callers can decide whether
-/// to execute the work serially or fan it out externally.
-///
-/// This function does not touch storage. It only:
-/// - validates that the caller-supplied segment contract is self-consistent
-/// - enforces that source fragment coverage is disjoint
-/// - groups source segments into physical segments according to
-///   `target_segment_bytes`
-///
-/// The grouping rule is intentionally simple:
-/// - `target_segment_bytes = None`: keep the existing segment boundary, so each
-///   input segment becomes one physical segment
-/// - `target_segment_bytes = Some(limit)`: greedily pack consecutive source
-///   segments until the next source would exceed `limit`
-pub(crate) async fn plan_segments(
-    segments: &[TableIndexMetadata],
-    requested_index_type: Option<IndexType>,
-    target_segment_bytes: Option<u64>,
-) -> Result<Vec<IndexSegmentPlan>> {
-    if let Some(index_type) = requested_index_type
-        && !matches!(
-            index_type,
-            IndexType::IvfFlat
-                | IndexType::IvfPq
-                | IndexType::IvfSq
-                | IndexType::IvfRq
-                | IndexType::IvfHnswFlat
-                | IndexType::IvfHnswPq
-                | IndexType::IvfHnswSq
-                | IndexType::Vector
-        )
-    {
-        return Err(Error::invalid_input(format!(
-            "Unsupported distributed vector segment build type: {}",
-            index_type
-        )));
-    }
+/// Merge one caller-defined group of source segments into a single segment.
+pub(crate) async fn merge_segments(
+    object_store: &ObjectStore,
+    indices_dir: &Path,
+    segments: Vec<TableIndexMetadata>,
+) -> Result<TableIndexMetadata> {
+    merge_segments_with_progress(
+        object_store,
+        indices_dir,
+        segments,
+        lance_index::progress::noop_progress(),
+    )
+    .await
+}
 
-    if let Some(0) = target_segment_bytes {
-        return Err(Error::invalid_input(
-            "target_segment_bytes must be greater than zero".to_string(),
-        ));
-    }
-
+/// Merge one caller-defined group of source segments into a single segment and
+/// report progress through the provided callback.
+pub(crate) async fn merge_segments_with_progress(
+    object_store: &ObjectStore,
+    indices_dir: &Path,
+    segments: Vec<TableIndexMetadata>,
+    progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
+) -> Result<TableIndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
     }
-
-    let mut sorted_segments = segments.to_vec();
-    sorted_segments.sort_by_key(|index| index.uuid);
-    let mut expected_segment_ids = HashSet::with_capacity(sorted_segments.len());
-    for segment in &sorted_segments {
-        if !expected_segment_ids.insert(segment.uuid) {
-            return Err(Error::index(format!(
-                "Distributed vector segment '{}' was provided more than once",
-                segment.uuid
-            )));
-        }
+    if segments.len() == 1 {
+        return Ok(segments.into_iter().next().unwrap());
     }
 
-    let mut covered_fragments = RoaringBitmap::new();
-    for segment in &sorted_segments {
-        let fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+    let mut merged_segment = segments[0].clone();
+    let mut fragment_bitmap = RoaringBitmap::new();
+    for segment in &segments {
+        let source_fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
             Error::index(format!(
                 "Segment '{}' is missing fragment coverage",
                 segment.uuid
             ))
         })?;
-        if covered_fragments.intersection_len(fragment_bitmap) > 0 {
-            return Err(Error::index(
-                "Distributed vector shards have overlapping fragment coverage".to_string(),
-            ));
-        }
-        covered_fragments |= fragment_bitmap.clone();
+        fragment_bitmap |= source_fragment_bitmap.clone();
     }
 
-    if target_segment_bytes.is_none() {
-        return sorted_segments
-            .into_iter()
-            .map(|segment| build_segment_plan(vec![segment], requested_index_type))
-            .collect();
-    }
+    let index_version = infer_source_index_version(&segments)?;
+    let segment_uuid = Uuid::new_v4();
+    let final_dir = indices_dir.child(segment_uuid.to_string());
+    merge_segments_to_dir(object_store, indices_dir, &final_dir, &segments, progress).await?;
+    let files = list_index_files_with_sizes(object_store, &final_dir).await?;
 
-    let target_segment_bytes = target_segment_bytes.unwrap();
-    let mut plans = Vec::new();
-    let mut current_group = Vec::new();
-    let mut current_bytes = 0_u64;
-
-    for segment in sorted_segments {
-        let source_bytes = estimate_source_index_bytes(&segment);
-        if !current_group.is_empty()
-            && current_bytes.saturating_add(source_bytes) > target_segment_bytes
-        {
-            plans.push(build_segment_plan(
-                std::mem::take(&mut current_group),
-                requested_index_type,
-            )?);
-            current_bytes = 0;
-        }
-        current_bytes = current_bytes.saturating_add(source_bytes);
-        current_group.push(segment);
-    }
-
-    if !current_group.is_empty() {
-        plans.push(build_segment_plan(current_group, requested_index_type)?);
-    }
-
-    Ok(plans)
-}
-
-/// Build one planned segment into its output directory.
-///
-/// Single-source plans are already materialized and return immediately. For
-/// multi-source plans, this function writes a new merged physical segment under
-/// `indices/<segment_uuid>/`.
-pub(crate) async fn build_segment(
-    object_store: &ObjectStore,
-    indices_dir: &Path,
-    segment_plan: &IndexSegmentPlan,
-) -> Result<IndexSegment> {
-    let built_segment = segment_plan.segment().clone();
-    let segments = segment_plan.segments();
-    debug_assert!(
-        !segments.is_empty(),
-        "segment plans must have at least one source segment"
-    );
-
-    if segments.len() == 1 && segments[0].uuid == built_segment.uuid() {
-        return Ok(built_segment);
-    }
-
-    let final_dir = indices_dir.child(built_segment.uuid().to_string());
-    merge_segments_to_dir(object_store, indices_dir, &final_dir, segment_plan).await?;
-
-    Ok(built_segment)
+    merged_segment = TableIndexMetadata {
+        uuid: segment_uuid,
+        fragment_bitmap: Some(fragment_bitmap),
+        index_details: Some(Arc::new(crate::index::vector_index_details())),
+        index_version,
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+        files: Some(files),
+        ..merged_segment
+    };
+    Ok(merged_segment)
 }
 
 /// Merge the selected input segments into `final_dir`.
 ///
-/// Callers must only invoke this helper for multi-source plans. It reads the
-/// selected input segments directly from `indices/<segment_uuid>/` and writes
-/// the merged auxiliary/index files into `final_dir`.
+/// The caller defines the source segment group explicitly. This helper reads
+/// those input segments directly from `indices/<segment_uuid>/` and writes the
+/// merged auxiliary/index files into `final_dir`.
 async fn merge_segments_to_dir(
     object_store: &ObjectStore,
     indices_dir: &Path,
     final_dir: &Path,
-    segment_plan: &IndexSegmentPlan,
+    segments: &[TableIndexMetadata],
+    progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<()> {
     reset_final_segment_dir(object_store, final_dir).await?;
 
-    let segments = segment_plan.segments();
     debug_assert!(
         segments.len() > 1,
-        "merge helper should only be used for multi-source plans"
+        "merge helper should only be used for multi-source groups"
     );
 
     let aux_paths = segments
@@ -2059,64 +2119,19 @@ async fn merge_segments_to_dir(
         object_store,
         &aux_paths,
         final_dir,
+        progress.clone(),
     )
     .await?;
     write_root_vector_index_from_auxiliary(
         object_store,
         final_dir,
-        segment_plan.requested_index_type(),
+        None,
         &source_index_paths,
+        progress.clone(),
     )
     .await?;
 
     Ok(())
-}
-
-/// Collapse one group of source segments into a single physical-segment plan.
-fn build_segment_plan(
-    group: Vec<TableIndexMetadata>,
-    requested_index_type: Option<IndexType>,
-) -> Result<IndexSegmentPlan> {
-    debug_assert!(!group.is_empty());
-    let first = &group[0];
-    let mut fragment_bitmap = RoaringBitmap::new();
-    let mut estimated_bytes = 0_u64;
-    let mut segments = Vec::with_capacity(group.len());
-
-    for segment in &group {
-        let source_fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
-            Error::index(format!(
-                "Segment '{}' is missing fragment coverage",
-                segment.uuid
-            ))
-        })?;
-        fragment_bitmap |= source_fragment_bitmap.clone();
-        estimated_bytes = estimated_bytes.saturating_add(estimate_source_index_bytes(segment));
-        segments.push(segment.clone());
-    }
-
-    let segment_uuid = if group.len() == 1 {
-        first.uuid
-    } else {
-        Uuid::new_v4()
-    };
-    let index_version = match requested_index_type {
-        Some(index_type) => index_type.version(),
-        None => infer_source_index_version(&group)?,
-    };
-    let segment = IndexSegment::new(
-        segment_uuid,
-        fragment_bitmap,
-        Arc::new(crate::index::vector_index_details()),
-        index_version,
-    );
-
-    Ok(IndexSegmentPlan::new(
-        segment,
-        segments,
-        estimated_bytes,
-        requested_index_type,
-    ))
 }
 
 fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
@@ -2128,14 +2143,6 @@ fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
         ));
     }
     Ok(first)
-}
-
-fn estimate_source_index_bytes(index_metadata: &TableIndexMetadata) -> u64 {
-    index_metadata
-        .files
-        .as_ref()
-        .map(|files| files.iter().map(|file| file.size_bytes).sum())
-        .unwrap_or(0)
 }
 
 /// Best-effort reset of one target directory before rewriting it.
@@ -2153,6 +2160,7 @@ async fn write_root_vector_index_from_auxiliary(
     index_dir: &Path,
     requested_index_type: Option<IndexType>,
     centroid_source_index_paths: &[Path],
+    progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<()> {
     let aux_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
     let scheduler = ScanScheduler::new(
@@ -2247,6 +2255,9 @@ async fn write_root_vector_index_from_auxiliary(
     // Write root index.idx via V2 writer so downstream opens through v2 path.
     let index_path = index_dir.child(INDEX_FILE_NAME);
     let obj_writer = object_store.create(&index_path).await?;
+    progress
+        .stage_start("write_root_index", Some(1), "files")
+        .await?;
 
     // Schema for HNSW sub-index: include neighbors/dist fields; empty batch is fine.
     let arrow_schema = HNSW::schema();
@@ -2273,7 +2284,7 @@ async fn write_root_vector_index_from_auxiliary(
     let is_hnsw = idx_meta.index_type.starts_with("IVF_HNSW");
     let is_flat_based = matches!(
         idx_meta.index_type.as_str(),
-        "IVF_FLAT" | "IVF_PQ" | "IVF_SQ"
+        "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ"
     );
 
     if is_hnsw {
@@ -2292,6 +2303,9 @@ async fn write_root_vector_index_from_auxiliary(
     let empty_batch = RecordBatch::new_empty(arrow_schema);
     v2_writer.write_batch(&empty_batch).await?;
     v2_writer.finish().await?;
+    progress.stage_progress("write_root_index", 1).await?;
+    progress.stage_complete("write_root_index").await?;
+
     Ok(())
 }
 
@@ -2444,11 +2458,12 @@ mod tests {
 
     use arrow_array::types::UInt64Type;
     use arrow_array::{
-        FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
-        UInt64Array, make_array,
+        FixedSizeListArray, Float16Array, Float32Array, RecordBatch, RecordBatchIterator,
+        RecordBatchReader, UInt64Array, make_array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType, Field, Schema};
+    use half::f16;
     use itertools::Itertools;
     use lance_core::ROW_ID;
     use lance_core::utils::address::RowAddress;
@@ -3287,6 +3302,7 @@ mod tests {
             DIM,
             MetricType::L2,
             &ivf_params,
+            None,
             lance_index::progress::noop_progress(),
         )
         .await
@@ -3322,6 +3338,7 @@ mod tests {
             DIM,
             MetricType::Cosine,
             &ivf_params,
+            None,
             lance_index::progress::noop_progress(),
         )
         .await
@@ -3528,6 +3545,106 @@ mod tests {
                 Field::new("_distance", DataType::Float32, true)
             ]))
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_flat_f16() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        const DIM: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let query = Float16Array::from_iter_values(repeat_n(f16::from_f32(0.5), DIM));
+        let results = dataset
+            .scan()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 5);
+        let schema = results[0].schema();
+        let field = schema.field(0);
+        let DataType::FixedSizeList(item, _) = field.data_type() else {
+            panic!("vector column should remain fixed size list");
+        };
+        assert_eq!(item.data_type(), &DataType::Float16);
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_flat_f16() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        const DIM: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_hnsw(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            HnswBuildParams::default(),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let query = Float16Array::from_iter_values(repeat_n(f16::from_f32(0.5), DIM));
+        let results = dataset
+            .scan()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 5);
+        let schema = results[0].schema();
+        let field = schema.field(0);
+        let DataType::FixedSizeList(item, _) = field.data_type() else {
+            panic!("vector column should remain fixed size list");
+        };
+        assert_eq!(item.data_type(), &DataType::Float16);
     }
 
     #[tokio::test]
@@ -3881,6 +3998,7 @@ mod tests {
             DIM,
             MetricType::L2,
             &ivf_params,
+            None,
             progress,
         )
         .await
@@ -4056,5 +4174,53 @@ mod tests {
         dataset.prewarm_index("vector_idx").await.unwrap();
         let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
+
+    #[tokio::test]
+    async fn test_optimize_ivf_flat_binary_vectors() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        const BIN_DIM: usize = 16;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "bin_vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::UInt8, true)),
+                BIN_DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = arrow_array::UInt8Array::from_iter_values((0..1000 * BIN_DIM).map(|i| i as u8));
+        let fsl = FixedSizeListArray::try_new_from_values(arr, BIN_DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_flat(2, MetricType::Hamming);
+        dataset
+            .create_index(&["bin_vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // Append more data so optimize_indices has unindexed fragments to merge
+        let arr2 =
+            arrow_array::UInt8Array::from_iter_values((0..500 * BIN_DIM).map(|i| (i + 7) as u8));
+        let fsl2 = FixedSizeListArray::try_new_from_values(arr2, BIN_DIM as i32).unwrap();
+        let batch2 = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl2)]).unwrap();
+        let mut dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![batch2])
+            .await
+            .unwrap();
+
+        // This used to panic with "unsupported index type: FLAT, FLATBIN"
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(!indices.is_empty(), "should have at least one index");
     }
 }

@@ -23,11 +23,9 @@ use lance_linalg::distance::DistanceType;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::storage_options::JavaStorageOptionsProvider;
 
 use crate::traits::FromJObjectWithEnv;
 use lance_index::vector::Query;
-use lance_io::object_store::StorageOptionsProvider;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -51,9 +49,9 @@ pub fn extract_write_params(
     data_storage_version: &JObject,
     enable_v2_manifest_paths: Option<&JObject>,
     storage_options_obj: &JObject,
-    storage_options_provider_obj: &JObject, // Optional<StorageOptionsProvider>
-    initial_bases: &JObject,                // Optional<BasePath>
-    target_bases: &JObject,                 // Optional<String>
+    initial_bases: &JObject,                     // Optional<BasePath>
+    target_bases: &JObject,                      // Optional<String>
+    allow_external_blob_outside_bases: &JObject, // Optional<Boolean>
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -90,13 +88,6 @@ pub fn extract_write_params(
     let storage_options: HashMap<String, String> =
         extract_storage_options(env, storage_options_obj)?;
 
-    // Extract storage options provider if present
-    let storage_options_provider: Option<Arc<dyn StorageOptionsProvider>> = env
-        .get_optional(storage_options_provider_obj, |env, provider_obj| {
-            JavaStorageOptionsProvider::new(env, provider_obj)
-        })?
-        .map(|p| Arc::new(p) as Arc<dyn StorageOptionsProvider>);
-
     if let Some(initial_bases) =
         env.get_list_opt(initial_bases, |env, elem| elem.extract_object(env))?
     {
@@ -107,18 +98,17 @@ pub fn extract_write_params(
         write_params.target_base_names_or_paths = Some(names);
     }
 
-    // Create storage options accessor from storage_options and provider
-    let accessor = match (storage_options.is_empty(), storage_options_provider) {
-        (false, Some(provider)) => Some(Arc::new(
-            lance::io::StorageOptionsAccessor::with_initial_and_provider(storage_options, provider),
-        )),
-        (false, None) => Some(Arc::new(
+    if let Some(allow) = env.get_boolean_opt(allow_external_blob_outside_bases)? {
+        write_params.allow_external_blob_outside_bases = allow;
+    }
+
+    // Create storage options accessor from static storage_options
+    let accessor = if storage_options.is_empty() {
+        None
+    } else {
+        Some(Arc::new(
             lance::io::StorageOptionsAccessor::with_static_options(storage_options),
-        )),
-        (true, Some(provider)) => Some(Arc::new(lance::io::StorageOptionsAccessor::with_provider(
-            provider,
-        ))),
-        (true, None) => None,
+        ))
     };
 
     write_params.store_params = Some(ObjectStoreParams {
@@ -578,5 +568,87 @@ pub fn to_java_float_obj<'local>(
             &[JValue::Float(base_index as jfloat)],
         )?),
         None => Ok(JObject::null()),
+    }
+}
+
+pub fn to_java_double_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<f64>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(v) => Ok(env.new_object("java/lang/Double", "(D)V", &[JValue::Double(v)])?),
+        None => Ok(JObject::null()),
+    }
+}
+
+pub fn to_java_string_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<&str>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(v) => {
+            let jstr = env.new_string(v)?;
+            Ok(jstr.into())
+        }
+        None => Ok(JObject::null()),
+    }
+}
+
+/// Convert a DataFusion ScalarValue to a Java Comparable object.
+///
+/// Maps numeric types to their boxed Java equivalents (Long, Double)
+/// and string types to Java String. Null ScalarValues produce JObject::null().
+///
+/// This is useful for exposing index statistics (e.g., zonemap min/max)
+/// to Java clients in a type-safe, Comparable-compatible way.
+pub fn scalar_value_to_java<'a>(
+    env: &mut JNIEnv<'a>,
+    value: &datafusion_common::ScalarValue,
+) -> Result<JObject<'a>> {
+    use datafusion_common::ScalarValue;
+
+    match value {
+        ScalarValue::Null => Ok(JObject::null()),
+
+        ScalarValue::Boolean(v) => to_java_boolean_obj(env, *v),
+
+        // Integer types → Java Long
+        ScalarValue::Int8(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::Int16(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::Int32(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::Int64(v) => to_java_long_obj(env, *v),
+        ScalarValue::UInt8(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::UInt16(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::UInt32(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        // UInt64 may overflow i64, but for min/max stats this is acceptable
+        ScalarValue::UInt64(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+
+        // Float types → Java Double
+        ScalarValue::Float16(v) => to_java_double_obj(env, v.map(|x| f64::from(x.to_f32()))),
+        ScalarValue::Float32(v) => to_java_double_obj(env, v.map(|x| x as f64)),
+        ScalarValue::Float64(v) => to_java_double_obj(env, *v),
+
+        // String types → Java String
+        ScalarValue::Utf8(v) => to_java_string_obj(env, v.as_deref()),
+        ScalarValue::LargeUtf8(v) => to_java_string_obj(env, v.as_deref()),
+
+        // Date types → Java Long
+        ScalarValue::Date32(v) => to_java_long_obj(env, v.map(|x| x as i64)),
+        ScalarValue::Date64(v) => to_java_long_obj(env, *v),
+
+        // Timestamp types → Java Long
+        ScalarValue::TimestampSecond(v, _) => to_java_long_obj(env, *v),
+        ScalarValue::TimestampMillisecond(v, _) => to_java_long_obj(env, *v),
+        ScalarValue::TimestampMicrosecond(v, _) => to_java_long_obj(env, *v),
+        ScalarValue::TimestampNanosecond(v, _) => to_java_long_obj(env, *v),
+
+        // For any unsupported type, return null (conservative: caller will skip)
+        _ => {
+            log::warn!(
+                "Unsupported ScalarValue type for Java conversion: {:?}",
+                value.data_type()
+            );
+            Ok(JObject::null())
+        }
     }
 }
