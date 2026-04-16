@@ -382,12 +382,17 @@ impl<'a> InsertBuilder<'a> {
             WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
             WriteDestination::Uri(uri) => {
                 // Check if it already exists.
-                let builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
+                let mut builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
                     store_options: params.store_params.clone(),
                     commit_handler: params.commit_handler.clone(),
                     session: params.session.clone(),
                     ..Default::default()
                 });
+                if let Some(base_store_params) = &params.base_store_params {
+                    for (base_path, store_params) in base_store_params {
+                        builder = builder.with_base_store_params(base_path, store_params.clone());
+                    }
+                }
 
                 match builder.load().await {
                     Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
@@ -445,6 +450,8 @@ mod test {
     use arrow_array::{BinaryArray, Int32Array, RecordBatchReader, StructArray};
     use arrow_schema::{ArrowError, DataType, Field, Schema};
     use lance_arrow::BLOB_META_KEY;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_io::object_store::ObjectStoreParams;
 
     use crate::session::Session;
 
@@ -523,6 +530,49 @@ mod test {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_insert_builder_base_store_params() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let test_dir = TempStrDir::default();
+        let uri = test_dir.as_ref();
+        let session = Arc::new(Session::default());
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            uri,
+            Some(WriteParams {
+                session: Some(session.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let base_path = "memory://external-base".to_string();
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            session: Some(session),
+            base_store_params: Some(HashMap::from([(
+                base_path.clone(),
+                ObjectStoreParams::default(),
+            )])),
+            ..Default::default()
+        };
+
+        let context = InsertBuilder::new(uri)
+            .with_params(&params)
+            .resolve_context()
+            .await
+            .unwrap();
+        let dataset = context.dest.dataset().expect("existing dataset");
+        let base_store_params = dataset
+            .base_store_params
+            .as_ref()
+            .expect("base store params should be attached to reopened dataset");
+        assert!(base_store_params.contains_key(&base_path));
     }
 
     #[tokio::test]
