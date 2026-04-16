@@ -566,6 +566,7 @@ class LanceDataset(pa.dataset.Dataset):
         namespace_client: Optional[Any] = None,
         table_id: Optional[List[str]] = None,
         namespace_client_managed_versioning: bool = False,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -604,6 +605,7 @@ class LanceDataset(pa.dataset.Dataset):
             namespace_client=namespace_client,
             table_id=table_id,
             namespace_client_managed_versioning=namespace_client_managed_versioning,
+            base_store_params=base_store_params,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -6281,6 +6283,7 @@ def write_dataset(
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
     target_bases: Optional[List[str]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
     blob_pack_file_size_threshold: Optional[int] = None,
@@ -6378,6 +6381,12 @@ def write_dataset(
 
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
+    base_store_params : dict of str to dict, optional
+        Runtime-only object store parameters keyed by base path URI. Each key
+        is a base path URI (e.g., "s3://bucket/path") and each value is a dict
+        of storage options (credentials, endpoint, etc.) for that base. These
+        are not persisted to the manifest. When a base has no explicit entry
+        here, the top-level ``storage_options`` is used as a fallback.
     external_blob_mode: {"reference", "ingest"}, default "reference"
         How external blob URIs are handled on write.
 
@@ -6518,6 +6527,7 @@ def write_dataset(
         "transaction_properties": merged_properties,
         "initial_bases": initial_bases,
         "target_bases": target_bases,
+        "base_store_params": base_store_params,
         "external_blob_mode": external_blob_mode,
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
         "blob_pack_file_size_threshold": blob_pack_file_size_threshold,
