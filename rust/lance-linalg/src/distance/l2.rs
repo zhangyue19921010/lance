@@ -97,11 +97,56 @@ impl L2 for u8 {
     }
 }
 
+#[cfg(feature = "fp16kernels")]
+mod bf16_kernel {
+    use half::bf16;
+
+    // These are the `l2_bf16` function in bf16.c. Our build.rs script compiles
+    // a version of this file for each SIMD level with different suffixes.
+    unsafe extern "C" {
+        #[cfg(target_arch = "aarch64")]
+        pub fn l2_bf16_neon(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+        pub fn l2_bf16_avx512(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn l2_bf16_avx2(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn l2_bf16_lsx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn l2_bf16_lasx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+    }
+}
+
 impl L2 for bf16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
-        // TODO: add SIMD support
-        l2_scalar::<Self, f32, 16>(x, y)
+        match *SIMD_SUPPORT {
+            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+            SimdSupport::Neon => unsafe {
+                bf16_kernel::l2_bf16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(
+                feature = "fp16kernels",
+                kernel_support = "avx512",
+                target_arch = "x86_64"
+            ))]
+            SimdSupport::Avx512FP16 => unsafe {
+                bf16_kernel::l2_bf16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
+            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+                bf16_kernel::l2_bf16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lasx => unsafe {
+                bf16_kernel::l2_bf16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lsx => unsafe {
+                bf16_kernel::l2_bf16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            _ => l2_scalar::<Self, f32, 16>(x, y),
+        }
     }
 }
 

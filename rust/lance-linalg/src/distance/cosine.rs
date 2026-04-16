@@ -72,7 +72,65 @@ impl Cosine for u8 {
     }
 }
 
-impl Cosine for bf16 {}
+#[cfg(feature = "fp16kernels")]
+mod bf16_kernel {
+    use half::bf16;
+
+    // These are the `cosine_bf16` function in bf16.c. Our build.rs script compiles
+    // a version of this file for each SIMD level with different suffixes.
+    unsafe extern "C" {
+        #[cfg(target_arch = "aarch64")]
+        pub fn cosine_bf16_neon(x: *const bf16, x_norm: f32, y: *const bf16, dimension: u32)
+        -> f32;
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+        pub fn cosine_bf16_avx512(
+            x: *const bf16,
+            x_norm: f32,
+            y: *const bf16,
+            dimension: u32,
+        ) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn cosine_bf16_avx2(x: *const bf16, x_norm: f32, y: *const bf16, dimension: u32)
+        -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn cosine_bf16_lsx(x: *const bf16, x_norm: f32, y: *const bf16, dimension: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn cosine_bf16_lasx(x: *const bf16, x_norm: f32, y: *const bf16, dimension: u32)
+        -> f32;
+    }
+}
+
+impl Cosine for bf16 {
+    fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
+        match *SIMD_SUPPORT {
+            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+            SimdSupport::Neon => unsafe {
+                bf16_kernel::cosine_bf16_neon(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            #[cfg(all(
+                feature = "fp16kernels",
+                kernel_support = "avx512",
+                target_arch = "x86_64"
+            ))]
+            SimdSupport::Avx512FP16 => unsafe {
+                bf16_kernel::cosine_bf16_avx512(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
+            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+                bf16_kernel::cosine_bf16_avx2(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lasx => unsafe {
+                bf16_kernel::cosine_bf16_lasx(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lsx => unsafe {
+                bf16_kernel::cosine_bf16_lsx(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
+            },
+            _ => cosine_scalar(x, x_norm, y),
+        }
+    }
+}
 
 #[cfg(feature = "fp16kernels")]
 mod kernel {
