@@ -189,11 +189,7 @@ fn dot_f64_simd(x: &[f64], y: &[f64]) -> f32 {
 impl Dot for u8 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
-        // TODO: this is not optimized for auto vectorization yet.
-        x.iter()
-            .zip(y.iter())
-            .map(|(&x_i, &y_i)| x_i as u32 * y_i as u32)
-            .sum::<u32>() as f32
+        super::dot_u8::dot_u8(x, y) as f32
     }
 }
 
