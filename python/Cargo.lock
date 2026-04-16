@@ -3761,6 +3761,7 @@ dependencies = [
  "permutation",
  "pin-project",
  "prost",
+ "prost-build",
  "prost-types",
  "rand 0.9.4",
  "roaring",
