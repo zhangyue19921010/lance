@@ -170,8 +170,50 @@ impl L2 for f32 {
 impl L2 for f64 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
-        l2_scalar::<Self, Self, 8>(x, y) as f32
+        l2_f64_simd(x, y)
     }
+}
+
+/// Explicit SIMD L2 distance for f64.
+#[inline]
+fn l2_f64_simd(x: &[f64], y: &[f64]) -> f32 {
+    use crate::simd::f64::{f64x4, f64x8};
+    use crate::simd::{FloatSimd, SIMD};
+
+    let dim = x.len();
+    let unrolled_len = dim / 8 * 8;
+
+    let mut acc8 = f64x8::zeros();
+    for i in (0..unrolled_len).step_by(8) {
+        unsafe {
+            let a = f64x8::load_unaligned(x.as_ptr().add(i));
+            let b = f64x8::load_unaligned(y.as_ptr().add(i));
+            let diff = a - b;
+            acc8.multiply_add(diff, diff);
+        }
+    }
+
+    let aligned_len = dim / 4 * 4;
+    let mut acc4 = f64x4::zeros();
+    for i in (unrolled_len..aligned_len).step_by(4) {
+        unsafe {
+            let a = f64x4::load_unaligned(x.as_ptr().add(i));
+            let b = f64x4::load_unaligned(y.as_ptr().add(i));
+            let diff = a - b;
+            acc4.multiply_add(diff, diff);
+        }
+    }
+
+    let tail: f64 = x[aligned_len..]
+        .iter()
+        .zip(y[aligned_len..].iter())
+        .map(|(&a, &b)| {
+            let diff = a - b;
+            diff * diff
+        })
+        .sum();
+
+    (acc8.reduce_sum() + acc4.reduce_sum() + tail) as f32
 }
 
 /// Accumulate squared differences for one dimension into per-target results.

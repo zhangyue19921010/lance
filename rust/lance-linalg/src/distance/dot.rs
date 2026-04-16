@@ -145,8 +145,45 @@ impl Dot for f32 {
 impl Dot for f64 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
-        dot_scalar::<Self, Self, 8>(x, y) as f32
+        dot_f64_simd(x, y)
     }
+}
+
+/// Explicit SIMD dot product for f64.
+#[inline]
+fn dot_f64_simd(x: &[f64], y: &[f64]) -> f32 {
+    use crate::simd::f64::{f64x4, f64x8};
+    use crate::simd::{FloatSimd, SIMD};
+
+    let dim = x.len();
+    let unrolled_len = dim / 8 * 8;
+
+    let mut acc8 = f64x8::zeros();
+    for i in (0..unrolled_len).step_by(8) {
+        unsafe {
+            let a = f64x8::load_unaligned(x.as_ptr().add(i));
+            let b = f64x8::load_unaligned(y.as_ptr().add(i));
+            acc8.multiply_add(a, b);
+        }
+    }
+
+    let aligned_len = dim / 4 * 4;
+    let mut acc4 = f64x4::zeros();
+    for i in (unrolled_len..aligned_len).step_by(4) {
+        unsafe {
+            let a = f64x4::load_unaligned(x.as_ptr().add(i));
+            let b = f64x4::load_unaligned(y.as_ptr().add(i));
+            acc4.multiply_add(a, b);
+        }
+    }
+
+    let tail: f64 = x[aligned_len..]
+        .iter()
+        .zip(y[aligned_len..].iter())
+        .map(|(&a, &b)| a * b)
+        .sum();
+
+    (acc8.reduce_sum() + acc4.reduce_sum() + tail) as f32
 }
 
 impl Dot for u8 {

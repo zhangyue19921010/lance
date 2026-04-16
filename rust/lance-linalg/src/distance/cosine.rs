@@ -230,7 +230,47 @@ impl Cosine for f32 {
     }
 }
 
-impl Cosine for f64 {}
+impl Cosine for f64 {
+    #[inline]
+    fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
+        use crate::simd::f64::{f64x4, f64x8};
+        use crate::simd::{FloatSimd, SIMD};
+
+        let dim = x.len();
+        let unrolled_len = dim / 8 * 8;
+        let mut y_norm8 = f64x8::zeros();
+        let mut xy8 = f64x8::zeros();
+        for i in (0..unrolled_len).step_by(8) {
+            unsafe {
+                let xv = f64x8::load_unaligned(x.as_ptr().add(i));
+                let yv = f64x8::load_unaligned(y.as_ptr().add(i));
+                xy8.multiply_add(xv, yv);
+                y_norm8.multiply_add(yv, yv);
+            }
+        }
+        let aligned_len = dim / 4 * 4;
+        let mut y_norm4 = f64x4::zeros();
+        let mut xy4 = f64x4::zeros();
+        for i in (unrolled_len..aligned_len).step_by(4) {
+            unsafe {
+                let xv = f64x4::load_unaligned(x.as_ptr().add(i));
+                let yv = f64x4::load_unaligned(y.as_ptr().add(i));
+                xy4.multiply_add(xv, yv);
+                y_norm4.multiply_add(yv, yv);
+            }
+        }
+        let tail_y_norm: Self = y[aligned_len..].iter().map(|&v| v * v).sum();
+        let tail_xy: Self = x[aligned_len..]
+            .iter()
+            .zip(y[aligned_len..].iter())
+            .map(|(&a, &b)| a * b)
+            .sum();
+
+        let y_norm_sq = (y_norm8.reduce_sum() + y_norm4.reduce_sum() + tail_y_norm) as f32;
+        let xy = (xy8.reduce_sum() + xy4.reduce_sum() + tail_xy) as f32;
+        1.0 - xy / x_norm / y_norm_sq.sqrt()
+    }
+}
 
 /// Fallback non-SIMD implementation
 #[inline]
