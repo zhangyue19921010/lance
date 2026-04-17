@@ -47,7 +47,9 @@ class Blob:
         return Blob(data=bytes(data))
 
     @staticmethod
-    def from_uri(uri: str, position: int = None, size: int = None) -> "Blob":
+    def from_uri(
+        uri: str, position: Optional[int] = None, size: Optional[int] = None
+    ) -> "Blob":
         if uri == "":
             raise ValueError("Blob uri cannot be empty")
         if (position is not None and position < 0) or (size is not None and size < 0):
@@ -83,7 +85,7 @@ class BlobType(pa.ExtensionType):
 
     @classmethod
     def __arrow_ext_deserialize__(
-            cls, storage_type: pa.DataType, serialized: bytes
+        cls, storage_type: pa.DataType, serialized: bytes
     ) -> "BlobType":
         return BlobType()
 
@@ -223,7 +225,7 @@ class BlobColumn:
             )
 
         if not pa.types.is_large_binary(blob_column.type) and not pa.types.is_binary(
-                blob_column.type
+            blob_column.type
         ):
             raise ValueError(f"Expected a binary array, got {blob_column.type}")
 
