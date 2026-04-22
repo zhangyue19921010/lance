@@ -788,7 +788,7 @@ impl PartialOrd for BitmapHeapItem {
 
 struct BitmapShardCursor {
     file_name: String,
-    reader: Arc<dyn IndexReader>,
+    store: Arc<dyn IndexStore>,
     total_rows: usize,
     next_row_offset: usize,
     batch: Option<RecordBatch>,
@@ -796,7 +796,11 @@ struct BitmapShardCursor {
 }
 
 impl BitmapShardCursor {
-    async fn try_new(file_name: String, reader: Arc<dyn IndexReader>) -> Result<Option<Self>> {
+    async fn try_new(
+        file_name: String,
+        store: Arc<dyn IndexStore>,
+        reader: Arc<dyn IndexReader>,
+    ) -> Result<Option<Self>> {
         let total_rows = reader.num_rows();
         if total_rows == 0 {
             return Ok(None);
@@ -804,13 +808,13 @@ impl BitmapShardCursor {
 
         let mut cursor = Self {
             file_name,
-            reader,
+            store,
             total_rows,
             next_row_offset: 0,
             batch: None,
             batch_row_idx: 0,
         };
-        if cursor.advance().await? {
+        if cursor.load_next_batch(reader).await? {
             Ok(Some(cursor))
         } else {
             Ok(None)
@@ -852,28 +856,37 @@ impl BitmapShardCursor {
         Ok((key, bitmap))
     }
 
-    async fn advance(&mut self) -> Result<bool> {
+    async fn load_next_batch(&mut self, reader: Arc<dyn IndexReader>) -> Result<bool> {
         loop {
-            if let Some(batch) = &self.batch
-                && self.batch_row_idx < batch.num_rows()
-            {
-                return Ok(true);
-            }
-
             if self.next_row_offset >= self.total_rows {
                 self.batch = None;
                 return Ok(false);
             }
 
             let end_row = (self.next_row_offset + MERGE_ROWS_PER_CHUNK).min(self.total_rows);
-            let batch = self
-                .reader
-                .read_range(self.next_row_offset..end_row, None)
-                .await?;
+            let batch = reader.read_range(self.next_row_offset..end_row, None).await?;
             self.next_row_offset = end_row;
-            self.batch = Some(batch);
             self.batch_row_idx = 0;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            self.batch = Some(batch);
+            return Ok(true);
         }
+    }
+
+    async fn advance(&mut self) -> Result<bool> {
+        if let Some(batch) = &self.batch
+            && self.batch_row_idx < batch.num_rows()
+        {
+            return Ok(true);
+        }
+
+        // Do not retain one open reader per shard for the entire merge. We only
+        // reopen the shard reader when the cursor needs another batch, which
+        // keeps peak reader/file-handle usage bounded even with many shards.
+        let reader = self.store.open_index_file(&self.file_name).await?;
+        self.load_next_batch(reader).await
     }
 }
 
@@ -1344,7 +1357,9 @@ impl BitmapIndexPlugin {
             } else {
                 value_type = Some(shard_value_type);
             }
-            if let Some(cursor) = BitmapShardCursor::try_new(file_name.clone(), reader).await? {
+            if let Some(cursor) =
+                BitmapShardCursor::try_new(file_name.clone(), store.clone_arc(), reader).await?
+            {
                 let key = cursor.peek_key()?;
                 let shard_idx = cursors.len();
                 cursors.push(cursor);
