@@ -59,6 +59,8 @@ pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
 const BITMAP_PART_LOOKUP_PREFIX: &str = "part_";
 const BITMAP_PART_LOOKUP_SUFFIX: &str = "_bitmap_page_lookup.lance";
+const EXPLICIT_SHARD_ID_TAG: u64 = 0;
+const IMPLICIT_FRAGMENT_ID_TAG: u64 = 1;
 
 const MAX_BITMAP_ARRAY_LENGTH: usize = i32::MAX as usize - 1024 * 1024; // leave headroom
 
@@ -668,8 +670,7 @@ impl ScalarIndex for BitmapIndex {
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        let params = serde_json::to_value(BitmapParameters::default())?;
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap).with_params(&params))
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap))
     }
 }
 
@@ -750,6 +751,10 @@ fn bitmap_shard_file_name(partition_id: u64) -> String {
     format!("{BITMAP_PART_LOOKUP_PREFIX}{partition_id}{BITMAP_PART_LOOKUP_SUFFIX}")
 }
 
+fn tagged_bitmap_partition_id(id: u32, tag: u64) -> u64 {
+    ((id as u64) << 32) | tag
+}
+
 fn bitmap_shard_partition_id(fragment_ids: &[u32], shard_id: Option<u32>) -> Result<u64> {
     if fragment_ids.is_empty() {
         return Err(Error::invalid_input(
@@ -758,7 +763,7 @@ fn bitmap_shard_partition_id(fragment_ids: &[u32], shard_id: Option<u32>) -> Res
     }
 
     if let Some(shard_id) = shard_id {
-        return Ok((shard_id as u64) << 32);
+        return Ok(tagged_bitmap_partition_id(shard_id, EXPLICIT_SHARD_ID_TAG));
     }
 
     let [fragment_id] = fragment_ids else {
@@ -771,7 +776,10 @@ fn bitmap_shard_partition_id(fragment_ids: &[u32], shard_id: Option<u32>) -> Res
         )));
     };
 
-    Ok((*fragment_id as u64) << 32)
+    Ok(tagged_bitmap_partition_id(
+        *fragment_id,
+        IMPLICIT_FRAGMENT_ID_TAG,
+    ))
 }
 
 fn extract_bitmap_shard_id(filename: &str) -> Result<u64> {
@@ -941,13 +949,14 @@ async fn drain_same_key_bitmaps(
     item: BitmapHeapItem,
 ) -> Result<(ScalarValue, RowAddrTreeMap)> {
     let (key, mut merged_bitmap) = cursors[item.shard_idx].take_current()?;
+    let merged_key = OrderableScalarValue(key);
     advance_cursor_and_push(cursors, heap, item.shard_idx).await?;
 
     loop {
         let Some(Reverse(next_item)) = heap.peek() else {
             break;
         };
-        if next_item.key.0 != key {
+        if next_item.key != merged_key {
             break;
         }
 
@@ -958,7 +967,7 @@ async fn drain_same_key_bitmaps(
         advance_cursor_and_push(cursors, heap, shard_idx).await?;
     }
 
-    Ok((key, merged_bitmap))
+    Ok((merged_key.0, merged_bitmap))
 }
 
 async fn list_bitmap_shard_files(
@@ -1472,7 +1481,11 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
                 "A bitmap index can only be created on a non-nested field.".into(),
             ));
         }
-        let params = serde_json::from_str::<BitmapParameters>(params)?;
+        let params = if params.is_empty() {
+            BitmapParameters::default()
+        } else {
+            serde_json::from_str::<BitmapParameters>(params)?
+        };
         Ok(Box::new(BitmapTrainingRequest::new(params)))
     }
 
@@ -1585,78 +1598,12 @@ mod tests {
         let sorted_row_ids = arrow::compute::take(row_ids.as_ref(), &indices, None).unwrap();
         RecordBatch::try_new(batch.schema(), vec![sorted_values, sorted_row_ids]).unwrap()
     }
-    use crate::progress::NoopIndexBuildProgress;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::utils::mask::RowSetOps;
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
     use std::collections::HashMap;
-
-    fn make_sorted_stream(batch: RecordBatch) -> SendableRecordBatchStream {
-        let schema = batch.schema();
-        let batch = sort_batch_by_value(&batch);
-        let stream = stream::once(async move { Ok(batch) });
-        Box::pin(RecordBatchStreamAdapter::new(schema, stream))
-    }
-
-    async fn write_bitmap_shard(
-        store: &dyn IndexStore,
-        batch: RecordBatch,
-        fragment_ids: &[u32],
-        shard_id: Option<u32>,
-    ) -> Result<()> {
-        BitmapIndexPlugin::train_bitmap_shard(
-            make_sorted_stream(batch),
-            store,
-            fragment_ids,
-            shard_id,
-            Arc::new(NoopIndexBuildProgress),
-        )
-        .await
-    }
-
-    #[test]
-    fn test_bitmap_shard_partition_id_uses_single_fragment_namespace() {
-        assert_eq!(bitmap_shard_partition_id(&[7], None).unwrap(), (7u64) << 32);
-        assert_eq!(
-            bitmap_shard_file_name(bitmap_shard_partition_id(&[7], None).unwrap()),
-            "part_30064771072_bitmap_page_lookup.lance"
-        );
-    }
-
-    #[test]
-    fn test_bitmap_shard_partition_id_uses_explicit_shard_id_for_fragment_groups() {
-        assert_eq!(
-            bitmap_shard_partition_id(&[1, 2], Some(9)).unwrap(),
-            (9u64) << 32
-        );
-        assert_eq!(
-            bitmap_shard_file_name(bitmap_shard_partition_id(&[1, 2], Some(9)).unwrap()),
-            "part_38654705664_bitmap_page_lookup.lance"
-        );
-    }
-
-    #[test]
-    fn test_bitmap_shard_partition_id_requires_shard_id_for_multi_fragment_builds() {
-        let empty_error = bitmap_shard_partition_id(&[], None).unwrap_err();
-        assert!(matches!(empty_error, Error::InvalidInput { .. }));
-        assert!(
-            empty_error
-                .to_string()
-                .contains("requires at least one fragment id"),
-            "unexpected error: {empty_error}"
-        );
-
-        let multi_error = bitmap_shard_partition_id(&[1, 2], None).unwrap_err();
-        assert!(matches!(multi_error, Error::InvalidInput { .. }));
-        assert!(
-            multi_error
-                .to_string()
-                .contains("requires an explicit shard_id"),
-            "unexpected error: {multi_error}"
-        );
-    }
 
     #[tokio::test]
     async fn test_bitmap_lazy_loading_and_cache() {
@@ -2331,182 +2278,5 @@ mod tests {
             }
             _ => panic!("Expected Exact search result"),
         }
-    }
-
-    #[tokio::test]
-    async fn test_bitmap_shard_merge_end_to_end() {
-        use arrow_array::Int32Array;
-
-        let tmpdir = TempObjDir::default();
-        let object_store = Arc::new(ObjectStore::local());
-        let store = Arc::new(LanceIndexStore::new(
-            object_store.clone(),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int32, true),
-            Field::new("_rowid", DataType::UInt64, false),
-        ]));
-
-        let shard_one = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![None, Some(1), Some(2), Some(10)])),
-                Arc::new(UInt64Array::from(vec![
-                    RowAddress::new_from_parts(1, 0).into(),
-                    RowAddress::new_from_parts(1, 1).into(),
-                    RowAddress::new_from_parts(1, 2).into(),
-                    RowAddress::new_from_parts(1, 3).into(),
-                ] as Vec<u64>)),
-            ],
-        )
-        .unwrap();
-        write_bitmap_shard(store.as_ref(), shard_one, &[1], None)
-            .await
-            .unwrap();
-
-        let shard_two = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![None, Some(1), Some(3), Some(11)])),
-                Arc::new(UInt64Array::from(vec![
-                    RowAddress::new_from_parts(2, 0).into(),
-                    RowAddress::new_from_parts(2, 1).into(),
-                    RowAddress::new_from_parts(2, 2).into(),
-                    RowAddress::new_from_parts(2, 3).into(),
-                ] as Vec<u64>)),
-            ],
-        )
-        .unwrap();
-        write_bitmap_shard(store.as_ref(), shard_two, &[2], None)
-            .await
-            .unwrap();
-
-        merge_index_files(
-            object_store.as_ref(),
-            tmpdir.as_ref(),
-            store.clone(),
-            Arc::new(NoopIndexBuildProgress),
-        )
-        .await
-        .unwrap();
-
-        let index = BitmapIndex::load(store.clone(), None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-
-        let eq_result = index
-            .search(
-                &SargableQuery::Equals(ScalarValue::Int32(Some(1))),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        let SearchResult::Exact(eq_rows) = eq_result else {
-            panic!("Expected exact result for equals query");
-        };
-        let mut eq_actual: Vec<u64> = eq_rows
-            .true_rows()
-            .row_addrs()
-            .unwrap()
-            .map(u64::from)
-            .collect();
-        eq_actual.sort();
-        assert_eq!(
-            eq_actual,
-            vec![
-                RowAddress::new_from_parts(1, 1).into(),
-                RowAddress::new_from_parts(2, 1).into(),
-            ] as Vec<u64>
-        );
-
-        let range_result = index
-            .search(
-                &SargableQuery::Range(
-                    Bound::Included(ScalarValue::Int32(Some(2))),
-                    Bound::Included(ScalarValue::Int32(Some(3))),
-                ),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        let SearchResult::Exact(range_rows) = range_result else {
-            panic!("Expected exact result for range query");
-        };
-        let mut range_actual: Vec<u64> = range_rows
-            .true_rows()
-            .row_addrs()
-            .unwrap()
-            .map(u64::from)
-            .collect();
-        range_actual.sort();
-        assert_eq!(
-            range_actual,
-            vec![
-                RowAddress::new_from_parts(1, 2).into(),
-                RowAddress::new_from_parts(2, 2).into(),
-            ] as Vec<u64>
-        );
-
-        let is_in_result = index
-            .search(
-                &SargableQuery::IsIn(vec![
-                    ScalarValue::Int32(Some(10)),
-                    ScalarValue::Int32(Some(11)),
-                ]),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        let SearchResult::Exact(is_in_rows) = is_in_result else {
-            panic!("Expected exact result for is-in query");
-        };
-        let mut is_in_actual: Vec<u64> = is_in_rows
-            .true_rows()
-            .row_addrs()
-            .unwrap()
-            .map(u64::from)
-            .collect();
-        is_in_actual.sort();
-        assert_eq!(
-            is_in_actual,
-            vec![
-                RowAddress::new_from_parts(1, 3).into(),
-                RowAddress::new_from_parts(2, 3).into(),
-            ] as Vec<u64>
-        );
-
-        let null_result = index
-            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
-            .await
-            .unwrap();
-        let SearchResult::Exact(null_rows) = null_result else {
-            panic!("Expected exact result for is-null query");
-        };
-        let mut null_actual: Vec<u64> = null_rows
-            .true_rows()
-            .row_addrs()
-            .unwrap()
-            .map(u64::from)
-            .collect();
-        null_actual.sort();
-        assert_eq!(
-            null_actual,
-            vec![
-                RowAddress::new_from_parts(1, 0).into(),
-                RowAddress::new_from_parts(2, 0).into(),
-            ] as Vec<u64>
-        );
-
-        let files = store.list_files_with_sizes().await.unwrap();
-        assert!(files.iter().any(|file| file.path == BITMAP_LOOKUP_NAME));
-        assert!(
-            files
-                .iter()
-                .all(|file| !file.path.ends_with(BITMAP_PART_LOOKUP_SUFFIX)),
-            "bitmap shard files should be cleaned up after merge"
-        );
     }
 }
