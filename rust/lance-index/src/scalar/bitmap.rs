@@ -771,10 +771,21 @@ fn bitmap_shard_partition_id(fragment_ids: &[u32], shard_id: Option<u32>) -> Res
         )));
     };
 
-    // Match the fragment-based partition naming used by the distributed BTree
-    // build. Encoding the fragment id into the upper 32 bits yields a shard
-    // identifier that is unique without relying on collision-prone hashing.
     Ok((*fragment_id as u64) << 32)
+}
+
+fn extract_bitmap_shard_id(filename: &str) -> Result<u64> {
+    let partition_id = filename
+        .strip_prefix(BITMAP_PART_LOOKUP_PREFIX)
+        .and_then(|name| name.strip_suffix(BITMAP_PART_LOOKUP_SUFFIX))
+        .ok_or_else(|| {
+            Error::internal(format!("Invalid bitmap shard file name format: {filename}"))
+        })?;
+    partition_id.parse::<u64>().map_err(|_| {
+        Error::internal(format!(
+            "Failed to parse bitmap partition id from file name: {filename}"
+        ))
+    })
 }
 
 fn deserialize_bitmap(bitmap_bytes: &[u8], file_name: &str) -> Result<RowAddrTreeMap> {
@@ -978,7 +989,15 @@ async fn list_bitmap_shard_files(
             }
         }
     }
-    shard_files.sort_unstable();
+    let mut shard_files = shard_files
+        .into_iter()
+        .map(|file_name| extract_bitmap_shard_id(&file_name).map(|shard_id| (shard_id, file_name)))
+        .collect::<Result<Vec<_>>>()?;
+    shard_files.sort_unstable_by_key(|(shard_id, _)| *shard_id);
+    let shard_files = shard_files
+        .into_iter()
+        .map(|(_, file_name)| file_name)
+        .collect::<Vec<_>>();
     if shard_files.is_empty() {
         return Err(Error::invalid_input(format!(
             "No bitmap shard files found in index directory: {}; \
@@ -1386,8 +1405,15 @@ impl BitmapIndexPlugin {
             }
         }
 
+        if heap.is_empty() {
+            // Shard files exist, but all are empty (0 rows). This is caller misuse.
+            return Err(Error::invalid_input(
+                "Bitmap shard merge requires at least one non-empty shard".to_string(),
+            ));
+        }
+
         let value_type = value_type.ok_or_else(|| {
-            Error::internal("Bitmap shard merge requires at least one non-empty shard".to_string())
+            Error::invalid_input("Bitmap shard merge requires at least one shard file".to_string())
         })?;
         let mut writer = new_bitmap_batch_writer(store, BITMAP_LOOKUP_NAME, &value_type).await?;
         let mut merged_keys = 0u64;
@@ -1477,7 +1503,12 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         let request = request
             .as_any()
             .downcast_ref::<BitmapTrainingRequest>()
-            .unwrap();
+            .ok_or_else(|| {
+                Error::internal(
+                    "BitmapIndexPlugin::train_index received a non-bitmap training request"
+                        .to_string(),
+                )
+            })?;
         if let Some(fragment_ids) = fragment_ids.as_ref() {
             Self::train_bitmap_shard(
                 data,
