@@ -3886,7 +3886,9 @@ def test_distributed_bitmap_index_build(tmp_path):
     index_name = "bitmap_multiple_fragment_idx"
     fragments = ds.get_fragments()
     fragment_ids = [fragment.fragment_id for fragment in fragments]
-    fragment_groups = [fragment_ids[idx : idx + 2] for idx in range(0, len(fragment_ids), 2)]
+    fragment_groups = [
+        fragment_ids[idx : idx + 2] for idx in range(0, len(fragment_ids), 2)
+    ]
     assert len(fragment_groups) >= 2
 
     for shard_id, fragment_group in enumerate(fragment_groups):
