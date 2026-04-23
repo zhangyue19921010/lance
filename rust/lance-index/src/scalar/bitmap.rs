@@ -30,11 +30,10 @@ use lance_core::{
     },
 };
 use lance_io::object_store::ObjectStore;
-use log::warn;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
-use serde::Serialize;
-use tracing::instrument;
+use serde::{Deserialize, Serialize};
+use tracing::{instrument, warn};
 
 use super::{AnyQuery, IndexStore, ScalarIndex};
 use super::{
@@ -49,8 +48,8 @@ use crate::{
         CreatedIndex, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-            TrainingRequest, VALUE_COLUMN_NAME,
+            ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+            VALUE_COLUMN_NAME,
         },
     },
 };
@@ -346,6 +345,37 @@ struct BitmapStatistics {
     num_bitmaps: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BitmapParameters {
+    /// Optional shard identifier for distributed bitmap builds spanning
+    /// multiple fragments.
+    pub shard_id: Option<u32>,
+}
+
+struct BitmapTrainingRequest {
+    parameters: BitmapParameters,
+    criteria: TrainingCriteria,
+}
+
+impl BitmapTrainingRequest {
+    fn new(parameters: BitmapParameters) -> Self {
+        Self {
+            parameters,
+            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+        }
+    }
+}
+
+impl TrainingRequest for BitmapTrainingRequest {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn criteria(&self) -> &TrainingCriteria {
+        &self.criteria
+    }
+}
+
 #[async_trait]
 impl Index for BitmapIndex {
     fn as_any(&self) -> &dyn Any {
@@ -638,7 +668,8 @@ impl ScalarIndex for BitmapIndex {
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap))
+        let params = serde_json::to_value(BitmapParameters::default())?;
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap).with_params(&params))
     }
 }
 
@@ -719,29 +750,31 @@ fn bitmap_shard_file_name(partition_id: u64) -> String {
     format!("{BITMAP_PART_LOOKUP_PREFIX}{partition_id}{BITMAP_PART_LOOKUP_SUFFIX}")
 }
 
-fn stable_bitmap_partition_id(fragment_ids: &[u32]) -> Result<u64> {
+fn bitmap_shard_partition_id(fragment_ids: &[u32], shard_id: Option<u32>) -> Result<u64> {
     if fragment_ids.is_empty() {
         return Err(Error::invalid_input(
-            "Bitmap shard build requires at least one fragment id",
+            "Bitmap shard build requires at least one fragment id".to_string(),
         ));
     }
 
-    let mut normalized = fragment_ids.to_vec();
-    normalized.sort_unstable();
-    normalized.dedup();
-
-    // FNV-1a over the little-endian bytes of each fragment id.  Processing one
-    // byte at a time (vs. XOR-ing the full u32 at once) gives correct FNV-1a
-    // dispersion and eliminates the trivial collisions the wide-XOR variant
-    // produces for fragment sets that differ only by bit-patterns.
-    let mut hash = 0xcbf29ce484222325u64;
-    for fragment_id in normalized {
-        for byte in fragment_id.to_le_bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x00000100000001b3);
-        }
+    if let Some(shard_id) = shard_id {
+        return Ok((shard_id as u64) << 32);
     }
-    Ok(hash)
+
+    let [fragment_id] = fragment_ids else {
+        return Err(Error::invalid_input(format!(
+            "Bitmap distributed build over multiple fragments requires an explicit shard_id. \
+             Received {} fragment ids: {:?}. Please assign mutually exclusive shard_id values \
+             to disjoint fragment groups.",
+            fragment_ids.len(),
+            fragment_ids
+        )));
+    };
+
+    // Match the fragment-based partition naming used by the distributed BTree
+    // build. Encoding the fragment id into the upper 32 bits yields a shard
+    // identifier that is unique without relying on collision-prone hashing.
+    Ok((*fragment_id as u64) << 32)
 }
 
 fn deserialize_bitmap(bitmap_bytes: &[u8], file_name: &str) -> Result<RowAddrTreeMap> {
@@ -1112,9 +1145,10 @@ impl BitmapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         fragment_ids: &[u32],
+        shard_id: Option<u32>,
         progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<()> {
-        let partition_id = stable_bitmap_partition_id(fragment_ids)?;
+        let partition_id = bitmap_shard_partition_id(fragment_ids, shard_id)?;
         let file_name = bitmap_shard_file_name(partition_id);
         progress
             .stage_start("build_bitmap_shard", None, "rows")
@@ -1404,7 +1438,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
 
     fn new_training_request(
         &self,
-        _params: &str,
+        params: &str,
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
@@ -1412,9 +1446,8 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
                 "A bitmap index can only be created on a non-nested field.".into(),
             ));
         }
-        Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
-        )))
+        let params = serde_json::from_str::<BitmapParameters>(params)?;
+        Ok(Box::new(BitmapTrainingRequest::new(params)))
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -1437,12 +1470,28 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        _request: Box<dyn TrainingRequest>,
+        request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
         progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
+        let request = request
+            .as_any()
+            .downcast_ref::<BitmapTrainingRequest>()
+            .unwrap();
         if let Some(fragment_ids) = fragment_ids.as_ref() {
-            Self::train_bitmap_shard(data, index_store, fragment_ids, progress).await?;
+            Self::train_bitmap_shard(
+                data,
+                index_store,
+                fragment_ids,
+                request.parameters.shard_id,
+                progress,
+            )
+            .await?;
+        } else if request.parameters.shard_id.is_some() {
+            return Err(Error::invalid_input(
+                "Bitmap shard_id requires fragment_ids and is only supported for distributed shard builds"
+                    .to_string(),
+            ));
         } else {
             Self::train_bitmap_index(data, index_store).await?;
         }
@@ -1524,14 +1573,58 @@ mod tests {
         store: &dyn IndexStore,
         batch: RecordBatch,
         fragment_ids: &[u32],
+        shard_id: Option<u32>,
     ) -> Result<()> {
         BitmapIndexPlugin::train_bitmap_shard(
             make_sorted_stream(batch),
             store,
             fragment_ids,
+            shard_id,
             Arc::new(NoopIndexBuildProgress),
         )
         .await
+    }
+
+    #[test]
+    fn test_bitmap_shard_partition_id_uses_single_fragment_namespace() {
+        assert_eq!(bitmap_shard_partition_id(&[7], None).unwrap(), (7u64) << 32);
+        assert_eq!(
+            bitmap_shard_file_name(bitmap_shard_partition_id(&[7], None).unwrap()),
+            "part_30064771072_bitmap_page_lookup.lance"
+        );
+    }
+
+    #[test]
+    fn test_bitmap_shard_partition_id_uses_explicit_shard_id_for_fragment_groups() {
+        assert_eq!(
+            bitmap_shard_partition_id(&[1, 2], Some(9)).unwrap(),
+            (9u64) << 32
+        );
+        assert_eq!(
+            bitmap_shard_file_name(bitmap_shard_partition_id(&[1, 2], Some(9)).unwrap()),
+            "part_38654705664_bitmap_page_lookup.lance"
+        );
+    }
+
+    #[test]
+    fn test_bitmap_shard_partition_id_requires_shard_id_for_multi_fragment_builds() {
+        let empty_error = bitmap_shard_partition_id(&[], None).unwrap_err();
+        assert!(matches!(empty_error, Error::InvalidInput { .. }));
+        assert!(
+            empty_error
+                .to_string()
+                .contains("requires at least one fragment id"),
+            "unexpected error: {empty_error}"
+        );
+
+        let multi_error = bitmap_shard_partition_id(&[1, 2], None).unwrap_err();
+        assert!(matches!(multi_error, Error::InvalidInput { .. }));
+        assert!(
+            multi_error
+                .to_string()
+                .contains("requires an explicit shard_id"),
+            "unexpected error: {multi_error}"
+        );
     }
 
     #[tokio::test]
@@ -2239,7 +2332,7 @@ mod tests {
             ],
         )
         .unwrap();
-        write_bitmap_shard(store.as_ref(), shard_one, &[1])
+        write_bitmap_shard(store.as_ref(), shard_one, &[1], None)
             .await
             .unwrap();
 
@@ -2256,7 +2349,7 @@ mod tests {
             ],
         )
         .unwrap();
-        write_bitmap_shard(store.as_ref(), shard_two, &[2])
+        write_bitmap_shard(store.as_ref(), shard_two, &[2], None)
             .await
             .unwrap();
 

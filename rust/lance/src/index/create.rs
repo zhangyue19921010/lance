@@ -534,6 +534,7 @@ mod tests {
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_linalg::distance::{DistanceType, MetricType};
+    use serde_json::json;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -1178,17 +1179,22 @@ mod tests {
         .await
         .unwrap();
 
-        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        let base_params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
         let fragments = dataset.get_fragments();
         let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
         let shared_uuid = Uuid::new_v4().to_string();
         let mut shard_metadata = None;
+        let shard_groups = fragment_ids.chunks(2).collect::<Vec<_>>();
 
-        for &fragment_id in &fragment_ids {
+        for (shard_id, fragment_group) in shard_groups.iter().enumerate() {
+            let params = base_params
+                .clone()
+                .with_params(&json!({ "shard_id": shard_id as u32 }));
             let index_metadata =
                 CreateIndexBuilder::new(&mut dataset, &["category"], IndexType::Bitmap, &params)
                     .name("distributed_bitmap".to_string())
-                    .fragments(vec![fragment_id])
+                    .fragments(fragment_group.to_vec())
                     .index_uuid(shared_uuid.clone())
                     .execute_uncommitted()
                     .await
