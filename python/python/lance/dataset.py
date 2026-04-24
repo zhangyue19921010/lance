@@ -3836,6 +3836,15 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.session()
 
     @staticmethod
+    def _inherit_base_store_params(
+        dataset_or_uri: Union[str, Path, LanceDataset, None],
+        base_store_params: Optional[Dict[str, Dict[str, str]]],
+    ) -> Optional[Dict[str, Dict[str, str]]]:
+        if base_store_params is None and isinstance(dataset_or_uri, LanceDataset):
+            return dataset_or_uri._base_store_params
+        return base_store_params
+
+    @staticmethod
     def _commit(
         base_uri: Union[str, Path],
         operation: LanceOperation.BaseOperation,
@@ -3964,6 +3973,10 @@ class LanceDataset(pa.dataset.Dataset):
         2  3  c
         3  4  d
         """
+        base_store_params = LanceDataset._inherit_base_store_params(
+            base_uri, base_store_params
+        )
+
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
         elif isinstance(base_uri, LanceDataset):
@@ -4110,6 +4123,10 @@ class LanceDataset(pa.dataset.Dataset):
             merged: Transaction
                 The merged transaction that was applied to the dataset.
         """
+        base_store_params = LanceDataset._inherit_base_store_params(
+            dest, base_store_params
+        )
+
         if isinstance(dest, Path):
             dest = str(dest)
         elif isinstance(dest, LanceDataset):
@@ -6526,6 +6543,7 @@ def write_dataset(
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
     # TODO add support for passing in LanceDataset and LanceScanner here
+    base_store_params = LanceDataset._inherit_base_store_params(uri, base_store_params)
 
     # Merge properties and commit_message with priority to commit_message
     merged_properties = _merge_message_to_properties(
