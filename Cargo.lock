@@ -4830,9 +4830,11 @@ name = "lance-tools"
 version = "6.1.0-beta.0"
 dependencies = [
  "clap",
+ "lance",
  "lance-core",
  "lance-file",
  "lance-io",
+ "lance-table",
  "object_store 0.12.5",
  "snafu",
  "tokio",
