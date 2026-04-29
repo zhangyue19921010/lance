@@ -1864,6 +1864,41 @@ def test_vector_index_with_nprobes(indexed_dataset):
     ).analyze_plan()
 
 
+def test_vector_index_with_query_parallelism(indexed_dataset):
+    q = np.random.randn(128)
+
+    sequential = indexed_dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,
+            "query_parallelism": 0,
+        }
+    )
+    parallel = indexed_dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,
+            "query_parallelism": -1,
+        }
+    )
+
+    assert sequential == parallel
+
+
+def test_vector_index_invalid_query_parallelism(indexed_dataset):
+    with pytest.raises(ValueError, match="query_parallelism"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "query_parallelism": -2,
+            }
+        )
+
+
 def test_knn_deleted_rows(tmp_path):
     data = create_table()
     ds = lance.write_dataset(data, tmp_path)
