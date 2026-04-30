@@ -1414,13 +1414,6 @@ impl BitmapIndexPlugin {
             }
         }
 
-        if heap.is_empty() {
-            // Shard files exist, but all are empty (0 rows). This is caller misuse.
-            return Err(Error::invalid_input(
-                "Bitmap shard merge requires at least one non-empty shard".to_string(),
-            ));
-        }
-
         let value_type = value_type.ok_or_else(|| {
             Error::invalid_input("Bitmap shard merge requires at least one shard file".to_string())
         })?;
