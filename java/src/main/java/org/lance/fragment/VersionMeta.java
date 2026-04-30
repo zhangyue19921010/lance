@@ -13,39 +13,26 @@
  */
 package org.lance.fragment;
 
-import org.lance.JniLoader;
-
 import com.google.common.base.MoreObjects;
 
 import java.io.Serializable;
 import java.util.Objects;
 
-public class RowIdMeta implements Serializable {
-  private static final long serialVersionUID = -6532828695072614148L;
-
-  static {
-    JniLoader.ensureLoaded();
-  }
+/**
+ * Metadata for per-row dataset version sequences (created_at / last_updated_at). Wraps the
+ * JSON-serialized Rust RowDatasetVersionMeta enum.
+ *
+ * <p>Structurally identical to {@link RowIdMeta} — kept separate because the two map to distinct
+ * Rust types with different serialization formats and evolution paths.
+ */
+public class VersionMeta implements Serializable {
+  private static final long serialVersionUID = 1L;
 
   private final String metadata;
 
-  public RowIdMeta(String metadata) {
+  public VersionMeta(String metadata) {
     this.metadata = metadata;
   }
-
-  /**
-   * Creates a RowIdMeta from an array of stable row IDs by delegating to the Rust {@code
-   * write_row_ids} encoder via JNI. The returned metadata is a JSON string wrapping the
-   * protobuf-encoded RowIdSequence, matching the format expected by lance-core.
-   *
-   * @param rowIds stable row IDs to encode
-   * @return RowIdMeta containing the serialized inline representation
-   */
-  public static RowIdMeta fromRowIds(long[] rowIds) {
-    return new RowIdMeta(nativeEncodeRowIds(rowIds));
-  }
-
-  private static native String nativeEncodeRowIds(long[] rowIds);
 
   public String getMetadata() {
     return metadata;
@@ -59,7 +46,7 @@ public class RowIdMeta implements Serializable {
     if (obj == null || getClass() != obj.getClass()) {
       return false;
     }
-    RowIdMeta that = (RowIdMeta) obj;
+    VersionMeta that = (VersionMeta) obj;
     return Objects.equals(metadata, that.metadata);
   }
 
