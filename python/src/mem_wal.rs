@@ -17,10 +17,12 @@ use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
-    LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
+    FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
 };
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
-use lance::dataset::mem_wal::{LsmScanner, RegionSnapshot, RegionWriter};
+use lance::dataset::mem_wal::{
+    LsmScanner, ShardSnapshot as RegionSnapshot, ShardWriter as RegionWriter,
+};
 use lance_index::mem_wal::MergedGeneration as LanceMergedGeneration;
 use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
@@ -80,7 +82,7 @@ impl PyMergedGeneration {
 ///
 /// Used to specify which flushed generations to include when creating an
 /// `_LsmScanner`. Supports a builder pattern for adding generations.
-#[pyclass(name = "_RegionSnapshot", module = "_lib")]
+#[pyclass(name = "_RegionSnapshot", module = "_lib", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyRegionSnapshot {
     pub inner: RegionSnapshot,
@@ -124,13 +126,13 @@ impl PyRegionSnapshot {
 
     #[getter]
     pub fn region_id(&self) -> String {
-        self.inner.region_id.to_string()
+        self.inner.shard_id.to_string()
     }
 
     pub fn __repr__(&self) -> String {
         format!(
             "_RegionSnapshot(region_id='{}', current_gen={}, flushed_gens={})",
-            self.inner.region_id,
+            self.inner.shard_id,
             self.inner.current_generation,
             self.inner.flushed_generations.len()
         )
@@ -279,7 +281,7 @@ impl PyRegionWriter {
         py: Python<'_>,
         region_snapshots: Vec<Bound<'_, PyRegionSnapshot>>,
     ) -> PyResult<PyLsmScanner> {
-        let snapshots: Vec<RegionSnapshot> = region_snapshots
+        let mut snapshots: Vec<RegionSnapshot> = region_snapshots
             .iter()
             .map(|s| s.borrow().inner.clone())
             .collect();
@@ -289,17 +291,27 @@ impl PyRegionWriter {
         let dataset = self.dataset.clone();
         let region_id = self.region_id;
 
-        let active_ref = rt()
+        let (active_ref, writer_snapshot) = rt()
             .block_on(Some(py), async move {
                 let guard = inner.lock().await;
                 match guard.as_ref() {
-                    Some(w) => Ok(w.active_memtable_ref().await),
+                    Some(w) => {
+                        let active_ref = w.active_memtable_ref().await;
+                        let writer_snapshot = w
+                            .manifest()
+                            .await?
+                            .map(region_snapshot_from_manifest)
+                            .unwrap_or_else(|| RegionSnapshot::new(region_id));
+                        Ok((active_ref, writer_snapshot))
+                    }
                     None => Err(lance_core::Error::invalid_input(
                         "RegionWriter is already closed",
                     )),
                 }
             })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        snapshots.retain(|snapshot| snapshot.shard_id != region_id);
+        snapshots.push(writer_snapshot);
 
         let scanner = LsmScanner::new(dataset, snapshots, pk_columns)
             .with_active_memtable(region_id, active_ref);
@@ -344,7 +356,7 @@ impl PyRegionWriter {
 }
 
 /// Python wrapper around a DataFusion physical execution plan.
-#[pyclass(name = "_ExecutionPlan", module = "_lib")]
+#[pyclass(name = "_ExecutionPlan", module = "_lib", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyExecutionPlan {
     plan: Arc<dyn ExecutionPlan>,
@@ -842,6 +854,22 @@ fn scalar_values_from_pk_value(
         pk_values.push(scalar);
     }
     Ok(pk_values)
+}
+
+fn region_snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -> RegionSnapshot {
+    RegionSnapshot {
+        shard_id: manifest.shard_id,
+        spec_id: manifest.shard_spec_id,
+        current_generation: manifest.current_generation,
+        flushed_generations: manifest
+            .flushed_generations
+            .into_iter()
+            .map(|generation| FlushedGeneration {
+                generation: generation.generation,
+                path: generation.path,
+            })
+            .collect(),
+    }
 }
 
 fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {

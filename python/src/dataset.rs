@@ -3146,7 +3146,7 @@ impl Dataset {
         region_spec: Option<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
-        use lance_index::mem_wal::{RegionField, RegionSpec};
+        use lance_index::mem_wal::{ShardField as RegionField, ShardSpec as RegionSpec};
         use std::collections::HashMap;
 
         let region_spec_rust = if let Some(spec) = region_spec {
@@ -3173,7 +3173,7 @@ impl Dataset {
         };
 
         let config = lance::dataset::mem_wal::MemWalConfig {
-            region_spec: region_spec_rust,
+            shard_spec: region_spec_rust,
             maintained_indexes: maintained_indexes.unwrap_or_default(),
         };
         let mut ds = Arc::clone(&self.ds);
@@ -3228,7 +3228,7 @@ impl Dataset {
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
     ) -> PyResult<crate::mem_wal::PyRegionWriter> {
-        use lance::dataset::mem_wal::{DatasetMemWalExt, RegionWriterConfig};
+        use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig as RegionWriterConfig};
 
         let uuid = uuid::Uuid::parse_str(&region_id)
             .map_err(|e| PyValueError::new_err(format!("Invalid region_id UUID: {}", e)))?;

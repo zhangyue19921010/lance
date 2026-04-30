@@ -135,6 +135,32 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert name_by_id[3] == "base_3"
 
 
+def test_region_writer_lsm_scanner_includes_own_flushed_generations(tmp_path):
+    ds_path = str(tmp_path / "base")
+    region_id = str(uuid.uuid4())
+    ds = lance.write_dataset(_lookup_table([0], "base"), ds_path, schema=_LOOKUP_SCHEMA)
+    ds.initialize_mem_wal()
+
+    with ds.mem_wal_writer(
+        region_id,
+        durable_write=True,
+        max_wal_buffer_size=1,
+        max_wal_flush_interval_ms=10,
+        max_memtable_batches=1,
+    ) as writer:
+        writer.put(_lookup_table([1, 2], "writer"))
+
+        deadline = time.time() + 5
+        while True:
+            table = writer.lsm_scanner().to_table()
+            name_by_id = {row["id"]: row["name"] for row in table.to_pylist()}
+            if name_by_id.get(1) == "writer_1" and name_by_id.get(2) == "writer_2":
+                break
+            if time.time() >= deadline:
+                assert False, "writer.lsm_scanner() did not include flushed writer rows"
+            time.sleep(0.05)
+
+
 _VDIM = 4  # matches Rust test fixture dimension
 
 
