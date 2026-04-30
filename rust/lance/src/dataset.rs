@@ -1845,6 +1845,33 @@ impl Dataset {
         self.data_file_dir_for_base(data_file.base_id)
     }
 
+    /// Resolve the object store and object path for a data file referenced by this dataset.
+    ///
+    /// This accounts for data files in the default dataset `data/` directory as well as
+    /// data files stored in registered manifest base paths.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance_table::format::DataFile;
+    /// # async fn resolve(dataset: &Dataset, data_file: &DataFile) -> Result<()> {
+    /// let (_store, _path) = dataset.resolve_data_file_location(data_file).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn resolve_data_file_location(
+        &self,
+        data_file: &DataFile,
+    ) -> Result<(Arc<ObjectStore>, Path)> {
+        let object_path = self
+            .data_file_dir(data_file)?
+            .child(data_file.path.as_str());
+        let object_store = match data_file.base_id {
+            Some(base_id) => self.object_store_for_base(base_id).await?,
+            None => self.object_store.clone(),
+        };
+        Ok((object_store, object_path))
+    }
+
     /// Create a [`DataFile`] by reading metadata from an existing lance file.
     ///
     /// This reads the file's schema and version information, matches columns to

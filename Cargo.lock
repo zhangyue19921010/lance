@@ -4829,6 +4829,8 @@ dependencies = [
 name = "lance-tools"
 version = "6.1.0-beta.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "clap",
  "lance",
  "lance-core",
@@ -4836,7 +4838,9 @@ dependencies = [
  "lance-io",
  "lance-table",
  "object_store 0.12.5",
+ "serde_json",
  "snafu",
+ "tempfile",
  "tokio",
  "url",
 ]

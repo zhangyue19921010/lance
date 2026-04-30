@@ -44,7 +44,7 @@ pub enum LanceFileCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum LanceDatasetCommand {
-    /// Locate the dataset version that introduced a data file.
+    /// Locate the first manifest in the latest run that references a data file.
     LocateDataFile(LanceDatasetLocateDataFileArgs),
     /// Verify manifest-referenced data files for missing or unreadable objects.
     VerifyDataFiles(LanceDatasetVerifyDataFilesArgs),
@@ -67,15 +67,19 @@ pub struct LanceDatasetLocateDataFileArgs {
     #[arg(short = 's', long, value_name = "source")]
     pub(crate) source: String,
 
+    /// JSON object of storage options to pass to the object store.
+    #[arg(long, alias = "storgae-options", value_name = "json")]
+    pub(crate) storage_options: Option<String>,
+
     /// Data file path or suffix to locate. Accepts full object keys, data/foo.lance, or foo.lance.
     #[arg(short = 'f', long, value_name = "data-file")]
     pub(crate) data_file: String,
 
-    /// Stop searching at this dataset version. Defaults to latest.
+    /// Start searching at this dataset version. Defaults to latest.
     #[arg(long)]
     pub(crate) version: Option<u64>,
 
-    /// Restore the version immediately before the first version that references the data file.
+    /// Restore the version immediately before the located manifest.
     #[arg(long)]
     pub(crate) restore: bool,
 }
@@ -85,6 +89,10 @@ pub struct LanceDatasetVerifyDataFilesArgs {
     /// The Lance dataset to examine.
     #[arg(short = 's', long, value_name = "source")]
     pub(crate) source: String,
+
+    /// JSON object of storage options to pass to the object store.
+    #[arg(long, alias = "storgae-options", value_name = "json")]
+    pub(crate) storage_options: Option<String>,
 
     /// Dataset version to check. Defaults to latest.
     #[arg(long)]
@@ -105,6 +113,10 @@ pub struct LanceDatasetRepairManifestArgs {
     #[arg(short = 's', long, value_name = "source")]
     pub(crate) source: String,
 
+    /// JSON object of storage options to pass to the object store.
+    #[arg(long, alias = "storgae-options", value_name = "json")]
+    pub(crate) storage_options: Option<String>,
+
     /// Remove fragments that reference this data file path or suffix. Can be specified multiple times.
     #[arg(long = "remove-data-files", value_name = "data-file", required = true)]
     pub(crate) remove_data_files: Vec<String>,
@@ -119,6 +131,10 @@ pub struct LanceDatasetRestoreArgs {
     /// The Lance dataset to restore.
     #[arg(short = 's', long, value_name = "source")]
     pub(crate) source: String,
+
+    /// JSON object of storage options to pass to the object store.
+    #[arg(long, alias = "storgae-options", value_name = "json")]
+    pub(crate) storage_options: Option<String>,
 
     /// Version to restore as the latest version.
     #[arg(long)]
