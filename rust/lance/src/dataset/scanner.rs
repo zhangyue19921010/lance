@@ -9603,8 +9603,10 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_eq!(scan_count(&dataset, "a >= 95 AND b >= 95", false).await, 15);
         assert_eq!(scan_count(&dataset, "a >= 95 AND b >= 95", true).await, 5);
 
-        // OR cannot safely use only the indexed side when the other side has no
-        // scalar index. Fast search should still scan the appended fragment.
+        // OR cannot safely skip unindexed fragments: a row in an unindexed fragment
+        // may satisfy `b >= 105` even if `a` is not indexed there. Skipping it would
+        // silently drop valid results, so fast_search has no effect on OR queries where
+        // any branch lacks a scalar index.
         assert_eq!(scan_count(&dataset, "a >= 105 OR b >= 105", false).await, 5);
         assert_eq!(scan_count(&dataset, "a >= 105 OR b >= 105", true).await, 5);
 
