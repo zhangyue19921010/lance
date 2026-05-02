@@ -68,7 +68,7 @@ pub struct LanceDatasetLocateDataFileArgs {
     pub(crate) source: String,
 
     /// JSON object of storage options to pass to the object store.
-    #[arg(long, alias = "storgae-options", value_name = "json")]
+    #[arg(long, alias = "storage-options", value_name = "json")]
     pub(crate) storage_options: Option<String>,
 
     /// Data file path or suffix to locate. Accepts full object keys, data/foo.lance, or foo.lance.
@@ -91,7 +91,7 @@ pub struct LanceDatasetVerifyDataFilesArgs {
     pub(crate) source: String,
 
     /// JSON object of storage options to pass to the object store.
-    #[arg(long, alias = "storgae-options", value_name = "json")]
+    #[arg(long, alias = "storage-options", value_name = "json")]
     pub(crate) storage_options: Option<String>,
 
     /// Dataset version to check. Defaults to latest.
@@ -114,10 +114,10 @@ pub struct LanceDatasetRepairManifestArgs {
     pub(crate) source: String,
 
     /// JSON object of storage options to pass to the object store.
-    #[arg(long, alias = "storgae-options", value_name = "json")]
+    #[arg(long, alias = "storage-options", value_name = "json")]
     pub(crate) storage_options: Option<String>,
 
-    /// Remove fragments that reference this data file path or suffix. Can be specified multiple times.
+    /// Remove the entire fragment (all its data files) if its file list includes this path or suffix. Can be specified multiple times.
     #[arg(long = "remove-data-files", value_name = "data-file", required = true)]
     pub(crate) remove_data_files: Vec<String>,
 
@@ -133,7 +133,7 @@ pub struct LanceDatasetRestoreArgs {
     pub(crate) source: String,
 
     /// JSON object of storage options to pass to the object store.
-    #[arg(long, alias = "storgae-options", value_name = "json")]
+    #[arg(long, alias = "storage-options", value_name = "json")]
     pub(crate) storage_options: Option<String>,
 
     /// Version to restore as the latest version.

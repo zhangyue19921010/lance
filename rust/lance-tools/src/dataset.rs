@@ -12,7 +12,6 @@ use lance::dataset::write::CommitBuilder;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, Fragment};
 use object_store::path::Path;
 use url::Url;
@@ -25,7 +24,7 @@ use crate::cli::{
 #[derive(Debug, Clone)]
 struct ReferencedDataFile {
     fragment_id: u64,
-    relative_path: String,
+    path: String,
     data_file: DataFile,
     base_id: Option<u32>,
 }
@@ -58,15 +57,16 @@ impl DataFileStatus {
         }
     }
 
-    fn message(&self) -> Option<&str> {
+    fn detail(&self) -> Option<&str> {
         match self {
             Self::Ok => None,
-            Self::Missing(message) | Self::Corrupt(message) | Self::Error(message) => {
-                Some(message.as_str())
-            }
+            Self::Missing(s) | Self::Corrupt(s) | Self::Error(s) => Some(s.as_str()),
         }
     }
 }
+
+/// I/O buffer budget for reading Lance file metadata in deep verify mode.
+const DEEP_VERIFY_IO_BUFFER_SIZE: u64 = 4 * 1024 * 1024;
 
 fn normalize_path(path: &str) -> String {
     let path = Url::parse(path)
@@ -78,7 +78,7 @@ fn normalize_path(path: &str) -> String {
 }
 
 fn parse_storage_options(storage_options: Option<&str>) -> Result<HashMap<String, String>> {
-    storage_options
+    let parsed = storage_options
         .map(|options| {
             serde_json::from_str::<HashMap<String, String>>(options).map_err(|err| {
                 Error::invalid_input(format!(
@@ -87,8 +87,8 @@ fn parse_storage_options(storage_options: Option<&str>) -> Result<HashMap<String
                 ))
             })
         })
-        .transpose()
-        .map(Option::unwrap_or_default)
+        .transpose()?;
+    Ok(parsed.unwrap_or_default())
 }
 
 async fn open_dataset(source: &str, storage_options: Option<&str>) -> Result<Dataset> {
@@ -108,46 +108,78 @@ fn path_matches(candidate: &str, query: &str) -> bool {
         || query.ends_with(&format!("/{candidate}"))
 }
 
-fn data_file_relative_path(data_file: &DataFile) -> String {
-    format!("data/{}", data_file.path)
+fn error_message_is_not_found(message: &str) -> bool {
+    message.contains("not found") || message.contains("No such file or directory")
+}
+
+fn source_is_not_found(source: &(dyn std::error::Error + 'static)) -> bool {
+    source
+        .downcast_ref::<object_store::Error>()
+        .is_some_and(|err| matches!(err, object_store::Error::NotFound { .. }))
+        || source
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+        || source
+            .downcast_ref::<Error>()
+            .is_some_and(is_not_found_error)
+        || source.source().is_some_and(source_is_not_found)
+}
+
+fn is_not_found_error(error: &Error) -> bool {
+    match error {
+        Error::NotFound { .. } => true,
+        Error::Cloned { message, .. } => error_message_is_not_found(message),
+        Error::IO { source, .. } | Error::Wrapped { error: source, .. } => {
+            source_is_not_found(source.as_ref()) || error_message_is_not_found(&source.to_string())
+        }
+        _ => false,
+    }
 }
 
 /// Return all data files referenced by a fragment manifest entry.
-fn fragment_data_file_refs(fragment: &Fragment) -> Vec<ReferencedDataFile> {
-    fragment
-        .files
-        .iter()
-        .map(|data_file| ReferencedDataFile {
+async fn fragment_data_file_refs(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<Vec<ReferencedDataFile>> {
+    let mut data_files = Vec::with_capacity(fragment.files.len());
+    for data_file in &fragment.files {
+        let (_, path) = dataset.resolve_data_file_location(data_file).await?;
+        data_files.push(ReferencedDataFile {
             fragment_id: fragment.id,
-            relative_path: data_file_relative_path(data_file),
+            path: path.to_string(),
             data_file: data_file.clone(),
             base_id: data_file.base_id,
-        })
-        .collect()
+        });
+    }
+    Ok(data_files)
 }
 
 /// Return all data files referenced by the checked-out dataset manifest.
-fn dataset_data_file_refs(dataset: &Dataset) -> Vec<ReferencedDataFile> {
-    dataset
-        .fragments()
-        .iter()
-        .flat_map(fragment_data_file_refs)
-        .collect()
+async fn dataset_data_file_refs(dataset: &Dataset) -> Result<Vec<ReferencedDataFile>> {
+    let mut data_files = Vec::new();
+    for fragment in dataset.fragments().iter() {
+        data_files.extend(fragment_data_file_refs(dataset, fragment).await?);
+    }
+    Ok(data_files)
 }
 
 /// Match a user-supplied data file path against manifest data file references.
-fn matching_data_files(dataset: &Dataset, data_file_path: &str) -> Vec<ReferencedDataFile> {
-    dataset_data_file_refs(dataset)
+async fn matching_data_files(
+    dataset: &Dataset,
+    data_file_path: &str,
+) -> Result<Vec<ReferencedDataFile>> {
+    Ok(dataset_data_file_refs(dataset)
+        .await?
         .into_iter()
-        .filter(|candidate| path_matches(&candidate.relative_path, data_file_path))
-        .collect()
+        .filter(|candidate| path_matches(&candidate.path, data_file_path))
+        .collect())
 }
 
 fn format_data_file(data_file: &ReferencedDataFile) -> String {
     format!(
         "fragment={} path={} base_id={}",
         data_file.fragment_id,
-        data_file.relative_path,
+        data_file.path,
         data_file
             .base_id
             .map(|base_id| base_id.to_string())
@@ -169,27 +201,27 @@ async fn verify_data_file_ref(
         Err(err) => return DataFileStatus::Error(err.to_string()),
     };
 
-    match store.inner.head(&path).await {
-        Ok(meta) => {
-            if deep {
-                let scan_scheduler =
-                    ScanScheduler::new(store, SchedulerConfig::new(2 * 1024 * 1024 * 1024));
-                let file_size = CachedFileSize::new(meta.size);
-                match scan_scheduler.open_file(&path, &file_size).await {
-                    Ok(file_scheduler) => {
-                        match FileReader::read_all_metadata(&file_scheduler).await {
-                            Ok(_) => DataFileStatus::Ok,
-                            Err(err) => DataFileStatus::Corrupt(err.to_string()),
-                        }
-                    }
-                    Err(err) => DataFileStatus::Error(err.to_string()),
-                }
-            } else {
-                DataFileStatus::Ok
-            }
+    if deep {
+        let scan_scheduler =
+            ScanScheduler::new(store, SchedulerConfig::new(DEEP_VERIFY_IO_BUFFER_SIZE));
+        match scan_scheduler
+            .open_file(&path, &data_file.data_file.file_size_bytes)
+            .await
+        {
+            Ok(file_scheduler) => match FileReader::read_all_metadata(&file_scheduler).await {
+                Ok(_) => DataFileStatus::Ok,
+                Err(err) if is_not_found_error(&err) => DataFileStatus::Missing(path.to_string()),
+                Err(err) => DataFileStatus::Corrupt(err.to_string()),
+            },
+            Err(err) if is_not_found_error(&err) => DataFileStatus::Missing(path.to_string()),
+            Err(err) => DataFileStatus::Error(err.to_string()),
         }
-        Err(object_store::Error::NotFound { .. }) => DataFileStatus::Missing(path.to_string()),
-        Err(err) => DataFileStatus::Error(err.to_string()),
+    } else {
+        match store.exists(&path).await {
+            Ok(true) => DataFileStatus::Ok,
+            Ok(false) => DataFileStatus::Missing(path.to_string()),
+            Err(err) => DataFileStatus::Error(err.to_string()),
+        }
     }
 }
 
@@ -208,7 +240,7 @@ async fn locate_first_data_file_manifest(
     let mut first_manifest = None;
     for version in versions {
         let dataset = dataset.checkout_version(version.version).await?;
-        let data_files = matching_data_files(&dataset, data_file_path);
+        let data_files = matching_data_files(&dataset, data_file_path).await?;
         if data_files.is_empty() {
             if first_manifest.is_some() {
                 break;
@@ -286,26 +318,29 @@ pub(crate) async fn verify_data_files(
         Some(version) => dataset.checkout_version(version).await?,
         None => dataset,
     };
-    let data_files = dataset_data_file_refs(&dataset);
+    let data_files = dataset_data_file_refs(&dataset).await?;
     let checked_data_files = data_files.len();
     let mut bad_data_files = Vec::new();
 
-    writeln!(writer, "version: {}", dataset.version_id())?;
-    writeln!(writer, "checked_data_files: {}", checked_data_files)?;
     for data_file in data_files {
         let status = verify_data_file_ref(&dataset, &data_file, args.deep).await;
         if !status.is_ok() {
-            writeln!(
-                writer,
-                "{} {} message={}",
-                status.label(),
-                format_data_file(&data_file),
-                status.message().unwrap_or("")
-            )?;
             bad_data_files.push((data_file, status));
         }
     }
+
+    writeln!(writer, "version: {}", dataset.version_id())?;
+    writeln!(writer, "checked_data_files: {}", checked_data_files)?;
     writeln!(writer, "bad_data_files: {}", bad_data_files.len())?;
+    for (data_file, status) in &bad_data_files {
+        writeln!(
+            writer,
+            "{} {} detail={}",
+            status.label(),
+            format_data_file(data_file),
+            status.detail().unwrap_or("")
+        )?;
+    }
 
     if args.fail && !bad_data_files.is_empty() {
         return Err(Error::corrupt_file(
@@ -334,7 +369,7 @@ pub(crate) async fn repair_manifest(
     let mut matched_data_file_count = 0;
 
     for data_file_path in &args.remove_data_files {
-        let matches = matching_data_files(&dataset, data_file_path);
+        let matches = matching_data_files(&dataset, data_file_path).await?;
         if matches.is_empty() {
             return Err(Error::invalid_input(format!(
                 "data file {} was not found in dataset version {}",
@@ -369,7 +404,10 @@ pub(crate) async fn repair_manifest(
     let operation = Operation::Delete {
         updated_fragments: vec![],
         deleted_fragment_ids: affected_fragment_ids.iter().copied().collect(),
-        predicate: "".to_string(),
+        predicate: format!(
+            "repair: removed fragments containing {}",
+            args.remove_data_files.join(", ")
+        ),
     };
     let transaction = Transaction::new(dataset.version_id(), operation, None);
     let committed = CommitBuilder::new(Arc::new(dataset))
@@ -400,7 +438,8 @@ mod tests {
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use lance::dataset::WriteParams;
+    use lance::dataset::{WriteMode, WriteParams};
+    use lance_table::format::BasePath;
     use tempfile::TempDir;
 
     fn test_schema() -> Arc<ArrowSchema> {
@@ -432,8 +471,10 @@ mod tests {
         (temp_dir, dataset_uri, dataset)
     }
 
-    fn data_file_for_fragment(dataset: &Dataset, fragment_id: u64) -> ReferencedDataFile {
+    async fn data_file_for_fragment(dataset: &Dataset, fragment_id: u64) -> ReferencedDataFile {
         dataset_data_file_refs(dataset)
+            .await
+            .unwrap()
             .into_iter()
             .find(|data_file| data_file.fragment_id == fragment_id)
             .unwrap()
@@ -446,7 +487,7 @@ mod tests {
     #[tokio::test]
     async fn test_locate_data_file_finds_latest_first_manifest_and_restores() {
         let (_temp_dir, dataset_uri, dataset) = write_two_version_dataset().await;
-        let data_file = data_file_for_fragment(&dataset, 1);
+        let data_file = data_file_for_fragment(&dataset, 1).await;
         let reintroduced_fragment = dataset
             .fragments()
             .iter()
@@ -459,7 +500,7 @@ mod tests {
             &LanceDatasetRepairManifestArgs {
                 source: dataset_uri.clone(),
                 storage_options: None,
-                remove_data_files: vec![data_file.relative_path.clone()],
+                remove_data_files: vec![data_file.path.clone()],
                 dry_run: false,
             },
         )
@@ -468,7 +509,12 @@ mod tests {
 
         let repaired = Dataset::open(&dataset_uri).await.unwrap();
         assert_eq!(repaired.version_id(), 3);
-        assert!(matching_data_files(&repaired, &data_file.relative_path).is_empty());
+        assert!(
+            matching_data_files(&repaired, &data_file.path)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let transaction = Transaction::new(
             repaired.version_id(),
@@ -488,7 +534,7 @@ mod tests {
             &LanceDatasetLocateDataFileArgs {
                 source: dataset_uri.clone(),
                 storage_options: None,
-                data_file: data_file.relative_path.clone(),
+                data_file: data_file.path.clone(),
                 version: None,
                 restore: true,
             },
@@ -507,13 +553,18 @@ mod tests {
         let restored = Dataset::open(&dataset_uri).await.unwrap();
         assert_eq!(restored.version_id(), 5);
         assert_eq!(restored.count_rows(None).await.unwrap(), 3);
-        assert!(matching_data_files(&restored, &data_file.relative_path).is_empty());
+        assert!(
+            matching_data_files(&restored, &data_file.path)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn test_repair_manifest_removes_data_file_fragment_and_commits() {
         let (_temp_dir, dataset_uri, dataset) = write_two_version_dataset().await;
-        let data_file = data_file_for_fragment(&dataset, 1);
+        let data_file = data_file_for_fragment(&dataset, 1).await;
         let mut output = Vec::new();
 
         repair_manifest(
@@ -521,7 +572,7 @@ mod tests {
             &LanceDatasetRepairManifestArgs {
                 source: dataset_uri.clone(),
                 storage_options: None,
-                remove_data_files: vec![data_file.relative_path.clone()],
+                remove_data_files: vec![data_file.path.clone()],
                 dry_run: false,
             },
         )
@@ -538,18 +589,24 @@ mod tests {
         let repaired = Dataset::open(&dataset_uri).await.unwrap();
         assert_eq!(repaired.version_id(), 3);
         assert_eq!(repaired.count_rows(None).await.unwrap(), 3);
-        assert!(matching_data_files(&repaired, &data_file.relative_path).is_empty());
-        assert_eq!(dataset_data_file_refs(&repaired).len(), 1);
+        assert!(
+            matching_data_files(&repaired, &data_file.path)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(dataset_data_file_refs(&repaired).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn test_verify_data_files_reports_missing_file_and_fail_errors() {
         let (_temp_dir, dataset_uri, dataset) = write_two_version_dataset().await;
-        let data_file = data_file_for_fragment(&dataset, 1);
-        std::fs::remove_file(
-            std::path::Path::new(&dataset_uri).join(data_file.relative_path.as_str()),
-        )
-        .unwrap();
+        let data_file = data_file_for_fragment(&dataset, 1).await;
+        let (store, path) = dataset
+            .resolve_data_file_location(&data_file.data_file)
+            .await
+            .unwrap();
+        store.delete(&path).await.unwrap();
 
         let mut output = Vec::new();
         verify_data_files(

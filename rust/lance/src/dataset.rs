@@ -1865,10 +1865,7 @@ impl Dataset {
         let object_path = self
             .data_file_dir(data_file)?
             .child(data_file.path.as_str());
-        let object_store = match data_file.base_id {
-            Some(base_id) => self.object_store_for_base(base_id).await?,
-            None => self.object_store.clone(),
-        };
+        let object_store = self.object_store(data_file.base_id).await?;
         Ok((object_store, object_path))
     }
 
