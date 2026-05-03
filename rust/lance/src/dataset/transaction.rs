@@ -14,7 +14,7 @@
 
 use super::ManifestWriteConfig;
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
-use crate::dataset::transaction::UpdateMode::RewriteRows;
+use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::index::mem_wal::update_mem_wal_index_merged_generations;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
@@ -396,6 +396,9 @@ pub enum Operation {
         /// Optional filter for detecting conflicts on inserted row keys.
         /// Only tracks keys from INSERT operations during merge insert, not updates.
         inserted_rows_filter: Option<KeyExistenceFilter>,
+        /// Physical row offsets (per fragment) that matched `update_columns` for RewriteColumns.
+        /// `None` means callers did not supply offsets; `build_manifest` skips partial refresh then.
+        updated_fragment_offsets: Option<UpdatedFragmentOffsets>,
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
@@ -442,6 +445,22 @@ pub enum UpdateMode {
     /// Old versions of columns are tombstoned. This is most optimal when most rows are affected
     /// but a small subset of columns are affected.
     RewriteColumns,
+}
+
+/// Matched physical row offsets per fragment for a partial [`UpdateMode::RewriteColumns`] update.
+///
+/// Used with stable row IDs so `build_manifest` can refresh row-level version
+/// metadata only for rows that were rewritten.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpdatedFragmentOffsets(pub HashMap<u64, RoaringBitmap>);
+
+impl DeepSizeOf for UpdatedFragmentOffsets {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.0.iter().fold(0_usize, |acc, (frag_id, bitmap)| {
+            acc + frag_id.deep_size_of_children(context)
+                + (bitmap.len() as usize).saturating_mul(std::mem::size_of::<u32>())
+        })
+    }
 }
 
 impl std::fmt::Display for Operation {
@@ -595,6 +614,7 @@ impl PartialEq for Operation {
                     fields_for_preserving_frag_bitmap: a_fields_for_preserving_frag_bitmap,
                     update_mode: a_update_mode,
                     inserted_rows_filter: a_inserted_rows_filter,
+                    updated_fragment_offsets: a_updated_fragment_offsets,
                 },
                 Self::Update {
                     removed_fragment_ids: b_removed,
@@ -605,6 +625,7 @@ impl PartialEq for Operation {
                     fields_for_preserving_frag_bitmap: b_fields_for_preserving_frag_bitmap,
                     update_mode: b_update_mode,
                     inserted_rows_filter: b_inserted_rows_filter,
+                    updated_fragment_offsets: b_updated_fragment_offsets,
                 },
             ) => {
                 compare_vec(a_removed, b_removed)
@@ -618,6 +639,7 @@ impl PartialEq for Operation {
                     )
                     && a_update_mode == b_update_mode
                     && a_inserted_rows_filter == b_inserted_rows_filter
+                    && a_updated_fragment_offsets == b_updated_fragment_offsets
             }
             (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
             (
@@ -1840,6 +1862,7 @@ impl Transaction {
                 merged_generations,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
+                updated_fragment_offsets,
                 ..
             } => {
                 // Extract existing fragments once for reuse
@@ -1869,6 +1892,36 @@ impl Transaction {
                 }
 
                 final_fragments.extend(updated_frags);
+
+                if next_row_id.is_some()
+                    && matches!(update_mode, Some(RewriteColumns))
+                    && let Some(UpdatedFragmentOffsets(off_map)) = updated_fragment_offsets
+                    && !off_map.is_empty()
+                {
+                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                    let prev_version = current_manifest.map(|m| m.version).unwrap_or(0);
+                    for fragment in final_fragments.iter_mut() {
+                        let Some(bitmap) = off_map.get(&fragment.id) else {
+                            continue;
+                        };
+                        if bitmap.is_empty() {
+                            continue;
+                        }
+                        // Skip fragments with no existing version metadata: the helper
+                        // would fill unmatched rows with prev_version, fabricating a
+                        // last_updated stamp for rows that never had one.
+                        if fragment.last_updated_at_version_meta.is_none() {
+                            continue;
+                        }
+                        let offsets: Vec<usize> = bitmap.iter().map(|o| o as usize).collect();
+                        lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                            fragment,
+                            &offsets,
+                            new_version,
+                            prev_version,
+                        )?;
+                    }
+                }
 
                 // If we updated any fields, remove those fragments from indices covering those fields
                 Self::prune_updated_fields_from_indices(
@@ -2918,6 +2971,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows,
+                updated_fragment_offsets,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -2942,6 +2996,18 @@ impl TryFrom<pb::Transaction> for Transaction {
                 inserted_rows_filter: inserted_rows
                     .map(|ik| KeyExistenceFilter::try_from(&ik))
                     .transpose()?,
+                updated_fragment_offsets: {
+                    let m: HashMap<u64, RoaringBitmap> = updated_fragment_offsets
+                        .into_iter()
+                        .filter(|(_, list)| !list.values.is_empty())
+                        .map(|(id, list)| (id, RoaringBitmap::from_iter(list.values)))
+                        .collect();
+                    if m.is_empty() {
+                        None
+                    } else {
+                        Some(UpdatedFragmentOffsets(m))
+                    }
+                },
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -3244,6 +3310,7 @@ impl From<&Transaction> for pb::Transaction {
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter,
+                updated_fragment_offsets,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
@@ -3265,6 +3332,18 @@ impl From<&Transaction> for pb::Transaction {
                     })
                     .unwrap_or(0),
                 inserted_rows: inserted_rows_filter.as_ref().map(|ik| ik.into()),
+                updated_fragment_offsets: updated_fragment_offsets
+                    .as_ref()
+                    .map(|UpdatedFragmentOffsets(m)| {
+                        m.iter()
+                            .filter(|(_, b)| !b.is_empty())
+                            .map(|(frag_id, b)| {
+                                let values: Vec<u32> = b.iter().collect();
+                                (*frag_id, pb::transaction::UInt32List { values })
+                            })
+                            .collect::<HashMap<_, _>>()
+                    })
+                    .unwrap_or_default(),
             }),
             Operation::Project { schema } => {
                 pb::transaction::Operation::Project(pb::transaction::Project {
@@ -3546,17 +3625,30 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::UInt64Type;
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use chrono::Utc;
+    use futures::TryStreamExt;
     use lance_core::datatypes::Schema as LanceSchema;
+    use lance_core::utils::address::RowAddress;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
+    use lance_file::version::LanceFileVersion;
     use lance_io::utils::CachedFileSize;
     use lance_table::format::{
         RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
     };
     use lance_table::rowids::segment::U64Segment;
     use lance_table::rowids::write_row_ids;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    use crate::Dataset;
+    use crate::dataset::write::WriteParams;
+    use crate::session::Session;
 
     fn sample_manifest() -> Manifest {
         let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
@@ -4529,6 +4621,242 @@ mod tests {
         assert!(indices.is_empty());
     }
 
+    /// When a fragment has no existing last_updated_at_version_meta (None), a
+    /// partial RewriteColumns refresh must leave it as None rather than fabricating
+    /// prev_version for unmatched rows.
+    #[test]
+    fn test_partial_rewrite_skips_fragment_with_no_version_meta() {
+        let row_ids = RowIdSequence::from([10u64, 11, 12, 13, 14].as_slice());
+        let row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_ids)));
+
+        let (major, minor) = lance_file::version::LanceFileVersion::Stable.to_numbers();
+        let data_file = DataFile::new("data.lance", vec![0], vec![0], major, minor, None, None);
+
+        let fragment = Fragment {
+            id: 1,
+            files: vec![data_file],
+            deletion_file: None,
+            row_id_meta,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+
+        let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
+
+        // Simulate a RewriteColumns update that matched offsets 1 and 3
+        let off_map = HashMap::from([(1u64, RoaringBitmap::from_iter([1u32, 3]))]);
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![fragment],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                merged_generations: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: Some(UpdatedFragmentOffsets(off_map)),
+            },
+            None,
+        );
+
+        let (out, _) = tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert!(
+            out.fragments[0].last_updated_at_version_meta.is_none(),
+            "fragment with no prior version metadata must not have fabricated prev_version stamped on unmatched rows"
+        );
+    }
+
+    /// Partial RewriteColumns refresh in `build_manifest`: only matched physical
+    /// rows get `last_updated_at_version` bumped; same-fragment unmatched rows and
+    /// untouched fragments keep both version sequences.
+    #[tokio::test]
+    async fn test_build_manifest_partial_last_updated_rewrite_columns_stable_row_ids() {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, false),
+            ArrowField::new("x", DataType::Int32, false),
+        ]));
+        let batch0 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..8)),
+                Arc::new(Int32Array::from(vec![0_i32; 8])),
+            ],
+        )
+        .unwrap();
+        let reader0 = RecordBatchIterator::new(vec![Ok(batch0)], schema.clone());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader0, uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(100..108)),
+                Arc::new(Int32Array::from(vec![0_i32; 8])),
+            ],
+        )
+        .unwrap();
+        let reader1 = RecordBatchIterator::new(vec![Ok(batch1)], schema.clone());
+        dataset.append(reader1, None).await.unwrap();
+
+        let frags = dataset.get_fragments();
+        assert_eq!(
+            frags.len(),
+            2,
+            "expected two fragments (append creates a new fragment)"
+        );
+
+        async fn scan_row_versions(ds: &Dataset) -> HashMap<(u32, u32), (u64, u64)> {
+            let mut scanner = ds.scan();
+            scanner
+                .project(&[
+                    ROW_ADDR,
+                    ROW_LAST_UPDATED_AT_VERSION,
+                    ROW_CREATED_AT_VERSION,
+                ])
+                .unwrap();
+            let batches = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut out = HashMap::new();
+            for batch in batches {
+                let addrs = batch
+                    .column_by_name(ROW_ADDR)
+                    .unwrap()
+                    .as_primitive::<UInt64Type>();
+                let last = batch
+                    .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
+                    .unwrap()
+                    .as_primitive::<UInt64Type>();
+                let created = batch
+                    .column_by_name(ROW_CREATED_AT_VERSION)
+                    .unwrap()
+                    .as_primitive::<UInt64Type>();
+                for row in 0..batch.num_rows() {
+                    let addr = RowAddress::from(addrs.value(row));
+                    out.insert(
+                        (addr.fragment_id(), addr.row_offset()),
+                        (last.value(row), created.value(row)),
+                    );
+                }
+            }
+            out
+        }
+
+        let before = scan_row_versions(&dataset).await;
+        assert_eq!(before.len(), 16);
+
+        // Update only rows i in {2, 4, 6} within fragment 0 (physical offsets 2, 4, 6).
+        let update_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, false),
+            ArrowField::new("x", DataType::Int32, false),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            update_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 4, 6])),
+                Arc::new(Int32Array::from(vec![99, 99, 99])),
+            ],
+        )
+        .unwrap();
+        let right: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
+            RecordBatchIterator::new(vec![Ok(update_batch)].into_iter(), update_schema),
+        );
+
+        let mut frag0 = dataset.get_fragment(0).unwrap();
+        let u = frag0
+            .update_columns_with_offsets(right, "i", "i")
+            .await
+            .unwrap();
+        assert_eq!(u.matched_offsets.iter().count(), 3);
+        for off in [2_u32, 4, 6] {
+            assert!(u.matched_offsets.contains(off));
+        }
+
+        let updated_fragment_offsets = Some(UpdatedFragmentOffsets(HashMap::from([(
+            u.fragment.id,
+            u.matched_offsets,
+        )])));
+
+        let op = Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![u.fragment],
+            new_fragments: vec![],
+            fields_modified: u.fields_modified,
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_fragment_offsets,
+        };
+
+        let read_v = dataset.version().version;
+        let dataset = Dataset::commit(
+            uri,
+            op,
+            Some(read_v),
+            None,
+            None,
+            Arc::new(Session::default()),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let new_v = dataset.version().version;
+        assert_eq!(new_v, read_v + 1);
+
+        let after = scan_row_versions(&dataset).await;
+        for off in 0..8_u32 {
+            let key = (0, off);
+            let (last_before, created_before) = before[&key];
+            let (last_after, created_after) = after[&key];
+            assert_eq!(created_after, created_before);
+            if off == 2 || off == 4 || off == 6 {
+                assert_eq!(
+                    last_after, new_v,
+                    "matched row offset {off} should advance last_updated to new version"
+                );
+            } else {
+                assert_eq!(
+                    last_after, last_before,
+                    "unmatched row offset {off} in fragment 0 should keep last_updated"
+                );
+            }
+        }
+
+        for off in 0..8_u32 {
+            let key = (1, off);
+            assert_eq!(
+                after[&key], before[&key],
+                "fragment 1 row offset {off}: both version columns unchanged"
+            );
+        }
+    }
+
     /// Regression test for https://github.com/lance-format/lance/issues/6417
     ///
     /// When overwriting a LEGACY dataset with STABLE-format fragments, the
@@ -4622,6 +4950,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
             None,
         )
