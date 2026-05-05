@@ -3162,7 +3162,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "lance-datagen",
@@ -3526,9 +3526,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.13"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -4401,7 +4401,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4501,7 +4501,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4551,7 +4551,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrayref",
  "paste",
@@ -4560,7 +4560,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4600,7 +4600,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4635,7 +4635,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4655,7 +4655,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4703,7 +4703,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4729,7 +4729,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4772,7 +4772,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4786,7 +4786,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "approx",
  "arrow",
@@ -4865,7 +4865,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4916,7 +4916,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4937,7 +4937,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4952,7 +4952,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4970,7 +4970,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -5028,7 +5028,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5074,7 +5074,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5083,7 +5083,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5094,7 +5094,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "jieba-rs",
  "lindera",
@@ -5105,7 +5105,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "7.0.0-beta.2"
+version = "7.0.0-beta.3"
 dependencies = [
  "clap",
  "lance-core",
@@ -5230,7 +5230,7 @@ dependencies = [
  "bitflags 2.11.1",
  "libc",
  "plain",
- "redox_syscall 0.7.4",
+ "redox_syscall 0.7.5",
 ]
 
 [[package]]
@@ -5923,7 +5923,7 @@ dependencies = [
  "md-5",
  "parking_lot",
  "percent-encoding",
- "quick-xml 0.39.2",
+ "quick-xml 0.39.3",
  "rand 0.10.1",
  "reqwest 0.12.28",
  "ring",
@@ -6240,15 +6240,14 @@ dependencies = [
 
 [[package]]
 name = "openssl"
-version = "0.10.78"
+version = "0.10.79"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f38c4372413cdaaf3cc79dd92d29d7d9f5ab09b51b10dded508fb90bb70b9222"
+checksum = "bf0b434746ee2832f4f0baf10137e1cabb18cbe6912c69e2e33263c45250f542"
 dependencies = [
  "bitflags 2.11.1",
  "cfg-if 1.0.4",
  "foreign-types",
  "libc",
- "once_cell",
  "openssl-macros",
  "openssl-sys",
 ]
@@ -6272,9 +6271,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.114"
+version = "0.9.115"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13ce1245cd07fcc4cfdb438f7507b0c7e4f3849a69fd84d52374c66d83741bb6"
+checksum = "158fe5b292746440aa6e7a7e690e55aeb72d41505e2804c23c6973ad0e9c9781"
 dependencies = [
  "cc",
  "libc",
@@ -6903,9 +6902,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.39.2"
+version = "0.39.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "958f21e8e7ceb5a1aa7fa87fab28e7c75976e0bfe7e23ff069e0a260f894067d"
+checksum = "721da970c312655cde9b4ffe0547f20a8494866a4af5ff51f18b7c633d0c870b"
 dependencies = [
  "memchr",
  "serde",
@@ -7174,9 +7173,9 @@ dependencies = [
 
 [[package]]
 name = "redox_syscall"
-version = "0.7.4"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f450ad9c3b1da563fb6948a8e0fb0fb9269711c9c73d9ea1de5058c79c8d643a"
+checksum = "4666a1a60d8412eab19d94f6d13dcc9cea0a5ef4fdf6a5db306537413c661b1b"
 dependencies = [
  "bitflags 2.11.1",
 ]
@@ -7303,7 +7302,7 @@ dependencies = [
  "http 1.4.0",
  "log",
  "percent-encoding",
- "quick-xml 0.39.2",
+ "quick-xml 0.39.3",
  "reqsign-core",
  "rust-ini",
  "serde",
@@ -8203,9 +8202,9 @@ dependencies = [
 
 [[package]]
 name = "siphasher"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "slab"
@@ -8822,9 +8821,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.1"
+version = "1.52.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
+checksum = "110a78583f19d5cdb2c5ccf321d1290344e71313c6c37d43520d386027d18386"
 dependencies = [
  "bytes",
  "libc",
