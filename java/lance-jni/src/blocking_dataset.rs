@@ -10,7 +10,8 @@ use crate::session::{handle_from_session, session_from_handle};
 use crate::traits::{FromJObjectWithEnv, FromJString, export_vec, import_vec, import_vec_to_rust};
 use crate::utils::{
     build_compaction_options, extract_base_store_params, extract_storage_options,
-    extract_write_params, get_scalar_index_params, get_vector_index_params, to_java_map, to_rust_map,
+    extract_write_params, get_scalar_index_params, get_vector_index_params, to_java_map,
+    to_rust_map,
 };
 use crate::{RT, traits::IntoJava};
 use arrow::array::RecordBatchReader;
