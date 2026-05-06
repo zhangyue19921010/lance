@@ -53,13 +53,13 @@ pub enum LanceFileCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum LanceDatasetCommand {
-    /// Locate the first manifest in the latest run that references a data file.
+    /// Locate the first manifest in the latest run that references a data file
     LocateDataFile(LanceDatasetLocateDataFileArgs),
-    /// Verify manifest-referenced data files for missing or unreadable objects.
+    /// Verify manifest-referenced data files for missing or unreadable objects
     VerifyDataFiles(LanceDatasetVerifyDataFilesArgs),
-    /// Repair a dataset manifest with explicit repair actions.
+    /// Repair a dataset manifest with explicit repair actions
     RepairManifest(LanceDatasetRepairManifestArgs),
-    /// Restore an old dataset version as the latest version.
+    /// Restore an old dataset version as the latest version
     Restore(LanceDatasetRestoreArgs),
 }
 
