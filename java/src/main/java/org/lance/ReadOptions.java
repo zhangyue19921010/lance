@@ -88,7 +88,6 @@ public class ReadOptions {
         .add("indexCacheSizeBytes", indexCacheSizeBytes)
         .add("metadataCacheSizeBytes", metadataCacheSizeBytes)
         .add("storageOptions", storageOptions)
-        .add("baseStoreParams", baseStoreParams)
         .add(
             "serializedManifest",
             serializedManifest.map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
