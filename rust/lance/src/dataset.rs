@@ -1863,9 +1863,7 @@ impl Dataset {
         &self,
         data_file: &DataFile,
     ) -> Result<(Arc<ObjectStore>, Path)> {
-        let object_path = self
-            .data_file_dir(data_file)?
-            .join(data_file.path.as_str());
+        let object_path = self.data_file_dir(data_file)?.join(data_file.path.as_str());
         let object_store = self.object_store(data_file.base_id).await?;
         Ok((object_store, object_path))
     }
