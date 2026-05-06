@@ -5,14 +5,17 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::sync::Arc;
 
+use futures::stream::{self, StreamExt};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::write::CommitBuilder;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReader;
+use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::{DataFile, Fragment};
+use object_store::Error as ObjectStoreError;
 use object_store::path::Path;
 use url::Url;
 
@@ -24,9 +27,12 @@ use crate::cli::{
 #[derive(Debug, Clone)]
 struct ReferencedDataFile {
     fragment_id: u64,
-    path: String,
+    /// Fully resolved object store for this data file. Cached from
+    /// [`Dataset::resolve_data_file_location`] so we don't re-resolve during verify.
+    store: Arc<ObjectStore>,
+    /// Fully resolved object path for this data file.
+    path: Path,
     data_file: DataFile,
-    base_id: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +74,8 @@ impl DataFileStatus {
 /// I/O buffer budget for reading Lance file metadata in deep verify mode.
 const DEEP_VERIFY_IO_BUFFER_SIZE: u64 = 4 * 1024 * 1024;
 
+/// Strip a URL scheme (if any) and leading slashes so paths from different
+/// sources can be compared as suffixes of one another.
 fn normalize_path(path: &str) -> String {
     let path = Url::parse(path)
         .ok()
@@ -100,40 +108,45 @@ async fn open_dataset(source: &str, storage_options: Option<&str>) -> Result<Dat
     builder.load().await
 }
 
+/// Match a manifest-referenced data file path against a user-supplied query.
+///
+/// Matching is anchored to path boundaries: the query must either equal the
+/// manifest path or be a suffix beginning at a `/` boundary. Unlike a naive
+/// bidirectional check, this does not match when the query is *longer* than
+/// the manifest entry, which protects destructive operations like
+/// `repair-manifest` from deleting fragments based on spurious matches.
 fn path_matches(candidate: &str, query: &str) -> bool {
     let candidate = normalize_path(candidate);
     let query = normalize_path(query);
-    candidate == query
-        || candidate.ends_with(&format!("/{query}"))
-        || query.ends_with(&format!("/{candidate}"))
+    candidate == query || candidate.ends_with(&format!("/{query}"))
 }
 
-fn error_message_is_not_found(message: &str) -> bool {
-    message.contains("not found") || message.contains("No such file or directory")
-}
-
-fn source_is_not_found(source: &(dyn std::error::Error + 'static)) -> bool {
-    source
-        .downcast_ref::<object_store::Error>()
-        .is_some_and(|err| matches!(err, object_store::Error::NotFound { .. }))
-        || source
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound)
-        || source
-            .downcast_ref::<Error>()
-            .is_some_and(is_not_found_error)
-        || source.source().is_some_and(source_is_not_found)
-}
-
+/// Whether `error` corresponds to an object-store "not found".
+///
+/// The ideal implementation walks `error.source()` and downcasts to
+/// [`ObjectStoreError::NotFound`] (as done in `lance::dataset::cleanup`).
+/// Unfortunately [`Error::Wrapped`] / [`Error::Cloned`] either do not expose
+/// their underlying error as `source()` or have already erased it to a string,
+/// so for deep verify we additionally check the rendered message for the
+/// well-known object-store "Object at location ... not found" phrasing.
 fn is_not_found_error(error: &Error) -> bool {
-    match error {
-        Error::NotFound { .. } => true,
-        Error::Cloned { message, .. } => error_message_is_not_found(message),
-        Error::IO { source, .. } | Error::Wrapped { error: source, .. } => {
-            source_is_not_found(source.as_ref()) || error_message_is_not_found(&source.to_string())
-        }
-        _ => false,
+    if matches!(error, Error::NotFound { .. }) {
+        return true;
     }
+    let message = error.to_string();
+    if message.contains("Object at location") && message.contains("not found") {
+        return true;
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
+    while let Some(err) = source {
+        if let Some(os_err) = err.downcast_ref::<ObjectStoreError>()
+            && matches!(os_err, ObjectStoreError::NotFound { .. })
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// Return all data files referenced by a fragment manifest entry.
@@ -143,12 +156,12 @@ async fn fragment_data_file_refs(
 ) -> Result<Vec<ReferencedDataFile>> {
     let mut data_files = Vec::with_capacity(fragment.files.len());
     for data_file in &fragment.files {
-        let (_, path) = dataset.resolve_data_file_location(data_file).await?;
+        let (store, path) = dataset.resolve_data_file_location(data_file).await?;
         data_files.push(ReferencedDataFile {
             fragment_id: fragment.id,
-            path: path.to_string(),
+            store,
+            path,
             data_file: data_file.clone(),
-            base_id: data_file.base_id,
         });
     }
     Ok(data_files)
@@ -171,7 +184,7 @@ async fn matching_data_files(
     Ok(dataset_data_file_refs(dataset)
         .await?
         .into_iter()
-        .filter(|candidate| path_matches(&candidate.path, data_file_path))
+        .filter(|candidate| path_matches(candidate.path.as_ref(), data_file_path))
         .collect())
 }
 
@@ -181,6 +194,7 @@ fn format_data_file(data_file: &ReferencedDataFile) -> String {
         data_file.fragment_id,
         data_file.path,
         data_file
+            .data_file
             .base_id
             .map(|base_id| base_id.to_string())
             .unwrap_or_else(|| "default".to_string())
@@ -188,38 +202,32 @@ fn format_data_file(data_file: &ReferencedDataFile) -> String {
 }
 
 /// Verify that a data file exists and, in deep mode, has readable Lance metadata.
-async fn verify_data_file_ref(
-    dataset: &Dataset,
-    data_file: &ReferencedDataFile,
-    deep: bool,
-) -> DataFileStatus {
-    let (store, path) = match dataset
-        .resolve_data_file_location(&data_file.data_file)
-        .await
-    {
-        Ok(store_and_path) => store_and_path,
-        Err(err) => return DataFileStatus::Error(err.to_string()),
-    };
-
+async fn verify_data_file_ref(data_file: &ReferencedDataFile, deep: bool) -> DataFileStatus {
     if deep {
-        let scan_scheduler =
-            ScanScheduler::new(store, SchedulerConfig::new(DEEP_VERIFY_IO_BUFFER_SIZE));
+        let scan_scheduler = ScanScheduler::new(
+            data_file.store.clone(),
+            SchedulerConfig::new(DEEP_VERIFY_IO_BUFFER_SIZE),
+        );
         match scan_scheduler
-            .open_file(&path, &data_file.data_file.file_size_bytes)
+            .open_file(&data_file.path, &data_file.data_file.file_size_bytes)
             .await
         {
             Ok(file_scheduler) => match FileReader::read_all_metadata(&file_scheduler).await {
                 Ok(_) => DataFileStatus::Ok,
-                Err(err) if is_not_found_error(&err) => DataFileStatus::Missing(path.to_string()),
+                Err(err) if is_not_found_error(&err) => {
+                    DataFileStatus::Missing(data_file.path.to_string())
+                }
                 Err(err) => DataFileStatus::Corrupt(err.to_string()),
             },
-            Err(err) if is_not_found_error(&err) => DataFileStatus::Missing(path.to_string()),
+            Err(err) if is_not_found_error(&err) => {
+                DataFileStatus::Missing(data_file.path.to_string())
+            }
             Err(err) => DataFileStatus::Error(err.to_string()),
         }
     } else {
-        match store.exists(&path).await {
+        match data_file.store.exists(&data_file.path).await {
             Ok(true) => DataFileStatus::Ok,
-            Ok(false) => DataFileStatus::Missing(path.to_string()),
+            Ok(false) => DataFileStatus::Missing(data_file.path.to_string()),
             Err(err) => DataFileStatus::Error(err.to_string()),
         }
     }
@@ -320,14 +328,29 @@ pub(crate) async fn verify_data_files(
     };
     let data_files = dataset_data_file_refs(&dataset).await?;
     let checked_data_files = data_files.len();
-    let mut bad_data_files = Vec::new();
-
-    for data_file in data_files {
-        let status = verify_data_file_ref(&dataset, &data_file, args.deep).await;
-        if !status.is_ok() {
-            bad_data_files.push((data_file, status));
-        }
-    }
+    // Use the default object store's io_parallelism as our concurrency bound.
+    // Matches the concurrency other tools (e.g. delete) derive from ObjectStore.
+    let concurrency = dataset.object_store(None).await?.io_parallelism();
+    let deep = args.deep;
+    let mut bad_data_files: Vec<(ReferencedDataFile, DataFileStatus)> =
+        stream::iter(data_files.into_iter())
+            .map(|data_file| async move {
+                let status = verify_data_file_ref(&data_file, deep).await;
+                (data_file, status)
+            })
+            .buffer_unordered(concurrency)
+            .filter(|(_, status)| {
+                let keep = !status.is_ok();
+                async move { keep }
+            })
+            .collect()
+            .await;
+    // Sort so output order is stable across runs regardless of completion order.
+    bad_data_files.sort_by(|(left, _), (right, _)| {
+        left.fragment_id
+            .cmp(&right.fragment_id)
+            .then_with(|| left.path.as_ref().cmp(right.path.as_ref()))
+    });
 
     writeln!(writer, "version: {}", dataset.version_id())?;
     writeln!(writer, "checked_data_files: {}", checked_data_files)?;
@@ -404,10 +427,11 @@ pub(crate) async fn repair_manifest(
     let operation = Operation::Delete {
         updated_fragments: vec![],
         deleted_fragment_ids: affected_fragment_ids.iter().copied().collect(),
-        predicate: format!(
-            "repair: removed fragments containing {}",
-            args.remove_data_files.join(", ")
-        ),
+        // `predicate` is semantically a SQL filter string (see write/delete.rs).
+        // This repair removes entire fragments rather than rows matching a
+        // predicate, so leave the field empty to avoid misleading downstream
+        // consumers (auditing, conflict resolution) that parse it as SQL.
+        predicate: String::new(),
     };
     let transaction = Transaction::new(dataset.version_id(), operation, None);
     let committed = CommitBuilder::new(Arc::new(dataset))
@@ -438,8 +462,7 @@ mod tests {
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use lance::dataset::{WriteMode, WriteParams};
-    use lance_table::format::BasePath;
+    use lance::dataset::WriteParams;
     use tempfile::TempDir;
 
     fn test_schema() -> Arc<ArrowSchema> {
@@ -500,7 +523,7 @@ mod tests {
             &LanceDatasetRepairManifestArgs {
                 source: dataset_uri.clone(),
                 storage_options: None,
-                remove_data_files: vec![data_file.path.clone()],
+                remove_data_files: vec![data_file.path.to_string()],
                 dry_run: false,
             },
         )
@@ -510,7 +533,7 @@ mod tests {
         let repaired = Dataset::open(&dataset_uri).await.unwrap();
         assert_eq!(repaired.version_id(), 3);
         assert!(
-            matching_data_files(&repaired, &data_file.path)
+            matching_data_files(&repaired, data_file.path.as_ref())
                 .await
                 .unwrap()
                 .is_empty()
@@ -534,7 +557,7 @@ mod tests {
             &LanceDatasetLocateDataFileArgs {
                 source: dataset_uri.clone(),
                 storage_options: None,
-                data_file: data_file.path.clone(),
+                data_file: data_file.path.to_string(),
                 version: None,
                 restore: true,
             },
@@ -554,7 +577,7 @@ mod tests {
         assert_eq!(restored.version_id(), 5);
         assert_eq!(restored.count_rows(None).await.unwrap(), 3);
         assert!(
-            matching_data_files(&restored, &data_file.path)
+            matching_data_files(&restored, data_file.path.as_ref())
                 .await
                 .unwrap()
                 .is_empty()
@@ -572,7 +595,7 @@ mod tests {
             &LanceDatasetRepairManifestArgs {
                 source: dataset_uri.clone(),
                 storage_options: None,
-                remove_data_files: vec![data_file.path.clone()],
+                remove_data_files: vec![data_file.path.to_string()],
                 dry_run: false,
             },
         )
@@ -590,7 +613,7 @@ mod tests {
         assert_eq!(repaired.version_id(), 3);
         assert_eq!(repaired.count_rows(None).await.unwrap(), 3);
         assert!(
-            matching_data_files(&repaired, &data_file.path)
+            matching_data_files(&repaired, data_file.path.as_ref())
                 .await
                 .unwrap()
                 .is_empty()

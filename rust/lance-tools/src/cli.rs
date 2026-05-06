@@ -4,6 +4,15 @@
 use clap::{Args, Parser, Subcommand};
 use lance_core::Result;
 
+fn parse_remove_data_file(value: &str) -> std::result::Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err("remove-data-files entries must not be empty".to_string())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "lance-tools",
@@ -117,8 +126,14 @@ pub struct LanceDatasetRepairManifestArgs {
     #[arg(long, alias = "storage-options", value_name = "json")]
     pub(crate) storage_options: Option<String>,
 
-    /// Remove the entire fragment (all its data files) if its file list includes this path or suffix. Can be specified multiple times.
-    #[arg(long = "remove-data-files", value_name = "data-file", required = true)]
+    /// Remove the entire fragment (all its data files) if its file list includes this path or suffix. Can be comma-separated or specified multiple times.
+    #[arg(
+        long = "remove-data-files",
+        value_name = "data-file",
+        required = true,
+        value_delimiter = ',',
+        value_parser = parse_remove_data_file
+    )]
     pub(crate) remove_data_files: Vec<String>,
 
     /// Show the affected fragments without committing a new version.
