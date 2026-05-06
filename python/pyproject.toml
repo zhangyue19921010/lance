@@ -114,6 +114,8 @@ filterwarnings = [
     'ignore:.*`np\\.object` will be defined as the corresponding NumPy scalar\\..*:FutureWarning',
     # Boto3
     'ignore:.*datetime\.datetime\.utcnow\(\) is deprecated.*:DeprecationWarning',
+    # Hugging Face Hub calls this deprecated hf-xet API internally.
+    'ignore:.*hf_xet\.download_files\(\) is deprecated.*:DeprecationWarning',
     # Pandas 2.2 on Python 2.12
     'ignore:.*datetime\.datetime\.utcfromtimestamp\(\) is deprecated.*:DeprecationWarning',
     # Pytorch 2.2 on Python 3.12
