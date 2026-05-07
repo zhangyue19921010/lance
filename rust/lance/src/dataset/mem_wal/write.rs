@@ -35,7 +35,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 pub use super::index::{
-    BTreeIndexConfig, BTreeMemIndex, FtsIndexConfig, IndexStore, IvfPqIndexConfig, MemIndexConfig,
+    BTreeIndexConfig, BTreeMemIndex, FtsIndexConfig, HnswIndexConfig, IndexStore, MemIndexConfig,
 };
 pub use super::memtable::CacheConfig;
 pub use super::memtable::MemTable;
@@ -113,8 +113,8 @@ pub struct ShardWriterConfig {
 
     /// Maximum number of rows in a MemTable.
     ///
-    /// Used to pre-allocate index storage (e.g., IVF-PQ partition capacity).
-    /// When a partition reaches capacity, memtable will be flushed.
+    /// Used to pre-allocate the in-memory HNSW graph and vector storage
+    /// capacity. When the memtable reaches capacity, it will be flushed.
     /// Default: 100,000 rows
     pub max_memtable_rows: usize,
 
@@ -125,14 +125,6 @@ pub struct ShardWriterConfig {
     /// 1024-dim vectors (~82KB per 20-row batch).
     /// Default: 8,000 batches
     pub max_memtable_batches: usize,
-
-    /// Safety factor for IVF-PQ index partition capacity calculation.
-    ///
-    /// Accounts for non-uniform distribution of vectors across partitions.
-    /// Higher values use more memory but reduce overflow risk.
-    /// Partition capacity = min((max_rows / num_partitions) * safety_factor, max_rows)
-    /// Default: 8
-    pub ivf_index_partition_capacity_safety_factor: usize,
 
     /// Batch size for parallel HEAD requests when scanning for manifest versions.
     ///
@@ -162,8 +154,8 @@ pub struct ShardWriterConfig {
     /// Maximum rows to buffer before flushing to async indexes.
     ///
     /// Only applies when `sync_indexed_write` is false. Larger values enable
-    /// better vectorization (especially for IVF-PQ) but increase memory usage
-    /// and latency before data becomes searchable.
+    /// better vectorization but increase memory usage and latency before data
+    /// becomes searchable.
     ///
     /// Default: 10,000 rows
     pub async_index_buffer_rows: usize,
@@ -202,8 +194,7 @@ pub struct ShardWriterConfig {
     ///   `durable_write` settings as MemTable mode.
     ///
     /// MemTable-tied tunables (`max_memtable_size`, `max_memtable_rows`,
-    /// `max_memtable_batches`, `ivf_index_partition_capacity_safety_factor`,
-    /// `sync_indexed_write`, `async_index_buffer_rows`,
+    /// `max_memtable_batches`, `sync_indexed_write`, `async_index_buffer_rows`,
     /// `async_index_interval`) are ignored when `enable_memtable == false`.
     ///
     /// For raw single-entry synchronous atomic appends with no buffering and
@@ -224,7 +215,6 @@ impl Default for ShardWriterConfig {
             max_memtable_size: 256 * 1024 * 1024,  // 256MB
             max_memtable_rows: 100_000,            // 100k rows
             max_memtable_batches: 8_000,           // 8k batches
-            ivf_index_partition_capacity_safety_factor: 8,
             manifest_scan_batch_size: 2,
             max_unflushed_memtable_bytes: 1024 * 1024 * 1024, // 1GB
             backpressure_log_interval: Duration::from_secs(30),
@@ -290,12 +280,6 @@ impl ShardWriterConfig {
     /// Set maximum MemTable batches for batch store pre-allocation.
     pub fn with_max_memtable_batches(mut self, batches: usize) -> Self {
         self.max_memtable_batches = batches;
-        self
-    }
-
-    /// Set partition capacity safety factor for IVF-PQ indexes.
-    pub fn with_ivf_index_partition_capacity_safety_factor(mut self, factor: usize) -> Self {
-        self.ivf_index_partition_capacity_safety_factor = factor;
         self
     }
 
@@ -818,7 +802,6 @@ struct SharedWriterState {
     pk_field_ids: Vec<i32>,
     max_memtable_batches: usize,
     max_memtable_rows: usize,
-    ivf_index_partition_capacity_safety_factor: usize,
     index_configs: Vec<MemIndexConfig>,
 }
 
@@ -834,7 +817,6 @@ impl SharedWriterState {
         pk_field_ids: Vec<i32>,
         max_memtable_batches: usize,
         max_memtable_rows: usize,
-        ivf_index_partition_capacity_safety_factor: usize,
         index_configs: Vec<MemIndexConfig>,
     ) -> Self {
         Self {
@@ -847,7 +829,6 @@ impl SharedWriterState {
             pk_field_ids,
             max_memtable_batches,
             max_memtable_rows,
-            ivf_index_partition_capacity_safety_factor,
             index_configs,
         }
     }
@@ -875,7 +856,7 @@ impl SharedWriterState {
             let indexes = Arc::new(IndexStore::from_configs(
                 &self.index_configs,
                 self.max_memtable_rows,
-                self.ivf_index_partition_capacity_safety_factor,
+                self.max_memtable_batches,
             )?);
             new_memtable.set_indexes_arc(indexes);
         }
@@ -1259,7 +1240,7 @@ impl ShardWriter {
             let indexes = Arc::new(IndexStore::from_configs(
                 index_configs,
                 config.max_memtable_rows,
-                config.ivf_index_partition_capacity_safety_factor,
+                config.max_memtable_batches,
             )?);
             memtable.set_indexes_arc(indexes);
         }
@@ -1336,7 +1317,6 @@ impl ShardWriter {
             pk_field_ids,
             config.max_memtable_batches,
             config.max_memtable_rows,
-            config.ivf_index_partition_capacity_safety_factor,
             index_configs.to_vec(),
         ));
 
@@ -3155,11 +3135,13 @@ mod tests {
                 .put(vec![create_test_batch(&schema, i * 10, 10)])
                 .await
                 .unwrap();
-            // Yield so the background flush handler gets a chance to drain
-            // the trigger queue before the next push, otherwise multiple
-            // pending triggers could coalesce into a single drain.
+            // Yield, then sleep, so the background flush handler can
+            // drain the trigger queue before the next push — otherwise
+            // multiple pending triggers can coalesce into a single drain.
+            // 50ms historically failed on slow Windows CI runners; 250ms
+            // gives a comfortable margin without making the suite slow.
             tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
 
         writer.close().await.unwrap();
