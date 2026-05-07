@@ -633,8 +633,26 @@ impl IndexDescriptionImpl {
         let field_ids_vec: Vec<u32> = field_ids.iter().map(|id| *id as u32).collect();
 
         // This should not fail as we have already filtered out indexes without index details.
-        let index_details = example_metadata.index_details.as_ref().ok_or(Error::index("Index details are required for index description.  This index must be retrained to support this method."
-            .to_string()))?;
+        let index_details = example_metadata.index_details.as_ref().ok_or_else(|| {
+            let fields = field_ids
+                .iter()
+                .map(|id| {
+                    dataset
+                        .schema()
+                        .field_by_id(*id)
+                        .map(|f| format!("{}({})", f.name, id))
+                        .unwrap_or_else(|| format!("<unknown>({})", id))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            Error::index(format!(
+                "Index details are required for index description. This index must be retrained to support this method. (index_name={}, uuid={}, fields=[{}])",
+                name,
+                example_metadata.uuid,
+                fields
+            ))
+        })?;
         let type_url = &index_details.type_url;
         if !segments.iter().all(|shard| {
             shard
