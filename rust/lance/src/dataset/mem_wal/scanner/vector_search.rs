@@ -429,11 +429,10 @@ mod tests {
     use crate::dataset::mem_wal::scanner::ActiveMemTableRef;
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
-    use crate::index::vector::VectorIndexParams;
     use crate::index::DatasetIndexExt;
+    use crate::index::vector::VectorIndexParams;
     use arrow_array::{
-        Int32Array, RecordBatch, RecordBatchIterator,
-        builder::FixedSizeListBuilder,
+        Int32Array, RecordBatch, RecordBatchIterator, builder::FixedSizeListBuilder,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::prelude::SessionContext;
@@ -587,8 +586,8 @@ mod tests {
             &VectorIndexParams::ivf_flat(2, DistanceType::L2),
             true,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let base = Arc::new(ds);
 
         // Active MemTable without HNSW — degrades to full scan, no _distance.
@@ -630,7 +629,10 @@ mod tests {
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert!(total > 0, "indexed base table should return results");
         assert!(
-            batches[0].schema().field_with_name(lance_core::ROW_ID).is_err(),
+            batches[0]
+                .schema()
+                .field_with_name(lance_core::ROW_ID)
+                .is_err(),
             "_rowid must be stripped from output"
         );
     }
