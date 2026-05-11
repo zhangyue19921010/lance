@@ -14,6 +14,7 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
 use lance_core::Result;
@@ -187,8 +188,16 @@ impl LsmVectorSearchPlanner {
             let knn = self
                 .build_knn_plan(source, query_vector, k, nprobes, projection)
                 .await?;
-            let tagged: Arc<dyn ExecutionPlan> = Arc::new(MemtableGenTagExec::new(knn, generation));
+            let Some(normalized) = Self::normalize_knn_schema(knn)? else {
+                continue;
+            };
+            let tagged: Arc<dyn ExecutionPlan> =
+                Arc::new(MemtableGenTagExec::new(normalized, generation));
             knn_plans.push(tagged);
+        }
+
+        if knn_plans.is_empty() {
+            return self.empty_plan(projection);
         }
 
         #[allow(deprecated)]
@@ -227,6 +236,60 @@ impl LsmVectorSearchPlanner {
         let limited: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sorted, 0, Some(k)));
 
         Ok(limited)
+    }
+
+    /// Normalize the output schema of a KNN plan for use in `UnionExec`.
+    ///
+    /// All sources in the LSM stack must produce the same output schema so that
+    /// `UnionExec` can merge them.  Two common sources of mismatch are:
+    ///
+    /// * **`_rowid` column**: The base-table/flushed `Scanner::fast_search()` path
+    ///   internally calls `include_row_id()`, which appends `_rowid` to the output.
+    ///   This is an internal implementation detail; we strip it here so that all
+    ///   arms of the union expose only the user-visible columns plus `_distance`.
+    ///
+    /// * **Missing `_distance`**: When an active MemTable has no HNSW vector index
+    ///   the `MemTableScanner` degrades to a plain full scan that produces no distance
+    ///   column.  Such a plan cannot be ranked against properly-indexed sources, so we
+    ///   return `None` to signal that this source should be skipped entirely.
+    ///
+    /// Returns `Ok(Some(plan))` with a possibly-projected plan, or `Ok(None)` when
+    /// the source should be omitted from the union.
+    fn normalize_knn_schema(
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let schema = plan.schema();
+
+        // Skip plans that have no _distance column – they cannot be ranked.
+        if schema.field_with_name(DISTANCE_COLUMN).is_err() {
+            return Ok(None);
+        }
+
+        // If there is no _rowid column the schema is already normalised.
+        if schema.field_with_name(lance_core::ROW_ID).is_err() {
+            return Ok(Some(plan));
+        }
+
+        // Build a projection that retains every column except _rowid.
+        use datafusion::physical_expr::PhysicalExpr;
+        let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() != lance_core::ROW_ID)
+            .map(|f| {
+                let idx = schema.index_of(f.name()).unwrap();
+                let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new(f.name(), idx));
+                (col, f.name().clone())
+            })
+            .collect();
+
+        let projected = ProjectionExec::try_new(exprs, plan).map_err(|e| {
+            lance_core::Error::internal(format!(
+                "LsmVectorSearchPlanner: failed to project away _rowid: {e}"
+            ))
+        })?;
+
+        Ok(Some(Arc::new(projected)))
     }
 
     /// Build KNN plan for a single data source.
@@ -363,12 +426,24 @@ fn single_query_array(query_vector: &FixedSizeListArray) -> arrow_array::ArrayRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::scanner::ActiveMemTableRef;
+    use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
+    use crate::index::vector::VectorIndexParams;
+    use crate::index::DatasetIndexExt;
     use arrow_array::{
-        Int32Array, RecordBatch, RecordBatchIterator, builder::FixedSizeListBuilder,
+        Int32Array, RecordBatch, RecordBatchIterator,
+        builder::FixedSizeListBuilder,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::prelude::SessionContext;
+    use futures::TryStreamExt;
+    use lance_index::IndexType;
+    use lance_linalg::distance::DistanceType;
     use std::collections::HashMap;
+    use uuid::Uuid;
+
+    const VECTOR_DIM: i32 = 4;
 
     fn create_vector_schema() -> Arc<ArrowSchema> {
         let mut id_metadata = HashMap::new();
@@ -382,8 +457,10 @@ mod tests {
             id_field,
             Field::new(
                 "vector",
-                // Use nullable=true to match what FixedSizeListBuilder produces
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    VECTOR_DIM,
+                ),
                 false,
             ),
         ]))
@@ -392,7 +469,7 @@ mod tests {
     fn create_query_vector() -> FixedSizeListArray {
         use arrow_array::builder::Float32Builder;
 
-        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), VECTOR_DIM);
         builder.values().append_value(0.1);
         builder.values().append_value(0.2);
         builder.values().append_value(0.3);
@@ -405,7 +482,7 @@ mod tests {
     fn create_test_batch(schema: &ArrowSchema, ids: &[i32]) -> RecordBatch {
         use arrow_array::builder::Float32Builder;
 
-        let mut vector_builder = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+        let mut vector_builder = FixedSizeListBuilder::new(Float32Builder::new(), VECTOR_DIM);
         for id in ids {
             let base = *id as f32 * 0.1;
             vector_builder.values().append_value(base);
@@ -482,5 +559,79 @@ mod tests {
 
         assert!(cols.contains(&"vector".to_string()));
         assert!(cols.contains(&"id".to_string()));
+    }
+
+    /// Test that KNN plans from different LSM sources produce aligned schemas.
+    ///
+    /// - Indexed base table: `fast_search()` appends `_rowid` to the output schema.
+    /// - Unindexed MemTable: degrades to full scan, emits no `_distance` column.
+    ///
+    /// `normalize_knn_schema` must strip `_rowid` and skip no-`_distance` arms so
+    /// that all inputs to `UnionExec` share the same schema.
+    #[tokio::test]
+    async fn test_knn_plan_schema_alignment() {
+        let schema = create_vector_schema();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Indexed base table — fast_search produces _rowid internally.
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let batch = create_test_batch(&schema, &(1..=8).collect::<Vec<_>>());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut ds = Dataset::write(reader, &base_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        ds.create_index(
+            &["vector"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(2, DistanceType::L2),
+            true,
+        )
+            .await
+            .unwrap();
+        let base = Arc::new(ds);
+
+        // Active MemTable without HNSW — degrades to full scan, no _distance.
+        let batch_store = Arc::new(BatchStore::with_capacity(8));
+        batch_store
+            .append(create_test_batch(&schema, &[10]))
+            .unwrap();
+        let active_ref = ActiveMemTableRef {
+            batch_store,
+            index_store: Arc::new(IndexStore::new()),
+            schema: schema.clone(),
+            generation: 1,
+        };
+
+        let base_schema: Arc<ArrowSchema> = Arc::new(base.schema().into());
+        let collector = LsmDataSourceCollector::new(base.clone(), vec![])
+            .with_active_memtable(Uuid::new_v4(), active_ref);
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            base_schema,
+            "vector".to_string(),
+            DistanceType::L2,
+        );
+
+        // Must not panic — this was the bug.
+        let plan = planner
+            .plan_search(&create_query_vector(), 3, 2, None)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total > 0, "indexed base table should return results");
+        assert!(
+            batches[0].schema().field_with_name(lance_core::ROW_ID).is_err(),
+            "_rowid must be stripped from output"
+        );
     }
 }
