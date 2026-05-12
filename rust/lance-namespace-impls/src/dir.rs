@@ -13,10 +13,15 @@ use arrow::record_batch::RecordBatchIterator;
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::scanner::Scanner;
+use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance::dataset::{
+    Dataset, MergeInsertBuilder, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
+    WriteParams,
+};
 use lance::index::{DatasetIndexExt, IndexParams, vector::VectorIndexParams};
 use lance::session::Session;
 use lance_index::scalar::{
@@ -29,7 +34,8 @@ use lance_index::vector::{
 use lance_index::{IndexType, is_system_index};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_linalg::distance::MetricType;
-use lance_table::io::commit::ManifestNamingScheme;
+use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
 use std::collections::HashMap;
@@ -38,23 +44,28 @@ use std::sync::{Arc, Mutex};
 
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
-    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
-    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
-    CreateTableScalarIndexResponse, CreateTableVersionRequest, CreateTableVersionResponse,
-    DeclareTableRequest, DeclareTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
-    DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse, DescribeTableRequest,
-    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
-    DescribeTransactionRequest, DescribeTransactionResponse, DropNamespaceRequest,
-    DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse, DropTableRequest,
-    DropTableResponse, Identity, IndexContent, InsertIntoTableRequest, InsertIntoTableResponse,
+    AnalyzeTableQueryPlanRequest, BatchDeleteTableVersionsRequest,
+    BatchDeleteTableVersionsResponse, CountTableRowsRequest, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
+    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableVersionRequest,
+    CreateTableVersionResponse, DeclareTableRequest, DeclareTableResponse,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
+    DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
+    DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
+    DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
+    DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
+    ExplainTableQueryPlanRequest, FragmentStats, FragmentSummary, GetTableStatsRequest,
+    GetTableStatsResponse, Identity, IndexContent, InsertIntoTableRequest, InsertIntoTableResponse,
     ListNamespacesRequest, ListNamespacesResponse, ListTableIndicesRequest,
     ListTableIndicesResponse, ListTableVersionsRequest, ListTableVersionsResponse,
-    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, QueryTableRequest,
-    TableExistsRequest, TableVersion,
+    ListTablesRequest, ListTablesResponse, MergeInsertIntoTableRequest,
+    MergeInsertIntoTableResponse, NamespaceExistsRequest, QueryTableRequest,
+    QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest, RestoreTableResponse,
+    TableExistsRequest, TableVersion, UpdateTableSchemaMetadataRequest,
+    UpdateTableSchemaMetadataResponse,
 };
 
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::schema::arrow_schema_to_json;
@@ -181,6 +192,11 @@ pub struct DirectoryNamespaceBuilder {
     /// When true, table versions are stored in the `__manifest` table instead of
     /// relying on Lance's native version management.
     table_version_storage_enabled: bool,
+    /// When true, enables migration mode where the namespace checks the manifest first
+    /// before falling back to directory listing for root-level tables. When false (default),
+    /// root-level tables use directory listing directly without checking the manifest,
+    /// avoiding extra object store calls.
+    dir_listing_to_manifest_migration_enabled: bool,
     credential_vendor_properties: HashMap<String, String>,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
     commit_retries: Option<u32>,
@@ -216,6 +232,10 @@ impl std::fmt::Debug for DirectoryNamespaceBuilder {
                 &self.table_version_storage_enabled,
             )
             .field(
+                "dir_listing_to_manifest_migration_enabled",
+                &self.dir_listing_to_manifest_migration_enabled,
+            )
+            .field(
                 "context_provider",
                 &self.context_provider.as_ref().map(|_| "Some(...)"),
             )
@@ -248,6 +268,7 @@ impl DirectoryNamespaceBuilder {
             inline_optimization_enabled: true,
             table_version_tracking_enabled: false, // Default to disabled
             table_version_storage_enabled: false,  // Default to disabled
+            dir_listing_to_manifest_migration_enabled: false, // Default to disabled
             credential_vendor_properties: HashMap::new(),
             context_provider: None,
             commit_retries: None,
@@ -272,6 +293,17 @@ impl DirectoryNamespaceBuilder {
     /// When disabled, only consults the manifest table.
     pub fn dir_listing_enabled(mut self, enabled: bool) -> Self {
         self.dir_listing_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable migration mode from directory listing to manifest.
+    ///
+    /// When enabled, root-level table operations check the manifest first before
+    /// falling back to directory listing. When disabled (default), root-level tables
+    /// use directory listing directly, avoiding extra object store calls.
+    /// Only relevant when both `manifest_enabled` and `dir_listing_enabled` are true.
+    pub fn dir_listing_to_manifest_migration_enabled(mut self, enabled: bool) -> Self {
+        self.dir_listing_to_manifest_migration_enabled = enabled;
         self
     }
 
@@ -333,6 +365,8 @@ impl DirectoryNamespaceBuilder {
     ///
     /// GCP-specific properties (for gs:// locations):
     /// - `credential_vendor.gcp_service_account`: Service account to impersonate (optional)
+    /// - `credential_vendor.gcp_workload_identity_provider`: Workload Identity Provider for OIDC token exchange (optional)
+    /// - `credential_vendor.gcp_impersonation_service_account`: Service account to impersonate after workload identity exchange (optional)
     ///
     /// Note: GCP uses Application Default Credentials (ADC). To use a service account key file,
     /// set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable before starting.
@@ -341,6 +375,7 @@ impl DirectoryNamespaceBuilder {
     /// Azure-specific properties (for az:// locations):
     /// - `credential_vendor.azure_account_name`: Azure storage account name (required for Azure)
     /// - `credential_vendor.azure_tenant_id`: Azure tenant ID (optional)
+    /// - `credential_vendor.azure_federated_client_id`: Client ID used for workload identity federation (optional)
     /// - `credential_vendor.azure_duration_millis`: Credential duration in ms (default: 3600000, up to 7 days)
     ///
     /// # Arguments
@@ -430,6 +465,12 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false);
 
+        // Extract dir_listing_to_manifest_migration_enabled (default: false)
+        let dir_listing_to_manifest_migration_enabled = properties
+            .get("dir_listing_to_manifest_migration_enabled")
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
         // Extract credential vendor properties (properties prefixed with "credential_vendor.")
         // The prefix is stripped to get short property names
         // The build() method will check if enabled=true before creating the vendor
@@ -471,6 +512,7 @@ impl DirectoryNamespaceBuilder {
             inline_optimization_enabled,
             table_version_tracking_enabled,
             table_version_storage_enabled,
+            dir_listing_to_manifest_migration_enabled,
             credential_vendor_properties,
             context_provider: None,
             commit_retries,
@@ -531,8 +573,8 @@ impl DirectoryNamespaceBuilder {
     /// Use short property names without the `credential_vendor.` prefix.
     /// Common properties: `enabled`, `permission`.
     /// AWS properties: `aws_role_arn`, `aws_external_id`, `aws_region`, `aws_role_session_name`, `aws_duration_millis`.
-    /// GCP properties: `gcp_service_account`.
-    /// Azure properties: `azure_account_name`, `azure_tenant_id`, `azure_duration_millis`.
+    /// GCP properties: `gcp_service_account`, `gcp_workload_identity_provider`, `gcp_impersonation_service_account`.
+    /// Azure properties: `azure_account_name`, `azure_tenant_id`, `azure_federated_client_id`, `azure_duration_millis`.
     ///
     /// # Arguments
     ///
@@ -709,6 +751,8 @@ impl DirectoryNamespaceBuilder {
             base_path,
             manifest_ns,
             dir_listing_enabled: self.dir_listing_enabled,
+            dir_listing_to_manifest_migration_enabled: self
+                .dir_listing_to_manifest_migration_enabled,
             table_version_tracking_enabled: self.table_version_tracking_enabled,
             table_version_storage_enabled: self.table_version_storage_enabled,
             credential_vendor,
@@ -747,7 +791,7 @@ impl DirectoryNamespaceBuilder {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to create object store: {}", e),
+                    message: format!("Failed to create object store: {:?}", e),
                 })
             })?;
 
@@ -786,6 +830,10 @@ pub struct DirectoryNamespace {
     base_path: Path,
     manifest_ns: Option<Arc<manifest::ManifestNamespace>>,
     dir_listing_enabled: bool,
+    /// When true, root-level table operations check the manifest first before
+    /// falling back to directory listing. When false, root-level tables skip
+    /// the manifest check and use directory listing directly.
+    dir_listing_to_manifest_migration_enabled: bool,
     /// When true, `describe_table` returns `managed_versioning: true` to indicate
     /// commits should go through namespace table version APIs.
     table_version_tracking_enabled: bool,
@@ -887,7 +935,7 @@ impl DirectoryNamespace {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to list directory: {}", e),
+                    message: format!("Failed to list directory: {:?}", e),
                 })
             })?;
 
@@ -899,9 +947,9 @@ impl DirectoryNamespace {
 
             let table_name = &path[..path.len() - 6];
 
-            // Use atomic check to skip deregistered tables and declared-but-not-written tables
+            // Use atomic check to skip deregistered tables.
             let status = self.check_table_status(table_name).await;
-            if status.is_deregistered || status.has_reserved_file {
+            if status.is_deregistered {
                 continue;
             }
 
@@ -948,6 +996,19 @@ impl DirectoryNamespace {
         Ok(id[0].clone())
     }
 
+    fn format_table_id(table_id: &[String]) -> String {
+        format!(
+            "table id '{}'",
+            manifest::ManifestNamespace::str_object_id(table_id)
+        )
+    }
+
+    fn format_table_id_from_request(id: &Option<Vec<String>>) -> String {
+        id.as_ref()
+            .map(|table_id| Self::format_table_id(table_id))
+            .unwrap_or_else(|| "table id '<unknown>'".to_string())
+    }
+
     async fn resolve_table_location(&self, id: &Option<Vec<String>>) -> Result<String> {
         let mut describe_req = DescribeTableRequest::new();
         describe_req.id = id.clone();
@@ -963,6 +1024,241 @@ impl DirectoryNamespace {
         })
     }
 
+    async fn table_has_actual_manifests(&self, table_name: &str) -> Result<bool> {
+        manifest::ManifestNamespace::path_has_actual_manifests(
+            &self.object_store,
+            &self.table_path(table_name),
+        )
+        .await
+    }
+
+    async fn filter_declared_tables(
+        &self,
+        tables: Vec<String>,
+        include_declared: bool,
+    ) -> Result<Vec<String>> {
+        if include_declared {
+            return Ok(tables);
+        }
+
+        let mut stream = futures::stream::iter(tables.into_iter().map(|table_name| async move {
+            // `include_declared=false` is an explicit opt-in. We still pay one `_versions/` probe
+            // per table here so declared-state is derived from actual manifests. This is linear in
+            // the total number of listed tables, but we probe a bounded number concurrently.
+            if self.table_has_actual_manifests(&table_name).await? {
+                Ok::<Option<String>, Error>(Some(table_name))
+            } else {
+                Ok::<Option<String>, Error>(None)
+            }
+        }))
+        .buffered(manifest::DECLARED_FILTER_CONCURRENCY);
+
+        let mut filtered = Vec::new();
+        while let Some(result) = stream.next().await {
+            if let Some(table_name) = result? {
+                filtered.push(table_name);
+            }
+        }
+        Ok(filtered)
+    }
+
+    fn ipc_reader_from_request_data(
+        request_data: &Bytes,
+        operation: &str,
+    ) -> Result<(
+        Box<dyn arrow::record_batch::RecordBatchReader + Send>,
+        usize,
+    )> {
+        if request_data.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Request data (Arrow IPC stream) is required for {}",
+                    operation
+                ),
+            }
+            .into());
+        }
+
+        let cursor = Cursor::new(request_data.as_ref());
+        let stream_reader =
+            StreamReader::try_new(cursor, None).map_err(|e| NamespaceError::InvalidInput {
+                message: format!("Invalid Arrow IPC stream: {}", e),
+            })?;
+        let arrow_schema = stream_reader.schema();
+
+        let mut num_rows = 0usize;
+        let mut batches = Vec::new();
+        for batch_result in stream_reader {
+            let batch = batch_result.map_err(|e| NamespaceError::Internal {
+                message: format!("Failed to read batch from IPC stream: {}", e),
+            })?;
+            num_rows += batch.num_rows();
+            batches.push(batch);
+        }
+
+        let reader: Box<dyn arrow::record_batch::RecordBatchReader + Send> = if batches.is_empty() {
+            let batch = arrow::record_batch::RecordBatch::new_empty(arrow_schema.clone());
+            Box::new(RecordBatchIterator::new(vec![Ok(batch)], arrow_schema))
+        } else {
+            let batch_results: Vec<_> = batches.into_iter().map(Ok).collect();
+            Box::new(RecordBatchIterator::new(batch_results, arrow_schema))
+        };
+
+        Ok((reader, num_rows))
+    }
+
+    async fn table_uri_has_actual_manifests(&self, table_uri: &str) -> Result<bool> {
+        let table_path = self.object_store_path_from_uri(table_uri)?;
+        manifest::ManifestNamespace::path_has_actual_manifests(&self.object_store, &table_path)
+            .await
+    }
+
+    fn object_store_path_from_uri(&self, uri: &str) -> Result<Path> {
+        let registry = self
+            .session
+            .as_ref()
+            .map(|session| session.store_registry())
+            .unwrap_or_else(|| Arc::new(ObjectStoreRegistry::default()));
+        ObjectStore::extract_path_from_uri(registry, uri)
+    }
+
+    fn validate_dir_only_properties(
+        properties: Option<&HashMap<String, String>>,
+        operation: &str,
+    ) -> Result<()> {
+        // Dir-only mode has no metadata catalog, so non-empty table properties would be accepted
+        // and then lost. Reject them instead. Request-level storage options are different: they
+        // directly affect the current write and remain supported in dir-only mode.
+        if properties.is_some_and(|properties| !properties.is_empty()) {
+            return Err(NamespaceError::Unsupported {
+                message: format!(
+                    "{} with non-empty table properties requires manifest_enabled=true",
+                    operation
+                ),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn write_reader_to_table(
+        &self,
+        table_uri: &str,
+        reader: Box<dyn arrow::record_batch::RecordBatchReader + Send>,
+        mode: WriteMode,
+        extra_storage_options: Option<HashMap<String, String>>,
+    ) -> Result<Dataset> {
+        // Insert and merge-insert request models do not carry request-level storage options,
+        // so these writes intentionally use the namespace-level storage options only.
+        let mut merged_storage_options = self.storage_options.clone().unwrap_or_default();
+        if let Some(extra_storage_options) = extra_storage_options {
+            merged_storage_options.extend(extra_storage_options);
+        }
+        let store_params = (!merged_storage_options.is_empty()).then(|| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                    merged_storage_options,
+                ),
+            )),
+            ..Default::default()
+        });
+
+        let write_params = WriteParams {
+            mode,
+            store_params,
+            session: self.session.clone(),
+            ..Default::default()
+        };
+
+        let dataset = Dataset::write(reader, table_uri, Some(write_params))
+            .await
+            .map_err(|e| NamespaceError::Internal {
+                message: format!("Failed to write table at '{}': {}", table_uri, e),
+            })?;
+
+        Ok(dataset)
+    }
+
+    async fn list_table_versions_from_storage(
+        &self,
+        table_uri: &str,
+        descending: bool,
+        limit: Option<i32>,
+    ) -> Result<Vec<TableVersion>> {
+        let table_path = self.object_store_path_from_uri(table_uri)?;
+        let versions_dir = table_path.clone().join(VERSIONS_DIR);
+        let manifest_metas: Vec<_> = self
+            .object_store
+            .read_dir_all(&versions_dir, None)
+            .try_collect()
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to list manifest files for table at '{}': {}",
+                        table_uri, e
+                    ),
+                })
+            })?;
+
+        let is_v2_naming = manifest_metas
+            .first()
+            .is_some_and(|meta| meta.location.filename().is_some_and(|f| f.len() == 29));
+
+        let mut table_versions: Vec<TableVersion> = manifest_metas
+            .into_iter()
+            .filter_map(|meta| {
+                let filename = meta.location.filename()?;
+                let version_str = filename.strip_suffix(".manifest")?;
+                if version_str.starts_with('d') {
+                    return None;
+                }
+                let file_version: u64 = version_str.parse().ok()?;
+
+                let actual_version = if file_version > u64::MAX / 2 {
+                    u64::MAX - file_version
+                } else {
+                    file_version
+                };
+
+                Some(TableVersion {
+                    version: actual_version as i64,
+                    manifest_path: meta.location.to_string(),
+                    manifest_size: Some(meta.size as i64),
+                    e_tag: meta.e_tag,
+                    timestamp_millis: Some(meta.last_modified.timestamp_millis()),
+                    metadata: None,
+                })
+            })
+            .collect();
+
+        let list_is_ordered = self.object_store.list_is_lexically_ordered;
+
+        let needs_sort = if list_is_ordered {
+            if is_v2_naming {
+                !descending
+            } else {
+                descending
+            }
+        } else {
+            true
+        };
+
+        if needs_sort {
+            if descending {
+                table_versions.sort_by(|a, b| b.version.cmp(&a.version));
+            } else {
+                table_versions.sort_by(|a, b| a.version.cmp(&b.version));
+            }
+        }
+
+        if let Some(limit) = limit {
+            table_versions.truncate(limit as usize);
+        }
+
+        Ok(table_versions)
+    }
+
     /// Internal describe_table implementation that doesn't record metrics.
     /// Used by both the public describe_table (which records metrics) and
     /// internal callers like resolve_table_location (which shouldn't).
@@ -970,7 +1266,13 @@ impl DirectoryNamespace {
         &self,
         request: DescribeTableRequest,
     ) -> Result<DescribeTableResponse> {
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
+        let skip_manifest_for_root = self.dir_listing_enabled
+            && is_root_level
+            && !self.dir_listing_to_manifest_migration_enabled;
+        if let Some(ref manifest_ns) = self.manifest_ns
+            && !skip_manifest_for_root
+        {
             match manifest_ns.describe_table(request.clone()).await {
                 Ok(mut response) => {
                     if let Some(ref table_uri) = response.table_uri {
@@ -987,10 +1289,7 @@ impl DirectoryNamespace {
                     }
                     return Ok(response);
                 }
-                Err(_)
-                    if self.dir_listing_enabled
-                        && request.id.as_ref().is_some_and(|id| id.len() == 1) =>
-                {
+                Err(_) if self.dir_listing_enabled && is_root_level => {
                     // Fall through to directory check only for single-level IDs
                 }
                 Err(e) => return Err(e),
@@ -998,6 +1297,7 @@ impl DirectoryNamespace {
         }
 
         let table_name = Self::table_name_from_id(&request.id)?;
+        let table_id = Self::format_table_id_from_request(&request.id);
         let table_uri = self.table_full_uri(&table_name);
 
         // Atomically check table existence and deregistration status
@@ -1005,24 +1305,34 @@ impl DirectoryNamespace {
 
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
-                message: table_name.to_string(),
+                message: table_id.clone(),
             }
             .into());
         }
 
         if status.is_deregistered {
-            return Err(NamespaceError::InvalidTableState {
-                message: format!("Table is deregistered: {}", table_name),
+            return Err(NamespaceError::TableNotFound {
+                message: format!("Table is deregistered: {}", table_id),
             }
             .into());
         }
 
         let load_detailed_metadata = request.load_detailed_metadata.unwrap_or(false);
+        let should_check_declared =
+            load_detailed_metadata || request.check_declared.unwrap_or(false);
         // For backwards compatibility, only skip vending credentials when explicitly set to false
         let vend_credentials = request.vend_credentials.unwrap_or(true);
         let identity = request.identity.as_deref();
+        let is_only_declared = if should_check_declared {
+            if status.has_reserved_file {
+                Some(!self.table_has_actual_manifests(&table_name).await?)
+            } else {
+                Some(false)
+            }
+        } else {
+            None
+        };
 
-        // If not loading detailed metadata, return minimal response with just location
         if !load_detailed_metadata {
             let storage_options = self
                 .get_storage_options_for_table(&table_uri, vend_credentials, identity)
@@ -1039,6 +1349,33 @@ impl DirectoryNamespace {
                 location: Some(table_uri.clone()),
                 table_uri: Some(table_uri),
                 storage_options,
+                is_only_declared,
+                managed_versioning: if self.table_version_tracking_enabled {
+                    Some(true)
+                } else {
+                    None
+                },
+                ..Default::default()
+            });
+        }
+
+        if is_only_declared == Some(true) {
+            let storage_options = self
+                .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+                .await?;
+            return Ok(DescribeTableResponse {
+                table: Some(table_name),
+                namespace: request.id.as_ref().map(|id| {
+                    if id.len() > 1 {
+                        id[..id.len() - 1].to_vec()
+                    } else {
+                        vec![]
+                    }
+                }),
+                location: Some(table_uri.clone()),
+                table_uri: Some(table_uri),
+                storage_options,
+                is_only_declared,
                 managed_versioning: if self.table_version_tracking_enabled {
                     Some(true)
                 } else {
@@ -1061,7 +1398,17 @@ impl DirectoryNamespace {
             Ok(mut dataset) => {
                 // If a specific version is requested, checkout that version
                 if let Some(requested_version) = request.version {
-                    dataset = dataset.checkout_version(requested_version as u64).await?;
+                    dataset = dataset
+                        .checkout_version(requested_version as u64)
+                        .await
+                        .map_err(|e| {
+                            lance_core::Error::from(NamespaceError::TableVersionNotFound {
+                                message: format!(
+                                    "Version {} not found for table '{}': {}",
+                                    requested_version, table_name, e
+                                ),
+                            })
+                        })?;
                 }
 
                 let version_info = dataset.version();
@@ -1091,6 +1438,7 @@ impl DirectoryNamespace {
                     schema: Some(Box::new(json_schema)),
                     storage_options,
                     metadata: Some(metadata),
+                    is_only_declared,
                     managed_versioning: if self.table_version_tracking_enabled {
                         Some(true)
                     } else {
@@ -1100,8 +1448,9 @@ impl DirectoryNamespace {
                 })
             }
             Err(err) => {
-                // Use the reserved file status from the atomic check
-                if status.has_reserved_file {
+                if manifest::ManifestNamespace::is_not_found_load_error(&err)
+                    && is_only_declared == Some(true)
+                {
                     let storage_options = self
                         .get_storage_options_for_table(&table_uri, vend_credentials, identity)
                         .await?;
@@ -1117,6 +1466,7 @@ impl DirectoryNamespace {
                         location: Some(table_uri.clone()),
                         table_uri: Some(table_uri),
                         storage_options,
+                        is_only_declared,
                         managed_versioning: if self.table_version_tracking_enabled {
                             Some(true)
                         } else {
@@ -1466,7 +1816,7 @@ impl DirectoryNamespace {
                 .read_transaction_by_version(version)
                 .await
                 .map_err(|e| {
-                    lance_core::Error::from(NamespaceError::Internal {
+                    lance_core::Error::from(NamespaceError::TransactionNotFound {
                         message: format!(
                             "Failed to read transaction for version {}: {}",
                             version, e
@@ -1518,39 +1868,27 @@ impl DirectoryNamespace {
         format!("{}/{}.lance", &self.root, table_name)
     }
 
-    fn uri_to_object_store_path(uri: &str) -> Path {
-        let path_str = if let Some(rest) = uri.strip_prefix("file://") {
-            rest
-        } else if let Some(rest) = uri.strip_prefix("s3://") {
-            rest.split_once('/').map(|(_, p)| p).unwrap_or(rest)
-        } else if let Some(rest) = uri.strip_prefix("gs://") {
-            rest.split_once('/').map(|(_, p)| p).unwrap_or(rest)
-        } else if let Some(rest) = uri.strip_prefix("az://") {
-            rest.split_once('/').map(|(_, p)| p).unwrap_or(rest)
-        } else {
-            uri
-        };
-        Path::from(path_str)
-    }
-
     /// Get the object store path for a table (relative to base_path)
     fn table_path(&self, table_name: &str) -> Path {
         self.base_path
-            .child(format!("{}.lance", table_name).as_str())
+            .clone()
+            .join(format!("{}.lance", table_name).as_str())
     }
 
     /// Get the reserved file path for a table
     fn table_reserved_file_path(&self, table_name: &str) -> Path {
         self.base_path
-            .child(format!("{}.lance", table_name).as_str())
-            .child(".lance-reserved")
+            .clone()
+            .join(format!("{}.lance", table_name).as_str())
+            .join(".lance-reserved")
     }
 
     /// Get the deregistered marker file path for a table
     fn table_deregistered_file_path(&self, table_name: &str) -> Path {
         self.base_path
-            .child(format!("{}.lance", table_name).as_str())
-            .child(".lance-deregistered")
+            .clone()
+            .join(format!("{}.lance", table_name).as_str())
+            .join(".lance-deregistered")
     }
 
     /// Atomically check table existence and deregistration status.
@@ -1600,7 +1938,7 @@ impl DirectoryNamespace {
             | Err(ObjectStoreError::Precondition { .. }) => {
                 Err(format!("{} already exists", file_description))
             }
-            Err(e) => Err(format!("Failed to create {}: {}", file_description, e)),
+            Err(e) => Err(format!("Failed to create {}: {:?}", file_description, e)),
         }
     }
 
@@ -1719,8 +2057,11 @@ impl DirectoryNamespace {
         // Get all table locations already in the manifest
         let manifest_locations = manifest_ns.list_manifest_table_locations().await?;
 
-        // Get all tables from directory
-        let dir_tables = self.list_directory_tables().await?;
+        // Get all tables from directory and skip declared-only tables that have not
+        // written any actual version manifests yet.
+        let dir_tables = self
+            .filter_declared_tables(self.list_directory_tables().await?, false)
+            .await?;
 
         // Register each directory table that doesn't have an overlapping location
         // If a directory name already exists in the manifest,
@@ -1755,14 +2096,14 @@ impl DirectoryNamespace {
         let mut deleted_count = 0i64;
         for te in table_entries {
             let table_uri = self.resolve_table_location(&te.table_id).await?;
-            let table_path = Self::uri_to_object_store_path(&table_uri);
-            let table_path_str = table_path.as_ref();
-            let versions_dir_path = Path::from(format!("{}_versions", table_path_str));
+            let table_path = self.object_store_path_from_uri(&table_uri)?;
+            let versions_dir_path = table_path.clone().join(VERSIONS_DIR);
 
             for (start, end) in &te.ranges {
                 for version in *start..=*end {
-                    let version_path =
-                        versions_dir_path.child(format!("{}.manifest", version as u64));
+                    let version_path = versions_dir_path
+                        .clone()
+                        .join(format!("{}.manifest", version as u64));
                     match self.object_store.inner.delete(&version_path).await {
                         Ok(_) => {
                             deleted_count += 1;
@@ -1791,6 +2132,142 @@ impl DirectoryNamespace {
             }
         }
         Ok(deleted_count)
+    }
+
+    /// Apply all query parameters from a `QueryTableRequest`-like source onto a `Scanner`.
+    ///
+    /// This covers vector search, filters, column projection, limits, and ANN tuning knobs so
+    /// that `explain_table_query_plan` / `analyze_table_query_plan` produce an accurate plan.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_query_params_to_scanner(
+        scanner: &mut Scanner,
+        filter: Option<&str>,
+        columns: Option<&QueryTableRequestColumns>,
+        vector_column: Option<&str>,
+        vector: &QueryTableRequestVector,
+        k: i32,
+        offset: Option<i32>,
+        prefilter: Option<bool>,
+        bypass_vector_index: Option<bool>,
+        nprobes: Option<i32>,
+        ef: Option<i32>,
+        refine_factor: Option<i32>,
+        distance_type: Option<&str>,
+        fast_search_flag: Option<bool>,
+        with_row_id: Option<bool>,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        operation: &str,
+    ) -> Result<()> {
+        // prefilter must be set before nearest() so the fragment-scan guard sees it.
+        if let Some(pf) = prefilter {
+            scanner.prefilter(pf);
+        }
+
+        if let Some(filter) = filter {
+            scanner.filter(filter).map_err(|e| {
+                Error::invalid_input_source(
+                    format!("Invalid filter expression for {}: {}", operation, e).into(),
+                )
+            })?;
+        }
+
+        if let Some(cols) = columns {
+            if let Some(ref names) = cols.column_names {
+                scanner.project(names.as_slice()).map_err(|e| {
+                    Error::invalid_input_source(
+                        format!("Invalid column projection for {}: {}", operation, e).into(),
+                    )
+                })?;
+            } else if let Some(ref aliases) = cols.column_aliases {
+                // aliases maps output_alias -> source_column
+                let pairs: Vec<(&str, &str)> = aliases
+                    .iter()
+                    .map(|(alias, src)| (alias.as_str(), src.as_str()))
+                    .collect();
+                scanner.project_with_transform(&pairs).map_err(|e| {
+                    Error::invalid_input_source(
+                        format!("Invalid column aliases for {}: {}", operation, e).into(),
+                    )
+                })?;
+            }
+        }
+
+        // Resolve query vector: prefer single_vector, fall back to first row of multi_vector.
+        let query_vec: Option<Vec<f32>> = vector
+            .single_vector
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .or_else(|| {
+                vector
+                    .multi_vector
+                    .as_ref()
+                    .and_then(|mv| mv.first())
+                    .filter(|v| !v.is_empty())
+                    .cloned()
+            });
+
+        if let Some(q_vec) = query_vec {
+            let col = vector_column.unwrap_or("vector");
+            let q = Arc::new(Float32Array::from(q_vec));
+            scanner
+                .nearest(col, q.as_ref(), k.max(1) as usize)
+                .map_err(|e| {
+                    Error::invalid_input_source(
+                        format!("Invalid vector query for {}: {}", operation, e).into(),
+                    )
+                })?;
+
+            // ANN parameters — must be applied after nearest().
+            if let Some(n) = nprobes {
+                scanner.nprobes(n.max(1) as usize);
+            }
+            if let Some(e) = ef {
+                scanner.ef(e.max(1) as usize);
+            }
+            if let Some(rf) = refine_factor {
+                scanner.refine(rf.max(0) as u32);
+            }
+            // bypass_vector_index and fast_search are mutually exclusive; apply in order.
+            if let Some(true) = bypass_vector_index {
+                scanner.use_index(false);
+            }
+            if let Some(true) = fast_search_flag {
+                scanner.fast_search();
+            }
+            if lower_bound.is_some() || upper_bound.is_some() {
+                scanner.distance_range(lower_bound, upper_bound);
+            }
+            if let Some(dt) = distance_type {
+                let metric = Self::parse_metric_type(Some(dt))?;
+                scanner.distance_metric(metric);
+            }
+            // Apply offset on top of the k nearest results.
+            if let Some(off) = offset.filter(|&o| o > 0) {
+                scanner.limit(None, Some(off as i64)).map_err(|e| {
+                    Error::invalid_input_source(
+                        format!("Invalid offset for {}: {}", operation, e).into(),
+                    )
+                })?;
+            }
+        } else {
+            // Scalar (non-vector) query: treat k as a row LIMIT.
+            let limit = if k > 0 { Some(k as i64) } else { None };
+            scanner
+                .limit(limit, offset.map(|o| o as i64))
+                .map_err(|e| {
+                    Error::invalid_input_source(
+                        format!("Invalid limit/offset for {}: {}", operation, e).into(),
+                    )
+                })?;
+        }
+
+        if let Some(true) = with_row_id {
+            scanner.with_row_id();
+        }
+
+        Ok(())
     }
 
     /// Retrieve a snapshot of operation metrics.
@@ -1943,8 +2420,12 @@ impl LanceNamespace for DirectoryNamespace {
             return manifest_ns.list_tables(request).await;
         }
 
-        // When both manifest and directory listing are enabled, we need to merge and deduplicate
-        let mut tables = if self.manifest_ns.is_some() && self.dir_listing_enabled {
+        // When both manifest and directory listing are enabled with migration mode,
+        // we need to merge and deduplicate
+        let mut tables = if self.manifest_ns.is_some()
+            && self.dir_listing_enabled
+            && self.dir_listing_to_manifest_migration_enabled
+        {
             // Get all manifest table locations (for deduplication)
             let manifest_locations = if let Some(ref manifest_ns) = self.manifest_ns {
                 manifest_ns.list_manifest_table_locations().await?
@@ -1984,6 +2465,10 @@ impl LanceNamespace for DirectoryNamespace {
             self.list_directory_tables().await?
         };
 
+        tables = self
+            .filter_declared_tables(tables, request.include_declared.unwrap_or(true))
+            .await?;
+
         // Apply sorting and pagination
         let next_page_token =
             Self::apply_pagination(&mut tables, request.page_token, request.limit);
@@ -1999,13 +2484,16 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
         self.record_op("table_exists");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
+        let skip_manifest_for_root = self.dir_listing_enabled
+            && is_root_level
+            && !self.dir_listing_to_manifest_migration_enabled;
+        if let Some(ref manifest_ns) = self.manifest_ns
+            && !skip_manifest_for_root
+        {
             match manifest_ns.table_exists(request.clone()).await {
                 Ok(()) => return Ok(()),
-                Err(_)
-                    if self.dir_listing_enabled
-                        && request.id.as_ref().is_some_and(|id| id.len() == 1) =>
-                {
+                Err(_) if self.dir_listing_enabled && is_root_level => {
                     // Fall through to directory check only for single-level IDs
                 }
                 Err(e) => return Err(e),
@@ -2013,20 +2501,21 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         let table_name = Self::table_name_from_id(&request.id)?;
+        let table_id = Self::format_table_id_from_request(&request.id);
 
         // Atomically check table existence and deregistration status
         let status = self.check_table_status(&table_name).await;
 
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
-                message: table_name.to_string(),
+                message: table_id.clone(),
             }
             .into());
         }
 
         if status.is_deregistered {
-            return Err(NamespaceError::InvalidTableState {
-                message: format!("Table is deregistered: {}", table_name),
+            return Err(NamespaceError::TableNotFound {
+                message: format!("Table is deregistered: {}", table_id),
             }
             .into());
         }
@@ -2049,7 +2538,7 @@ impl LanceNamespace for DirectoryNamespace {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to drop table {}: {}", table_name, e),
+                    message: format!("Failed to drop table {}: {:?}", table_name, e),
                 })
             })?;
 
@@ -2070,70 +2559,43 @@ impl LanceNamespace for DirectoryNamespace {
             return manifest_ns.create_table(request, request_data).await;
         }
 
+        Self::validate_dir_only_properties(request.properties.as_ref(), "create_table")?;
+
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
-        if request_data.is_empty() {
-            return Err(NamespaceError::InvalidInput {
-                message: "Request data (Arrow IPC stream) is required for create_table".to_string(),
+        let status = self.check_table_status(&table_name).await;
+        let (reader, _num_rows) =
+            Self::ipc_reader_from_request_data(&request_data, "create_table")?;
+
+        if status.exists && self.table_has_actual_manifests(&table_name).await? {
+            return Err(NamespaceError::TableAlreadyExists {
+                message: table_name,
             }
             .into());
         }
 
-        // Parse the Arrow IPC stream from request_data
-        let cursor = Cursor::new(request_data.to_vec());
-        let stream_reader = StreamReader::try_new(cursor, None).map_err(|e| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: format!("Invalid Arrow IPC stream: {}", e),
-            })
-        })?;
-        let arrow_schema = stream_reader.schema();
-
-        // Collect all batches from the stream
-        let mut batches = Vec::new();
-        for batch_result in stream_reader {
-            batches.push(batch_result.map_err(|e| {
-                lance_core::Error::from(NamespaceError::InvalidInput {
-                    message: format!("Failed to read batch from IPC stream: {}", e),
-                })
-            })?);
+        let write_result = self
+            .write_reader_to_table(
+                &table_uri,
+                reader,
+                WriteMode::Create,
+                request.storage_options.clone(),
+            )
+            .await;
+        if let Err(err) = write_result {
+            if self.table_uri_has_actual_manifests(&table_uri).await? {
+                return Err(NamespaceError::TableAlreadyExists {
+                    message: table_name,
+                }
+                .into());
+            }
+            return Err(err);
         }
-
-        // Create RecordBatchReader from the batches
-        let reader = if batches.is_empty() {
-            let batch = arrow::record_batch::RecordBatch::new_empty(arrow_schema.clone());
-            let batches = vec![Ok(batch)];
-            RecordBatchIterator::new(batches, arrow_schema.clone())
-        } else {
-            let batch_results: Vec<_> = batches.into_iter().map(Ok).collect();
-            RecordBatchIterator::new(batch_results, arrow_schema)
-        };
-
-        let store_params = self.storage_options.as_ref().map(|opts| ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(
-                lance_io::object_store::StorageOptionsAccessor::with_static_options(opts.clone()),
-            )),
-            ..Default::default()
-        });
-
-        let write_params = WriteParams {
-            mode: WriteMode::Create,
-            store_params,
-            ..Default::default()
-        };
-
-        // Create the Lance dataset using the actual Lance API
-        Dataset::write(reader, &table_uri, Some(write_params))
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to create Lance dataset: {}", e),
-                })
-            })?;
-
         Ok(CreateTableResponse {
             version: Some(1),
             location: Some(table_uri),
             storage_options: self.storage_options.clone(),
+            properties: request.properties,
             ..Default::default()
         })
     }
@@ -2156,6 +2618,8 @@ impl LanceNamespace for DirectoryNamespace {
             }
             return Ok(response);
         }
+
+        Self::validate_dir_only_properties(request.properties.as_ref(), "declare_table")?;
 
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
@@ -2213,6 +2677,7 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(DeclareTableResponse {
             location: Some(table_uri),
             storage_options,
+            properties: request.properties,
             managed_versioning: if self.table_version_tracking_enabled {
                 Some(true)
             } else {
@@ -2265,7 +2730,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         if status.is_deregistered {
-            return Err(NamespaceError::InvalidTableState {
+            return Err(NamespaceError::TableNotFound {
                 message: format!("Table is already deregistered: {}", table_name),
             }
             .into());
@@ -2317,79 +2782,10 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Fallback when table_version_storage is not enabled: list from _versions/ directory
         let table_uri = self.resolve_table_location(&request.id).await?;
-
-        let table_path = Self::uri_to_object_store_path(&table_uri);
-        let versions_dir = table_path.child("_versions");
-        let manifest_metas: Vec<_> = self
-            .object_store
-            .read_dir_all(&versions_dir, None)
-            .try_collect()
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to list manifest files for table at '{}': {}",
-                        table_uri, e
-                    ),
-                })
-            })?;
-
-        let is_v2_naming = manifest_metas
-            .first()
-            .is_some_and(|meta| meta.location.filename().is_some_and(|f| f.len() == 29));
-
-        let mut table_versions: Vec<TableVersion> = manifest_metas
-            .into_iter()
-            .filter_map(|meta| {
-                let filename = meta.location.filename()?;
-                let version_str = filename.strip_suffix(".manifest")?;
-                if version_str.starts_with('d') {
-                    return None;
-                }
-                let file_version: u64 = version_str.parse().ok()?;
-
-                let actual_version = if file_version > u64::MAX / 2 {
-                    u64::MAX - file_version
-                } else {
-                    file_version
-                };
-
-                // Use full path from object_store (relative to object store root)
-                Some(TableVersion {
-                    version: actual_version as i64,
-                    manifest_path: meta.location.to_string(),
-                    manifest_size: Some(meta.size as i64),
-                    e_tag: meta.e_tag,
-                    timestamp_millis: Some(meta.last_modified.timestamp_millis()),
-                    metadata: None,
-                })
-            })
-            .collect();
-
-        let list_is_ordered = self.object_store.list_is_lexically_ordered;
         let want_descending = request.descending == Some(true);
-
-        let needs_sort = if list_is_ordered {
-            if is_v2_naming {
-                !want_descending
-            } else {
-                want_descending
-            }
-        } else {
-            true
-        };
-
-        if needs_sort {
-            if want_descending {
-                table_versions.sort_by(|a, b| b.version.cmp(&a.version));
-            } else {
-                table_versions.sort_by(|a, b| a.version.cmp(&b.version));
-            }
-        }
-
-        if let Some(limit) = request.limit {
-            table_versions.truncate(limit as usize);
-        }
+        let table_versions = self
+            .list_table_versions_from_storage(&table_uri, want_descending, request.limit)
+            .await?;
 
         Ok(ListTableVersionsResponse {
             versions: table_versions,
@@ -2407,7 +2803,7 @@ impl LanceNamespace for DirectoryNamespace {
         let staging_manifest_path = &request.manifest_path;
         let version = request.version as u64;
 
-        let table_path = Self::uri_to_object_store_path(&table_uri);
+        let table_path = self.object_store_path_from_uri(&table_uri)?;
 
         // Determine naming scheme from request, default to V2
         let naming_scheme = match request.naming_scheme.as_deref() {
@@ -2418,62 +2814,100 @@ impl LanceNamespace for DirectoryNamespace {
         // Compute final path using the naming scheme
         let final_path = naming_scheme.manifest_path(&table_path, version);
 
-        let staging_path = Self::uri_to_object_store_path(staging_manifest_path);
-        let manifest_data = self
+        let staging_path = Path::parse(staging_manifest_path).map_err(|e| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: format!(
+                    "Invalid staging manifest path '{}': {}",
+                    staging_manifest_path, e
+                ),
+            })
+        })?;
+
+        let copy_result = match self
             .object_store
             .inner
-            .get(&staging_path)
+            .copy_if_not_exists(&staging_path, &final_path)
             .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to read staging manifest at '{}': {}",
-                        staging_manifest_path, e
-                    ),
-                })
-            })?
-            .bytes()
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to read staging manifest bytes at '{}': {}",
-                        staging_manifest_path, e
-                    ),
-                })
-            })?;
+        {
+            Ok(()) => Ok(()),
+            Err(ObjectStoreError::NotImplemented { .. })
+            | Err(ObjectStoreError::NotSupported { .. }) => {
+                let manifest_data = self
+                    .object_store
+                    .inner
+                    .get(&staging_path)
+                    .await
+                    .map_err(|e| {
+                        lance_core::Error::from(NamespaceError::Internal {
+                            message: format!(
+                                "Failed to read staging manifest at '{}': {}",
+                                staging_manifest_path, e
+                            ),
+                        })
+                    })?
+                    .bytes()
+                    .await
+                    .map_err(|e| {
+                        lance_core::Error::from(NamespaceError::Internal {
+                            message: format!(
+                                "Failed to read staging manifest bytes at '{}': {}",
+                                staging_manifest_path, e
+                            ),
+                        })
+                    })?;
+                self.object_store
+                    .inner
+                    .put_opts(
+                        &final_path,
+                        manifest_data.into(),
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            }
+            Err(e) => Err(e),
+        };
 
-        let manifest_size = manifest_data.len() as i64;
-
-        let put_result = self
-            .object_store
-            .inner
-            .put_opts(
-                &final_path,
-                manifest_data.into(),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| match e {
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. } => {
-                    lance_core::Error::from(NamespaceError::ConcurrentModification {
+        match copy_result {
+            Ok(()) => {}
+            Err(ObjectStoreError::AlreadyExists { .. })
+            | Err(ObjectStoreError::Precondition { .. }) => {
+                return Err(lance_core::Error::from(
+                    NamespaceError::ConcurrentModification {
                         message: format!(
                             "Version {} already exists for table at '{}'",
                             version, table_uri
                         ),
-                    })
-                }
-                _ => lance_core::Error::from(NamespaceError::Internal {
+                    },
+                ));
+            }
+            Err(e) => {
+                return Err(lance_core::Error::from(NamespaceError::Internal {
                     message: format!(
                         "Failed to create version {} for table at '{}': {}",
                         version, table_uri, e
                     ),
-                }),
+                }));
+            }
+        }
+
+        let final_meta = self
+            .object_store
+            .inner
+            .head(&final_path)
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to stat created version {} for table at '{}': {}",
+                        version, table_uri, e
+                    ),
+                })
             })?;
+        let manifest_size = final_meta.size as i64;
 
         // Delete the staging manifest after successful copy
         if let Err(e) = self.object_store.inner.delete(&staging_path).await {
@@ -2495,7 +2929,7 @@ impl LanceNamespace for DirectoryNamespace {
             let metadata_json = serde_json::json!({
                 "manifest_path": final_path.to_string(),
                 "manifest_size": manifest_size,
-                "e_tag": put_result.e_tag,
+                "e_tag": final_meta.e_tag,
                 "naming_scheme": request.naming_scheme.as_deref().unwrap_or("V2"),
             })
             .to_string();
@@ -2525,7 +2959,7 @@ impl LanceNamespace for DirectoryNamespace {
                 version: version as i64,
                 manifest_path: final_path.to_string(),
                 manifest_size: Some(manifest_size),
-                e_tag: put_result.e_tag,
+                e_tag: final_meta.e_tag,
                 timestamp_millis: None,
                 metadata: None,
             })),
@@ -2546,53 +2980,33 @@ impl LanceNamespace for DirectoryNamespace {
             return manifest_ns.describe_table_version(&table_id, version).await;
         }
 
-        // Fallback when table_version_storage is not enabled: open the dataset to describe the version
+        // Fallback when table_version_storage is not enabled: inspect physical manifests directly.
         let table_uri = self.resolve_table_location(&request.id).await?;
-
-        // Use DatasetBuilder with storage options to support S3 with custom endpoints
-        let mut builder = DatasetBuilder::from_uri(&table_uri);
-        if let Some(opts) = &self.storage_options {
-            builder = builder.with_storage_options(opts.clone());
-        }
-        if let Some(sess) = &self.session {
-            builder = builder.with_session(sess.clone());
-        }
-        let mut dataset = builder.load().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to open table at '{}': {}", table_uri, e),
-            })
-        })?;
-
-        if let Some(version) = request.version {
-            dataset = dataset
-                .checkout_version(version as u64)
-                .await
-                .map_err(|e| {
+        let versions = self
+            .list_table_versions_from_storage(&table_uri, true, None)
+            .await?;
+        let table_version = if let Some(requested_version) = request.version {
+            versions
+                .into_iter()
+                .find(|version| version.version == requested_version)
+                .ok_or_else(|| {
                     lance_core::Error::from(NamespaceError::TableVersionNotFound {
                         message: format!(
-                            "Failed to checkout version {} for table at '{}': {}",
-                            version, table_uri, e
+                            "version {} for table {}",
+                            requested_version,
+                            Self::format_table_id_from_request(&request.id)
                         ),
                     })
-                })?;
-        }
-
-        let version_info = dataset.version();
-        let manifest_location = dataset.manifest_location();
-        let metadata: std::collections::HashMap<String, String> =
-            version_info.metadata.into_iter().collect();
-
-        let table_version = TableVersion {
-            version: version_info.version as i64,
-            manifest_path: manifest_location.path.to_string(),
-            manifest_size: manifest_location.size.map(|s| s as i64),
-            e_tag: manifest_location.e_tag.clone(),
-            timestamp_millis: Some(version_info.timestamp.timestamp_millis()),
-            metadata: if metadata.is_empty() {
-                None
-            } else {
-                Some(metadata)
-            },
+                })?
+        } else {
+            versions.into_iter().next().ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::TableVersionNotFound {
+                    message: format!(
+                        "latest version for table {}",
+                        Self::format_table_id_from_request(&request.id)
+                    ),
+                })
+            })?
         };
 
         Ok(DescribeTableVersionResponse {
@@ -2704,16 +3118,36 @@ impl LanceNamespace for DirectoryNamespace {
             )
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to create {} index '{}' on column '{}' for table '{}': {}",
-                        request.index_type,
-                        request.name.as_deref().unwrap_or("<auto-generated>"),
-                        request.column,
-                        table_uri,
-                        e
-                    ),
-                })
+                let err_msg = format!("{}", e);
+                let ns_err = if err_msg.contains("already exists") {
+                    NamespaceError::TableIndexAlreadyExists {
+                        message: format!(
+                            "Index '{}' already exists on table '{}': {:?}",
+                            request.name.as_deref().unwrap_or("<auto-generated>"),
+                            table_uri,
+                            e
+                        ),
+                    }
+                } else if err_msg.contains("not found") || err_msg.contains("does not exist") {
+                    NamespaceError::TableColumnNotFound {
+                        message: format!(
+                            "Column '{}' not found for table '{}': {:?}",
+                            request.column, table_uri, e
+                        ),
+                    }
+                } else {
+                    NamespaceError::Internal {
+                        message: format!(
+                            "Failed to create {} index '{}' on column '{}' for table '{}': {:?}",
+                            request.index_type,
+                            request.name.as_deref().unwrap_or("<auto-generated>"),
+                            request.column,
+                            table_uri,
+                            e
+                        ),
+                    }
+                };
+                lance_core::Error::from(ns_err)
             })?;
 
         let transaction_id = dataset
@@ -2746,7 +3180,7 @@ impl LanceNamespace for DirectoryNamespace {
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to describe table indices for '{}': {}", table_uri, e),
+                    message: format!("Failed to describe table indices for '{}': {:?}", table_uri, e),
                 })
             })?
             .into_iter()
@@ -2817,7 +3251,7 @@ impl LanceNamespace for DirectoryNamespace {
             .load_indices_by_name(index_name)
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
+                lance_core::Error::from(NamespaceError::TableIndexNotFound {
                     message: format!(
                         "Failed to load index '{}' metadata for table '{}': {}",
                         index_name, table_uri, e
@@ -2834,7 +3268,7 @@ impl LanceNamespace for DirectoryNamespace {
         let stats = <Dataset as DatasetIndexExt>::index_statistics(&dataset, index_name)
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
+                lance_core::Error::from(NamespaceError::TableIndexNotFound {
                     message: format!(
                         "Failed to describe index statistics for '{}' on table '{}': {}",
                         index_name, table_uri, e
@@ -2925,7 +3359,7 @@ impl LanceNamespace for DirectoryNamespace {
             .load_indices_by_name(index_name)
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
+                lance_core::Error::from(NamespaceError::TableIndexNotFound {
                     message: format!(
                         "Failed to load index '{}' before dropping it from table '{}': {}",
                         index_name, table_uri, e
@@ -2943,7 +3377,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         dataset.drop_index(index_name).await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
+            lance_core::Error::from(NamespaceError::TableIndexNotFound {
                 message: format!(
                     "Failed to drop index '{}' from table '{}': {}",
                     index_name, table_uri, e
@@ -2967,6 +3401,284 @@ impl LanceNamespace for DirectoryNamespace {
         Ok(DropTableIndexResponse { transaction_id })
     }
 
+    async fn list_all_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
+        // In dir-only mode there are no child namespaces, so all tables live in the
+        // root directory. This is equivalent to listing the root namespace.
+        let mut tables = self.list_directory_tables().await?;
+        tables = self
+            .filter_declared_tables(tables, request.include_declared.unwrap_or(true))
+            .await?;
+        Self::apply_pagination(&mut tables, request.page_token, request.limit);
+        Ok(ListTablesResponse::new(tables))
+    }
+
+    async fn restore_table(&self, request: RestoreTableRequest) -> Result<RestoreTableResponse> {
+        let version = request.version;
+        if version < 0 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Table version for restore_table must be non-negative, got {}",
+                    version
+                )
+                .into(),
+            ));
+        }
+
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let mut dataset = self.load_dataset(&table_uri, None, "restore_table").await?;
+
+        dataset = dataset
+            .checkout_version(version as u64)
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to checkout version {} for restore at '{}': {}",
+                        version, table_uri, e
+                    )
+                    .into(),
+                )
+            })?;
+
+        dataset.restore().await.map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to restore table at '{}' to version {}: {}",
+                    table_uri, version, e
+                )
+                .into(),
+            )
+        })?;
+
+        let transaction_id = dataset
+            .read_transaction()
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to read transaction after restoring '{}': {}",
+                        table_uri, e
+                    )
+                    .into(),
+                )
+            })?
+            .map(|t| t.uuid);
+
+        Ok(RestoreTableResponse { transaction_id })
+    }
+
+    async fn update_table_schema_metadata(
+        &self,
+        request: UpdateTableSchemaMetadataRequest,
+    ) -> Result<UpdateTableSchemaMetadataResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let mut dataset = self
+            .load_dataset(&table_uri, None, "update_table_schema_metadata")
+            .await?;
+
+        let new_metadata = request.metadata.unwrap_or_default();
+        let updated_metadata = dataset
+            .update_schema_metadata(new_metadata.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to update schema metadata for table at '{}': {}",
+                        table_uri, e
+                    )
+                    .into(),
+                )
+            })?;
+
+        let transaction_id = dataset
+            .read_transaction()
+            .await
+            .map_err(|e| {
+                Error::namespace_source(
+                    format!(
+                        "Failed to read transaction after updating metadata for '{}': {}",
+                        table_uri, e
+                    )
+                    .into(),
+                )
+            })?
+            .map(|t| t.uuid);
+
+        Ok(UpdateTableSchemaMetadataResponse {
+            metadata: Some(updated_metadata),
+            transaction_id,
+        })
+    }
+
+    async fn get_table_stats(
+        &self,
+        request: GetTableStatsRequest,
+    ) -> Result<GetTableStatsResponse> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = Arc::new(
+            self.load_dataset(&table_uri, None, "get_table_stats")
+                .await?,
+        );
+
+        // Compute total bytes on disk using field-level statistics
+        let data_stats = dataset.calculate_data_stats().await.map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to calculate data statistics for table at '{}': {}",
+                    table_uri, e
+                )
+                .into(),
+            )
+        })?;
+        let total_bytes: i64 = data_stats
+            .fields
+            .iter()
+            .map(|f| f.bytes_on_disk as i64)
+            .sum();
+
+        // Collect per-fragment row counts
+        let fragment_row_futures: Vec<_> = dataset
+            .get_fragments()
+            .into_iter()
+            .map(|f| async move { f.physical_rows().await })
+            .collect();
+        let fragment_row_results = futures::future::join_all(fragment_row_futures).await;
+        let mut fragment_row_counts: Vec<i64> = fragment_row_results
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .map(|r| r as i64)
+            .collect();
+
+        let num_fragments = fragment_row_counts.len() as i64;
+        let num_rows: i64 = fragment_row_counts.iter().sum();
+
+        // Fragments with fewer rows than the compaction target are considered "small",
+        // consistent with CompactionOptions::target_rows_per_fragment default.
+        const SMALL_FRAGMENT_THRESHOLD: i64 = 1024 * 1024;
+        let num_small_fragments = fragment_row_counts
+            .iter()
+            .filter(|&&r| r < SMALL_FRAGMENT_THRESHOLD)
+            .count() as i64;
+
+        // Compute length summary statistics
+        fragment_row_counts.sort_unstable();
+        let lengths = if fragment_row_counts.is_empty() {
+            FragmentSummary::new(0, 0, 0, 0, 0, 0, 0)
+        } else {
+            let len = fragment_row_counts.len();
+            let min = fragment_row_counts[0];
+            let max = fragment_row_counts[len - 1];
+            let mean = num_rows / num_fragments;
+            let pct = |p: f64| fragment_row_counts[((len - 1) as f64 * p) as usize];
+            FragmentSummary::new(min, max, mean, pct(0.25), pct(0.50), pct(0.75), pct(0.99))
+        };
+
+        // Count non-system indices
+        let indices = dataset.load_indices().await.map_err(|e| {
+            Error::namespace_source(
+                format!("Failed to load indices for table at '{}': {}", table_uri, e).into(),
+            )
+        })?;
+        let num_indices = indices.iter().filter(|m| !is_system_index(m)).count() as i64;
+
+        let fragment_stats = FragmentStats::new(num_fragments, num_small_fragments, lengths);
+        Ok(GetTableStatsResponse::new(
+            total_bytes,
+            num_rows,
+            num_indices,
+            fragment_stats,
+        ))
+    }
+
+    async fn explain_table_query_plan(
+        &self,
+        request: ExplainTableQueryPlanRequest,
+    ) -> Result<String> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(
+                &table_uri,
+                request.query.version,
+                "explain_table_query_plan",
+            )
+            .await?;
+        let verbose = request.verbose.unwrap_or(false);
+
+        let mut scanner = dataset.scan();
+        Self::apply_query_params_to_scanner(
+            &mut scanner,
+            request.query.filter.as_deref(),
+            request.query.columns.as_deref(),
+            request.query.vector_column.as_deref(),
+            &request.query.vector,
+            request.query.k,
+            request.query.offset,
+            request.query.prefilter,
+            request.query.bypass_vector_index,
+            request.query.nprobes,
+            request.query.ef,
+            request.query.refine_factor,
+            request.query.distance_type.as_deref(),
+            request.query.fast_search,
+            request.query.with_row_id,
+            request.query.lower_bound,
+            request.query.upper_bound,
+            "explain_table_query_plan",
+        )?;
+
+        scanner.explain_plan(verbose).await.map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to explain query plan for table at '{}': {}",
+                    table_uri, e
+                )
+                .into(),
+            )
+        })
+    }
+
+    async fn analyze_table_query_plan(
+        &self,
+        request: AnalyzeTableQueryPlanRequest,
+    ) -> Result<String> {
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, request.version, "analyze_table_query_plan")
+            .await?;
+
+        let mut scanner = dataset.scan();
+        Self::apply_query_params_to_scanner(
+            &mut scanner,
+            request.filter.as_deref(),
+            request.columns.as_deref(),
+            request.vector_column.as_deref(),
+            &request.vector,
+            request.k,
+            request.offset,
+            request.prefilter,
+            request.bypass_vector_index,
+            request.nprobes,
+            request.ef,
+            request.refine_factor,
+            request.distance_type.as_deref(),
+            request.fast_search,
+            request.with_row_id,
+            request.lower_bound,
+            request.upper_bound,
+            "analyze_table_query_plan",
+        )?;
+
+        scanner.analyze_plan().await.map_err(|e| {
+            Error::namespace_source(
+                format!(
+                    "Failed to analyze query plan for table at '{}': {}",
+                    table_uri, e
+                )
+                .into(),
+            )
+        })
+    }
+
     async fn count_table_rows(&self, request: CountTableRowsRequest) -> Result<i64> {
         self.record_op("count_table_rows");
         let table_uri = self.resolve_table_location(&request.id).await?;
@@ -2979,7 +3691,7 @@ impl LanceNamespace for DirectoryNamespace {
                 .count_rows(request.predicate)
                 .await
                 .map_err(|e| NamespaceError::Internal {
-                    message: format!("Failed to count rows for table at '{}': {}", table_uri, e),
+                    message: format!("Failed to count rows for table at '{}': {:?}", table_uri, e),
                 })?;
 
         Ok(count as i64)
@@ -2992,37 +3704,8 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<InsertIntoTableResponse> {
         self.record_op("insert_into_table");
         let table_uri = self.resolve_table_location(&request.id).await?;
-
-        if request_data.is_empty() {
-            return Err(NamespaceError::InvalidInput {
-                message: "Request data (Arrow IPC stream) is required for insert_into_table"
-                    .to_string(),
-            }
-            .into());
-        }
-
-        let cursor = Cursor::new(request_data.as_ref());
-        let stream_reader =
-            StreamReader::try_new(cursor, None).map_err(|e| NamespaceError::InvalidInput {
-                message: format!("Invalid Arrow IPC stream: {}", e),
-            })?;
-        let arrow_schema = stream_reader.schema();
-
-        let mut batches = Vec::new();
-        for batch_result in stream_reader {
-            batches.push(batch_result.map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to read batch from IPC stream: {}", e),
-            })?);
-        }
-
-        let reader = if batches.is_empty() {
-            let batch = arrow::record_batch::RecordBatch::new_empty(arrow_schema.clone());
-            let batches = vec![Ok(batch)];
-            RecordBatchIterator::new(batches, arrow_schema.clone())
-        } else {
-            let batch_results: Vec<_> = batches.into_iter().map(Ok).collect();
-            RecordBatchIterator::new(batch_results, arrow_schema)
-        };
+        let (reader, _num_rows) =
+            Self::ipc_reader_from_request_data(&request_data, "insert_into_table")?;
 
         let mode = match request.mode.as_deref() {
             Some(m) if m.eq_ignore_ascii_case("overwrite") => WriteMode::Overwrite,
@@ -3039,28 +3722,122 @@ impl LanceNamespace for DirectoryNamespace {
             }
         };
 
-        let store_params = self.storage_options.as_ref().map(|opts| ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(
-                lance_io::object_store::StorageOptionsAccessor::with_static_options(opts.clone()),
-            )),
-            ..Default::default()
-        });
-
-        let write_params = WriteParams {
-            mode,
-            store_params,
-            session: self.session.clone(),
-            ..Default::default()
-        };
-
-        Dataset::write(reader, &table_uri, Some(write_params))
-            .await
-            .map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to insert into table at '{}': {}", table_uri, e),
-            })?;
+        if !self.table_uri_has_actual_manifests(&table_uri).await? {
+            self.write_reader_to_table(&table_uri, reader, WriteMode::Create, None)
+                .await?;
+        } else {
+            self.write_reader_to_table(&table_uri, reader, mode, None)
+                .await?;
+        }
 
         Ok(InsertIntoTableResponse {
             transaction_id: None,
+        })
+    }
+
+    async fn merge_insert_into_table(
+        &self,
+        request: MergeInsertIntoTableRequest,
+        request_data: Bytes,
+    ) -> Result<MergeInsertIntoTableResponse> {
+        self.record_op("merge_insert_into_table");
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let on = request.on.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "'on' field is required for merge_insert_into_table".to_string(),
+            })
+        })?;
+
+        let table_has_manifests = self.table_uri_has_actual_manifests(&table_uri).await?;
+        let (reader, num_rows) =
+            Self::ipc_reader_from_request_data(&request_data, "merge_insert_into_table")?;
+
+        if !table_has_manifests {
+            let dataset = self
+                .write_reader_to_table(&table_uri, reader, WriteMode::Create, None)
+                .await?;
+            let version = dataset.version().version as i64;
+            return Ok(MergeInsertIntoTableResponse {
+                transaction_id: None,
+                num_updated_rows: Some(0),
+                num_inserted_rows: Some(num_rows as i64),
+                num_deleted_rows: Some(0),
+                version: Some(version),
+            });
+        }
+
+        let dataset = Arc::new(
+            self.load_dataset(&table_uri, None, "merge_insert_into_table")
+                .await?,
+        );
+
+        let mut merge_builder = MergeInsertBuilder::try_new(dataset.clone(), vec![on.clone()])
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!("Failed to create merge_insert_into_table builder: {}", e),
+                })
+            })?;
+
+        if let Some(filter) = request.when_matched_update_all_filt.as_deref() {
+            let behavior = WhenMatched::update_if(dataset.as_ref(), filter).map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Invalid when_matched_update_all_filt for merge_insert_into_table: {}",
+                        e
+                    ),
+                })
+            })?;
+            merge_builder.when_matched(behavior);
+        } else if request.when_matched_update_all.unwrap_or(false) {
+            merge_builder.when_matched(WhenMatched::UpdateAll);
+        }
+
+        if matches!(request.when_not_matched_insert_all, Some(false)) {
+            merge_builder.when_not_matched(WhenNotMatched::DoNothing);
+        } else {
+            merge_builder.when_not_matched(WhenNotMatched::InsertAll);
+        }
+
+        if let Some(filter) = request.when_not_matched_by_source_delete_filt.as_deref() {
+            let behavior = WhenNotMatchedBySource::delete_if(dataset.as_ref(), filter).map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Invalid when_not_matched_by_source_delete_filt for merge_insert_into_table: {}",
+                        e
+                    ),
+                })
+            })?;
+            merge_builder.when_not_matched_by_source(behavior);
+        } else if request.when_not_matched_by_source_delete.unwrap_or(false) {
+            merge_builder.when_not_matched_by_source(WhenNotMatchedBySource::Delete);
+        }
+
+        if let Some(use_index) = request.use_index {
+            merge_builder.use_index(use_index);
+        }
+
+        let (dataset, stats) = merge_builder
+            .try_build()
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!("Failed to build merge_insert_into_table job: {}", e),
+                })
+            })?
+            .execute_reader(reader)
+            .await
+            .map_err(|e| NamespaceError::Internal {
+                message: format!(
+                    "Failed to merge_insert_into_table at '{}': {}",
+                    table_uri, e
+                ),
+            })?;
+
+        Ok(MergeInsertIntoTableResponse {
+            transaction_id: None,
+            num_updated_rows: Some(stats.num_updated_rows as i64),
+            num_inserted_rows: Some(stats.num_inserted_rows as i64),
+            num_deleted_rows: Some(stats.num_deleted_rows as i64),
+            version: Some(dataset.version().version as i64),
         })
     }
 
@@ -3124,7 +3901,7 @@ impl LanceNamespace for DirectoryNamespace {
                 scanner
                     .nearest(vector_column, &query_array, k)
                     .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid vector search: {}", e),
+                        message: format!("Invalid vector search: {:?}", e),
                     })?;
 
                 // Apply distance type if specified
@@ -3189,14 +3966,14 @@ impl LanceNamespace for DirectoryNamespace {
                     fts = fts
                         .with_columns(columns)
                         .map_err(|e| NamespaceError::InvalidInput {
-                            message: format!("Invalid FTS columns: {}", e),
+                            message: format!("Invalid FTS columns: {:?}", e),
                         })?;
                 }
 
                 scanner
                     .full_text_search(fts)
                     .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid full text search: {}", e),
+                        message: format!("Invalid full text search: {:?}", e),
                     })?;
             }
             // Note: structured_query would require more complex parsing
@@ -3211,7 +3988,7 @@ impl LanceNamespace for DirectoryNamespace {
                 scanner
                     .project(column_names)
                     .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid column projection: {}", e),
+                        message: format!("Invalid column projection: {:?}", e),
                     })?;
             } else if let Some(ref column_aliases) = columns.column_aliases
                 && !column_aliases.is_empty()
@@ -3229,7 +4006,7 @@ impl LanceNamespace for DirectoryNamespace {
                             .collect::<Vec<_>>(),
                     )
                     .map_err(|e| NamespaceError::InvalidInput {
-                        message: format!("Invalid column alias expression: {}", e),
+                        message: format!("Invalid column alias expression: {:?}", e),
                     })?;
             }
         }
@@ -3241,7 +4018,7 @@ impl LanceNamespace for DirectoryNamespace {
             scanner
                 .filter(filter)
                 .map_err(|e| NamespaceError::InvalidInput {
-                    message: format!("Invalid filter expression: {}", e),
+                    message: format!("Invalid filter expression: {:?}", e),
                 })?;
         }
 
@@ -3257,7 +4034,7 @@ impl LanceNamespace for DirectoryNamespace {
             let offset = request.offset.map(|o| o as i64);
             scanner.limit(Some(request.k as i64), offset).map_err(|e| {
                 NamespaceError::InvalidInput {
-                    message: format!("Invalid limit/offset: {}", e),
+                    message: format!("Invalid limit/offset: {:?}", e),
                 }
             })?;
         } else if has_vector_query && request.offset.is_some() {
@@ -3266,7 +4043,7 @@ impl LanceNamespace for DirectoryNamespace {
             scanner
                 .limit(None, offset)
                 .map_err(|e| NamespaceError::InvalidInput {
-                    message: format!("Invalid offset: {}", e),
+                    message: format!("Invalid offset: {:?}", e),
                 })?;
         }
 
@@ -3275,7 +4052,7 @@ impl LanceNamespace for DirectoryNamespace {
             .try_into_batch()
             .await
             .map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to execute query: {}", e),
+                message: format!("Failed to execute query: {:?}", e),
             })?;
 
         // Serialize to Arrow IPC file format
@@ -3284,14 +4061,14 @@ impl LanceNamespace for DirectoryNamespace {
         {
             let mut writer = FileWriter::try_new(&mut buffer, &schema).map_err(|e| {
                 NamespaceError::Internal {
-                    message: format!("Failed to create IPC writer: {}", e),
+                    message: format!("Failed to create IPC writer: {:?}", e),
                 }
             })?;
             writer.write(&batch).map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to write batch to IPC: {}", e),
+                message: format!("Failed to write batch to IPC: {:?}", e),
             })?;
             writer.finish().map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to finish IPC writer: {}", e),
+                message: format!("Failed to finish IPC writer: {:?}", e),
             })?;
         }
 
@@ -3310,12 +4087,31 @@ mod tests {
     use lance::dataset::Dataset;
     use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
+    use lance_core::utils::testing::CountingObjectStore;
+    use lance_io::object_store::{providers::local::FileStoreProvider, uri_to_url};
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
+        QueryTableRequestColumns,
     };
     use lance_namespace::schema::convert_json_arrow_schema;
     use std::io::Cursor;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use url::Url;
+
+    fn assert_plan_contains_all(plan: &str, expected_fragments: &[&str], context: &str) {
+        for expected_fragment in expected_fragments {
+            assert!(
+                plan.contains(expected_fragment),
+                "{}. Missing fragment: '{}'. Plan:\n{}",
+                context,
+                expected_fragment,
+                plan
+            );
+        }
+    }
 
     /// Helper to create a test DirectoryNamespace with a temporary directory
     async fn create_test_namespace() -> (DirectoryNamespace, TempStdDir) {
@@ -3326,6 +4122,58 @@ mod tests {
             .await
             .unwrap();
         (namespace, temp_dir)
+    }
+
+    #[derive(Debug)]
+    struct CountingFileStoreProvider {
+        listing_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl lance_io::object_store::ObjectStoreProvider for CountingFileStoreProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            let provider = FileStoreProvider;
+            let mut store = provider.new_store(base_path, params).await?;
+            store.inner = Arc::new(CountingObjectStore::new(
+                store.inner.clone(),
+                self.listing_count.clone(),
+            ));
+            Ok(store)
+        }
+
+        fn extract_path(&self, url: &Url) -> Result<Path> {
+            let provider = FileStoreProvider;
+            provider.extract_path(url)
+        }
+
+        fn calculate_object_store_prefix(
+            &self,
+            url: &Url,
+            storage_options: Option<&HashMap<String, String>>,
+        ) -> Result<String> {
+            let provider = FileStoreProvider;
+            provider.calculate_object_store_prefix(url, storage_options)
+        }
+    }
+
+    fn file_object_store_uri(path: &str) -> String {
+        let file_url = uri_to_url(path).unwrap();
+        let mut url = Url::parse("file-object-store:///").unwrap();
+        url.set_path(file_url.path());
+        url.to_string()
+    }
+
+    fn build_listing_counting_session(listing_count: Arc<AtomicUsize>) -> Arc<Session> {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        registry.insert(
+            "file-object-store",
+            Arc::new(CountingFileStoreProvider { listing_count }),
+        );
+        Arc::new(Session::new(0, 0, registry))
     }
 
     /// Helper to create test IPC data from a schema
@@ -3359,6 +4207,38 @@ mod tests {
             writer.finish().unwrap();
         }
         buffer
+    }
+
+    fn create_non_empty_test_ipc_data() -> Vec<u8> {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(convert_json_arrow_schema(&create_test_schema()).unwrap());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("alice"), Some("bob")])),
+            ],
+        )
+        .unwrap();
+        create_ipc_data_from_batches(schema, vec![batch])
+    }
+
+    fn create_single_row_test_ipc_data() -> Vec<u8> {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(convert_json_arrow_schema(&create_test_schema()).unwrap());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(StringArray::from(vec![Some("carol")])),
+            ],
+        )
+        .unwrap();
+        create_ipc_data_from_batches(schema, vec![batch])
     }
 
     /// Helper to create a simple test schema
@@ -4957,6 +5837,7 @@ mod tests {
         let temp_path = temp_dir.to_str().unwrap();
 
         let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_to_manifest_migration_enabled(true)
             .build()
             .await
             .unwrap();
@@ -5369,7 +6250,7 @@ mod tests {
     #[tokio::test]
     async fn test_declare_table_v1_mode() {
         use lance_namespace::models::{
-            DeclareTableRequest, DescribeTableRequest, TableExistsRequest,
+            DeclareTableRequest, DescribeTableRequest, ListTablesRequest, TableExistsRequest,
         };
 
         let temp_dir = TempStdDir::default();
@@ -5404,11 +6285,536 @@ mod tests {
         assert!(describe_response.location.is_some());
         assert!(describe_response.version.is_none()); // Not written yet
         assert!(describe_response.schema.is_none()); // Not written yet
+        assert_eq!(describe_response.is_only_declared, None);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.check_declared = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, Some(true));
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        let list_response = namespace.list_tables(list_req.clone()).await.unwrap();
+        assert_eq!(list_response.tables, vec!["test_table".to_string()]);
+
+        list_req.include_declared = Some(false);
+        let list_response = namespace.list_tables(list_req).await.unwrap();
+        assert!(list_response.tables.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_insert_into_declared_table_promotes_it_from_declared_state() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, InsertIntoTableRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut insert_req = InsertIntoTableRequest::new();
+        insert_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .insert_into_table(insert_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.load_detailed_metadata = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+
+        assert_eq!(describe_response.is_only_declared, Some(false));
+        assert_eq!(describe_response.version, Some(1));
+        assert!(describe_response.schema.is_some());
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        list_req.include_declared = Some(false);
+        assert_eq!(
+            namespace.list_tables(list_req).await.unwrap().tables,
+            vec!["test_table".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_after_declare_table_v1_mode_creates_table() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, ListTablesRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        let response = namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.version, Some(1));
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.load_detailed_metadata = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, Some(false));
+        assert_eq!(describe_response.version, Some(1));
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        list_req.include_declared = Some(false);
+        assert_eq!(
+            namespace.list_tables(list_req).await.unwrap().tables,
+            vec!["test_table".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_into_declared_table_with_manifest_promotes_it() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, InsertIntoTableRequest, ListTablesRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut insert_req = InsertIntoTableRequest::new();
+        insert_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .insert_into_table(
+                insert_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.load_detailed_metadata = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, Some(false));
+        assert_eq!(describe_response.version, Some(1));
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        list_req.include_declared = Some(false);
+        assert_eq!(
+            namespace.list_tables(list_req).await.unwrap().tables,
+            vec!["test_table".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_after_declare_table_with_manifest_creates_table() {
+        use lance_namespace::models::{
+            CreateTableRequest, DeclareTableRequest, DescribeTableRequest, ListTablesRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        declare_req.properties = Some(HashMap::from([("owner".to_string(), "alice".to_string())]));
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.mode = Some("Overwrite".to_string());
+        let response = namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.version, Some(1));
+        assert_eq!(
+            response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.load_detailed_metadata = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, Some(false));
+        assert_eq!(describe_response.version, Some(1));
+        assert_eq!(
+            describe_response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        list_req.include_declared = Some(false);
+        assert_eq!(
+            namespace.list_tables(list_req).await.unwrap().tables,
+            vec!["test_table".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_after_declare_table_with_manifest_rejects_new_properties() {
+        use lance_namespace::models::{CreateTableRequest, DeclareTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        declare_req.properties = Some(HashMap::from([("owner".to_string(), "alice".to_string())]));
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.properties = Some(HashMap::from([("owner".to_string(), "bob".to_string())]));
+
+        let result = namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot set properties for already declared table")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_manifest_exist_ok_keeps_existing_table() {
+        use lance_namespace::models::{CreateTableRequest, DescribeTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.properties = Some(HashMap::from([("owner".to_string(), "alice".to_string())]));
+        namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.mode = Some("ExistOk".to_string());
+        create_req.properties = Some(HashMap::from([("owner".to_string(), "bob".to_string())]));
+        let response = namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_single_row_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
+        assert_eq!(
+            open_dataset(&namespace, "test_table")
+                .await
+                .count_rows(None)
+                .await
+                .unwrap(),
+            2
+        );
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(
+            describe_response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_manifest_overwrite_replaces_existing_table() {
+        use lance_namespace::models::{CreateTableRequest, DescribeTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.properties = Some(HashMap::from([("owner".to_string(), "alice".to_string())]));
+        namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.mode = Some("overwrite".to_string());
+        create_req.properties = Some(HashMap::from([("owner".to_string(), "bob".to_string())]));
+        let response = namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_single_row_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.version, Some(2));
+        assert_eq!(
+            response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"bob".to_string())
+        );
+        assert_eq!(
+            open_dataset(&namespace, "test_table")
+                .await
+                .count_rows(None)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(
+            describe_response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"bob".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_manifest_invalid_mode_rejected() {
+        use lance_namespace::models::CreateTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.mode = Some("append".to_string());
+        let result = namespace
+            .create_table(
+                create_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unsupported create_table mode")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_into_declared_table_v1_mode_creates_table() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, ListTablesRequest,
+            MergeInsertIntoTableRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some("id".to_string());
+        let response = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.num_inserted_rows, Some(2));
+        assert_eq!(response.num_updated_rows, Some(0));
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.load_detailed_metadata = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, Some(false));
+        assert_eq!(describe_response.version, Some(1));
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        list_req.include_declared = Some(false);
+        assert_eq!(
+            namespace.list_tables(list_req).await.unwrap().tables,
+            vec!["test_table".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_into_declared_table_with_manifest_creates_table() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, ListTablesRequest,
+            MergeInsertIntoTableRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some("id".to_string());
+        let response = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.num_inserted_rows, Some(2));
+        assert_eq!(response.num_updated_rows, Some(0));
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.load_detailed_metadata = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, Some(false));
+        assert_eq!(describe_response.version, Some(1));
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        list_req.include_declared = Some(false);
+        assert_eq!(
+            namespace.list_tables(list_req).await.unwrap().tables,
+            vec!["test_table".to_string()]
+        );
     }
 
     #[tokio::test]
     async fn test_declare_table_with_manifest() {
-        use lance_namespace::models::{DeclareTableRequest, TableExistsRequest};
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, ListTablesRequest, TableExistsRequest,
+        };
 
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
@@ -5424,15 +6830,61 @@ mod tests {
         // Declare a table
         let mut declare_req = DeclareTableRequest::new();
         declare_req.id = Some(vec!["test_table".to_string()]);
+        declare_req.properties = Some(HashMap::from([("owner".to_string(), "alice".to_string())]));
         let response = namespace.declare_table(declare_req).await.unwrap();
 
         // Should return location
         assert!(response.location.is_some());
+        assert_eq!(
+            response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
 
         // Table should exist in manifest
         let mut exists_req = TableExistsRequest::new();
         exists_req.id = Some(vec!["test_table".to_string()]);
         assert!(namespace.table_exists(exists_req).await.is_ok());
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, None);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.check_declared = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, Some(true));
+        assert_eq!(
+            describe_response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"alice".to_string())
+        );
+
+        let mut list_req = ListTablesRequest::new();
+        list_req.id = Some(vec![]);
+        assert_eq!(
+            namespace
+                .list_tables(list_req.clone())
+                .await
+                .unwrap()
+                .tables,
+            vec!["test_table".to_string()]
+        );
+        list_req.include_declared = Some(false);
+        assert!(
+            namespace
+                .list_tables(list_req)
+                .await
+                .unwrap()
+                .tables
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -5657,7 +7109,11 @@ mod tests {
         // Describe should fail after deregistration
         let result = namespace.describe_table(describe_req).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("deregistered"));
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("deregistered"));
+        assert!(err_msg.contains("table id 'test_table'"));
     }
 
     #[tokio::test]
@@ -5697,7 +7153,11 @@ mod tests {
         // Table exists should fail after deregistration
         let result = namespace.table_exists(exists_req).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("deregistered"));
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("deregistered"));
+        assert!(err_msg.contains("table id 'test_table'"));
     }
 
     #[tokio::test]
@@ -5807,7 +7267,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn test_list_table_versions() {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -5924,7 +7383,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn test_describe_table_version() {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -6039,7 +7497,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn test_describe_table_version_latest() {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -6121,7 +7578,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn test_create_table_version() {
         use futures::TryStreamExt;
         use lance::dataset::builder::DatasetBuilder;
@@ -6160,7 +7616,9 @@ mod tests {
         // Use dataset's object_store to find and copy the manifest
         let versions_path = dataset.versions_dir();
         let manifest_metas: Vec<_> = dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .list(Some(&versions_path))
             .try_collect()
@@ -6179,7 +7637,9 @@ mod tests {
 
         // Read the existing manifest data
         let manifest_data = dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .get(&manifest_meta.location)
             .await
@@ -6189,9 +7649,11 @@ mod tests {
             .unwrap();
 
         // Write to a staging location using the dataset's object_store
-        let staging_path = dataset.versions_dir().child("staging_manifest");
+        let staging_path = dataset.versions_dir().join("staging_manifest");
         dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .put(&staging_path, manifest_data.into())
             .await
@@ -6215,8 +7677,14 @@ mod tests {
         let version_info = response
             .version
             .expect("response should contain version info");
-        let version_2_path = Path::from(version_info.manifest_path);
-        let head_result = dataset.object_store().inner.head(&version_2_path).await;
+        let version_2_path = Path::parse(&version_info.manifest_path).unwrap();
+        let head_result = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .head(&version_2_path)
+            .await;
         assert!(
             head_result.is_ok(),
             "Version 2 manifest should exist at {}",
@@ -6224,7 +7692,13 @@ mod tests {
         );
 
         // Verify the staging file has been deleted
-        let staging_head_result = dataset.object_store().inner.head(&staging_path).await;
+        let staging_head_result = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .head(&staging_path)
+            .await;
         assert!(
             staging_head_result.is_err(),
             "Staging manifest should have been deleted after create_table_version"
@@ -6232,7 +7706,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn test_create_table_version_conflict() {
         // create_table_version should fail if the version already exists.
         // Each version always writes to a new file location.
@@ -6273,7 +7746,9 @@ mod tests {
         // Use dataset's object_store to find and copy the manifest
         let versions_path = dataset.versions_dir();
         let manifest_metas: Vec<_> = dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .list(Some(&versions_path))
             .try_collect()
@@ -6292,7 +7767,9 @@ mod tests {
 
         // Read the existing manifest data
         let manifest_data = dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .get(&manifest_meta.location)
             .await
@@ -6302,9 +7779,11 @@ mod tests {
             .unwrap();
 
         // Write to a staging location using the dataset's object_store
-        let staging_path = dataset.versions_dir().child("staging_manifest");
+        let staging_path = dataset.versions_dir().join("staging_manifest");
         dataset
-            .object_store()
+            .object_store(None)
+            .await
+            .unwrap()
             .inner
             .put(&staging_path, manifest_data.into())
             .await
@@ -6322,13 +7801,14 @@ mod tests {
         );
 
         // Get the path from the response for verification
-        let version_2_path = Path::from(
-            first_result
+        let version_2_path = Path::parse(
+            &first_result
                 .unwrap()
                 .version
                 .expect("response should contain version info")
                 .manifest_path,
-        );
+        )
+        .unwrap();
 
         // Create version 2 again (should fail - conflict)
         let mut create_version_req = CreateTableVersionRequest::new(2, staging_path.to_string());
@@ -6342,7 +7822,13 @@ mod tests {
         );
 
         // Verify version 2 still exists using the dataset's object_store
-        let head_result = dataset.object_store().inner.head(&version_2_path).await;
+        let head_result = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .head(&version_2_path)
+            .await;
         assert!(
             head_result.is_ok(),
             "Version 2 manifest should still exist at {}",
@@ -6578,7 +8064,6 @@ mod tests {
         }
 
         #[tokio::test]
-        #[cfg(not(windows))]
         async fn test_external_manifest_store_invokes_namespace_apis() {
             use arrow::array::{Int32Array, StringArray};
             use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -6698,7 +8183,6 @@ mod tests {
         }
 
         #[tokio::test]
-        #[cfg(not(windows))]
         async fn test_dataset_commit_with_external_manifest_store() {
             use arrow::array::{Int32Array, StringArray};
             use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -6781,7 +8265,9 @@ mod tests {
             // Verify version 2 was created using the dataset's object_store
             // List manifests in the versions directory to find the V2 named manifest
             let manifest_metas: Vec<_> = dataset
-                .object_store()
+                .object_store(None)
+                .await
+                .unwrap()
                 .inner
                 .list(Some(&dataset.versions_dir()))
                 .try_collect()
@@ -7636,7 +9122,9 @@ mod tests {
             // Find existing manifest and create a staging copy
             let versions_path = dataset.versions_dir();
             let manifest_metas: Vec<_> = dataset
-                .object_store()
+                .object_store(None)
+                .await
+                .unwrap()
                 .inner
                 .list(Some(&versions_path))
                 .try_collect()
@@ -7654,7 +9142,9 @@ mod tests {
                 .expect("No manifest file found");
 
             let manifest_data = dataset
-                .object_store()
+                .object_store(None)
+                .await
+                .unwrap()
                 .inner
                 .get(&manifest_meta.location)
                 .await
@@ -7665,9 +9155,11 @@ mod tests {
 
             let staging_path = dataset
                 .versions_dir()
-                .child(format!("staging_{}", table_name));
+                .join(format!("staging_{}", table_name));
             dataset
-                .object_store()
+                .object_store(None)
+                .await
+                .unwrap()
                 .inner
                 .put(&staging_path, manifest_data.into())
                 .await
@@ -7695,7 +9187,6 @@ mod tests {
         }
 
         #[tokio::test]
-        #[cfg(not(windows))]
         async fn test_create_table_version_records_in_manifest() {
             // When table_version_storage_enabled is enabled, single create_table_version
             // should also record the version in __manifest
@@ -7733,5 +9224,424 @@ mod tests {
             let (ver, _path) = &versions[0];
             assert_eq!(*ver, 2, "Recorded version should be 2");
         }
+    }
+
+    #[tokio::test]
+    async fn test_list_all_tables() {
+        use lance_namespace::models::ListTablesRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "alpha").await;
+        create_scalar_table(&namespace, "beta").await;
+
+        let request = ListTablesRequest {
+            id: Some(vec![]),
+            page_token: None,
+            limit: None,
+            ..Default::default()
+        };
+        let response = namespace.list_all_tables(request).await.unwrap();
+        let mut tables = response.tables;
+        tables.sort();
+        assert_eq!(tables, vec!["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn test_restore_table() {
+        use lance_namespace::models::RestoreTableRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+
+        // Create a second version by creating a scalar index (this adds a new version)
+        create_scalar_index(&namespace, "users", "users_id_idx").await;
+
+        let dataset = open_dataset(&namespace, "users").await;
+        let current_version = dataset.version().version;
+        assert!(current_version >= 2, "Should have at least 2 versions");
+
+        // Restore to version 1
+        let mut restore_req = RestoreTableRequest::new(1);
+        restore_req.id = Some(vec!["users".to_string()]);
+        let response = namespace.restore_table(restore_req).await.unwrap();
+
+        // transaction_id should be present (the restore operation)
+        assert!(
+            response.transaction_id.is_some(),
+            "restore_table should return a transaction_id"
+        );
+
+        // Verify the dataset now has a new version (restore creates a new version)
+        let dataset_after = open_dataset(&namespace, "users").await;
+        assert!(
+            dataset_after.version().version > current_version,
+            "Restore should create a new version"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_table_schema_metadata() {
+        use lance_namespace::models::UpdateTableSchemaMetadataRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "products").await;
+
+        let mut metadata = HashMap::new();
+        metadata.insert("owner".to_string(), "team_a".to_string());
+        metadata.insert("version".to_string(), "1.0".to_string());
+
+        let mut req = UpdateTableSchemaMetadataRequest::new();
+        req.id = Some(vec!["products".to_string()]);
+        req.metadata = Some(metadata.clone());
+
+        let response = namespace.update_table_schema_metadata(req).await.unwrap();
+
+        assert!(response.metadata.is_some());
+        let returned = response.metadata.unwrap();
+        assert_eq!(returned.get("owner"), Some(&"team_a".to_string()));
+        assert_eq!(returned.get("version"), Some(&"1.0".to_string()));
+        assert!(
+            response.transaction_id.is_some(),
+            "update_table_schema_metadata should return a transaction_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_table_stats() {
+        use lance_namespace::models::GetTableStatsRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "items").await;
+        create_scalar_index(&namespace, "items", "items_id_idx").await;
+
+        let mut req = GetTableStatsRequest::new();
+        req.id = Some(vec!["items".to_string()]);
+
+        let response = namespace.get_table_stats(req).await.unwrap();
+        assert_eq!(response.num_rows, 3);
+        assert_eq!(response.num_indices, 1);
+    }
+
+    #[tokio::test]
+    async fn test_explain_table_query_plan() {
+        use lance_namespace::models::QueryTableRequestVector;
+        use lance_namespace::models::{ExplainTableQueryPlanRequest, QueryTableRequest};
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "catalog").await;
+
+        let mut query = QueryTableRequest::new(1, QueryTableRequestVector::new());
+        query.filter = Some("id > 1".to_string());
+        query.columns = Some(Box::new(QueryTableRequestColumns {
+            column_names: Some(vec!["id".to_string(), "name".to_string()]),
+            column_aliases: None,
+        }));
+        query.with_row_id = Some(true);
+
+        let mut req = ExplainTableQueryPlanRequest::new(query);
+        req.id = Some(vec!["catalog".to_string()]);
+
+        let plan_str = namespace.explain_table_query_plan(req).await.unwrap();
+        assert_plan_contains_all(
+            &plan_str,
+            &[
+                "ProjectionExec: expr=[id@0 as id, name@2 as name",
+                "Take: columns=\"id, _rowid, (name)\"",
+                "LanceRead: uri=",
+                "projection=[id]",
+                "row_id=true, row_addr=false",
+                "full_filter=id > Int32(1)",
+                "refine_filter=id > Int32(1)",
+            ],
+            "Filtered explain plan should preserve late materialization and filter pushdown",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_analyze_table_query_plan() {
+        use lance_namespace::models::AnalyzeTableQueryPlanRequest;
+        use lance_namespace::models::QueryTableRequestVector;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "catalog").await;
+
+        let mut req = AnalyzeTableQueryPlanRequest::new(1, QueryTableRequestVector::new());
+        req.id = Some(vec!["catalog".to_string()]);
+        req.filter = Some("id > 0".to_string());
+        req.columns = Some(Box::new(QueryTableRequestColumns {
+            column_names: Some(vec!["id".to_string(), "name".to_string()]),
+            column_aliases: None,
+        }));
+        req.with_row_id = Some(true);
+
+        let analysis_str = namespace.analyze_table_query_plan(req).await.unwrap();
+        assert_plan_contains_all(
+            &analysis_str,
+            &[
+                "AnalyzeExec verbose=true",
+                "ProjectionExec: elapsed=",
+                "expr=[id@0 as id, name@2 as name",
+                "Take: elapsed=",
+                "columns=\"id, _rowid, (name)\"",
+                "CoalesceBatchesExec: elapsed=",
+                "LanceRead: elapsed=",
+                "projection=[id]",
+                "row_id=true, row_addr=false",
+                "full_filter=id > Int32(0)",
+                "refine_filter=id > Int32(0)",
+                "metrics=[output_rows=",
+            ],
+            "Filtered analyze plan should preserve late materialization and filter pushdown",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dir_listing_no_extra_calls_without_migration() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let root_uri = file_object_store_uri(temp_path);
+        let listing_count = Arc::new(AtomicUsize::new(0));
+        let session = build_listing_counting_session(listing_count.clone());
+
+        // Create a table using dir-listing-only namespace
+        let dir_only_ns = DirectoryNamespaceBuilder::new(root_uri.clone())
+            .session(session.clone())
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        dir_only_ns
+            .create_table(create_req, Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        // Build a namespace with both enabled but migration disabled (default)
+        let hybrid_ns = DirectoryNamespaceBuilder::new(root_uri)
+            .session(session)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        // Reset counter before the operation we want to measure
+        listing_count.store(0, Ordering::SeqCst);
+
+        // table_exists should use dir listing directly, making only 1 listing call
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_table".to_string()]);
+        hybrid_ns.table_exists(exists_req).await.unwrap();
+
+        let count = listing_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 1,
+            "Expected exactly 1 listing call for table_exists \
+             without migration mode, but got {}",
+            count
+        );
+
+        // Reset and test describe_table
+        listing_count.store(0, Ordering::SeqCst);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        hybrid_ns.describe_table(describe_req).await.unwrap();
+
+        let count = listing_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 1,
+            "Expected exactly 1 listing call for describe_table \
+             without migration mode, but got {}",
+            count
+        );
+    }
+
+    #[tokio::test]
+    async fn test_describe_declared_table_checks_versions_only_when_requested() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let root_uri = file_object_store_uri(temp_path);
+        let listing_count = Arc::new(AtomicUsize::new(0));
+        let session = build_listing_counting_session(listing_count.clone());
+
+        let namespace = DirectoryNamespaceBuilder::new(root_uri)
+            .session(session)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        listing_count.store(0, Ordering::SeqCst);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+
+        assert_eq!(describe_response.is_only_declared, None);
+        assert_eq!(
+            listing_count.load(Ordering::SeqCst),
+            1,
+            "Default describe_table should only list the table directory"
+        );
+
+        listing_count.store(0, Ordering::SeqCst);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        describe_req.check_declared = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+
+        assert_eq!(describe_response.is_only_declared, Some(true));
+        assert_eq!(
+            listing_count.load(Ordering::SeqCst),
+            2,
+            "check_declared describe_table should list the table directory and _versions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dir_listing_extra_calls_with_migration() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let root_uri = file_object_store_uri(temp_path);
+        let listing_count = Arc::new(AtomicUsize::new(0));
+        let session = build_listing_counting_session(listing_count.clone());
+
+        // Create a table using dir-listing-only namespace so it exists physically but is absent from __manifest.
+        let dir_only_ns = DirectoryNamespaceBuilder::new(root_uri.clone())
+            .session(session.clone())
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        dir_only_ns
+            .create_table(create_req, Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let hybrid_ns = DirectoryNamespaceBuilder::new(root_uri)
+            .session(session)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // table_exists first checks __manifest (one list on __manifest/_versions),
+        // then falls back to the table directory (one list_with_delimiter on test_table.lance).
+        listing_count.store(0, Ordering::SeqCst);
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["test_table".to_string()]);
+        hybrid_ns.table_exists(exists_req).await.unwrap();
+
+        let count = listing_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 2,
+            "Expected exactly 2 listing calls for table_exists with migration mode \
+             (manifest reload + table directory fallback), but got {}",
+            count
+        );
+
+        // describe_table follows the same path when the table is not yet registered in __manifest.
+        listing_count.store(0, Ordering::SeqCst);
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["test_table".to_string()]);
+        hybrid_ns.describe_table(describe_req).await.unwrap();
+
+        let count = listing_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 2,
+            "Expected exactly 2 listing calls for describe_table with migration mode \
+             (manifest reload + table directory fallback), but got {}",
+            count
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migration_not_found_errors_include_table_id() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["missing_table".to_string()]);
+        let err = namespace.table_exists(exists_req).await.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Table not found"));
+        assert!(err_msg.contains("table id 'missing_table'"));
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["missing_table".to_string()]);
+        let err = namespace.describe_table(describe_req).await.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Table not found"));
+        assert!(err_msg.contains("table id 'missing_table'"));
+    }
+
+    #[tokio::test]
+    async fn test_manifest_not_found_errors_include_full_table_id() {
+        use lance_namespace::models::CreateNamespaceRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["workspace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        let missing_table_id = vec!["workspace".to_string(), "missing_table".to_string()];
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(missing_table_id.clone());
+        let err = namespace.table_exists(exists_req).await.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Table not found"));
+        assert!(err_msg.contains("table id 'workspace$missing_table'"));
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(missing_table_id);
+        let err = namespace.describe_table(describe_req).await.unwrap_err();
+        assert!(matches!(err, Error::Namespace { .. }));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("Table not found"));
+        assert!(err_msg.contains("table id 'workspace$missing_table'"));
     }
 }

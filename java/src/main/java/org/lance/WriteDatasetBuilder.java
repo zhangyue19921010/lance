@@ -70,6 +70,7 @@ public class WriteDatasetBuilder {
   private WriteParams.WriteMode mode = WriteParams.WriteMode.CREATE;
   private Schema schema;
   private Map<String, String> storageOptions = new HashMap<>();
+  private Map<String, Map<String, String>> baseStoreParams = new HashMap<>();
   private boolean ignoreNamespaceStorageOptions = false;
   private Optional<Integer> maxRowsPerFile = Optional.empty();
   private Optional<Integer> maxRowsPerGroup = Optional.empty();
@@ -78,6 +79,8 @@ public class WriteDatasetBuilder {
   private Optional<String> dataStorageVersion = Optional.empty();
   private Optional<List<BasePath>> initialBases = Optional.empty();
   private Optional<List<String>> targetBases = Optional.empty();
+  private Optional<Boolean> allowExternalBlobOutsideBases = Optional.empty();
+  private Optional<Long> blobPackFileSizeThreshold = Optional.empty();
   private Session session;
 
   /** Creates a new builder instance. Package-private, use Dataset.write() instead. */
@@ -205,6 +208,21 @@ public class WriteDatasetBuilder {
   }
 
   /**
+   * Sets runtime-only object store parameters for registered base paths.
+   *
+   * <p>Entries are keyed by the exact {@link BasePath#getPath()} value persisted in the manifest.
+   * Each value is used as-is for that base. These params are not persisted in the manifest. If a
+   * base has no explicit entry, the write-level storage options are used as a fallback.
+   *
+   * @param baseStoreParams object store parameters keyed by base path URI
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder baseStoreParams(Map<String, Map<String, String>> baseStoreParams) {
+    this.baseStoreParams = new HashMap<>(baseStoreParams);
+    return this;
+  }
+
+  /**
    * Sets whether to ignore storage options from the namespace client's describeTable() or
    * declareTable().
    *
@@ -279,6 +297,30 @@ public class WriteDatasetBuilder {
 
   public WriteDatasetBuilder targetBases(List<String> targetBases) {
     this.targetBases = Optional.of(targetBases);
+    return this;
+  }
+
+  /**
+   * Sets whether to allow external blob URIs outside registered base paths.
+   *
+   * @param allowExternalBlobOutsideBases Whether to allow external blob URIs outside bases
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder allowExternalBlobOutsideBases(boolean allowExternalBlobOutsideBases) {
+    this.allowExternalBlobOutsideBases = Optional.of(allowExternalBlobOutsideBases);
+    return this;
+  }
+
+  /**
+   * Sets the maximum size in bytes for blob v2 pack (.blob) sidecar files.
+   *
+   * <p>When a pack file reaches this size, a new one is started. If not set, defaults to 1 GiB.
+   *
+   * @param blobPackFileSizeThreshold maximum pack file size in bytes
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder blobPackFileSizeThreshold(long blobPackFileSizeThreshold) {
+    this.blobPackFileSizeThreshold = Optional.of(blobPackFileSizeThreshold);
     return this;
   }
 
@@ -404,7 +446,10 @@ public class WriteDatasetBuilder {
 
     // Build WriteParams with merged storage options
     WriteParams.Builder paramsBuilder =
-        new WriteParams.Builder().withMode(mode).withStorageOptions(mergedStorageOptions);
+        new WriteParams.Builder()
+            .withMode(mode)
+            .withStorageOptions(mergedStorageOptions)
+            .withBaseStoreParams(baseStoreParams);
 
     maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
     maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);
@@ -414,6 +459,8 @@ public class WriteDatasetBuilder {
 
     initialBases.ifPresent(paramsBuilder::withInitialBases);
     targetBases.ifPresent(paramsBuilder::withTargetBases);
+    allowExternalBlobOutsideBases.ifPresent(paramsBuilder::withAllowExternalBlobOutsideBases);
+    blobPackFileSizeThreshold.ifPresent(paramsBuilder::withBlobPackFileSizeThreshold);
 
     WriteParams params = paramsBuilder.build();
 
@@ -437,7 +484,10 @@ public class WriteDatasetBuilder {
 
   private Dataset executeWithUri() {
     WriteParams.Builder paramsBuilder =
-        new WriteParams.Builder().withMode(mode).withStorageOptions(storageOptions);
+        new WriteParams.Builder()
+            .withMode(mode)
+            .withStorageOptions(storageOptions)
+            .withBaseStoreParams(baseStoreParams);
 
     maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
     maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);
@@ -446,6 +496,8 @@ public class WriteDatasetBuilder {
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
     initialBases.ifPresent(paramsBuilder::withInitialBases);
     targetBases.ifPresent(paramsBuilder::withTargetBases);
+    allowExternalBlobOutsideBases.ifPresent(paramsBuilder::withAllowExternalBlobOutsideBases);
+    blobPackFileSizeThreshold.ifPresent(paramsBuilder::withBlobPackFileSizeThreshold);
 
     WriteParams params = paramsBuilder.build();
 

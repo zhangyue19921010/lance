@@ -25,6 +25,7 @@ lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
 lance-namespace = { workspace = true }
+lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
 lance-geo = { workspace = true, optional = true }
 arrow-arith = { workspace = true }
@@ -76,7 +77,6 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 moka.workspace = true
 permutation = { version = "0.4.0" }
-tantivy.workspace = true
 aws-sdk-dynamodb = { workspace = true, optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 tracing.workspace = true
 humantime = { workspace = true }
@@ -84,6 +84,10 @@ async_cell = "0.2.2"
 semver.workspace = true
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+
+[build-dependencies]
+prost-build.workspace = true
+protobuf-src = { version = "2.1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
@@ -110,6 +114,7 @@ tempfile.workspace = true
 test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
+serial_test = { workspace = true }
 tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
 paste = "1.0"
 # For S3 / DynamoDB tests
@@ -119,6 +124,8 @@ geoarrow-array = { workspace = true }
 geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
+parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "geo"]
@@ -129,6 +136,7 @@ dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]
 protoc = [
+    "dep:protobuf-src",
     "lance-encoding/protoc",
     "lance-file/protoc",
     "lance-index/protoc",
@@ -150,6 +158,10 @@ required-features = ["cli"]
 
 [[bench]]
 name = "scalar_index"
+harness = false
+
+[[bench]]
+name = "merge_insert"
 harness = false
 
 [[bench]]
@@ -198,6 +210,22 @@ harness = false
 
 [[bench]]
 name = "mem_wal_read"
+harness = false
+
+[[bench]]
+name = "mem_wal_replay"
+harness = false
+
+[[bench]]
+name = "mem_wal_vector"
+harness = false
+
+[[bench]]
+name = "mem_wal_index_micro"
+harness = false
+
+[[bench]]
+name = "mem_wal_recall_hnsw"
 harness = false
 
 [lints]

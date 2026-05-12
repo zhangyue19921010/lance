@@ -60,6 +60,7 @@ use lance_core::{Error, Result};
 use lance_index::is_system_index;
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 
@@ -79,7 +80,10 @@ pub(crate) async fn read_transaction_file(
     base_path: &Path,
     transaction_file: &str,
 ) -> Result<Transaction> {
-    let path = base_path.child(TRANSACTIONS_DIR).child(transaction_file);
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(transaction_file);
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
     let transaction = pb::Transaction::decode(data)?;
@@ -99,7 +103,10 @@ async fn cleanup_transaction_file(
     if transaction_file.is_empty() {
         return;
     }
-    let path = base_path.child(TRANSACTIONS_DIR).child(transaction_file);
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(transaction_file);
     if let Err(e) = object_store.delete(&path).await {
         log::warn!(
             "Failed to clean up orphaned transaction file '{}': {}",
@@ -116,7 +123,10 @@ pub(crate) async fn write_transaction_file(
     transaction: &Transaction,
 ) -> Result<String> {
     let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
-    let path = base_path.child(TRANSACTIONS_DIR).child(file_name.as_str());
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(file_name.as_str());
 
     let message = pb::Transaction::from(transaction);
     let buf = message.encode_to_vec();
@@ -492,17 +502,22 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     // We iterate over files in reverse order so that we only map the last field id
     seen_fields.clear();
     for fragment in fragments.iter_mut() {
-        for field_id in fragment
-            .files
-            .iter_mut()
-            .rev()
-            .flat_map(|file| file.fields.iter_mut())
-        {
-            if let Some(new_field_id) = old_field_id_mapping.get(field_id)
-                && seen_fields.insert(*field_id)
-            {
-                *field_id = *new_field_id;
-            }
+        for file in fragment.files.iter_mut().rev() {
+            let new_fields: Arc<[i32]> = file
+                .fields
+                .iter()
+                .map(|field_id| {
+                    if let Some(new_field_id) = old_field_id_mapping.get(field_id)
+                        && seen_fields.insert(*field_id)
+                    {
+                        *new_field_id
+                    } else {
+                        *field_id
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into();
+            file.fields = new_fields;
         }
         seen_fields.clear();
     }
@@ -576,7 +591,7 @@ pub(crate) async fn migrate_fragments(
             let mut data_files = fragment.files.clone();
 
             // For each of the data files in the fragment, we need to get the file size
-            let object_store = dataset.object_store();
+            let object_store = dataset.object_store.as_ref();
             let get_sizes = data_files
                 .iter()
                 .map(|file| {
@@ -585,7 +600,7 @@ pub(crate) async fn migrate_fragments(
                     } else {
                         Either::Right(async {
                             object_store
-                                .size(&dataset.base.child("data").child(file.path.clone()))
+                                .size(&dataset.base.clone().join("data").join(file.path.clone()))
                                 .map_ok(|size| {
                                     NonZero::new(size).ok_or_else(|| {
                                         Error::internal(format!("File {} has size 0", file.path))
@@ -693,8 +708,9 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             let result = async {
                 let index_dir = dataset
                     .indice_files_dir(index)?
-                    .child(index.uuid.to_string());
-                list_index_files_with_sizes(&dataset.object_store, &index_dir).await
+                    .join(index.uuid.to_string());
+                let object_store = dataset.object_store_for_index(index).await?;
+                list_index_files_with_sizes(&object_store, &index_dir).await
             }
             .await;
             match result {
@@ -903,7 +919,7 @@ pub(crate) async fn commit_transaction(
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    // Note: object_store has been configured with WriteParams, but dataset.object_store()
+    // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;

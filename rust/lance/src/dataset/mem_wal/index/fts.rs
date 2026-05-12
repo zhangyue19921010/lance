@@ -33,15 +33,14 @@ use crossbeam_skiplist::SkipMap;
 use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
 use lance_index::scalar::InvertedIndexParams;
-use lance_index::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
-use tantivy::tokenizer::TokenStream;
+use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
+use lance_tokenizer::TokenStream;
 
 use super::RowPosition;
 
 /// Composite key for FTS index.
 ///
 /// By combining (token, row_position), each entry is unique.
-/// This follows the same pattern as IndexKey and IvfPqKey.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FtsKey {
     /// The indexed token (lowercase).

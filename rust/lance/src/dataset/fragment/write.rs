@@ -15,6 +15,7 @@ use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::Result;
@@ -136,7 +137,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let data_file_key = generate_random_filename();
         let filename = format!("{}.lance", data_file_key);
         let mut fragment = Fragment::new(id);
-        let full_path = base_path.child(DATA_DIR).child(filename.clone());
+        let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
         let mut writer = lance_file::writer::FileWriter::try_new(
             obj_writer,
@@ -170,16 +171,18 @@ impl<'a> FragmentCreateBuilder<'a> {
             return Err(Error::invalid_input("Input data was empty."));
         }
 
-        let field_ids = writer
+        let field_ids: Arc<[i32]> = writer
             .field_id_to_column_indices()
             .iter()
             .map(|(field_id, _)| *field_id as i32)
-            .collect::<Vec<_>>();
-        let column_indices = writer
+            .collect::<Vec<_>>()
+            .into();
+        let column_indices: Arc<[i32]> = writer
             .field_id_to_column_indices()
             .iter()
             .map(|(_, column_index)| *column_index as i32)
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+            .into();
 
         fragment.files[0].fields = field_ids;
         fragment.files[0].column_indices = column_indices;
@@ -244,7 +247,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         .await?;
         let filename = format!("{}.lance", generate_random_filename());
         let mut fragment = Fragment::with_file_legacy(id, &filename, &schema, None);
-        let full_path = base_path.child(DATA_DIR).child(filename.clone());
+        let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let mut writer = PreviousFileWriter::<ManifestDescribing>::try_new(
             &object_store,
             &full_path,
@@ -414,7 +417,7 @@ mod tests {
         assert_eq!(fragment.id, 0);
         assert_eq!(fragment.deletion_file, None);
         assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.files[0].fields, vec![0, 1]);
+        assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1]);
     }
 
     #[tokio::test]
@@ -437,8 +440,8 @@ mod tests {
         assert_eq!(fragment.id, 42);
         assert_eq!(fragment.deletion_file, None);
         assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.files[0].fields, vec![3, 1]);
-        assert_eq!(fragment.files[0].column_indices, vec![0, 1]);
+        assert_eq!(fragment.files[0].fields.as_ref(), &[3, 1]);
+        assert_eq!(fragment.files[0].column_indices.as_ref(), &[0, 1]);
     }
 
     #[tokio::test]
@@ -500,7 +503,7 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].deletion_file, None);
         assert_eq!(fragments[0].files.len(), 1);
-        assert_eq!(fragments[0].files[0].fields, vec![0, 1]);
+        assert_eq!(fragments[0].files[0].fields.as_ref(), &[0, 1]);
     }
 
     #[tokio::test]
@@ -521,13 +524,13 @@ mod tests {
         assert_eq!(fragments.len(), 3);
         assert_eq!(fragments[0].deletion_file, None);
         assert_eq!(fragments[0].files.len(), 1);
-        assert_eq!(fragments[0].files[0].column_indices, vec![0, 1]);
+        assert_eq!(fragments[0].files[0].column_indices.as_ref(), &[0, 1]);
         assert_eq!(fragments[1].deletion_file, None);
         assert_eq!(fragments[1].files.len(), 1);
-        assert_eq!(fragments[1].files[0].column_indices, vec![0, 1]);
+        assert_eq!(fragments[1].files[0].column_indices.as_ref(), &[0, 1]);
         assert_eq!(fragments[2].deletion_file, None);
         assert_eq!(fragments[2].files.len(), 1);
-        assert_eq!(fragments[2].files[0].column_indices, vec![0, 1]);
+        assert_eq!(fragments[2].files[0].column_indices.as_ref(), &[0, 1]);
     }
 
     #[rstest]

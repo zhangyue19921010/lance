@@ -57,6 +57,7 @@ use crate::dataset::fragment::{FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
+    get_default_io_buffer_size_override,
 };
 
 use super::utils::IoMetrics;
@@ -412,7 +413,12 @@ impl FilteredReadStream {
         let output_schema = Arc::new(options.projection.to_arrow_schema());
 
         let obj_store = dataset.object_store.clone();
-        let scheduler_config = if let Some(io_buffer_size_bytes) = options.io_buffer_size_bytes {
+        // Explicit options take precedence; otherwise fall back to the
+        // LANCE_DEFAULT_IO_BUFFER_SIZE env var if set; otherwise max_bandwidth.
+        let scheduler_config = if let Some(io_buffer_size_bytes) = options
+            .io_buffer_size_bytes
+            .or_else(get_default_io_buffer_size_override)
+        {
             SchedulerConfig::new(io_buffer_size_bytes)
         } else {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())
@@ -651,7 +657,10 @@ impl FilteredReadStream {
     ) -> Vec<ScopedFragmentRead> {
         let default_batch_size = options.batch_size.unwrap_or_else(|| {
             get_default_batch_size().unwrap_or_else(|| {
-                std::cmp::max(dataset.object_store().block_size() / 4, BATCH_SIZE_FALLBACK)
+                std::cmp::max(
+                    dataset.object_store.as_ref().block_size() / 4,
+                    BATCH_SIZE_FALLBACK,
+                )
             }) as u32
         });
         let projection = Arc::new(options.projection.clone());
@@ -1107,7 +1116,8 @@ impl FilteredReadStream {
             .read_ranges(
                 fragment_read_task.ranges.into(),
                 fragment_read_task.batch_size,
-            )?
+            )
+            .await?
             .map(move |batch_fut: ReadBatchFut| {
                 let global_metrics = global_metrics.clone();
                 let fragment_counted = fragment_counted.clone();
@@ -1469,7 +1479,7 @@ impl FilteredReadOptions {
 pub struct FilteredReadExec {
     dataset: Arc<Dataset>,
     options: FilteredReadOptions,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     index_input: Option<Arc<dyn ExecutionPlan>>,
     // Precomputed internal plan
@@ -1568,12 +1578,12 @@ impl FilteredReadExec {
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
         };
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema),
             Partitioning::RoundRobinBatch(num_partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         let metrics = ExecutionPlanMetricsSet::new();
 
@@ -1707,16 +1717,18 @@ impl FilteredReadExec {
         let running_stream_lock = self.running_stream.clone();
         let dataset = self.dataset.clone();
         let options = self.options.clone();
+        let batch_size_bytes = options
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes);
         let metrics = self.metrics.clone();
         let index_input = self.index_input.clone();
         let plan_cell = self.plan.clone();
 
         let stream = futures::stream::once(async move {
             let mut running_stream = running_stream_lock.lock().await;
-            if let Some(running_stream) = &*running_stream {
-                DataFusionResult::<SendableRecordBatchStream>::Ok(
-                    running_stream.get_stream(&metrics, partition),
-                )
+            let inner = if let Some(running_stream) = &*running_stream {
+                running_stream.get_stream(&metrics, partition)
             } else {
                 let plan = Self::get_or_create_plan_impl(
                     &plan_cell,
@@ -1726,13 +1738,32 @@ impl FilteredReadExec {
                     partition,
                     context.clone(),
                 )
-                .await?;
+                .await
+                .map_err(|e| DataFusionError::External(e.into()))?;
                 let new_running_stream =
-                    FilteredReadStream::try_new(dataset, options, &metrics, plan.clone()).await?;
+                    FilteredReadStream::try_new(dataset, options, &metrics, plan.clone())
+                        .await
+                        .map_err(|e| DataFusionError::External(e.into()))?;
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
                 *running_stream = Some(new_running_stream);
-                DataFusionResult::Ok(first_stream)
-            }
+                first_stream
+            };
+            let stream: SendableRecordBatchStream = match batch_size_bytes {
+                Some(target) => {
+                    let schema = inner.schema();
+                    Box::pin(RecordBatchStreamAdapter::new(
+                        schema.clone(),
+                        lance_arrow::stream::rechunk_stream_by_size(
+                            inner,
+                            schema,
+                            0,
+                            target as usize,
+                        ),
+                    ))
+                }
+                None => inner,
+            };
+            DataFusionResult::<SendableRecordBatchStream>::Ok(stream)
         })
         .try_flatten();
 
@@ -1836,7 +1867,7 @@ impl ExecutionPlan for FilteredReadExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

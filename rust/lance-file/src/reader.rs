@@ -115,14 +115,58 @@ impl CachedFileMetadata {
 }
 
 impl DeepSizeOf for CachedFileMetadata {
-    // TODO: include size for `column_metadatas` and `column_infos`.
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.file_schema.deep_size_of_children(context)
-            + self
-                .file_buffers
-                .iter()
-                .map(|file_buffer| file_buffer.deep_size_of_children(context))
-                .sum::<usize>()
+        let schema_size = self.file_schema.deep_size_of_children(context);
+
+        let buffers_size: usize = self
+            .file_buffers
+            .iter()
+            .map(|fb| fb.deep_size_of_children(context))
+            .sum();
+
+        // column_metadatas is Vec<pbfile::ColumnMetadata> (protobuf generated,
+        // does not implement DeepSizeOf). We use prost::Message::encoded_len()
+        // as a proxy for in-memory size. The decoded representation is typically
+        // several times larger than the wire format due to heap-allocated
+        // repeated/string/bytes fields, so we apply a 4x multiplier.
+        let column_metadatas_size: usize = self
+            .column_metadatas
+            .iter()
+            .map(|cm| cm.encoded_len() * 4)
+            .sum::<usize>()
+            + std::mem::size_of_val(self.column_metadatas.as_slice());
+
+        // column_infos is Vec<Arc<ColumnInfo>>. Each ColumnInfo contains
+        // page_infos (with protobuf PageEncoding), buffer offsets, and a
+        // column-level ColumnEncoding protobuf.
+        let column_infos_size: usize = self
+            .column_infos
+            .iter()
+            .map(|ci| {
+                let pages_size: usize = ci
+                    .page_infos
+                    .iter()
+                    .map(|pi| {
+                        let enc_size = match &pi.encoding {
+                            lance_encoding::decoder::PageEncoding::Legacy(e) => e.encoded_len() * 4,
+                            lance_encoding::decoder::PageEncoding::Structural(e) => {
+                                e.encoded_len() * 4
+                            }
+                        };
+                        enc_size
+                            + std::mem::size_of_val(pi.buffer_offsets_and_sizes.as_ref())
+                            + std::mem::size_of::<u64>() * 2 // num_rows + priority
+                    })
+                    .sum();
+                pages_size
+                    + std::mem::size_of_val(ci.buffer_offsets_and_sizes.as_ref())
+                    + ci.encoding.encoded_len() * 4
+                    + std::mem::size_of::<u32>() // index
+                    + std::mem::size_of::<usize>() * 2 // Arc overhead
+            })
+            .sum();
+
+        schema_size + buffers_size + column_metadatas_size + column_infos_size
     }
 }
 
@@ -868,7 +912,7 @@ impl FileReader {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn do_read_range(
+    async fn do_read_range(
         column_infos: Vec<Arc<ColumnInfo>>,
         io: Arc<dyn EncodingsIo>,
         cache: Arc<LanceCache>,
@@ -901,17 +945,18 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
 
-        Ok(schedule_and_decode(
+        schedule_and_decode(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
             config,
-        ))
+        )
+        .await
     }
 
-    fn read_range(
+    async fn read_range(
         &self,
         range: Range<u64>,
         batch_size: u32,
@@ -932,10 +977,11 @@ impl FileReader {
             self.options.decoder_config.clone(),
             self.options.batch_size_bytes,
         )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn do_take_rows(
+    async fn do_take_rows(
         column_infos: Vec<Arc<ColumnInfo>>,
         io: Arc<dyn EncodingsIo>,
         cache: Arc<LanceCache>,
@@ -967,17 +1013,18 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Indices(indices);
 
-        Ok(schedule_and_decode(
+        schedule_and_decode(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
             config,
-        ))
+        )
+        .await
     }
 
-    fn take_rows(
+    async fn take_rows(
         &self,
         indices: Vec<u64>,
         batch_size: u32,
@@ -996,10 +1043,11 @@ impl FileReader {
             self.options.decoder_config.clone(),
             self.options.batch_size_bytes,
         )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn do_read_ranges(
+    async fn do_read_ranges(
         column_infos: Vec<Arc<ColumnInfo>>,
         io: Arc<dyn EncodingsIo>,
         cache: Arc<LanceCache>,
@@ -1033,17 +1081,18 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Ranges(ranges);
 
-        Ok(schedule_and_decode(
+        schedule_and_decode(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
             config,
-        ))
+        )
+        .await
     }
 
-    fn read_ranges(
+    async fn read_ranges(
         &self,
         ranges: Vec<Range<u64>>,
         batch_size: u32,
@@ -1062,6 +1111,7 @@ impl FileReader {
             self.options.decoder_config.clone(),
             self.options.batch_size_bytes,
         )
+        .await
     }
 
     /// Creates a stream of "read tasks" to read the data from the file
@@ -1074,7 +1124,20 @@ impl FileReader {
     /// Note that "read task" is probably a bit imprecise.  The tasks are actually "decode tasks".  The
     /// reading happens asynchronously in the background.  In other words, a single read task may map to
     /// multiple I/O operations or a single I/O operation may map to multiple read tasks.
-    pub fn read_tasks(
+    ///
+    /// # Why is this async?
+    ///
+    /// Constructing the read stream requires running the decode scheduler's
+    /// `initialize` step, which performs the metadata I/O (chunk metadata,
+    /// dictionaries, repetition index, ...) needed to plan the read.  We
+    /// drive that I/O on the awaiting task rather than smuggling it into
+    /// the stream's first poll.  This way callers control where the
+    /// scheduling I/O runs (typically inside a per-fragment
+    /// `tokio::spawn`), planning errors surface from the await instead of
+    /// from the first stream item, and small reads can also complete the
+    /// synchronous scheduling step before returning (see
+    /// [`DecoderConfig::inline_scheduling`]).
+    pub async fn read_tasks(
         &self,
         params: ReadBatchParams,
         batch_size: u32,
@@ -1106,7 +1169,7 @@ impl FileReader {
                     }
                 }
                 let indices = indices.iter().map(|idx| idx.unwrap() as u64).collect();
-                self.take_rows(indices, batch_size, projection)
+                self.take_rows(indices, batch_size, projection).await
             }
             ReadBatchParams::Range(range) => {
                 verify_bound(&params, range.end as u64, false)?;
@@ -1116,6 +1179,7 @@ impl FileReader {
                     projection,
                     filter,
                 )
+                .await
             }
             ReadBatchParams::Ranges(ranges) => {
                 let mut ranges_u64 = Vec::with_capacity(ranges.len());
@@ -1124,6 +1188,7 @@ impl FileReader {
                     ranges_u64.push(range.start..range.end);
                 }
                 self.read_ranges(ranges_u64, batch_size, projection, filter)
+                    .await
             }
             ReadBatchParams::RangeFrom(range) => {
                 verify_bound(&params, range.start as u64, true)?;
@@ -1133,13 +1198,16 @@ impl FileReader {
                     projection,
                     filter,
                 )
+                .await
             }
             ReadBatchParams::RangeTo(range) => {
                 verify_bound(&params, range.end as u64, false)?;
                 self.read_range(0..range.end as u64, batch_size, projection, filter)
+                    .await
             }
             ReadBatchParams::RangeFull => {
                 self.read_range(0..self.num_rows, batch_size, projection, filter)
+                    .await
             }
         }
     }
@@ -1165,7 +1233,15 @@ impl FileReader {
     /// * `projection` - A projection to apply to the read.  This controls which columns
     ///   are read from the file.  The projection is NOT applied on top of the base
     ///   projection.  The projection is applied directly to the file schema.
-    pub fn read_stream_projected(
+    ///
+    /// # Why is this async?
+    ///
+    /// This delegates to [`Self::read_tasks`], which awaits the decode
+    /// scheduler's `initialize` step (and, for small reads, the synchronous
+    /// scheduling that follows) before returning.  See `read_tasks` for
+    /// details on why this work is performed up front rather than on the
+    /// stream's first poll.
+    pub async fn read_stream_projected(
         &self,
         params: ReadBatchParams,
         batch_size: u32,
@@ -1174,7 +1250,9 @@ impl FileReader {
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
         let arrow_schema = Arc::new(ArrowSchema::from(projection.schema.as_ref()));
-        let tasks_stream = self.read_tasks(params, batch_size, Some(projection), filter)?;
+        let tasks_stream = self
+            .read_tasks(params, batch_size, Some(projection), filter)
+            .await?;
         let batch_stream = tasks_stream
             .map(|task| task.task)
             .buffered(batch_readahead as usize)
@@ -1389,7 +1467,13 @@ impl FileReader {
     /// This is similar to [`Self::read_stream_projected`] but uses the base projection
     /// provided when the file was opened (or reads all columns if the file was
     /// opened without a base projection)
-    pub fn read_stream(
+    ///
+    /// # Why is this async?
+    ///
+    /// This delegates to [`Self::read_stream_projected`], which awaits the
+    /// decode scheduler's `initialize` step before returning the stream.
+    /// See [`Self::read_tasks`] for the rationale.
+    pub async fn read_stream(
         &self,
         params: ReadBatchParams,
         batch_size: u32,
@@ -1403,6 +1487,7 @@ impl FileReader {
             self.base_projection.clone(),
             filter,
         )
+        .await
     }
 
     pub fn schema(&self) -> &Arc<Schema> {
@@ -1702,6 +1787,7 @@ mod tests {
                     16,
                     FilterExpression::no_filter(),
                 )
+                .await
                 .unwrap();
 
             verify_expected(&data, batch_stream, read_size, None).await;
@@ -1852,6 +1938,7 @@ mod tests {
                         projection.clone(),
                         FilterExpression::no_filter(),
                     )
+                    .await
                     .unwrap();
 
                 let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
@@ -1883,6 +1970,7 @@ mod tests {
                         16,
                         FilterExpression::no_filter(),
                     )
+                    .await
                     .unwrap();
 
                 let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
@@ -1905,6 +1993,7 @@ mod tests {
                             empty_projection.clone(),
                             FilterExpression::no_filter(),
                         )
+                        .await
                         .is_err()
                 );
             }
@@ -1987,6 +2076,7 @@ mod tests {
                 projection.clone(),
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
 
         let projection_arrow = Arc::new(ArrowSchema::from(projection.schema.as_ref()));
@@ -2029,6 +2119,7 @@ mod tests {
                 16,
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -2110,6 +2201,7 @@ mod tests {
                 16,
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
 
         drop(file_reader);
@@ -2219,6 +2311,7 @@ mod tests {
                 16,
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -2234,6 +2327,7 @@ mod tests {
                 16,
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -2288,5 +2382,69 @@ mod tests {
 
         let buf = file_reader.read_global_buffer(1).await.unwrap();
         assert_eq!(buf, test_bytes);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_deep_size_of_includes_column_metadata(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        )]
+        version: LanceFileVersion,
+    ) {
+        // Regression test: CachedFileMetadata::deep_size_of must account for
+        // column_metadatas and column_infos, otherwise the moka cache weigher
+        // dramatically underestimates entry sizes and never evicts, causing
+        // unbounded memory growth on random-access workloads.
+        use deepsize::DeepSizeOf;
+
+        let fs = FsFixture::default();
+        let _written = create_some_file(&fs, version).await;
+        let cache = test_cache();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &cache,
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let metadata = file_reader.metadata();
+        let deep_size = metadata.deep_size_of();
+
+        // The file has multiple columns (score, location, categories, binary,
+        // maybe large_bin). The deep_size_of must be substantially more than
+        // just the schema — it should include column_metadatas + column_infos.
+        // A naive implementation that ignores these fields reports < 1 KB;
+        // a correct one should report at least several KB for this test file.
+        assert!(
+            deep_size > 1024,
+            "deep_size_of ({deep_size}) is suspiciously small — \
+             column_metadatas and column_infos may not be accounted for"
+        );
+
+        // Verify column_metadatas is non-empty (sanity check).
+        assert!(
+            !metadata.column_metadatas.is_empty(),
+            "Expected non-empty column_metadatas"
+        );
+
+        // Verify the size scales with the number of columns: a file with more
+        // columns should have a larger deep_size_of.
+        let num_columns = metadata.column_metadatas.len();
+        assert!(
+            deep_size > num_columns * 50,
+            "deep_size_of ({deep_size}) should scale with column count ({num_columns})"
+        );
     }
 }

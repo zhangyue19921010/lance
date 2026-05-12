@@ -15,7 +15,7 @@ use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_core::cache::LanceCache;
 use lance_index::prefilter::NoFilter;
-use lance_index::scalar::inverted::lance_tokenizer::DocType;
+use lance_index::scalar::inverted::document_tokenizer::DocType;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -188,6 +188,7 @@ fn bench_inverted(c: &mut Criterion) {
                             Operator::Or,
                             no_filter.clone(),
                             Arc::new(NoOpMetricsCollector),
+                            None,
                         )
                         .await
                         .unwrap(),
@@ -226,6 +227,7 @@ fn bench_inverted(c: &mut Criterion) {
                             Operator::And,
                             no_filter.clone(),
                             Arc::new(NoOpMetricsCollector),
+                            None,
                         )
                         .await
                         .unwrap(),

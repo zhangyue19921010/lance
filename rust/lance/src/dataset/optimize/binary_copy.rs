@@ -56,7 +56,7 @@ async fn init_writer_if_necessary(
 ) -> Result<bool> {
     if current_writer.is_none() {
         let filename = format!("{}.lance", generate_random_filename());
-        let path = dataset.base.child(DATA_DIR).child(filename.as_str());
+        let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
         let writer = dataset.object_store.create(&path).await?;
         *current_writer = Some(writer);
         *current_filename = Some(filename);
@@ -136,9 +136,10 @@ async fn finalize_current_output_file(
     // Register the newly closed output file as a fragment data file
     let (maj, min) = version.to_numbers();
     let mut fragment = Fragment::new(0);
+    let field_column_indices = compute_field_column_indices(schema, full_field_ids.len(), version);
     let mut data_file = DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-    data_file.fields = full_field_ids.to_vec();
-    data_file.column_indices = compute_field_column_indices(schema, full_field_ids.len(), version);
+    data_file.fields = full_field_ids.to_vec().into();
+    data_file.column_indices = field_column_indices.into();
     fragment.files.push(data_file);
     fragment.physical_rows = Some(total_rows_in_current as usize);
     Ok(fragment)
@@ -249,11 +250,11 @@ pub async fn rewrite_files_binary_copy(
     for frag in fragments.iter() {
         for df in frag.files.iter() {
             let object_store = if let Some(base_id) = df.base_id {
-                dataset.object_store_for_base(base_id).await?
+                dataset.object_store(Some(base_id)).await?
             } else {
                 dataset.object_store.clone()
             };
-            let full_path = dataset.data_file_dir(df)?.child(df.path.as_str());
+            let full_path = dataset.data_file_dir(df)?.clone().join(df.path.as_str());
             let scan_scheduler = ScanScheduler::new(
                 object_store.clone(),
                 SchedulerConfig::max_bandwidth(&object_store),
