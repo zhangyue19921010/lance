@@ -15,6 +15,9 @@ categories.workspace = true
 features = []
 no-default-features = true
 
+[package.metadata.cargo-machete]
+ignored = ["tracing-chrome"]
+
 [dependencies]
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }
@@ -27,7 +30,6 @@ lance-index = { workspace = true }
 lance-namespace = { workspace = true }
 lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
-lance-geo = { workspace = true, optional = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -70,12 +72,10 @@ datafusion-physical-expr.workspace = true
 datafusion-physical-plan.workspace = true
 datafusion-expr.workspace = true
 either.workspace = true
-lapack = { version = "0.19.0", optional = true }
 snafu = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
-moka.workspace = true
 permutation = { version = "0.4.0" }
 aws-sdk-dynamodb = { workspace = true, optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 tracing.workspace = true
@@ -102,8 +102,6 @@ libc = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
 approx.workspace = true
-rand_distr.workspace = true
-dirs = "5.0.0"
 all_asserts = "2.3.1"
 mock_instant.workspace = true
 lance-testing = { workspace = true }
@@ -114,8 +112,8 @@ tempfile.workspace = true
 test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
+serial_test = { workspace = true }
 tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
-paste = "1.0"
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["default-https-client", "http-1x", "rt-tokio"] }
@@ -123,6 +121,8 @@ geoarrow-array = { workspace = true }
 geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
+parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "geo"]
@@ -145,7 +145,7 @@ azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]
 tencent = ["lance-io/tencent"]
 huggingface = ["lance-io/huggingface"]
-geo = ["dep:lance-geo", "lance-geo/geo", "lance-datafusion/geo", "lance-index/geo"]
+geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
 
@@ -155,6 +155,10 @@ required-features = ["cli"]
 
 [[bench]]
 name = "scalar_index"
+harness = false
+
+[[bench]]
+name = "merge_insert"
 harness = false
 
 [[bench]]
@@ -203,6 +207,22 @@ harness = false
 
 [[bench]]
 name = "mem_wal_read"
+harness = false
+
+[[bench]]
+name = "mem_wal_replay"
+harness = false
+
+[[bench]]
+name = "mem_wal_vector"
+harness = false
+
+[[bench]]
+name = "mem_wal_index_micro"
+harness = false
+
+[[bench]]
+name = "mem_wal_recall_hnsw"
 harness = false
 
 [lints]

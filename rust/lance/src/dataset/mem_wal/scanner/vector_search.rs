@@ -80,6 +80,14 @@ pub struct LsmVectorSearchPlanner {
     vector_column: String,
     /// Distance metric type (L2, Cosine, Dot, etc.).
     distance_type: lance_linalg::distance::DistanceType,
+    /// Refine factor applied to the base-table KNN scan.
+    ///
+    /// `None` (default): no refine — base distances may be approximate
+    /// (e.g. when the base table is indexed with IVF-PQ). `Some(n)`: fetch
+    /// `k * n` candidates and re-rank with exact distances using the
+    /// original vectors. Set this to make cross-source distance comparison
+    /// across the LSM merge fully exact.
+    base_table_refine_factor: Option<u32>,
 }
 
 impl LsmVectorSearchPlanner {
@@ -106,7 +114,21 @@ impl LsmVectorSearchPlanner {
             bloom_filters: Vec::new(),
             vector_column,
             distance_type,
+            base_table_refine_factor: None,
         }
+    }
+
+    /// Enable base-table refine.
+    ///
+    /// When set, the base-table arm of the KNN plan asks the scanner for
+    /// `k * factor` candidates and re-ranks them with exact distances. This
+    /// is useful when the base table uses an approximate index (IVF-PQ) and
+    /// you need exact distances for cross-source merging in the LSM scan.
+    ///
+    /// Default: disabled (base table returns approximate distances).
+    pub fn with_base_table_refine_factor(mut self, factor: u32) -> Self {
+        self.base_table_refine_factor = Some(factor);
+        self
     }
 
     /// Add a bloom filter for staleness detection.
@@ -221,11 +243,18 @@ impl LsmVectorSearchPlanner {
                 let mut scanner = dataset.scan();
                 let cols = self.build_projection_for_knn(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                scanner.nearest(&self.vector_column, query_vector, k)?;
+                let query_arr = single_query_array(query_vector);
+                scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
-                // fast_search: only search indexed data (memtables cover unindexed)
+                // fast_search: only search indexed data (memtables cover unindexed).
                 scanner.fast_search();
+                // Optional: re-rank base-table candidates with exact distances so
+                // they are directly comparable to MemTable / flushed-MemTable
+                // distances in the cross-source merge.
+                if let Some(factor) = self.base_table_refine_factor {
+                    scanner.refine(factor);
+                }
                 scanner.create_plan().await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
@@ -235,7 +264,8 @@ impl LsmVectorSearchPlanner {
                 let mut scanner = dataset.scan();
                 let cols = self.build_projection_for_knn(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                scanner.nearest(&self.vector_column, query_vector, k)?;
+                let query_arr = single_query_array(query_vector);
+                scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
                 // fast_search: only search indexed data
@@ -311,6 +341,22 @@ impl LsmVectorSearchPlanner {
 
         let schema = Arc::new(Schema::new(fields));
         Ok(Arc::new(EmptyExec::new(schema)))
+    }
+}
+
+/// Convert a (typically single-row) FixedSizeList query into the array shape
+/// `Scanner::nearest` expects:
+///
+/// - 1 row → the inner Float32Array (single-vector query). Passing the FSL
+///   directly would make the scanner treat it as a multivector query and
+///   reject it on a non-multivector column.
+/// - >1 row → the FSL itself (multivector query path).
+fn single_query_array(query_vector: &FixedSizeListArray) -> arrow_array::ArrayRef {
+    use arrow_array::Array;
+    if query_vector.len() == 1 {
+        query_vector.value(0)
+    } else {
+        std::sync::Arc::new(query_vector.clone()) as arrow_array::ArrayRef
     }
 }
 
@@ -408,9 +454,9 @@ mod tests {
         let query = create_query_vector();
         let plan = planner.plan_search(&query, 10, 8, None).await;
 
-        // Plan creation should succeed (even if execution would fail on empty data)
-        // The important thing is the plan structure is correct
-        assert!(plan.is_ok() || plan.is_err()); // Either is fine for structure test
+        // Plan construction must succeed. Execution against empty data is a
+        // separate concern handled by integration tests.
+        plan.expect("planner should produce a plan even when memtables are empty");
     }
 
     #[tokio::test]
@@ -436,5 +482,55 @@ mod tests {
 
         assert!(cols.contains(&"vector".to_string()));
         assert!(cols.contains(&"id".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_without_base_table() {
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        // No base dataset written. Plan construction must still succeed and
+        // exclude any base-table scan node.
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 10, 8, None)
+            .await
+            .expect("planner should produce a plan without a base table");
+
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            !plan_str.contains("base/data"),
+            "Plan must not scan base table, got: {}",
+            plan_str
+        );
+
+        // Execute the plan so runtime issues (schema mismatches, missing
+        // sources, etc.) surface here rather than at the call site.
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan
+            .execute(0, ctx.task_ctx())
+            .expect("plan should execute without a base table");
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .expect("collecting batches should succeed");
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0, "fresh tier with no sources should yield no rows");
     }
 }
