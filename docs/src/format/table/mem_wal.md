@@ -151,7 +151,7 @@ However, since our MemTable is not sorted, we just use the term flushed MemTable
 
 #### Flushed MemTable Storage Layout
 
-The MemTable of generation `i` is flushed to `_mem_wal/{region_uuid}/{random_hex}_gen_{i}/` directory,
+The MemTable of generation `i` is flushed to `_mem_wal/{shard_id}/{random_hex}_gen_{i}/` directory,
 where `{random_hex}` is a random 8-character hex value generated at flush time.
 The random hex value is necessary to ensure if one MemTable flush attempt fails,
 The retry can use another directory.
@@ -384,12 +384,12 @@ Here is a recap of the storage layout with all the files and concepts defined so
 │       └── index.lance                  # Serialized shard snapshots (Lance file)
 │
 └── _mem_wal/
-    └── {region_uuid}/                   # Shard directory (UUID v4)
+    └── {shard_id}/                   # Shard directory (UUID v4)
         ├── manifest/
         │   ├── {bit_reversed_version}.binpb     # Serialized shard manifest (bit-reversed naming)
         │   └── version_hint.json                # Version hint file
         ├── wal/
-        │   ├── {bit_reversed_entry_id}.lance    # WAL data files (bit-reversed naming)
+        │   ├── {bit_reversed_entry_id}.arrow    # WAL data files (bit-reversed naming)
         │   └── ...
         └── {random_hash}_gen_{i}/        # Flushed MemTable (generation i, random prefix)
             ├── _versions/
