@@ -3093,7 +3093,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -4321,7 +4321,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4420,7 +4420,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4468,7 +4468,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrayref",
  "paste",
@@ -4477,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4514,7 +4514,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4547,7 +4547,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4567,7 +4567,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4612,7 +4612,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4638,7 +4638,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4678,7 +4678,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4692,7 +4692,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "approx",
  "arc-swap",
@@ -4769,7 +4769,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4818,7 +4818,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4839,7 +4839,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4851,7 +4851,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4867,7 +4867,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4923,7 +4923,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4969,7 +4969,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4978,7 +4978,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4989,7 +4989,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "jieba-rs",
  "lindera",
@@ -5000,7 +5000,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "7.0.0-beta.10"
+version = "7.0.0-beta.11"
 dependencies = [
  "clap",
  "lance-core",
@@ -6055,9 +6055,9 @@ dependencies = [
 
 [[package]]
 name = "openssl"
-version = "0.10.79"
+version = "0.10.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf0b434746ee2832f4f0baf10137e1cabb18cbe6912c69e2e33263c45250f542"
+checksum = "a45fa2aa886c42762255da344f0a0d313e254066c46aad76f300c3d3da62d967"
 dependencies = [
  "bitflags 2.11.1",
  "cfg-if 1.0.4",
@@ -6086,9 +6086,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.115"
+version = "0.9.116"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "158fe5b292746440aa6e7a7e690e55aeb72d41505e2804c23c6973ad0e9c9781"
+checksum = "f28a22dc7140cda5f096e5e7724a6962ca81a7f8bfd2979f9b18c11af56318c4"
 dependencies = [
  "cc",
  "libc",
