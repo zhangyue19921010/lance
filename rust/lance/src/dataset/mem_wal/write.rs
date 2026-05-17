@@ -686,12 +686,32 @@ struct WriterState {
     frozen_memtable_bytes: usize,
     /// Flush watchers for frozen memtables (for backpressure).
     frozen_flush_watchers: VecDeque<(usize, DurabilityWatcher)>,
+    /// Sealed-but-undrained memtables, kept queryable so a concurrent reader
+    /// sees no hole between `freeze_memtable` and the flush task's manifest
+    /// commit. Pushed in `freeze_memtable`; removed by generation in
+    /// `flush_memtable` on commit success only (retained on failure until a
+    /// later flush or WAL replay on reopen).
+    frozen_memtables: VecDeque<Arc<MemTable>>,
     /// Flag to prevent duplicate memtable flush requests.
     flush_requested: bool,
     /// Counter for WAL flush threshold crossings.
     wal_flush_trigger_count: usize,
     /// Last time a WAL flush was triggered (for time-based flush).
     last_wal_flush_trigger_time: u64,
+}
+
+/// Capture a point-in-time scan handle to one in-memory memtable (active
+/// or frozen — same shape). Shared by `active_memtable_ref` and
+/// `in_memory_memtable_refs` so both stamp identical fields.
+fn in_memory_ref(mt: &MemTable) -> crate::dataset::mem_wal::scanner::InMemoryMemTableRef {
+    crate::dataset::mem_wal::scanner::InMemoryMemTableRef {
+        batch_store: mt.batch_store(),
+        index_store: mt
+            .indexes_arc()
+            .unwrap_or_else(|| Arc::new(IndexStore::new())),
+        schema: mt.schema().clone(),
+        generation: mt.generation(),
+    }
 }
 
 fn start_time() -> std::time::Instant {
@@ -896,6 +916,11 @@ impl SharedWriterState {
             .push_back((frozen_size, flush_watcher));
 
         let frozen_memtable = Arc::new(old_memtable);
+
+        // Keep this generation queryable until its manifest commit lands
+        // (dropped in `flush_memtable`, success only). Arc refcount, not a
+        // copy — the flush task holds it alive for the whole drain anyway.
+        state.frozen_memtables.push_back(frozen_memtable.clone());
 
         debug!(
             "Frozen memtable generation {}, pending_count = {}",
@@ -1286,6 +1311,7 @@ impl ShardWriter {
             last_flushed_wal_entry_position: initial_covered_wal_entry_position,
             frozen_memtable_bytes: 0,
             frozen_flush_watchers: VecDeque::new(),
+            frozen_memtables: VecDeque::new(),
             flush_requested: false,
             wal_flush_trigger_count: 0,
             last_wal_flush_trigger_time: 0,
@@ -1693,26 +1719,38 @@ impl ShardWriter {
         Ok(state.memtable.scan())
     }
 
-    /// Get an ActiveMemTableRef for use with LsmScanner.
-    ///
-    /// This provides read access to the current in-memory MemTable data
-    /// for unified LSM scanning across base table, flushed MemTables, and
-    /// active MemTable.
+    /// A handle to just the active memtable, for unified LSM scanning.
+    /// Prefer [`Self::in_memory_memtable_refs`] on the read path — it also
+    /// carries frozen-awaiting-flush generations.
     ///
     /// Returns an error in WAL-only mode.
     pub async fn active_memtable_ref(
         &self,
-    ) -> Result<crate::dataset::mem_wal::scanner::ActiveMemTableRef> {
+    ) -> Result<crate::dataset::mem_wal::scanner::InMemoryMemTableRef> {
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
-        Ok(crate::dataset::mem_wal::scanner::ActiveMemTableRef {
-            batch_store: state.memtable.batch_store(),
-            index_store: state
-                .memtable
-                .indexes_arc()
-                .unwrap_or_else(|| Arc::new(IndexStore::new())),
-            schema: state.memtable.schema().clone(),
-            generation: state.memtable.generation(),
+        Ok(in_memory_ref(&state.memtable))
+    }
+
+    /// The active memtable plus every frozen-awaiting-flush memtable,
+    /// captured atomically under one `state.read()` (no torn freeze).
+    /// Mirrors `WriterState { memtable, frozen_memtables }`. The WAL read
+    /// path uses this instead of [`Self::active_memtable_ref`] so a
+    /// concurrent reader sees no hole while a flush drains.
+    ///
+    /// Returns an error in WAL-only mode.
+    pub async fn in_memory_memtable_refs(
+        &self,
+    ) -> Result<crate::dataset::mem_wal::scanner::InMemoryMemTables> {
+        let state_lock = self.memtable_state_lock()?;
+        let state = state_lock.read().await;
+        Ok(crate::dataset::mem_wal::scanner::InMemoryMemTables {
+            active: in_memory_ref(&state.memtable),
+            frozen: state
+                .frozen_memtables
+                .iter()
+                .map(|m| in_memory_ref(m))
+                .collect(),
         })
     }
 
@@ -2200,9 +2238,21 @@ impl MemTableFlushHandler {
 
         {
             let mut state = self.state.write().await;
+            // Backpressure drain: unconditional so `wait_for_flush_drain`
+            // sees the watcher's error signal, not a dropped channel.
             if let Some((_size, _watcher)) = state.frozen_flush_watchers.pop_front() {
                 state.frozen_memtable_bytes =
                     state.frozen_memtable_bytes.saturating_sub(memtable_size);
+            }
+            // Drop the queryable handle ONLY on commit success. On failure
+            // keep it: rows must stay in the read union until a later flush
+            // or WAL replay, else a transient flush error reopens the hole.
+            // Keyed by generation, so non-FIFO completion is fine.
+            if flush_result.is_ok() {
+                let flushed_generation = memtable.generation();
+                state
+                    .frozen_memtables
+                    .retain(|m| m.generation() != flushed_generation);
             }
         }
 
@@ -3254,6 +3304,8 @@ mod tests {
         assert!(err.to_string().contains("WAL-only mode"));
         let err = writer.active_memtable_ref().await.err().unwrap();
         assert!(err.to_string().contains("WAL-only mode"));
+        let err = writer.in_memory_memtable_refs().await.err().unwrap();
+        assert!(err.to_string().contains("WAL-only mode"));
 
         writer.close().await.unwrap();
     }
@@ -3986,6 +4038,130 @@ mod tests {
         assert_eq!(manifest.flushed_generations.len(), flushed_before + 1);
 
         writer.close().await.unwrap();
+    }
+
+    /// On a successful flush commit the sealed generation is dropped from
+    /// the queryable set (no leak), and its rows land in the manifest.
+    #[tokio::test]
+    async fn test_frozen_dropped_after_successful_flush() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 64 * 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let initial_gen = writer.memtable_stats().await.unwrap().generation;
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        assert!(
+            refs.frozen.is_empty(),
+            "frozen handle must be dropped once the flush commit lands"
+        );
+        assert_eq!(refs.active.generation, initial_gen + 1);
+
+        let manifest = writer.manifest().await.unwrap().expect("manifest exists");
+        assert!(
+            manifest
+                .flushed_generations
+                .iter()
+                .any(|g| g.generation == initial_gen),
+            "flushed generation must be recorded in the manifest"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// Regression: a transient flush failure must NOT reopen the
+    /// concurrent-read-vs-flush hole. The sealed generation stays in the
+    /// queryable set (rows intact) until a later flush or WAL replay.
+    /// Failure is induced deterministically by fencing the writer with a
+    /// successor before the seal, so the flush's `check_fenced` rejects it.
+    #[tokio::test]
+    async fn test_frozen_retained_after_failed_flush() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let initial_gen = writer_a.memtable_stats().await.unwrap().generation;
+        writer_a
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+
+        // Successor claims a higher epoch, fencing A.
+        let writer_b = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(writer_b.epoch() > writer_a.epoch());
+
+        // `force_seal_active` would reject up-front on a fenced writer;
+        // freeze directly so the failure surfaces at flush-commit time —
+        // exactly the freeze/flush race the fix guards.
+        match &writer_a.mode {
+            WriterMode::MemTable {
+                state,
+                writer_state,
+                ..
+            } => {
+                let mut st = state.write().await;
+                writer_state.freeze_memtable(&mut st).unwrap();
+            }
+            WriterMode::WalOnly { .. } => unreachable!("opened in memtable mode"),
+        }
+
+        // The fenced flush fails; the drain surfaces that error.
+        assert!(
+            writer_a.wait_for_flush_drain().await.is_err(),
+            "fenced flush should fail the drain"
+        );
+
+        // The hole did not reopen: the sealed generation is still queryable
+        // with its rows, alongside the new (empty) active generation.
+        let refs = writer_a.in_memory_memtable_refs().await.unwrap();
+        assert_eq!(refs.frozen.len(), 1, "sealed generation must be retained");
+        assert_eq!(refs.frozen[0].generation, initial_gen);
+        assert!(
+            !refs.frozen[0].batch_store.is_empty(),
+            "retained sealed memtable must still hold its rows"
+        );
+        assert_eq!(refs.active.generation, initial_gen + 1);
+
+        writer_b.close().await.unwrap();
     }
 }
 

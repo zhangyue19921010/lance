@@ -41,7 +41,9 @@ mod projection;
 mod vector_search;
 
 pub use builder::LsmScanner;
-pub use collector::{ActiveMemTableRef, LsmDataSourceCollector};
+pub use collector::{
+    ActiveMemTableRef, InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector,
+};
 pub use data_source::{FlushedGeneration, LsmDataSource, LsmGeneration, ShardSnapshot};
 pub use point_lookup::LsmPointLookupPlanner;
 pub use projection::DISTANCE_COLUMN;

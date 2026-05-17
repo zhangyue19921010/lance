@@ -508,7 +508,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_search_base_plus_active_returns_distance() {
-        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
@@ -538,13 +538,16 @@ mod tests {
         let index_store = Arc::new(index_store);
 
         let shard_id = uuid::Uuid::new_v4();
-        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_active_memtable(
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
             shard_id,
-            ActiveMemTableRef {
-                batch_store,
-                index_store,
-                schema: schema.clone(),
-                generation: 1,
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
             },
         );
 
@@ -624,7 +627,7 @@ mod tests {
         // Regression for: active arm previously did NOT call `build_projection_for_knn`,
         // so when the caller passed `projection=Some([...])`, the active arm's output
         // dropped the PK column (and the staleness/dedup pipeline lost its hash input).
-        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
@@ -653,13 +656,16 @@ mod tests {
         let index_store = Arc::new(index_store);
 
         let shard_id = uuid::Uuid::new_v4();
-        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_active_memtable(
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
             shard_id,
-            ActiveMemTableRef {
-                batch_store,
-                index_store,
-                schema: schema.clone(),
-                generation: 1,
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
             },
         );
 
@@ -700,7 +706,7 @@ mod tests {
         // Regression: `_distance` / `_rowid` in projection must not break
         // the plan. `_distance` honored at requested position (no
         // duplication); `_rowid` honored as nullable.
-        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
@@ -729,13 +735,16 @@ mod tests {
         let index_store = Arc::new(index_store);
 
         let shard_id = uuid::Uuid::new_v4();
-        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_active_memtable(
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
             shard_id,
-            ActiveMemTableRef {
-                batch_store,
-                index_store,
-                schema: schema.clone(),
-                generation: 1,
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
             },
         );
 
@@ -807,7 +816,7 @@ mod tests {
         // Regression for: when bloom filters are configured, FilterStaleExec preserves
         // its `_memtable_gen` input column. Without the post-filter projection that
         // strips it, the column would leak into the user-visible output.
-        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
@@ -837,13 +846,16 @@ mod tests {
         let index_store = Arc::new(index_store);
 
         let shard_id = uuid::Uuid::new_v4();
-        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_active_memtable(
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
             shard_id,
-            ActiveMemTableRef {
-                batch_store,
-                index_store,
-                schema: schema.clone(),
-                generation: 1,
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
             },
         );
 
@@ -932,7 +944,7 @@ mod tests {
         //   2. flushed-memtable arm runs without erroring
         //   3. `_rowaddr` symmetry with `_rowid` (same code path, both are
         //      surfaced when requested and NULL'd outside the base arm)
-        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
@@ -990,13 +1002,16 @@ mod tests {
             .with_flushed_generation(1, "gen_1".to_string());
 
         let collector = LsmDataSourceCollector::new(base_dataset, vec![shard_snapshot])
-            .with_active_memtable(
+            .with_in_memory_memtables(
                 shard_id,
-                ActiveMemTableRef {
-                    batch_store,
-                    index_store,
-                    schema: schema.clone(),
-                    generation: 2,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: schema.clone(),
+                        generation: 2,
+                    },
+                    frozen: vec![],
                 },
             );
 
