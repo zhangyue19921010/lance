@@ -822,21 +822,97 @@ def test_dataset_to_pandas_invalid_blob_mode(dataset_for_pandas_blob_tests):
         dataset_for_pandas_blob_tests.to_pandas(blob_mode="inline")
 
 
-def test_blob_column_sources_rejects_unmappable_transform(
-    dataset_for_pandas_blob_tests,
-):
-    projected_schema = pa.schema(
-        [
-            pa.field(
-                "video",
-                pa.large_binary(),
-                metadata={"lance-encoding:blob": "true"},
-            )
-        ]
+@pytest.fixture
+def dataset_with_nested_blobs(tmp_path):
+    blob_field = pa.field(
+        "blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
     )
-    snapshot = {"_columns_with_transform": (("video", "concat(blob, blob)"),)}
+    info_type = pa.struct([pa.field("name", pa.string()), blob_field])
+    info_array = pa.array(
+        [
+            {"name": "a", "blob": b"foo"},
+            {"name": "b", "blob": None},
+            {"name": "c", "blob": b"baz"},
+        ],
+        type=info_type,
+    )
+    table = pa.table(
+        [pa.array([1, 2, 3], pa.int64()), info_array],
+        schema=pa.schema([pa.field("id", pa.int64()), pa.field("info", info_type)]),
+    )
+    return lance.write_dataset(table, tmp_path / "nested_blob_ds")
 
-    with pytest.raises(NotImplementedError, match="direct blob column references"):
-        lance_dataset_module._blob_column_sources(
-            projected_schema, snapshot, dataset_for_pandas_blob_tests.schema
-        )
+
+def test_to_pandas_returns_blob_file_handles_for_nested_fields(
+    dataset_with_nested_blobs,
+):
+    df = dataset_with_nested_blobs.to_pandas()
+    row0, row1, row2 = df["info"].tolist()
+
+    assert row0["blob"].readall() == b"foo"
+    assert row1["blob"] is None
+    assert row2["blob"].readall() == b"baz"
+
+
+def test_to_pandas_reads_nested_blob_bytes_directly(dataset_with_nested_blobs):
+    rows = dataset_with_nested_blobs.to_pandas(blob_mode="bytes")["info"].tolist()
+
+    assert [r["blob"] for r in rows] == [b"foo", None, b"baz"]
+
+
+def test_to_pandas_returns_descriptors_for_nested_fields(dataset_with_nested_blobs):
+    descriptions_df = dataset_with_nested_blobs.to_pandas(blob_mode="descriptions")
+    table_df = dataset_with_nested_blobs.to_table().to_pandas()
+
+    assert descriptions_df.equals(table_df)
+
+
+def test_take_blobs_resolves_nested_field_path(dataset_with_nested_blobs):
+    blobs = dataset_with_nested_blobs.take_blobs("info.blob", indices=[0, 2])
+
+    with blobs[0] as f:
+        assert f.read() == b"foo"
+    with blobs[1] as f:
+        assert f.read() == b"baz"
+
+
+def test_read_blobs_resolves_nested_field_path(dataset_with_nested_blobs):
+    results = dataset_with_nested_blobs.read_blobs("info.blob", indices=[0, 2])
+
+    assert [data for _, data in results] == [b"foo", b"baz"]
+
+
+def test_to_pandas_returns_blob_files_for_projected_nested_fields(
+    dataset_with_nested_blobs,
+):
+    images = (
+        dataset_with_nested_blobs.scanner(columns=["info.blob"])
+        .to_pandas()["info.blob"]
+        .tolist()
+    )
+
+    assert images[0].readall() == b"foo"
+    assert images[1] is None
+    assert images[2].readall() == b"baz"
+
+
+def test_to_pandas_reads_bytes_for_projected_nested_fields(dataset_with_nested_blobs):
+    df = dataset_with_nested_blobs.scanner(columns=["info.blob"]).to_pandas(
+        blob_mode="bytes"
+    )
+
+    assert df["info.blob"].tolist() == [b"foo", None, b"baz"]
+
+
+def test_to_pandas_returns_blob_files_when_nested_field_is_aliased(
+    dataset_with_nested_blobs,
+):
+    images = (
+        dataset_with_nested_blobs.scanner(columns={"my_img": "info.blob"})
+        .to_pandas()["my_img"]
+        .tolist()
+    )
+
+    assert images[0].readall() == b"foo"
+    assert images[1] is None
+    assert images[2].readall() == b"baz"
