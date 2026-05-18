@@ -4183,7 +4183,7 @@ mod shard_writer_tests {
     use lance_linalg::distance::MetricType;
     use uuid::Uuid;
 
-    use crate::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig};
+    use crate::dataset::mem_wal::DatasetMemWalExt;
     use crate::dataset::{Dataset, WriteParams};
     use crate::index::vector::VectorIndexParams;
 
@@ -4247,6 +4247,211 @@ mod shard_writer_tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn test_initialize_mem_wal_records_writer_config_defaults() {
+        let vector_dim = 128;
+        let schema = create_test_schema(vector_dim);
+        let uri = format!("memory://test_writer_config_defaults_{}", Uuid::new_v4());
+
+        let initial_batch = create_test_batch(&schema, 0, 100, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+
+        let writer_config = ShardWriterConfig::default()
+            .with_durable_write(false)
+            .with_max_memtable_size(8 * 1024 * 1024);
+
+        dataset
+            .initialize_mem_wal()
+            .writer_config_defaults(writer_config)
+            .add_writer_config_default("custom_knob", "custom_value")
+            .execute()
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        // Defaults must survive the manifest round-trip so all writers share them.
+        let details = dataset
+            .mem_wal_index_details()
+            .await
+            .expect("Failed to read MemWAL index details")
+            .expect("MemWAL index details should exist");
+
+        let defaults = &details.writer_config_defaults;
+        // ShardWriterConfig tunables are recorded under their field names.
+        assert_eq!(
+            defaults.get("durable_write").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            defaults.get("max_memtable_size").map(String::as_str),
+            Some("8388608")
+        );
+        // Duration knobs are recorded in milliseconds with a `_ms` suffix.
+        assert_eq!(
+            defaults
+                .get("max_wal_flush_interval_ms")
+                .map(String::as_str),
+            Some("100")
+        );
+        // Every tunable field is present.
+        assert!(defaults.contains_key("sync_indexed_write"));
+        assert!(defaults.contains_key("enable_memtable"));
+        assert!(defaults.contains_key("async_index_interval_ms"));
+        // add_writer_config_default records arbitrary keys.
+        assert_eq!(
+            defaults.get("custom_knob").map(String::as_str),
+            Some("custom_value")
+        );
+        // Shard identity is not a configuration default.
+        assert!(!defaults.contains_key("shard_id"));
+        assert!(!defaults.contains_key("shard_spec_id"));
+    }
+
+    #[tokio::test]
+    async fn test_initialize_mem_wal_bucket_sharding() {
+        let vector_dim = 128;
+        let schema = create_test_schema(vector_dim);
+        let uri = format!("memory://test_bucket_sharding_{}", Uuid::new_v4());
+
+        let initial_batch = create_test_batch(&schema, 0, 100, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+
+        // num_buckets out of range is rejected.
+        let result = dataset
+            .initialize_mem_wal()
+            .bucket_sharding("id", 0)
+            .execute()
+            .await;
+        assert!(result.is_err(), "num_buckets = 0 should be rejected");
+
+        // The bucket column must be the unenforced primary key column.
+        let result = dataset
+            .initialize_mem_wal()
+            .bucket_sharding("text", 8)
+            .execute()
+            .await;
+        assert!(
+            result.is_err(),
+            "a non-primary-key bucket column should be rejected"
+        );
+
+        dataset
+            .initialize_mem_wal()
+            .bucket_sharding("id", 8)
+            .execute()
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        let details = dataset
+            .mem_wal_index_details()
+            .await
+            .expect("Failed to read MemWAL index details")
+            .expect("MemWAL index details should exist");
+
+        assert_eq!(details.num_shards, 8);
+        assert_eq!(details.sharding_specs.len(), 1);
+        let field = &details.sharding_specs[0].fields[0];
+        assert_eq!(field.transform.as_deref(), Some("bucket"));
+        assert_eq!(
+            field.parameters.get("num_buckets").map(String::as_str),
+            Some("8")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_mem_wal_unsharded() {
+        let vector_dim = 128;
+        let schema = create_test_schema(vector_dim);
+        let uri = format!("memory://test_unsharded_{}", Uuid::new_v4());
+
+        let initial_batch = create_test_batch(&schema, 0, 100, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        let details = dataset
+            .mem_wal_index_details()
+            .await
+            .expect("Failed to read MemWAL index details")
+            .expect("MemWAL index details should exist");
+
+        assert_eq!(details.num_shards, 1);
+        assert_eq!(details.sharding_specs.len(), 1);
+        assert_eq!(
+            details.sharding_specs[0].fields[0].transform.as_deref(),
+            Some("unsharded")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_mem_wal_identity_sharding() {
+        let vector_dim = 128;
+        let schema = create_test_schema(vector_dim);
+        let uri = format!("memory://test_identity_sharding_{}", Uuid::new_v4());
+
+        let initial_batch = create_test_batch(&schema, 0, 100, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+
+        // A column that does not exist is rejected.
+        let result = dataset
+            .initialize_mem_wal()
+            .identity_sharding("nonexistent")
+            .execute()
+            .await;
+        assert!(
+            result.is_err(),
+            "an unknown identity column should be rejected"
+        );
+
+        // A non-scalar column cannot be a shard key.
+        let result = dataset
+            .initialize_mem_wal()
+            .identity_sharding("vector")
+            .execute()
+            .await;
+        assert!(
+            result.is_err(),
+            "a non-scalar identity column should be rejected"
+        );
+
+        dataset
+            .initialize_mem_wal()
+            .identity_sharding("text")
+            .execute()
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        let details = dataset
+            .mem_wal_index_details()
+            .await
+            .expect("Failed to read MemWAL index details")
+            .expect("MemWAL index details should exist");
+
+        // Identity sharding has an open-ended shard count.
+        assert_eq!(details.num_shards, 0);
+        assert_eq!(details.sharding_specs.len(), 1);
+        let field = &details.sharding_specs[0].fields[0];
+        assert_eq!(field.transform.as_deref(), Some("identity"));
+        assert_eq!(field.result_type.as_str(), "utf8");
+        assert_eq!(field.source_ids.len(), 1);
+    }
+
     /// Quick smoke test for shard writer - runs against memory://
     /// Run with: cargo test -p lance shard_writer_tests::test_shard_writer_smoke -- --nocapture
     #[tokio::test]
@@ -4267,10 +4472,8 @@ mod shard_writer_tests {
 
         // Initialize MemWAL (no indexes for smoke test)
         dataset
-            .initialize_mem_wal(MemWalConfig {
-                sharding_spec: None,
-                maintained_indexes: vec![],
-            })
+            .initialize_mem_wal()
+            .execute()
             .await
             .expect("Failed to initialize MemWAL");
 
@@ -4324,10 +4527,9 @@ mod shard_writer_tests {
             .expect("Failed to create base vector index");
 
         dataset
-            .initialize_mem_wal(MemWalConfig {
-                sharding_spec: None,
-                maintained_indexes: vec!["vector_idx".to_string()],
-            })
+            .initialize_mem_wal()
+            .maintained_indexes(["vector_idx"])
+            .execute()
             .await
             .expect("Failed to initialize MemWAL");
 
@@ -4465,14 +4667,9 @@ mod shard_writer_tests {
 
         // Initialize MemWAL with all three indexes
         dataset
-            .initialize_mem_wal(MemWalConfig {
-                sharding_spec: None,
-                maintained_indexes: vec![
-                    "id_btree".to_string(),
-                    "text_fts".to_string(),
-                    "vector_idx".to_string(),
-                ],
-            })
+            .initialize_mem_wal()
+            .maintained_indexes(["id_btree", "text_fts", "vector_idx"])
+            .execute()
             .await
             .expect("Failed to initialize MemWAL");
 
@@ -4547,10 +4744,9 @@ mod shard_writer_tests {
 
         // Initialize MemWAL with BTree index only (simpler for this test)
         dataset
-            .initialize_mem_wal(MemWalConfig {
-                sharding_spec: None,
-                maintained_indexes: vec!["id_btree".to_string()],
-            })
+            .initialize_mem_wal()
+            .maintained_indexes(["id_btree"])
+            .execute()
             .await
             .expect("Failed to initialize MemWAL");
 
