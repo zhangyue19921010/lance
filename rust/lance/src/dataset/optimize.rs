@@ -1044,7 +1044,7 @@ impl CandidateBin {
 async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
     let indices = dataset.load_indices().await?;
     let mut index_fragmaps = Vec::with_capacity(indices.len());
-    for index in indices.iter() {
+    for index in indices.iter().filter(|index| !is_system_index(index)) {
         if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
             index_fragmaps.push(fragment_bitmap.clone());
         } else {
