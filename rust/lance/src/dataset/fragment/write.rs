@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::write::{do_write_fragments, validate_and_resolve_target_bases};
-use crate::dataset::{DATA_DIR, Dataset, WriteMode, WriteParams};
+use crate::dataset::{DATA_DIR, Dataset, ReadParams, WriteMode, WriteParams};
 
 /// Generates a filename optimized for S3 throughput using a UUID-based approach.
 ///
@@ -330,10 +330,12 @@ impl<'a> FragmentCreateBuilder<'a> {
     }
 
     async fn existing_dataset(&self, params: &WriteParams) -> Result<Option<Dataset>> {
-        let mut builder = DatasetBuilder::from_uri(self.dataset_uri);
-        if let Some(store_params) = params.store_params.clone() {
-            builder = builder.with_store_params(store_params);
-        }
+        let mut builder = DatasetBuilder::from_uri(self.dataset_uri).with_read_params(ReadParams {
+            store_options: params.store_params.clone(),
+            commit_handler: params.commit_handler.clone(),
+            session: params.session.clone(),
+            ..Default::default()
+        });
         if let Some(base_store_params) = &params.base_store_params {
             for (base_path, store_params) in base_store_params {
                 builder = builder.with_base_store_params(base_path, store_params.clone());
@@ -341,7 +343,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         }
         match builder.load().await {
             Ok(dataset) => Ok(Some(dataset)),
-            Err(Error::DatasetNotFound { .. }) => Ok(None),
+            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
