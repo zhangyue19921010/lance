@@ -12,14 +12,13 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::FutureExt;
 use itertools::Itertools;
-use lance_core::cache::{CacheKey, UnsizedCacheKey};
+use lance_core::cache::CacheKey;
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::parse_env_as_bool;
 use lance_core::utils::tracing::{
-    IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR,
-    TRACE_IO_EVENTS,
+    IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS,
 };
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::FileReaderOptions;
@@ -232,34 +231,6 @@ fn segment_has_inverted_details(segment: &IndexMetadata) -> bool {
 }
 
 // Cache keys for different index types
-#[derive(Debug, Clone)]
-pub struct ScalarIndexCacheKey<'a> {
-    pub uuid: &'a str,
-    pub fri_uuid: Option<&'a Uuid>,
-}
-
-impl<'a> ScalarIndexCacheKey<'a> {
-    pub fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
-        Self { uuid, fri_uuid }
-    }
-}
-
-impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
-    type ValueType = dyn ScalarIndex;
-
-    fn key(&self) -> std::borrow::Cow<'_, str> {
-        if let Some(fri_uuid) = self.fri_uuid {
-            format!("{}-{}", self.uuid, fri_uuid).into()
-        } else {
-            self.uuid.into()
-        }
-    }
-
-    fn type_name() -> &'static str {
-        "ScalarIndex"
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct LegacyVectorIndexCacheKey<'a> {
     uuid: &'a str,
@@ -1701,12 +1672,10 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>> {
-        // Checking for cache existence is cheap so we just check both scalar and vector caches
+        // Checking for cache existence is cheap so we just check the vector caches.
+        // Scalar indices cache themselves inside `open_scalar_index` (the cache
+        // key is a plugin detail), so there is no cheap scalar check here.
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
-        let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
-            return Ok(index.as_index());
-        }
 
         // Check sized cache for IvfIndexState (v2+ indices).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
@@ -1766,26 +1735,14 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
-        let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
-            return Ok(index);
-        }
-
+        // Caching (including the choice of in-memory vs. serializable state) is
+        // a plugin implementation detail handled inside `scalar::open_scalar_index`.
         let index_meta = self
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
 
-        let index = scalar::open_scalar_index(self, column, &index_meta, metrics).await?;
-
-        info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_SCALAR, index_type=index.index_type().to_string());
-        metrics.record_index_load();
-
-        self.index_cache
-            .insert_unsized_with_key(&cache_key, index.clone())
-            .await;
-        Ok(index)
+        scalar::open_scalar_index(self, column, &index_meta, metrics).await
     }
 
     async fn open_vector_index(
