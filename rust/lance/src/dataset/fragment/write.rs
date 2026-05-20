@@ -212,8 +212,11 @@ impl<'a> FragmentCreateBuilder<'a> {
         let existing_base_paths = existing_dataset
             .as_ref()
             .map(|dataset| &dataset.manifest.base_paths);
-        let target_bases_info =
-            validate_and_resolve_target_bases(&mut params, existing_base_paths).await?;
+        let target_bases_info = if needs_existing_dataset {
+            validate_and_resolve_target_bases(&mut params, existing_base_paths).await?
+        } else {
+            None
+        };
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
@@ -312,8 +315,16 @@ impl<'a> FragmentCreateBuilder<'a> {
             builder = builder.with_storage_options_accessor(accessor);
         }
         match builder.load().await {
-            Ok(dataset) => Ok(Some(dataset.schema().clone())),
-            Err(Error::DatasetNotFound { .. }) => Ok(None),
+            Ok(dataset) => {
+                // Use the schema from the dataset, because it has the correct
+                // field ids.
+                Ok(Some(dataset.schema().clone()))
+            }
+            Err(Error::DatasetNotFound { .. }) => {
+                // If the dataset does not exist, we can use the schema from
+                // the reader.
+                Ok(None)
+            }
             Err(e) => Err(e),
         }
     }
