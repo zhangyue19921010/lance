@@ -621,12 +621,12 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
+    use lance_index::pb::VectorIndexDetails;
     use lance_index::{IndexType, optimize::OptimizeOptions};
     use lance_index::{
         pbold::NGramIndexDetails,
         scalar::{BuiltinIndexType, ScalarIndexParams},
     };
-    use lance_table::format::pb::VectorIndexDetails;
 
     fn make_index_metadata(
         name: &str,
