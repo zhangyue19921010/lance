@@ -37,9 +37,9 @@ public class ScanOptions {
   private final int batchReadahead;
   private final Optional<List<ColumnOrdering>> columnOrderings;
   private final boolean useScalarIndex;
-  private final boolean fastSearch;
   private final Optional<ByteBuffer> substraitAggregate;
   private final boolean collectStats;
+  private final boolean fastSearch;
 
   public ScanOptions(
       Optional<List<Integer>> fragmentIds,
@@ -57,7 +57,8 @@ public class ScanOptions {
       int batchReadahead,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
-      Optional<ByteBuffer> substraitAggregate) {
+      Optional<ByteBuffer> substraitAggregate,
+      boolean collectStats) {
     this(
         fragmentIds,
         batchSize,
@@ -74,8 +75,8 @@ public class ScanOptions {
         batchReadahead,
         columnOrderings,
         useScalarIndex,
-        false,
         substraitAggregate,
+        collectStats,
         false);
   }
 
@@ -98,8 +99,9 @@ public class ScanOptions {
    * @param batchReadahead Number of batches to read ahead.
    * @param columnOrderings (Optional) Column orderings for result sorting.
    * @param useScalarIndex Whether to use scalar indices for the scan. Default is true.
-   * @param fastSearch Whether to only search indexed fragments. Default is false.
    * @param substraitAggregate (Optional) Substrait aggregate expression for aggregate pushdown.
+   * @param collectStats Whether to collect scan execution statistics. Default is false.
+   * @param fastSearch Whether to only search indexed fragments. Default is false.
    */
   public ScanOptions(
       Optional<List<Integer>> fragmentIds,
@@ -117,9 +119,9 @@ public class ScanOptions {
       int batchReadahead,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
-      boolean fastSearch,
       Optional<ByteBuffer> substraitAggregate,
-      boolean collectStats) {
+      boolean collectStats,
+      boolean fastSearch) {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
@@ -138,9 +140,9 @@ public class ScanOptions {
     this.batchReadahead = batchReadahead;
     this.columnOrderings = columnOrderings;
     this.useScalarIndex = useScalarIndex;
-    this.fastSearch = fastSearch;
     this.substraitAggregate = substraitAggregate;
     this.collectStats = collectStats;
+    this.fastSearch = fastSearch;
   }
 
   /**
@@ -597,9 +599,9 @@ public class ScanOptions {
           batchReadahead,
           columnOrderings,
           useScalarIndex,
-          fastSearch,
           substraitAggregate,
-          collectStats);
+          collectStats,
+          fastSearch);
     }
   }
 }
