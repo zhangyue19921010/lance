@@ -4386,6 +4386,7 @@ dependencies = [
  "log",
  "lzma-sys",
  "mock_instant",
+ "moka",
  "object_store",
  "parquet",
  "permutation",

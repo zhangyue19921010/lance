@@ -4023,6 +4023,7 @@ dependencies = [
  "lance-table",
  "lance-tokenizer",
  "log",
+ "moka",
  "object_store",
  "permutation",
  "pin-project",
