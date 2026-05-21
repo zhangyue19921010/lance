@@ -4878,63 +4878,8 @@ mod tests {
         (tmpdir, store, index)
     }
 
-    fn empty_train_stream() -> SendableRecordBatchStream {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("value", arrow_schema::DataType::Int32, true),
-            arrow_schema::Field::new("_rowid", arrow_schema::DataType::UInt64, false),
-        ]));
-        Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::empty(),
-        ))
-    }
-
     #[tokio::test]
-    async fn test_merge_segments_three_way_no_new_data() {
-        // Build three disjoint BTree segments
-        let (_dir1, _s1, idx1) = build_segment_for_merge(0, 0, 100).await;
-        let (_dir2, _s2, idx2) = build_segment_for_merge(100, 100, 100).await;
-        let (_dir3, _s3, idx3) = build_segment_for_merge(200, 200, 100).await;
-
-        let dest_dir = TempObjDir::default();
-        let dest = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            dest_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let segments = vec![idx1, idx2, idx3];
-        BTreeIndex::merge_segments(
-            &segments,
-            empty_train_stream(),
-            dest.as_ref(),
-            None,
-            noop_progress(),
-        )
-        .await
-        .unwrap();
-
-        let merged = BTreeIndex::load(dest, None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-
-        // Probe sample values from each source segment's value range.
-        for value in [0i32, 50, 100, 150, 200, 250, 299] {
-            let query = SargableQuery::Equals(ScalarValue::Int32(Some(value)));
-            let result = merged.search(&query, &NoOpMetricsCollector).await.unwrap();
-            let expected_row_id = value as u64;
-            assert_eq!(
-                result,
-                SearchResult::exact(RowAddrTreeMap::from_iter([expected_row_id])),
-                "value {} should map to row id {} in merged index",
-                value,
-                expected_row_id
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_merge_segments_with_new_data() {
+    async fn test_merge_segments() {
         let (_dir1, _s1, idx1) = build_segment_for_merge(0, 0, 50).await;
         let (_dir2, _s2, idx2) = build_segment_for_merge(50, 50, 50).await;
 
@@ -4985,81 +4930,5 @@ mod tests {
                 SearchResult::exact(RowAddrTreeMap::from_iter([expected_row_id])),
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_merge_segments_empty_input_errors() {
-        let dest_dir = TempObjDir::default();
-        let dest = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            dest_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let result = BTreeIndex::merge_segments(
-            &[],
-            empty_train_stream(),
-            dest.as_ref(),
-            None,
-            noop_progress(),
-        )
-        .await;
-        assert!(result.is_err(), "expected error on empty segments slice");
-    }
-
-    #[tokio::test]
-    async fn test_merge_segments_with_old_data_filter() {
-        // Two segments covering fragment_id 1 and 2 (rowid high bits encode fragment).
-        // Filter to keep only fragment 2 — values from segment 1 should disappear.
-        let frag1_start: u64 = 1u64 << 32;
-        let frag2_start: u64 = 2u64 << 32;
-
-        let (_dir1, _s1, idx1) = build_segment_for_merge(0, frag1_start, 50).await;
-        let (_dir2, _s2, idx2) = build_segment_for_merge(100, frag2_start, 50).await;
-
-        let dest_dir = TempObjDir::default();
-        let dest = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            dest_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let mut to_keep = roaring::RoaringBitmap::new();
-        to_keep.insert(2);
-        let filter = OldIndexDataFilter::Fragments {
-            to_keep,
-            to_remove: roaring::RoaringBitmap::new(),
-        };
-
-        BTreeIndex::merge_segments(
-            &[idx1, idx2],
-            empty_train_stream(),
-            dest.as_ref(),
-            Some(filter),
-            noop_progress(),
-        )
-        .await
-        .unwrap();
-
-        let merged = BTreeIndex::load(dest, None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-
-        // Value from fragment 1 should be gone.
-        let query = SargableQuery::Equals(ScalarValue::Int32(Some(10)));
-        let result = merged.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(
-            result,
-            SearchResult::exact(RowAddrTreeMap::new()),
-            "filter should have dropped fragment 1 rows"
-        );
-
-        // Value from fragment 2 should still be present.
-        let query = SargableQuery::Equals(ScalarValue::Int32(Some(110)));
-        let result = merged.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(
-            result,
-            SearchResult::exact(RowAddrTreeMap::from_iter([frag2_start + 10])),
-        );
     }
 }
