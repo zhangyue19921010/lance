@@ -1185,6 +1185,8 @@ def write_fragments(
     elif isinstance(dataset_uri, LanceDataset):
         if base_store_params is None:
             base_store_params = dataset_uri._base_store_params
+        if storage_options is None:
+            storage_options = dataset_uri._storage_options
         dataset_uri = dataset_uri._ds
     elif not isinstance(dataset_uri, str):
         raise TypeError(f"Unknown dataset_uri type {type(dataset_uri)}")
