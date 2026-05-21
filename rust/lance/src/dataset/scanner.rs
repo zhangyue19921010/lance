@@ -1146,7 +1146,7 @@ impl Scanner {
     ) -> Result<&mut Self> {
         self.explicit_projection = true;
         self.projection_plan = ProjectionPlan::from_expressions(self.dataset.clone(), columns)?;
-        if self.legacy_with_row_id {
+        if self.legacy_with_row_id || self.fast_search {
             self.projection_plan.include_row_id();
         }
         if self.legacy_with_row_addr {
@@ -1526,9 +1526,6 @@ impl Scanner {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         });
-        if self.fast_search {
-            self.projection_plan.include_row_id();
-        }
         Ok(self)
     }
 
@@ -1630,9 +1627,9 @@ impl Scanner {
     pub fn fast_search(&mut self) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.use_index = true;
-            self.projection_plan.include_row_id();
         }
         self.fast_search = true;
+        self.projection_plan.include_row_id(); // fast search requires _rowid
         self
     }
 
@@ -9778,7 +9775,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         assert_eq!(normal_batch.num_rows(), 15);
         assert_eq!(fast_batch.num_rows(), 5);
-        assert!(fast_batch.schema().field_with_name(ROW_ID).is_err());
+        assert!(fast_batch.schema().field_with_name(ROW_ID).is_ok());
     }
 
     fn make_scalar_filter_test_batch(schema: SchemaRef, start: i32, end: i32) -> RecordBatch {
