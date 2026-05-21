@@ -19,8 +19,8 @@ use lance_index::IndexType;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::BTreeIndexDetails;
 use lance_index::progress::NoopIndexBuildProgress;
-use lance_index::scalar::{ScalarIndex, ScalarIndexParams};
 use lance_index::scalar::btree::BTreeIndex;
+use lance_index::scalar::{ScalarIndex, ScalarIndexParams};
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
@@ -77,6 +77,29 @@ pub(crate) fn plan_segments(
         ));
     }
 
+    // Reject overlapping fragment coverage at planning time so the planner
+    // contract matches the commit-time validation in
+    // `commit_existing_index_segments`. Catching it here gives callers a
+    // clear, build-time error rather than a confusing failure deep inside
+    // the commit transaction.
+    let mut covered = RoaringBitmap::new();
+    for segment in segments {
+        let fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+            Error::index(format!(
+                "Segment '{}' is missing fragment coverage",
+                segment.uuid
+            ))
+        })?;
+        if covered.intersection_len(fragment_bitmap) > 0 {
+            return Err(Error::invalid_input(format!(
+                "BTree segment builder received overlapping fragment coverage \
+                 (segment '{}')",
+                segment.uuid
+            )));
+        }
+        covered |= fragment_bitmap.clone();
+    }
+
     segments
         .iter()
         .map(|segment| {
@@ -113,9 +136,10 @@ pub(crate) fn plan_segments(
 /// Per-fragment BTree training already produces self-contained
 /// `part_<partition_id>_*.lance` files inside the segment UUID directory and
 /// `BTreeIndex::load` knows how to open them via its single-partition
-/// fallback, so finalization is a no-op once we have validated the inputs.
+/// fallback, so finalization is a no-op once we have validated the inputs and
+/// confirmed the staged files actually exist on disk.
 pub(crate) async fn build_segment(
-    _dataset: &Dataset,
+    dataset: &Dataset,
     segment_plan: &IndexSegmentPlan,
 ) -> Result<IndexSegment> {
     let built_segment = segment_plan.segment().clone();
@@ -138,6 +162,31 @@ pub(crate) async fn build_segment(
         ));
     }
     ensure_btree_details(source_segment)?;
+
+    // Verify the staged directory actually contains a BTree lookup file
+    // (canonical `page_lookup.lance` or a `part_*_page_lookup.lance` written
+    // by per-fragment training). Without this, a malformed segment passed
+    // through the builder would become commit-ready and only fail later at
+    // open/query time.
+    let index_dir = dataset.indices_dir().join(source_segment.uuid.to_string());
+    let mut list_stream = dataset.object_store.list(Some(index_dir.clone()));
+    let mut has_lookup = false;
+    while let Some(meta) = futures::StreamExt::next(&mut list_stream).await {
+        let file_name = meta?.location.filename().unwrap_or_default().to_string();
+        if file_name == "page_lookup.lance"
+            || (file_name.starts_with("part_") && file_name.ends_with("_page_lookup.lance"))
+        {
+            has_lookup = true;
+            break;
+        }
+    }
+    if !has_lookup {
+        return Err(Error::invalid_input(format!(
+            "BTree segment '{}' has no BTree lookup file under {}",
+            source_segment.uuid, index_dir
+        )));
+    }
+
     Ok(built_segment)
 }
 
@@ -169,14 +218,21 @@ pub(crate) async fn merge_segments(
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
 
+    // Intersect each segment's stored bitmap with the dataset's current
+    // fragments so we don't try to scan IDs that compaction or pruning has
+    // already retired. The merged segment must only claim live coverage.
+    let dataset_fragments = dataset.fragment_bitmap.as_ref();
     let mut fragment_bitmap = RoaringBitmap::new();
     for segment in &segments {
-        fragment_bitmap |= segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
-            Error::invalid_input(format!(
+        if segment.fragment_bitmap.is_none() {
+            return Err(Error::invalid_input(format!(
                 "CreateIndex: segment {} is missing fragment coverage",
                 segment.uuid
-            ))
-        })?;
+            )));
+        }
+        if let Some(effective) = segment.effective_fragment_bitmap(dataset_fragments) {
+            fragment_bitmap |= effective;
+        }
     }
 
     // Derive training parameters (e.g. zone_size) from one of the source
@@ -211,7 +267,11 @@ pub(crate) async fn merge_segments(
 
     // Plugins are required to return BTreeIndexDetails here, but be defensive
     // so the merge surfaces a clear error if that contract is ever broken.
-    if !created_index.index_details.type_url.ends_with("BTreeIndexDetails") {
+    if !created_index
+        .index_details
+        .type_url
+        .ends_with("BTreeIndexDetails")
+    {
         return Err(Error::internal(format!(
             "merge_existing_index_segments: BTree merge produced unexpected details type_url '{}'",
             created_index.index_details.type_url

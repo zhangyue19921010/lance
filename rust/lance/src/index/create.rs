@@ -1975,13 +1975,12 @@ mod tests {
         let mut expected_fragments = roaring::RoaringBitmap::new();
         for fragment in &fragments {
             expected_fragments.insert(fragment.id() as u32);
-            let segment =
-                CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
-                    .name("id_btree".to_string())
-                    .fragments(vec![fragment.id() as u32])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap();
+            let segment = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+                .name("id_btree".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
             assert!(
                 segment
                     .index_details
@@ -2057,13 +2056,13 @@ mod tests {
             Bound::Included(ScalarValue::Int32(Some(20))),
             Bound::Excluded(ScalarValue::Int32(Some(40))),
         );
-        let result = logical
-            .search(&query, &NoOpMetricsCollector)
-            .await
-            .unwrap();
+        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
         let row_addrs = match result {
             SearchResult::Exact(row_addrs) => row_addrs,
-            other => panic!("expected exact result from segmented btree, got {:?}", other),
+            other => panic!(
+                "expected exact result from segmented btree, got {:?}",
+                other
+            ),
         };
         let matched = row_addrs.true_rows().row_addrs().unwrap().count();
         assert_eq!(matched, 20);
@@ -2098,22 +2097,65 @@ mod tests {
 
         let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
         let fragments = dataset.get_fragments();
-        let mut input_segments = Vec::new();
+        assert!(fragments.len() >= 2);
+
+        // Step 1: build one staged BTree segment per fragment.
+        let mut staged_segments = Vec::new();
         let mut expected_fragments = roaring::RoaringBitmap::new();
         for fragment in &fragments {
             expected_fragments.insert(fragment.id() as u32);
-            let segment =
-                CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
-                    .name("id_btree".to_string())
-                    .fragments(vec![fragment.id() as u32])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap();
-            input_segments.push(segment);
+            let segment = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+                .name("id_btree".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            staged_segments.push(segment);
         }
+        let staged_uuids: std::collections::HashSet<_> =
+            staged_segments.iter().map(|s| s.uuid).collect();
 
+        // Step 2: commit them as a multi-segment logical index.
+        dataset
+            .commit_existing_index_segments("id_btree", "id", staged_segments)
+            .await
+            .unwrap();
+        let pre_merge_committed = dataset.load_indices_by_name("id_btree").await.unwrap();
+        assert_eq!(pre_merge_committed.len(), fragments.len());
+        let pre_merge_uuids: std::collections::HashSet<_> =
+            pre_merge_committed.iter().map(|idx| idx.uuid).collect();
+        assert_eq!(pre_merge_uuids, staged_uuids);
+
+        // Step 3: each committed segment must be usable for queries via the
+        // logical view, otherwise we are not actually merging "independent
+        // segments" in step 4.
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(0))),
+            Bound::Excluded(ScalarValue::Int32(Some(50))),
+        );
+        let pre_merge_logical = crate::index::scalar_logical::open_named_scalar_index(
+            &dataset,
+            "id",
+            "id_btree",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        let pre_merge_matched = match pre_merge_logical
+            .search(&query, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+        {
+            SearchResult::Exact(row_addrs) => row_addrs.true_rows().row_addrs().unwrap().count(),
+            other => panic!("expected exact result before merge, got {other:?}"),
+        };
+        assert_eq!(pre_merge_matched, 50);
+
+        // Step 4: re-load the committed segments and consolidate them.
+        let source_segments = dataset.load_indices_by_name("id_btree").await.unwrap();
+        assert_eq!(source_segments.len(), fragments.len());
         let merged = dataset
-            .merge_existing_index_segments(input_segments)
+            .merge_existing_index_segments(source_segments)
             .await
             .unwrap();
         assert_eq!(
@@ -2132,42 +2174,43 @@ mod tests {
                 .ends_with("BTreeIndexDetails")
         );
 
+        // Step 5: commit the merged segment; it should replace the previously
+        // committed per-fragment segments rather than coexist with them.
+        let merged_uuid = merged.uuid;
         dataset
             .commit_existing_index_segments("id_btree", "id", vec![merged])
             .await
             .unwrap();
-
-        let committed = dataset.load_indices_by_name("id_btree").await.unwrap();
-        assert_eq!(committed.len(), 1);
+        let post_merge_committed = dataset.load_indices_by_name("id_btree").await.unwrap();
+        assert_eq!(post_merge_committed.len(), 1);
+        assert_eq!(post_merge_committed[0].uuid, merged_uuid);
         assert_eq!(
-            committed[0]
+            post_merge_committed[0]
                 .fragment_bitmap
                 .as_ref()
                 .expect("committed BTree segment should have fragment coverage"),
             &expected_fragments
         );
 
-        let scalar_index = crate::index::scalar::open_scalar_index(
+        // Step 6: same query still returns the same set of rows through the
+        // single-segment logical view.
+        let post_merge_logical = crate::index::scalar_logical::open_named_scalar_index(
             &dataset,
             "id",
-            &committed[0],
+            "id_btree",
             &NoOpMetricsCollector,
         )
         .await
         .unwrap();
-        let query = SargableQuery::Range(
-            Bound::Included(ScalarValue::Int32(Some(0))),
-            Bound::Excluded(ScalarValue::Int32(Some(50))),
-        );
-        let result = scalar_index
+        let post_merge_matched = match post_merge_logical
             .search(&query, &NoOpMetricsCollector)
             .await
-            .unwrap();
-        let matched = match result {
+            .unwrap()
+        {
             SearchResult::Exact(row_addrs) => row_addrs.true_rows().row_addrs().unwrap().count(),
-            other => panic!("expected exact result from merged btree, got {:?}", other),
+            other => panic!("expected exact result after merge, got {other:?}"),
         };
-        assert_eq!(matched, 50);
+        assert_eq!(post_merge_matched, pre_merge_matched);
     }
 
     #[tokio::test]
@@ -2556,27 +2599,34 @@ mod tests {
         // Load indices after optimization
         let indices_after = dataset.load_indices().await.unwrap();
 
-        // There should be 3 indices:
-        // 1. one scalar index with name "id_idx", and the bitmap is [0,1]
-        // 2. one delta vector index with name "vector_idx", and the bitmap is [0]
-        // 3. one delta vector index with name "vector_idx", and the bitmap is [1]
-        assert_eq!(indices_after.len(), 3, "{:?}", indices_after);
-        let id_idx = indices_after
+        // `OptimizeOptions::append()` (`num_indices_to_merge == Some(0)`)
+        // means "don't merge any existing segments, just publish a delta for
+        // the unindexed fragments". The append path must not silently rewrite
+        // any pre-existing segment — neither vector nor scalar. So after
+        // optimize we expect 4 indices:
+        // 1. one scalar (BTree) `id_idx` covering [0] (the original segment)
+        // 2. one scalar (BTree) `id_idx` covering [1] (the new delta)
+        // 3. one vector `vector_idx` covering [0]
+        // 4. one vector `vector_idx` covering [1]
+        assert_eq!(indices_after.len(), 4, "{:?}", indices_after);
+        let id_indices = indices_after
             .iter()
-            .find(|idx| idx.name == "id_idx")
-            .unwrap();
+            .filter(|idx| idx.name == "id_idx")
+            .collect::<Vec<_>>();
         let vector_indices = indices_after
             .iter()
             .filter(|idx| idx.name == "vector_idx")
             .collect::<Vec<_>>();
-        assert!(
-            id_idx
-                .fragment_bitmap
-                .as_ref()
-                .unwrap()
-                .contains_range(0..2)
-                && id_idx.fragment_bitmap.as_ref().unwrap().len() == 2
-        );
+        assert_eq!(id_indices.len(), 2);
+        for frag in [0_u32, 1] {
+            assert!(
+                id_indices.iter().any(|idx| {
+                    let bitmap = idx.fragment_bitmap.as_ref().unwrap();
+                    bitmap.contains(frag) && bitmap.len() == 1
+                }),
+                "append() should preserve scalar segment for fragment {frag}"
+            );
+        }
         assert_eq!(vector_indices.len(), 2);
         assert!(
             vector_indices
