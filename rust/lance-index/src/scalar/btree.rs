@@ -1372,20 +1372,6 @@ impl BTreeIndex {
 
     /// Merge N source BTree segments plus an additional `new_data` stream into
     /// a single BTree under `dest_store`, without re-reading the dataset.
-    ///
-    /// Mirrors [`InvertedIndex::merge_segments`]: each source segment's
-    /// already-sorted `(value, _rowid)` page data is replayed as one input
-    /// stream; `new_data` is appended as the last input; an N+1-way
-    /// `SortPreservingMerge` produces the globally-ordered training stream
-    /// that is fed back through [`train_btree_index`].
-    ///
-    /// `old_data_filter` is applied uniformly to every source stream — same
-    /// semantics as [`Self::update`]: drop rows from fragments / row IDs that
-    /// have been pruned at the dataset level.
-    ///
-    /// `progress` is accepted for signature parity with
-    /// `InvertedIndex::merge_segments`; the BTree training pipeline does not
-    /// yet emit progress events, so the handle is intentionally unused.
     pub async fn merge_segments(
         segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,

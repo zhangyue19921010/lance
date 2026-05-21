@@ -9,9 +9,19 @@
 //! `part_<partition_id>_page_data.lance` and `part_<partition_id>_page_lookup.lance`
 //! under its own segment UUID. Those single-partition files are directly
 //! loadable through [`crate::index::scalar::open_scalar_index`] (via
-//! `BTreeIndex::load`'s single-partition fallback), so the segment-level
-//! planner and finalizer here only need to validate input, surface a 1:1 plan,
-//! and assemble a commit-ready `IndexSegment` per source.
+//! `BTreeIndex::load`'s single-partition fallback).
+//!
+//! This module exposes two layers of segment plumbing on top of those files:
+//!
+//! * **1:1 passthrough** — without a `target_segment_bytes` budget, each staged
+//!   source becomes its own physical output. [`plan_segments`] emits one plan
+//!   per source and [`build_segment`] only validates the staged files exist.
+//! * **N:1 consolidation** — when `target_segment_bytes` is set,
+//!   [`plan_segments`] packs sources greedily into size-bounded groups, and
+//!   [`build_segment`] delegates each multi-source group to [`merge_segments`],
+//!   which opens every source as a [`BTreeIndex`] and runs the k-way
+//!   [`BTreeIndex::merge_segments`] over the already-sorted page data — no
+//!   dataset scan, no retraining from raw rows.
 
 use std::sync::Arc;
 

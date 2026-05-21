@@ -1941,7 +1941,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_index_segment_builder_btree_commits_multi_segment_logical_index() {
+    async fn test_btree_index_segment_builder() {
         use datafusion::common::ScalarValue;
         use lance_index::scalar::{SargableQuery, SearchResult};
         use std::ops::Bound;
@@ -1991,40 +1991,50 @@ mod tests {
             );
             input_segments.push(segment);
         }
+        let input_uuids: std::collections::HashSet<_> =
+            input_segments.iter().map(|s| s.uuid).collect();
+
+        // Pick a target byte budget larger than the sum of all staged
+        // segments so the planner packs every source into one group.
+        let target_segment_bytes: u64 = 100 * 1024 * 1024;
 
         let plans = dataset
             .create_index_segment_builder()
             .with_index_type(IndexType::BTree)
             .with_segments(input_segments.clone())
+            .with_target_segment_bytes(target_segment_bytes)
             .plan()
             .await
             .unwrap();
-        assert_eq!(plans.len(), input_segments.len());
-        for plan in &plans {
-            assert_eq!(plan.requested_index_type(), Some(IndexType::BTree));
-            assert_eq!(plan.segments().len(), 1);
-        }
+        // N:1 grouping → exactly one consolidated plan covering all sources.
+        assert_eq!(plans.len(), 1, "planner should pack all sources into one group");
+        let plan = &plans[0];
+        assert_eq!(plan.requested_index_type(), Some(IndexType::BTree));
+        assert_eq!(plan.segments().len(), input_segments.len());
 
         let segments = dataset
             .create_index_segment_builder()
             .with_index_type(IndexType::BTree)
             .with_segments(input_segments.clone())
+            .with_target_segment_bytes(target_segment_bytes)
             .build_all()
             .await
             .unwrap();
-        assert_eq!(segments.len(), input_segments.len());
-
-        let mut built_segment_ids = segments
-            .iter()
-            .map(|segment| segment.uuid())
-            .collect::<Vec<_>>();
-        built_segment_ids.sort();
-        let mut input_segment_ids = input_segments
-            .iter()
-            .map(|segment| segment.uuid)
-            .collect::<Vec<_>>();
-        input_segment_ids.sort();
-        assert_eq!(built_segment_ids, input_segment_ids);
+        // Exactly one physical segment is produced — proving the k-way merge
+        // path consolidated the staged inputs rather than passing them
+        // through 1:1.
+        assert_eq!(segments.len(), 1);
+        let built_uuid = segments[0].uuid();
+        assert!(
+            !input_uuids.contains(&built_uuid),
+            "merged segment must own a fresh UUID, got {} (in input set)",
+            built_uuid
+        );
+        assert_eq!(
+            segments[0].fragment_bitmap(),
+            &expected_fragments,
+            "merged segment should cover the union of all input fragments"
+        );
 
         dataset
             .commit_existing_index_segments("id_btree", "id", segments)
@@ -2032,21 +2042,26 @@ mod tests {
             .unwrap();
 
         let committed = dataset.load_indices_by_name("id_btree").await.unwrap();
-        assert_eq!(committed.len(), input_segments.len());
+        assert_eq!(
+            committed.len(),
+            1,
+            "committed logical index should have exactly one segment after N:1 merge"
+        );
+        let committed_segment = &committed[0];
+        assert_eq!(committed_segment.uuid, built_uuid);
+        assert_eq!(
+            committed_segment
+                .fragment_bitmap
+                .as_ref()
+                .expect("committed BTree segment should carry fragment coverage"),
+            &expected_fragments
+        );
 
-        let committed_fragments = committed
-            .iter()
-            .filter_map(|idx| idx.fragment_bitmap.clone())
-            .fold(roaring::RoaringBitmap::new(), |mut acc, bitmap| {
-                acc |= bitmap;
-                acc
-            });
-        assert_eq!(committed_fragments, expected_fragments);
-
-        let column_field_path = "id".to_string();
+        // Range query over the merged single segment returns the expected
+        // rows — proves the k-way merge preserved data correctly.
         let logical = crate::index::scalar_logical::open_named_scalar_index(
             &dataset,
-            &column_field_path,
+            "id",
             "id_btree",
             &NoOpMetricsCollector,
         )
@@ -2060,7 +2075,7 @@ mod tests {
         let row_addrs = match result {
             SearchResult::Exact(row_addrs) => row_addrs,
             other => panic!(
-                "expected exact result from segmented btree, got {:?}",
+                "expected exact result from merged btree, got {:?}",
                 other
             ),
         };
@@ -2069,7 +2084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_existing_index_segments_supports_btree_segments() {
+    async fn test_btree_merge_existing_index_segments() {
         use datafusion::common::ScalarValue;
         use lance_index::scalar::{SargableQuery, SearchResult};
         use std::ops::Bound;

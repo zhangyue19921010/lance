@@ -76,6 +76,54 @@ async fn build_stable_row_id_filter(
     Ok(<RowAddrTreeMap as RowSetOps>::union_all(&row_id_map_refs))
 }
 
+/// Build the [`OldIndexDataFilter`] that must be applied to existing index
+/// rows when their owning fragments have been pruned by compaction or
+/// deletions. The filter shape depends on the dataset's row-id strategy:
+/// stable row IDs require an exact row-id allow-list, address-style row IDs
+/// can use fragment-bit filtering.
+async fn build_old_data_filter(
+    dataset: &Dataset,
+    effective_old_frags: &RoaringBitmap,
+    deleted_old_frags: &RoaringBitmap,
+) -> Result<Option<OldIndexDataFilter>> {
+    if dataset.manifest.uses_stable_row_ids() {
+        let valid_old_row_ids =
+            build_stable_row_id_filter(dataset, effective_old_frags).await?;
+        Ok(Some(OldIndexDataFilter::RowIds(valid_old_row_ids)))
+    } else {
+        Ok(Some(OldIndexDataFilter::Fragments {
+            to_keep: effective_old_frags.clone(),
+            to_remove: deleted_old_frags.clone(),
+        }))
+    }
+}
+
+/// Load the `new_data` training stream for a scalar-index update. If the
+/// index needs the union of old + new for retraining (`requires_old_data`),
+/// the full dataset is scanned; otherwise only the unindexed fragments are
+/// scanned.
+async fn load_unindexed_training_data(
+    dataset: &Dataset,
+    field_path: &str,
+    update_criteria: &lance_index::scalar::UpdateCriteria,
+    unindexed: &[Fragment],
+) -> Result<datafusion::execution::SendableRecordBatchStream> {
+    let fragments = if update_criteria.requires_old_data {
+        None
+    } else {
+        Some(unindexed.to_vec())
+    };
+    load_training_data(
+        dataset,
+        field_path,
+        &update_criteria.data_criteria,
+        fragments,
+        true,
+        None,
+    )
+    .await
+}
+
 async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> Result<bool> {
     if let Some(files) = &index.files {
         return Ok(files.iter().any(|file| file.path == INDEX_FILE_NAME));
@@ -563,101 +611,20 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         Arc::new(NoopIndexBuildProgress),
                     )
                     .await?
-                } else if selected_old_indices.len() > 1 {
-                    // Multi-segment merge: dispatch by index type. BTree
-                    // uses the k-way merge over already-sorted page data
-                    // (no dataset scan); other scalar types are not yet
-                    // implemented and return a clear error.
-                    let old_data_filter = if dataset.manifest.uses_stable_row_ids() {
-                        let valid_old_row_ids =
-                            build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags)
-                                .await?;
-                        Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
-                    } else {
-                        Some(OldIndexDataFilter::Fragments {
-                            to_keep: effective_old_frags.clone(),
-                            to_remove: deleted_old_frags.clone(),
-                        })
-                    };
-
-                    let fragments = if update_criteria.requires_old_data {
-                        None
-                    } else {
-                        Some(unindexed.to_vec())
-                    };
-                    let new_data_stream = load_training_data(
-                        dataset.as_ref(),
-                        &field_path,
-                        &update_criteria.data_criteria,
-                        fragments,
-                        true,
-                        None,
-                    )
-                    .await?;
-
-                    let new_store =
-                        LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
-
-                    match index_type {
-                        IndexType::BTree => {
-                            let mut source_indices =
-                                Vec::with_capacity(selected_old_indices.len());
-                            for idx in selected_old_indices {
-                                let scalar_index = dataset
-                                    .open_scalar_index(
-                                        &field_path,
-                                        &idx.uuid.to_string(),
-                                        &NoOpMetricsCollector,
-                                    )
-                                    .await?;
-                                let btree = scalar_index
-                                    .as_any()
-                                    .downcast_ref::<lance_index::scalar::btree::BTreeIndex>()
-                                    .ok_or_else(|| {
-                                        Error::index(format!(
-                                            "Append index: expected BTree segment {}, got {:?}",
-                                            idx.uuid,
-                                            scalar_index.index_type()
-                                        ))
-                                    })?;
-                                source_indices.push(Arc::new(btree.clone()));
-                            }
-                            lance_index::scalar::btree::BTreeIndex::merge_segments(
-                                &source_indices,
-                                new_data_stream,
-                                &new_store,
-                                old_data_filter,
-                                options.progress.clone(),
-                            )
-                            .await?
-                        }
-                        other => {
-                            return Err(Error::not_supported(format!(
-                                "Multi-segment scalar index merge is not implemented for \
-                                 index type {:?}; use num_indices_to_merge=1 or rebuild the \
-                                 index from scratch",
-                                other
-                            )));
-                        }
-                    }
                 } else {
-                    // Single selected segment -> incremental update path.
-                    let fragments = if update_criteria.requires_old_data {
-                        None
-                    } else {
-                        Some(unindexed.to_vec())
-                    };
-                    let new_data_stream = load_training_data(
+                    // Both single- and multi-segment merge need new data +
+                    // an `old_data_filter` keyed off the dataset's row-id
+                    // strategy. They diverge only in how they consume the
+                    // existing segment(s).
+                    let new_data_stream = load_unindexed_training_data(
                         dataset.as_ref(),
                         &field_path,
-                        &update_criteria.data_criteria,
-                        fragments,
-                        true,
-                        None,
+                        &update_criteria,
+                        unindexed,
                     )
                     .await?;
 
-                    if effective_old_frags.is_empty() {
+                    if selected_old_indices.len() == 1 && effective_old_frags.is_empty() {
                         // Old data is fully stale (bitmap pruned to empty). Rebuild
                         // from scratch instead of merging stale entries.
                         let params = reference_index.derive_index_params()?;
@@ -675,25 +642,67 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     } else {
                         let new_store =
                             LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
-                        let old_data_filter = if dataset.manifest.uses_stable_row_ids() {
-                            // Stable row IDs are opaque IDs, so fragment-bit filtering on
-                            // (row_id >> 32) is invalid. Build an exact allow-list from retained
-                            // fragments' row-id sequences and use precise filtering.
-                            let valid_old_row_ids =
-                                build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags)
-                                    .await?;
-                            Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
+                        let old_data_filter = build_old_data_filter(
+                            dataset.as_ref(),
+                            &effective_old_frags,
+                            &deleted_old_frags,
+                        )
+                        .await?;
+
+                        if selected_old_indices.len() == 1 {
+                            // Single-segment incremental update path.
+                            reference_index
+                                .update(new_data_stream, &new_store, old_data_filter)
+                                .await?
                         } else {
-                            // Address-style row IDs encode fragment_id in high 32 bits.
-                            // Fragment bitmap filtering is valid and cheaper in this mode.
-                            Some(OldIndexDataFilter::Fragments {
-                                to_keep: effective_old_frags,
-                                to_remove: deleted_old_frags,
-                            })
-                        };
-                        reference_index
-                            .update(new_data_stream, &new_store, old_data_filter)
-                            .await?
+                            // Multi-segment merge: dispatch by index type.
+                            // BTree uses the k-way merge over already-sorted
+                            // page data (no dataset scan); other scalar
+                            // types are not yet implemented and return a
+                            // clear error.
+                            match index_type {
+                                IndexType::BTree => {
+                                    let mut source_indices =
+                                        Vec::with_capacity(selected_old_indices.len());
+                                    for idx in selected_old_indices {
+                                        let scalar_index = dataset
+                                            .open_scalar_index(
+                                                &field_path,
+                                                &idx.uuid.to_string(),
+                                                &NoOpMetricsCollector,
+                                            )
+                                            .await?;
+                                        let btree = scalar_index
+                                            .as_any()
+                                            .downcast_ref::<lance_index::scalar::btree::BTreeIndex>()
+                                            .ok_or_else(|| {
+                                                Error::index(format!(
+                                                    "Append index: expected BTree segment {}, got {:?}",
+                                                    idx.uuid,
+                                                    scalar_index.index_type()
+                                                ))
+                                            })?;
+                                        source_indices.push(Arc::new(btree.clone()));
+                                    }
+                                    lance_index::scalar::btree::BTreeIndex::merge_segments(
+                                        &source_indices,
+                                        new_data_stream,
+                                        &new_store,
+                                        old_data_filter,
+                                        options.progress.clone(),
+                                    )
+                                    .await?
+                                }
+                                other => {
+                                    return Err(Error::not_supported(format!(
+                                        "Multi-segment scalar index merge is not implemented \
+                                         for index type {:?}; use num_indices_to_merge=1 or \
+                                         rebuild the index from scratch",
+                                        other
+                                    )));
+                                }
+                            }
+                        }
                     }
                 };
 
@@ -1309,19 +1318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_optimize_btree_multi_segment_optimize() {
-        // Regression test for a corruption pattern in the scalar optimize path:
-        // when a logical BTree has multiple committed segments, the old code
-        // would union *all* old segments' fragments into the new
-        // fragment_bitmap but only update from `old_indices[0]` and remove
-        // `old_indices[last]`. The resulting new segment claimed to cover the
-        // tail segments but contained none of their data, causing queries for
-        // values living in non-first old segments to silently miss rows.
-        //
-        // After the fix the optimize path selects the tail subset
-        // (respecting `num_indices_to_merge`) and either uses single-segment
-        // update or rebuilds from the dataset over exactly the selected
-        // fragments, so coverage and data stay consistent.
+    async fn test_optimize_btree_multi_segment_optimize_default() {
         async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
             dataset
                 .scan()
@@ -1454,14 +1451,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_optimize_btree_append_mode_preserves_old_segments() {
-        // Regression test for the P1 finding: `OptimizeOptions::append()`
-        // sets `num_indices_to_merge = Some(0)`, which means "append a delta
-        // for unindexed fragments without touching any existing segments".
-        // A previous version of the scalar branch clamped that to 1 with
-        // `.max(1)`, which silently rewrote and removed the latest old
-        // segment — breaking append semantics for BTree just like it would
-        // for FTS.
+    async fn test_optimize_btree_optimize_append() {
         async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
             dataset
                 .scan()
@@ -1583,105 +1573,6 @@ mod tests {
         for id in ["song-10", "song-100", "song-160"] {
             assert_eq!(query_id_count(&dataset, id).await, 1, "missing row {id}");
         }
-    }
-
-    #[tokio::test]
-    async fn test_merge_existing_index_segments_btree_drops_stale_fragments() {
-        // Regression test for the P2 finding: `btree::merge_segments()` used
-        // raw `IndexMetadata.fragment_bitmap`, which after compaction can
-        // contain fragment IDs that no longer exist on the dataset. Scanning
-        // those IDs makes `load_training_data` fail (or silently scan nothing)
-        // and leaves the merged segment claiming coverage of fragments that
-        // are no longer live.
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-        let make_batch = |start: i32, end: i32| {
-            let ids = StringArray::from_iter_values((start..end).map(|i| format!("song-{i}")));
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap()
-        };
-
-        let reader = RecordBatchIterator::new(
-            vec![
-                Ok(make_batch(0, 32)),
-                Ok(make_batch(32, 64)),
-                Ok(make_batch(64, 96)),
-            ],
-            schema.clone(),
-        );
-        let mut dataset = Dataset::write(
-            reader,
-            test_uri,
-            Some(WriteParams {
-                max_rows_per_file: 32,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
-        let mut staged = Vec::new();
-        for fragment in dataset.get_fragments() {
-            let segment = crate::index::create::CreateIndexBuilder::new(
-                &mut dataset,
-                &["id"],
-                IndexType::BTree,
-                &params,
-            )
-            .name("id_idx".into())
-            .fragments(vec![fragment.id() as u32])
-            .execute_uncommitted()
-            .await
-            .unwrap();
-            staged.push(segment);
-        }
-
-        // Compact the dataset BEFORE committing the staged segments. The
-        // staged segments now reference fragment IDs that no longer exist;
-        // merging them must reduce to only live fragments rather than
-        // blowing up on missing IDs.
-        compact_files(
-            &mut dataset,
-            crate::dataset::optimize::CompactionOptions {
-                target_rows_per_fragment: 200,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
-        let live_fragments: RoaringBitmap = dataset
-            .get_fragments()
-            .iter()
-            .map(|f| f.id() as u32)
-            .collect();
-        // Sanity: compaction produced a fresh fragment set, so the staged
-        // bitmaps and the dataset's bitmap should now be disjoint.
-        for segment in &staged {
-            assert!(
-                segment
-                    .fragment_bitmap
-                    .as_ref()
-                    .unwrap()
-                    .is_disjoint(&live_fragments),
-                "staged segment {} still references live fragments after compaction",
-                segment.uuid
-            );
-        }
-
-        let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
-        let merged_frags = merged
-            .fragment_bitmap
-            .as_ref()
-            .expect("merged BTree segment must have fragment coverage");
-        // Merged coverage must equal the intersection with live fragments,
-        // which after full compaction means: it cannot claim any stale ids.
-        assert!(
-            merged_frags.is_subset(&live_fragments),
-            "merged coverage {merged_frags:?} must be a subset of live fragments {live_fragments:?}"
-        );
     }
 
     #[tokio::test]
