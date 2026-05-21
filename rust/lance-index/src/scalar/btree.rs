@@ -4852,7 +4852,7 @@ mod tests {
         value_start: i32,
         rowid_start: u64,
         count: u64,
-    ) -> (Arc<LanceIndexStore>, Arc<BTreeIndex>) {
+    ) -> (TempObjDir, Arc<LanceIndexStore>, Arc<BTreeIndex>) {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -4875,9 +4875,7 @@ mod tests {
         let index = BTreeIndex::load(store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
-        // Forget tmpdir so the store outlives the call.
-        std::mem::forget(tmpdir);
-        (store, index)
+        (tmpdir, store, index)
     }
 
     fn empty_train_stream() -> SendableRecordBatchStream {
@@ -4894,9 +4892,9 @@ mod tests {
     #[tokio::test]
     async fn test_merge_segments_three_way_no_new_data() {
         // Build three disjoint BTree segments
-        let (_s1, idx1) = build_segment_for_merge(0, 0, 100).await;
-        let (_s2, idx2) = build_segment_for_merge(100, 100, 100).await;
-        let (_s3, idx3) = build_segment_for_merge(200, 200, 100).await;
+        let (_dir1, _s1, idx1) = build_segment_for_merge(0, 0, 100).await;
+        let (_dir2, _s2, idx2) = build_segment_for_merge(100, 100, 100).await;
+        let (_dir3, _s3, idx3) = build_segment_for_merge(200, 200, 100).await;
 
         let dest_dir = TempObjDir::default();
         let dest = Arc::new(LanceIndexStore::new(
@@ -4937,8 +4935,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_segments_with_new_data() {
-        let (_s1, idx1) = build_segment_for_merge(0, 0, 50).await;
-        let (_s2, idx2) = build_segment_for_merge(50, 50, 50).await;
+        let (_dir1, _s1, idx1) = build_segment_for_merge(0, 0, 50).await;
+        let (_dir2, _s2, idx2) = build_segment_for_merge(50, 50, 50).await;
 
         // new_data covers values 100..150 with row_ids 100..150.
         let new_source = gen_batch()
@@ -5016,8 +5014,8 @@ mod tests {
         let frag1_start: u64 = 1u64 << 32;
         let frag2_start: u64 = 2u64 << 32;
 
-        let (_s1, idx1) = build_segment_for_merge(0, frag1_start, 50).await;
-        let (_s2, idx2) = build_segment_for_merge(100, frag2_start, 50).await;
+        let (_dir1, _s1, idx1) = build_segment_for_merge(0, frag1_start, 50).await;
+        let (_dir2, _s2, idx2) = build_segment_for_merge(100, frag2_start, 50).await;
 
         let dest_dir = TempObjDir::default();
         let dest = Arc::new(LanceIndexStore::new(

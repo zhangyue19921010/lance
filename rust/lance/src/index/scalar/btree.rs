@@ -183,12 +183,9 @@ pub(crate) fn plan_segments(
                 }
             }
 
-            // For singleton groups, preserve the source UUID and version so
-            // `build_segment` can fast-path validate the existing files.
-            // For multi-source groups, allocate a fresh UUID; the real
-            // version is decided by `merge_segments` at build time and will
-            // overwrite this placeholder in `build_segment`.
-            let (placeholder_uuid, version, details) = if group.len() == 1 {
+            // For singleton groups, preserve the source UUID. For multi-source
+            // groups, this UUID is the final merged segment destination.
+            let (output_uuid, version, details) = if group.len() == 1 {
                 let only = group[0];
                 (only.uuid, only.index_version, ensure_btree_details(only)?)
             } else {
@@ -200,7 +197,7 @@ pub(crate) fn plan_segments(
             };
 
             let built_segment =
-                IndexSegment::new(placeholder_uuid, group_bitmap.iter(), details, version);
+                IndexSegment::new(output_uuid, group_bitmap.iter(), details, version);
             let source_metadata: Vec<IndexMetadata> = group.into_iter().cloned().collect();
             Ok(IndexSegmentPlan::new(
                 built_segment,
@@ -237,7 +234,12 @@ pub(crate) async fn build_segment(
 
     // Multi-source group → k-way merge via the inherent `merge_segments` Layer 2.
     if source_segments.len() > 1 {
-        let merged_metadata = merge_segments(dataset, source_segments.to_vec()).await?;
+        let merged_metadata = merge_segments(
+            dataset,
+            source_segments.to_vec(),
+            Some(segment_plan.segment().uuid()),
+        )
+        .await?;
         let fragment_bitmap = merged_metadata.fragment_bitmap.ok_or_else(|| {
             Error::internal(
                 "merge_segments returned metadata without fragment coverage".to_string(),
@@ -305,6 +307,7 @@ pub(crate) async fn build_segment(
 pub(crate) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
+    output_uuid: Option<Uuid>,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -354,8 +357,8 @@ pub(crate) async fn merge_segments(
         source_indices.push(Arc::new(btree.clone()));
     }
 
-    let new_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid.to_string())?;
+    let output_uuid = output_uuid.unwrap_or_else(Uuid::new_v4);
+    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &output_uuid.to_string())?;
     let empty_new_data = empty_btree_update_stream(dataset, field_id)?;
     let created_index = BTreeIndex::merge_segments(
         &source_indices,
@@ -384,7 +387,7 @@ pub(crate) async fn merge_segments(
     );
 
     Ok(IndexMetadata {
-        uuid: new_uuid,
+        uuid: output_uuid,
         fields: vec![field_id],
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(fragment_bitmap),

@@ -87,8 +87,7 @@ async fn build_old_data_filter(
     deleted_old_frags: &RoaringBitmap,
 ) -> Result<Option<OldIndexDataFilter>> {
     if dataset.manifest.uses_stable_row_ids() {
-        let valid_old_row_ids =
-            build_stable_row_id_filter(dataset, effective_old_frags).await?;
+        let valid_old_row_ids = build_stable_row_id_filter(dataset, effective_old_frags).await?;
         Ok(Some(OldIndexDataFilter::RowIds(valid_old_row_ids)))
     } else {
         Ok(Some(OldIndexDataFilter::Fragments {

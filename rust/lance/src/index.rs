@@ -1090,7 +1090,7 @@ impl DatasetIndexExt for Dataset {
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
         } else {
-            crate::index::scalar::btree::merge_segments(self, source_segments).await?
+            crate::index::scalar::btree::merge_segments(self, source_segments, None).await?
         };
         merged_segment.dataset_version = self.manifest.version;
         merged_segment.fields = vec![field_id];

@@ -1998,33 +1998,34 @@ mod tests {
         // segments so the planner packs every source into one group.
         let target_segment_bytes: u64 = 100 * 1024 * 1024;
 
-        let plans = dataset
+        let builder = dataset
             .create_index_segment_builder()
             .with_index_type(IndexType::BTree)
             .with_segments(input_segments.clone())
-            .with_target_segment_bytes(target_segment_bytes)
-            .plan()
-            .await
-            .unwrap();
+            .with_target_segment_bytes(target_segment_bytes);
+        let plans = builder.plan().await.unwrap();
         // N:1 grouping → exactly one consolidated plan covering all sources.
-        assert_eq!(plans.len(), 1, "planner should pack all sources into one group");
+        assert_eq!(
+            plans.len(),
+            1,
+            "planner should pack all sources into one group"
+        );
         let plan = &plans[0];
         assert_eq!(plan.requested_index_type(), Some(IndexType::BTree));
         assert_eq!(plan.segments().len(), input_segments.len());
 
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_index_type(IndexType::BTree)
-            .with_segments(input_segments.clone())
-            .with_target_segment_bytes(target_segment_bytes)
-            .build_all()
-            .await
-            .unwrap();
+        let segment = builder.build(plan).await.unwrap();
+        let segments = vec![segment];
         // Exactly one physical segment is produced — proving the k-way merge
         // path consolidated the staged inputs rather than passing them
         // through 1:1.
         assert_eq!(segments.len(), 1);
         let built_uuid = segments[0].uuid();
+        assert_eq!(
+            built_uuid,
+            plan.segment().uuid(),
+            "merged segment should use the UUID assigned by its plan"
+        );
         assert!(
             !input_uuids.contains(&built_uuid),
             "merged segment must own a fresh UUID, got {} (in input set)",
@@ -2035,6 +2036,7 @@ mod tests {
             &expected_fragments,
             "merged segment should cover the union of all input fragments"
         );
+        drop(builder);
 
         dataset
             .commit_existing_index_segments("id_btree", "id", segments)
@@ -2074,10 +2076,7 @@ mod tests {
         let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
         let row_addrs = match result {
             SearchResult::Exact(row_addrs) => row_addrs,
-            other => panic!(
-                "expected exact result from merged btree, got {:?}",
-                other
-            ),
+            other => panic!("expected exact result from merged btree, got {:?}", other),
         };
         let matched = row_addrs.true_rows().row_addrs().unwrap().count();
         assert_eq!(matched, 20);
