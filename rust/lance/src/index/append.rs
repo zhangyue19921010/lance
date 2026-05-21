@@ -504,16 +504,33 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 ))
             }
             it if it.is_scalar() => {
+                // Pick the tail subset to merge, mirroring the FTS branch. With a
+                // single old segment this is just that segment; with multiple
+                // committed segments we respect `num_indices_to_merge` and only
+                // touch the requested suffix instead of silently dropping data
+                // from earlier segments. Without this, a multi-segment scalar
+                // logical index would have its `effective_old_frags` union all
+                // segments but the resulting BTree would only contain data from
+                // `old_indices[0]`, leaving the manifest claiming coverage of
+                // fragments whose data was thrown away.
+                let num_to_merge = options
+                    .num_indices_to_merge
+                    .unwrap_or(1)
+                    .max(1)
+                    .min(old_indices.len());
+                let selected_start = old_indices.len().saturating_sub(num_to_merge);
+                let selected_old_indices = &old_indices[selected_start..];
+
                 // Use effective bitmap (intersected with existing dataset fragments)
                 // to avoid carrying stale data from pruned indices.
-                let effective_old_frags: RoaringBitmap = old_indices
+                let effective_old_frags: RoaringBitmap = selected_old_indices
                     .iter()
                     .filter_map(|idx| idx.effective_fragment_bitmap(&dataset.fragment_bitmap))
                     .fold(RoaringBitmap::new(), |mut acc, b| {
                         acc |= &b;
                         acc
                     });
-                let deleted_old_frags: RoaringBitmap = old_indices
+                let deleted_old_frags: RoaringBitmap = selected_old_indices
                     .iter()
                     .filter_map(|idx| idx.deleted_fragment_bitmap(&dataset.fragment_bitmap))
                     .fold(RoaringBitmap::new(), |mut acc, b| {
@@ -522,79 +539,100 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     });
                 frag_bitmap |= &effective_old_frags;
 
-                let index = dataset
+                let reference_index = dataset
                     .open_scalar_index(
                         &field_path,
-                        &old_indices[0].uuid.to_string(),
+                        &selected_old_indices[0].uuid.to_string(),
                         &NoOpMetricsCollector,
                     )
                     .await?;
 
-                let update_criteria = index.update_criteria();
-
-                let fragments = if update_criteria.requires_old_data {
-                    None
-                } else {
-                    Some(unindexed.to_vec())
-                };
-                let new_data_stream = load_training_data(
-                    dataset.as_ref(),
-                    &field_path,
-                    &update_criteria.data_criteria,
-                    fragments,
-                    true,
-                    None,
-                )
-                .await?;
+                let update_criteria = reference_index.update_criteria();
 
                 let new_uuid = Uuid::new_v4();
 
-                let created_index = if effective_old_frags.is_empty() {
-                    // Old data is fully stale (bitmap pruned to empty). Rebuild
-                    // from scratch instead of merging stale entries.
-                    let params = index.derive_index_params()?;
+                let created_index = if selected_old_indices.len() > 1 {
+                    // Multi-segment scalar merge: `ScalarIndex::update` would
+                    // only pull data from one source segment and silently drop
+                    // the rest. Rebuild from the dataset over the exact union
+                    // of the selected old fragments plus the unindexed
+                    // fragments so the manifest's coverage matches the on-disk
+                    // index contents.
+                    let params = reference_index.derive_index_params()?;
+                    let mut union_frags = effective_old_frags.clone();
+                    union_frags |= &base_unindexed_bitmap;
+                    let union_fragment_ids: Vec<u32> = union_frags.iter().collect();
                     super::scalar::build_scalar_index(
                         dataset.as_ref(),
                         column.name.as_str(),
                         &new_uuid.to_string(),
                         &params,
                         true,
+                        Some(union_fragment_ids),
                         None,
-                        Some(new_data_stream),
                         Arc::new(NoopIndexBuildProgress),
                     )
                     .await?
                 } else {
-                    let new_store =
-                        LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
-                    let old_data_filter = if dataset.manifest.uses_stable_row_ids() {
-                        // Stable row IDs are opaque IDs, so fragment-bit filtering on
-                        // (row_id >> 32) is invalid. Build an exact allow-list from retained
-                        // fragments' row-id sequences and use precise filtering.
-                        let valid_old_row_ids =
-                            build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags)
-                                .await?;
-                        Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
+                    let fragments = if update_criteria.requires_old_data {
+                        None
                     } else {
-                        // Address-style row IDs encode fragment_id in high 32 bits.
-                        // Fragment bitmap filtering is valid and cheaper in this mode.
-                        Some(OldIndexDataFilter::Fragments {
-                            to_keep: effective_old_frags,
-                            to_remove: deleted_old_frags,
-                        })
+                        Some(unindexed.to_vec())
                     };
-                    index
-                        .update(new_data_stream, &new_store, old_data_filter)
+                    let new_data_stream = load_training_data(
+                        dataset.as_ref(),
+                        &field_path,
+                        &update_criteria.data_criteria,
+                        fragments,
+                        true,
+                        None,
+                    )
+                    .await?;
+
+                    if effective_old_frags.is_empty() {
+                        // Old data is fully stale (bitmap pruned to empty). Rebuild
+                        // from scratch instead of merging stale entries.
+                        let params = reference_index.derive_index_params()?;
+                        super::scalar::build_scalar_index(
+                            dataset.as_ref(),
+                            column.name.as_str(),
+                            &new_uuid.to_string(),
+                            &params,
+                            true,
+                            None,
+                            Some(new_data_stream),
+                            Arc::new(NoopIndexBuildProgress),
+                        )
                         .await?
+                    } else {
+                        let new_store = LanceIndexStore::from_dataset_for_new(
+                            &dataset,
+                            &new_uuid.to_string(),
+                        )?;
+                        let old_data_filter = if dataset.manifest.uses_stable_row_ids() {
+                            // Stable row IDs are opaque IDs, so fragment-bit filtering on
+                            // (row_id >> 32) is invalid. Build an exact allow-list from retained
+                            // fragments' row-id sequences and use precise filtering.
+                            let valid_old_row_ids =
+                                build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags)
+                                    .await?;
+                            Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
+                        } else {
+                            // Address-style row IDs encode fragment_id in high 32 bits.
+                            // Fragment bitmap filtering is valid and cheaper in this mode.
+                            Some(OldIndexDataFilter::Fragments {
+                                to_keep: effective_old_frags,
+                                to_remove: deleted_old_frags,
+                            })
+                        };
+                        reference_index
+                            .update(new_data_stream, &new_store, old_data_filter)
+                            .await?
+                    }
                 };
 
                 // TODO: don't hard-code index version
-                Ok((
-                    new_uuid,
-                    vec![old_indices[old_indices.len() - 1]],
-                    frag_bitmap,
-                    created_index,
-                ))
+                Ok((new_uuid, selected_old_indices.to_vec(), frag_bitmap, created_index))
             }
             _ => Err(Error::index(format!(
                 "Append index: invalid index type: {:?}",
@@ -643,7 +681,7 @@ mod tests {
 
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::compact_files;
-    use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
+    use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
@@ -1196,6 +1234,148 @@ mod tests {
         assert!(
             merge_result.is_some(),
             "subset merges should respect the caller-provided indices"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_btree_multi_segment_preserves_all_old_segment_data() {
+        // Regression test for a corruption pattern in the scalar optimize path:
+        // when a logical BTree has multiple committed segments, the old code
+        // would union *all* old segments' fragments into the new
+        // fragment_bitmap but only update from `old_indices[0]` and remove
+        // `old_indices[last]`. The resulting new segment claimed to cover the
+        // tail segments but contained none of their data, causing queries for
+        // values living in non-first old segments to silently miss rows.
+        //
+        // After the fix the optimize path selects the tail subset
+        // (respecting `num_indices_to_merge`) and either uses single-segment
+        // update or rebuilds from the dataset over exactly the selected
+        // fragments, so coverage and data stay consistent.
+        async fn query_id_count(dataset: &Dataset, id: &str) -> usize {
+            dataset
+                .scan()
+                .filter(&format!("id = '{}'", id))
+                .unwrap()
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .num_rows()
+        }
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let make_batch = |start: i32, end: i32| {
+            let ids =
+                StringArray::from_iter_values((start..end).map(|i| format!("song-{i}")));
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap()
+        };
+
+        // Three fragments of 64 rows each; each commits as its own BTree
+        // segment so optimize sees a multi-segment scalar logical index.
+        let reader = RecordBatchIterator::new(
+            vec![Ok(make_batch(0, 64)), Ok(make_batch(64, 128)), Ok(make_batch(128, 192))],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 3);
+
+        let mut staged_segments = Vec::new();
+        for fragment in &fragments {
+            let segment = crate::index::create::CreateIndexBuilder::new(
+                &mut dataset,
+                &["id"],
+                IndexType::BTree,
+                &params,
+            )
+            .name("id_idx".into())
+            .fragments(vec![fragment.id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+            staged_segments.push(segment);
+        }
+        dataset
+            .commit_existing_index_segments("id_idx", "id", staged_segments)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("id_idx").await.unwrap().len(),
+            3
+        );
+
+        // Add an unindexed fragment so the scalar optimize path triggers the
+        // bug surface (need at least one unindexed fragment, otherwise the
+        // optimize_indices gate short-circuits scalar indices).
+        let appended = RecordBatchIterator::new(vec![Ok(make_batch(192, 256))], schema.clone());
+        let mut dataset = Dataset::write(
+            appended,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 4);
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        // Reload from disk to ensure we're reading committed manifest state.
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+
+        // Each of these IDs lives in a distinct old segment / fragment.
+        // song-10 lives in old segment 0 (fragment 0).
+        // song-80 lives in old segment 1 (fragment 1).
+        // song-160 lives in old segment 2 (fragment 2) — this is the one the
+        // pre-fix code would lose.
+        // song-200 lives in the appended fragment, exercising the merge with
+        // the unindexed data.
+        for id in ["song-10", "song-80", "song-160", "song-200"] {
+            assert_eq!(
+                query_id_count(&dataset, id).await,
+                1,
+                "expected exactly one row for {id} after multi-segment optimize"
+            );
+        }
+
+        // Fragment coverage should still be intact: every fragment must be
+        // referenced by some committed segment.
+        let segments_after = dataset.load_indices_by_name("id_idx").await.unwrap();
+        let covered: RoaringBitmap = segments_after
+            .iter()
+            .filter_map(|idx| idx.fragment_bitmap.clone())
+            .fold(RoaringBitmap::new(), |mut acc, b| {
+                acc |= b;
+                acc
+            });
+        let mut expected = RoaringBitmap::new();
+        for frag in dataset.get_fragments() {
+            expected.insert(frag.id() as u32);
+        }
+        assert_eq!(
+            covered, expected,
+            "post-optimize coverage should equal all dataset fragments"
         );
     }
 

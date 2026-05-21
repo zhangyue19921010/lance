@@ -4,6 +4,7 @@
 //! Utilities for integrating scalar indices with datasets
 //!
 
+pub(crate) mod btree;
 pub(crate) mod inverted;
 
 pub use inverted::{load_segment_details, load_segments};

@@ -231,6 +231,14 @@ fn segment_has_inverted_details(segment: &IndexMetadata) -> bool {
         .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"))
 }
 
+/// Detect BTree segments from manifest details.
+fn segment_has_btree_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("BTreeIndexDetails"))
+}
+
 // Cache keys for different index types
 #[derive(Debug, Clone)]
 pub struct ScalarIndexCacheKey<'a> {
@@ -1064,7 +1072,8 @@ impl DatasetIndexExt for Dataset {
         }
         let all_vector = source_segments.iter().all(segment_has_vector_details);
         let all_inverted = source_segments.iter().all(segment_has_inverted_details);
-        if !all_vector && !all_inverted {
+        let all_btree = source_segments.iter().all(segment_has_btree_details);
+        if !all_vector && !all_inverted && !all_btree {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
                     .to_string(),
@@ -1078,8 +1087,10 @@ impl DatasetIndexExt for Dataset {
                 source_segments,
             )
             .await?
-        } else {
+        } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
+        } else {
+            crate::index::scalar::btree::merge_segments(self, source_segments).await?
         };
         merged_segment.dataset_version = self.manifest.version;
         merged_segment.fields = vec![field_id];
