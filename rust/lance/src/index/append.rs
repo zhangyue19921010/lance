@@ -547,14 +547,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
                 let new_uuid = Uuid::new_v4();
 
-                let created_index = if selected_old_indices.is_empty()
-                    || selected_old_indices.len() > 1
-                {
-                    // Append-only (no selected) or multi-segment merge
+                let created_index = if selected_old_indices.is_empty() {
+                    // Append-only: nothing to merge with, build fresh over
+                    // the unindexed fragments.
                     let params = reference_index.derive_index_params()?;
-                    let mut union_frags = effective_old_frags.clone();
-                    union_frags |= &base_unindexed_bitmap;
-                    let union_fragment_ids: Vec<u32> = union_frags.iter().collect();
+                    let union_fragment_ids: Vec<u32> = base_unindexed_bitmap.iter().collect();
                     super::scalar::build_scalar_index(
                         dataset.as_ref(),
                         column.name.as_str(),
@@ -566,6 +563,83 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         Arc::new(NoopIndexBuildProgress),
                     )
                     .await?
+                } else if selected_old_indices.len() > 1 {
+                    // Multi-segment merge: dispatch by index type. BTree
+                    // uses the k-way merge over already-sorted page data
+                    // (no dataset scan); other scalar types are not yet
+                    // implemented and return a clear error.
+                    let old_data_filter = if dataset.manifest.uses_stable_row_ids() {
+                        let valid_old_row_ids =
+                            build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags)
+                                .await?;
+                        Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
+                    } else {
+                        Some(OldIndexDataFilter::Fragments {
+                            to_keep: effective_old_frags.clone(),
+                            to_remove: deleted_old_frags.clone(),
+                        })
+                    };
+
+                    let fragments = if update_criteria.requires_old_data {
+                        None
+                    } else {
+                        Some(unindexed.to_vec())
+                    };
+                    let new_data_stream = load_training_data(
+                        dataset.as_ref(),
+                        &field_path,
+                        &update_criteria.data_criteria,
+                        fragments,
+                        true,
+                        None,
+                    )
+                    .await?;
+
+                    let new_store =
+                        LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+
+                    match index_type {
+                        IndexType::BTree => {
+                            let mut source_indices =
+                                Vec::with_capacity(selected_old_indices.len());
+                            for idx in selected_old_indices {
+                                let scalar_index = dataset
+                                    .open_scalar_index(
+                                        &field_path,
+                                        &idx.uuid.to_string(),
+                                        &NoOpMetricsCollector,
+                                    )
+                                    .await?;
+                                let btree = scalar_index
+                                    .as_any()
+                                    .downcast_ref::<lance_index::scalar::btree::BTreeIndex>()
+                                    .ok_or_else(|| {
+                                        Error::index(format!(
+                                            "Append index: expected BTree segment {}, got {:?}",
+                                            idx.uuid,
+                                            scalar_index.index_type()
+                                        ))
+                                    })?;
+                                source_indices.push(Arc::new(btree.clone()));
+                            }
+                            lance_index::scalar::btree::BTreeIndex::merge_segments(
+                                &source_indices,
+                                new_data_stream,
+                                &new_store,
+                                old_data_filter,
+                                options.progress.clone(),
+                            )
+                            .await?
+                        }
+                        other => {
+                            return Err(Error::not_supported(format!(
+                                "Multi-segment scalar index merge is not implemented for \
+                                 index type {:?}; use num_indices_to_merge=1 or rebuild the \
+                                 index from scratch",
+                                other
+                            )));
+                        }
+                    }
                 } else {
                     // Single selected segment -> incremental update path.
                     let fragments = if update_criteria.requires_old_data {
