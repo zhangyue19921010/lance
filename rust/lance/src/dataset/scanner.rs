@@ -1146,7 +1146,7 @@ impl Scanner {
     ) -> Result<&mut Self> {
         self.explicit_projection = true;
         self.projection_plan = ProjectionPlan::from_expressions(self.dataset.clone(), columns)?;
-        if self.legacy_with_row_id || self.fast_search {
+        if self.legacy_with_row_id {
             self.projection_plan.include_row_id();
         }
         if self.legacy_with_row_addr {
@@ -9775,7 +9775,6 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         assert_eq!(normal_batch.num_rows(), 15);
         assert_eq!(fast_batch.num_rows(), 5);
-        assert!(fast_batch.schema().field_with_name(ROW_ID).is_ok());
     }
 
     fn make_scalar_filter_test_batch(schema: SchemaRef, start: i32, end: i32) -> RecordBatch {
