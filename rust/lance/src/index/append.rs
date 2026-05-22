@@ -517,9 +517,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 ))
             }
             it if it.is_scalar() => {
-                // Skip work when the caller has nothing to do: no unindexed
-                // fragments AND no explicit request to consolidate more than
-                // one old segment.
                 let num_to_merge = options
                     .num_indices_to_merge
                     .unwrap_or(1)
