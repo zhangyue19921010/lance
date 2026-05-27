@@ -5090,9 +5090,7 @@ impl PrimitiveStructuralEncoder {
     /// Probe whether a page looks near-unique before attempting dictionary encoding.
     ///
     /// Uses block sampling: takes consecutive samples from evenly-distributed blocks
-    /// across the page. This is robust against sorted data patterns (where stride
-    /// sampling fails because the step size exceeds run length) while maintaining
-    /// O(max_samples) cost.
+    /// across the page. This is robust against sorted data patterns
     fn sample_is_near_unique(
         data_block: &DataBlock,
         max_samples: usize,
@@ -5100,9 +5098,7 @@ impl PrimitiveStructuralEncoder {
     ) -> Option<bool> {
         use std::collections::HashSet;
 
-        // Split the budget into this many consecutive blocks. Block sampling keeps
-        // each sample run >= run_length, which avoids the stride-aliases-with-runs
-        // failure mode that uniform stride sampling has on sorted low-cardinality data.
+        // Split the budget into this many consecutive blocks.
         const NUM_SAMPLE_BLOCKS: usize = 32;
         // Below this many samples the ratio is too noisy to trust; treat as not near-unique.
         const MIN_RELIABLE_SAMPLES: usize = 1024;
@@ -5121,8 +5117,6 @@ impl PrimitiveStructuralEncoder {
         let actual_samples = samples_per_block * NUM_SAMPLE_BLOCKS;
         let block_spacing = num_values / NUM_SAMPLE_BLOCKS;
 
-        // Indices fit in num_values: (NUM_SAMPLE_BLOCKS-1)*block_spacing + (samples_per_block-1)
-        // <= NUM_SAMPLE_BLOCKS*(num_values/NUM_SAMPLE_BLOCKS) - 1 <= num_values - 1.
         let indices = || {
             (0..NUM_SAMPLE_BLOCKS).flat_map(move |block_idx| {
                 let block_start = block_idx * block_spacing;
@@ -7200,12 +7194,6 @@ mod tests {
     fn test_block_sampling_detects_low_cardinality_in_short_sorted_runs() {
         use arrow_array::StringArray;
 
-        // Sorted low-cardinality data where each run is shorter than what uniform
-        // stride sampling would step over. With 200k values, cardinality=8000, the
-        // run length is 25; stride sampling with sample_count=4096 has step ≈ 48,
-        // so every sample lands in a fresh run and the page looks near-unique.
-        // Block sampling reads 32 consecutive windows that each cover several runs,
-        // so it sees the true low cardinality.
         let sample_count: usize = 4096;
         let num_values: u64 = 200_000;
         let cardinality: u64 = 8_000;
