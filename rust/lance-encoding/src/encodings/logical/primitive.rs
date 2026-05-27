@@ -5089,15 +5089,23 @@ impl PrimitiveStructuralEncoder {
 
     /// Probe whether a page looks near-unique before attempting dictionary encoding.
     ///
-    /// The probe uses deterministic stride sampling (not RNG sampling), which keeps
-    /// the check cheap and reproducible across runs. The result is only a gate for
-    /// whether we try dictionary encoding, not a cardinality statistic.
+    /// Uses block sampling: takes consecutive samples from evenly-distributed blocks
+    /// across the page. This is robust against sorted data patterns (where stride
+    /// sampling fails because the step size exceeds run length) while maintaining
+    /// O(max_samples) cost.
     fn sample_is_near_unique(
         data_block: &DataBlock,
         max_samples: usize,
         unique_ratio_threshold: f64,
     ) -> Option<bool> {
         use std::collections::HashSet;
+
+        // Split the budget into this many consecutive blocks. Block sampling keeps
+        // each sample run >= run_length, which avoids the stride-aliases-with-runs
+        // failure mode that uniform stride sampling has on sorted low-cardinality data.
+        const NUM_SAMPLE_BLOCKS: usize = 32;
+        // Below this many samples the ratio is too noisy to trust; treat as not near-unique.
+        const MIN_RELIABLE_SAMPLES: usize = 1024;
 
         if unique_ratio_threshold <= 0.0 || unique_ratio_threshold > 1.0 {
             return None;
@@ -5109,71 +5117,82 @@ impl PrimitiveStructuralEncoder {
         }
 
         let sample_count = num_values.min(max_samples).max(1);
-        // Uniform stride sampling across the page.
-        let step = (num_values / sample_count).max(1);
+        let samples_per_block = (sample_count / NUM_SAMPLE_BLOCKS).max(1);
+        let actual_samples = samples_per_block * NUM_SAMPLE_BLOCKS;
+        let block_spacing = num_values / NUM_SAMPLE_BLOCKS;
 
-        match data_block {
+        // Indices fit in num_values: (NUM_SAMPLE_BLOCKS-1)*block_spacing + (samples_per_block-1)
+        // <= NUM_SAMPLE_BLOCKS*(num_values/NUM_SAMPLE_BLOCKS) - 1 <= num_values - 1.
+        let indices = || {
+            (0..NUM_SAMPLE_BLOCKS).flat_map(move |block_idx| {
+                let block_start = block_idx * block_spacing;
+                (0..samples_per_block).map(move |i| block_start + i)
+            })
+        };
+
+        let ratio = match data_block {
             DataBlock::FixedWidth(fixed) => match fixed.bits_per_value {
                 64 => {
                     let values = fixed.data.borrow_to_typed_slice::<u64>();
                     let values = values.as_ref();
-                    let mut unique: HashSet<u64> = HashSet::with_capacity(sample_count.min(1024));
-                    for idx in (0..num_values).step_by(step).take(sample_count) {
-                        unique.insert(values.get(idx).copied()?);
+                    let mut unique: HashSet<u64> =
+                        HashSet::with_capacity(actual_samples.min(MIN_RELIABLE_SAMPLES));
+                    for idx in indices() {
+                        unique.insert(*values.get(idx)?);
                     }
-                    let ratio = unique.len() as f64 / sample_count as f64;
-                    // Avoid overreacting to tiny pages with too few samples.
-                    Some(sample_count >= 1024 && ratio >= unique_ratio_threshold)
+                    unique.len() as f64 / actual_samples as f64
                 }
                 128 => {
                     let values = fixed.data.borrow_to_typed_slice::<u128>();
                     let values = values.as_ref();
-                    let mut unique: HashSet<u128> = HashSet::with_capacity(sample_count.min(1024));
-                    for idx in (0..num_values).step_by(step).take(sample_count) {
-                        unique.insert(values.get(idx).copied()?);
+                    let mut unique: HashSet<u128> =
+                        HashSet::with_capacity(actual_samples.min(MIN_RELIABLE_SAMPLES));
+                    for idx in indices() {
+                        unique.insert(*values.get(idx)?);
                     }
-                    let ratio = unique.len() as f64 / sample_count as f64;
-                    Some(sample_count >= 1024 && ratio >= unique_ratio_threshold)
+                    unique.len() as f64 / actual_samples as f64
                 }
-                _ => Some(false),
+                _ => return Some(false),
             },
             DataBlock::VariableWidth(var) => {
                 use xxhash_rust::xxh3::xxh3_64;
 
-                // Hash variable-width slices instead of storing borrowed slice keys.
-                let mut unique: HashSet<u64> = HashSet::with_capacity(sample_count.min(1024));
+                let mut unique: HashSet<u64> =
+                    HashSet::with_capacity(actual_samples.min(MIN_RELIABLE_SAMPLES));
+                let mut hash_at = |start: usize, end: usize| -> Option<()> {
+                    if start > end || end > var.data.len() {
+                        return None;
+                    }
+                    unique.insert(xxh3_64(&var.data[start..end]));
+                    Some(())
+                };
                 match var.bits_per_offset {
                     32 => {
                         let offsets_ref = var.offsets.borrow_to_typed_slice::<u32>();
                         let offsets: &[u32] = offsets_ref.as_ref();
-                        for i in (0..num_values).step_by(step).take(sample_count) {
-                            let start = usize::try_from(*offsets.get(i)?).ok()?;
-                            let end = usize::try_from(*offsets.get(i + 1)?).ok()?;
-                            if start > end || end > var.data.len() {
-                                return None;
-                            }
-                            unique.insert(xxh3_64(&var.data[start..end]));
+                        for idx in indices() {
+                            let start = usize::try_from(*offsets.get(idx)?).ok()?;
+                            let end = usize::try_from(*offsets.get(idx + 1)?).ok()?;
+                            hash_at(start, end)?;
                         }
                     }
                     64 => {
                         let offsets_ref = var.offsets.borrow_to_typed_slice::<u64>();
                         let offsets: &[u64] = offsets_ref.as_ref();
-                        for i in (0..num_values).step_by(step).take(sample_count) {
-                            let start = usize::try_from(*offsets.get(i)?).ok()?;
-                            let end = usize::try_from(*offsets.get(i + 1)?).ok()?;
-                            if start > end || end > var.data.len() {
-                                return None;
-                            }
-                            unique.insert(xxh3_64(&var.data[start..end]));
+                        for idx in indices() {
+                            let start = usize::try_from(*offsets.get(idx)?).ok()?;
+                            let end = usize::try_from(*offsets.get(idx + 1)?).ok()?;
+                            hash_at(start, end)?;
                         }
                     }
                     _ => return Some(false),
                 }
-                let ratio = unique.len() as f64 / sample_count as f64;
-                Some(sample_count >= 1024 && ratio >= unique_ratio_threshold)
+                unique.len() as f64 / actual_samples as f64
             }
-            _ => Some(false),
-        }
+            _ => return Some(false),
+        };
+
+        Some(actual_samples >= MIN_RELIABLE_SAMPLES && ratio >= unique_ratio_threshold)
     }
 
     // Creates an encode task, consuming all buffered data
@@ -7174,6 +7193,42 @@ mod tests {
         assert!(
             result.is_none(),
             "Should not probe dictionary encoding for near-unique data"
+        );
+    }
+
+    #[test]
+    fn test_block_sampling_detects_low_cardinality_in_short_sorted_runs() {
+        use arrow_array::StringArray;
+
+        // Sorted low-cardinality data where each run is shorter than what uniform
+        // stride sampling would step over. With 200k values, cardinality=8000, the
+        // run length is 25; stride sampling with sample_count=4096 has step ≈ 48,
+        // so every sample lands in a fresh run and the page looks near-unique.
+        // Block sampling reads 32 consecutive windows that each cover several runs,
+        // so it sees the true low cardinality.
+        let sample_count: usize = 4096;
+        let num_values: u64 = 200_000;
+        let cardinality: u64 = 8_000;
+        let run_length = num_values / cardinality;
+        let stride = num_values as usize / sample_count;
+        assert!(
+            stride > run_length as usize,
+            "test must construct the stride > run_length case (stride={stride}, run_length={run_length})",
+        );
+
+        let mut values = Vec::with_capacity(num_values as usize);
+        for i in 0..cardinality {
+            for _ in 0..run_length {
+                values.push(format!("value_{:016}", i));
+            }
+        }
+        let block = DataBlock::from_array(Arc::new(StringArray::from(values)) as ArrayRef);
+
+        let result = PrimitiveStructuralEncoder::sample_is_near_unique(&block, sample_count, 0.98);
+        assert_eq!(
+            result,
+            Some(false),
+            "sorted data with {cardinality} runs of length {run_length} must not be classified as near-unique",
         );
     }
 
