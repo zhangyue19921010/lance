@@ -1,0 +1,476 @@
+rust/lance/src/dataset/optimize.rs
+  d360b2678d1a2687 891-893,903-905,920-943,1669,1678,1680,1693,1718,1981-2143 gitai:{"mixed_line_ranges":[{"Range":[891,893]},{"Range":[1981,1987]},{"Range":[1990,1991]},{"Single":1993},{"Single":1995},{"Single":1999},{"Range":[2001,2002]},{"Range":[2004,2011]},{"Range":[2019,2022]},{"Single":2030},{"Range":[2032,2033]},{"Single":2035},{"Single":2037},{"Single":2039},{"Single":2041},{"Range":[2043,2044]},{"Single":2052},{"Range":[2055,2058]},{"Single":2060},{"Range":[2065,2066]},{"Range":[2074,2077]},{"Range":[2085,2088]},{"Single":2090},{"Range":[2092,2095]},{"Range":[2098,2104]},{"Single":2106},{"Range":[2110,2115]},{"Range":[2117,2119]},{"Single":2121},{"Range":[2129,2130]},{"Single":2132},{"Range":[2135,2139]},{"Single":2141}],"operations":[{"operation_id":"6a03e07cc97b1abc47cba638","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[891,893]},{"Range":[903,905]},{"Range":[920,943]},{"Single":1669},{"Single":1678},{"Single":1680},{"Single":1693},{"Single":1718},{"Range":[1981,2143]}]}]}
+rust/lance/src/dataset/blob.rs
+  d360b2678d1a2687 36,39-40,211,219-237,338,351,368,376-378,473-583,586-591,594,600-601,603-607,610-612,626-806,1025,1031-1033,2238-2247 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a03e07cc97b1abc47cba638","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Single":36},{"Range":[39,40]},{"Single":211},{"Range":[219,237]},{"Single":338},{"Single":351},{"Single":368},{"Range":[376,378]},{"Range":[473,583]},{"Range":[586,591]},{"Single":594},{"Range":[600,601]},{"Range":[603,607]},{"Range":[610,612]},{"Range":[626,806]},{"Single":1025},{"Range":[1031,1033]},{"Range":[2238,2247]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b21ecd9c0c2e22cd6a33dbf19e880150cec46e83",
+  "prompts": {
+    "d360b2678d1a2687": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a031d9ec97b1abc47cba1f4",
+        "model": "openrouter-1o__dev"
+      },
+      "human_author": "zhangyue19921010 <zhangyue.1010@bytedance.com>",
+      "messages": [],
+      "total_additions": 659,
+      "total_deletions": 22,
+      "accepted_lines": 58,
+      "overriden_lines": 90
+    }
+  },
+  "attestation_metadata": {
+    "rust/lance/src/dataset/blob.rs": [
+      {
+        "hash": "d360b2678d1a2687",
+        "line_ranges": [
+          {
+            "Single": 36
+          },
+          {
+            "Range": [
+              39,
+              40
+            ]
+          },
+          {
+            "Single": 211
+          },
+          {
+            "Range": [
+              219,
+              237
+            ]
+          },
+          {
+            "Single": 338
+          },
+          {
+            "Single": 351
+          },
+          {
+            "Single": 368
+          },
+          {
+            "Range": [
+              376,
+              378
+            ]
+          },
+          {
+            "Range": [
+              473,
+              583
+            ]
+          },
+          {
+            "Range": [
+              586,
+              591
+            ]
+          },
+          {
+            "Single": 594
+          },
+          {
+            "Range": [
+              600,
+              601
+            ]
+          },
+          {
+            "Range": [
+              603,
+              607
+            ]
+          },
+          {
+            "Range": [
+              610,
+              612
+            ]
+          },
+          {
+            "Range": [
+              626,
+              806
+            ]
+          },
+          {
+            "Single": 1025
+          },
+          {
+            "Range": [
+              1031,
+              1033
+            ]
+          },
+          {
+            "Range": [
+              2238,
+              2247
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a03e07cc97b1abc47cba638",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Single": 36
+              },
+              {
+                "Range": [
+                  39,
+                  40
+                ]
+              },
+              {
+                "Single": 211
+              },
+              {
+                "Range": [
+                  219,
+                  237
+                ]
+              },
+              {
+                "Single": 338
+              },
+              {
+                "Single": 351
+              },
+              {
+                "Single": 368
+              },
+              {
+                "Range": [
+                  376,
+                  378
+                ]
+              },
+              {
+                "Range": [
+                  473,
+                  583
+                ]
+              },
+              {
+                "Range": [
+                  586,
+                  591
+                ]
+              },
+              {
+                "Single": 594
+              },
+              {
+                "Range": [
+                  600,
+                  601
+                ]
+              },
+              {
+                "Range": [
+                  603,
+                  607
+                ]
+              },
+              {
+                "Range": [
+                  610,
+                  612
+                ]
+              },
+              {
+                "Range": [
+                  626,
+                  806
+                ]
+              },
+              {
+                "Single": 1025
+              },
+              {
+                "Range": [
+                  1031,
+                  1033
+                ]
+              },
+              {
+                "Range": [
+                  2238,
+                  2247
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "rust/lance/src/dataset/optimize.rs": [
+      {
+        "hash": "d360b2678d1a2687",
+        "line_ranges": [
+          {
+            "Range": [
+              891,
+              893
+            ]
+          },
+          {
+            "Range": [
+              903,
+              905
+            ]
+          },
+          {
+            "Range": [
+              920,
+              943
+            ]
+          },
+          {
+            "Single": 1669
+          },
+          {
+            "Single": 1678
+          },
+          {
+            "Single": 1680
+          },
+          {
+            "Single": 1693
+          },
+          {
+            "Single": 1718
+          },
+          {
+            "Range": [
+              1981,
+              2143
+            ]
+          }
+        ],
+        "mixed_line_ranges": [
+          {
+            "Range": [
+              891,
+              893
+            ]
+          },
+          {
+            "Range": [
+              1981,
+              1987
+            ]
+          },
+          {
+            "Range": [
+              1990,
+              1991
+            ]
+          },
+          {
+            "Single": 1993
+          },
+          {
+            "Single": 1995
+          },
+          {
+            "Single": 1999
+          },
+          {
+            "Range": [
+              2001,
+              2002
+            ]
+          },
+          {
+            "Range": [
+              2004,
+              2011
+            ]
+          },
+          {
+            "Range": [
+              2019,
+              2022
+            ]
+          },
+          {
+            "Single": 2030
+          },
+          {
+            "Range": [
+              2032,
+              2033
+            ]
+          },
+          {
+            "Single": 2035
+          },
+          {
+            "Single": 2037
+          },
+          {
+            "Single": 2039
+          },
+          {
+            "Single": 2041
+          },
+          {
+            "Range": [
+              2043,
+              2044
+            ]
+          },
+          {
+            "Single": 2052
+          },
+          {
+            "Range": [
+              2055,
+              2058
+            ]
+          },
+          {
+            "Single": 2060
+          },
+          {
+            "Range": [
+              2065,
+              2066
+            ]
+          },
+          {
+            "Range": [
+              2074,
+              2077
+            ]
+          },
+          {
+            "Range": [
+              2085,
+              2088
+            ]
+          },
+          {
+            "Single": 2090
+          },
+          {
+            "Range": [
+              2092,
+              2095
+            ]
+          },
+          {
+            "Range": [
+              2098,
+              2104
+            ]
+          },
+          {
+            "Single": 2106
+          },
+          {
+            "Range": [
+              2110,
+              2115
+            ]
+          },
+          {
+            "Range": [
+              2117,
+              2119
+            ]
+          },
+          {
+            "Single": 2121
+          },
+          {
+            "Range": [
+              2129,
+              2130
+            ]
+          },
+          {
+            "Single": 2132
+          },
+          {
+            "Range": [
+              2135,
+              2139
+            ]
+          },
+          {
+            "Single": 2141
+          }
+        ],
+        "operations": [
+          {
+            "operation_id": "6a03e07cc97b1abc47cba638",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  891,
+                  893
+                ]
+              },
+              {
+                "Range": [
+                  903,
+                  905
+                ]
+              },
+              {
+                "Range": [
+                  920,
+                  943
+                ]
+              },
+              {
+                "Single": 1669
+              },
+              {
+                "Single": 1678
+              },
+              {
+                "Single": 1680
+              },
+              {
+                "Single": 1693
+              },
+              {
+                "Single": 1718
+              },
+              {
+                "Range": [
+                  1981,
+                  2143
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "d360b2678d1a2687": {
+      "tool": "trae",
+      "conversation_id": "6a031d9ec97b1abc47cba1f4",
+      "session_id": "6a031d9ec97b1abc47cba1f4",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
