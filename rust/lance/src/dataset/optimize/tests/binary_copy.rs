@@ -46,6 +46,57 @@ async fn do_test_binary_copy_merge_small_files(version: LanceFileVersion) {
 }
 
 #[tokio::test]
+async fn test_binary_copy_empty_string_scalar_index() {
+    for version in LanceFileVersion::iter_non_legacy() {
+        do_test_binary_copy_empty_string_scalar_index(version).await;
+    }
+}
+
+async fn do_test_binary_copy_empty_string_scalar_index(version: LanceFileVersion) {
+    use arrow_array::StringArray;
+
+    let test_dir = TempStrDir::default();
+    let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from_iter_values(
+            std::iter::repeat_n("", 4_000),
+        ))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(data)], schema);
+    let mut dataset = Dataset::write(
+        reader,
+        &test_dir,
+        Some(WriteParams {
+            max_rows_per_file: 1_000,
+            data_storage_version: Some(version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100_000,
+        compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+        ..Default::default()
+    };
+    compact_files(&mut dataset, options, None).await.unwrap();
+
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Scalar,
+            Some("text_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn test_binary_copy_with_defer_remap() {
     for version in LanceFileVersion::iter_non_legacy() {
         do_test_binary_copy_with_defer_remap(version).await;
