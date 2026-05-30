@@ -49,7 +49,6 @@ use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::noop_progress;
-use lance_index::scalar::btree::BTreeParameters;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
@@ -960,8 +959,9 @@ fn inner_create_index<'local>(
         None
     };
 
-    // we should skip committing index when building distributed indices.
-    let mut skip_commit = fragment_ids.is_some();
+    // we should skip committing index when building distributed indices
+    // (one segment per worker; commit happens later via commit_existing_index_segments).
+    let skip_commit = fragment_ids.is_some();
 
     // Handle scalar vs vector indices differently and get params before borrowing dataset
     let params_result: Result<Box<dyn IndexParams>> = match index_type {
@@ -980,7 +980,6 @@ fn inner_create_index<'local>(
                 index_type: index_type_str,
                 params: params_opt.clone(),
             };
-            skip_commit = skip_commit || should_skip_commit(index_type, &params_opt)?;
             Ok(Box::new(scalar_params))
         }
         IndexType::FragmentReuse | IndexType::MemWal => {
@@ -1058,20 +1057,6 @@ fn inner_drop_index(env: &mut JNIEnv, java_dataset: JObject, name: JString) -> R
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     RT.block_on(dataset_guard.inner.drop_index(&name))?;
     Ok(())
-}
-
-fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Result<bool> {
-    match index_type {
-        IndexType::BTree => {
-            // Should defer the commit if we are building range-based BTree index
-            if let Some(params) = params_opt {
-                let btree_parameters = serde_json::from_str::<BTreeParameters>(params)?;
-                return Ok(btree_parameters.range_id.is_some());
-            }
-            Ok(false)
-        }
-        _ => Ok(false),
-    }
 }
 
 #[unsafe(no_mangle)]
