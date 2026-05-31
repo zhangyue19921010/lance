@@ -755,18 +755,21 @@ mod tests {
     use arrow_array::{FixedSizeListArray, RecordBatchIterator};
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use datafusion::common::ScalarValue;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::{address::RowAddress, tempfile::TempStrDir};
     use lance_datagen::{self, gen_batch};
     use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
-    use lance_index::scalar::{FullTextSearchQuery, inverted::tokenizer::InvertedIndexParams};
+    use lance_index::scalar::{
+        FullTextSearchQuery, SargableQuery, SearchResult, inverted::tokenizer::InvertedIndexParams,
+    };
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_linalg::distance::{DistanceType, MetricType};
     use serde_json::json;
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, ops::Bound, sync::Arc};
     use uuid::Uuid;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
@@ -1325,12 +1328,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_segmented_btree_multi_fragment_commit_and_search() {
+        let test_dir = TempStrDir::default();
+        let dataset = gen_batch()
+            .col("value", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(16),
+            )
+            .await
+            .unwrap();
+        let mut dataset = dataset;
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 4);
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let mut segments = Vec::new();
+        for fragment in &fragments {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+                    .name("value_btree_segments".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let segment_uuids = segments
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+
+        dataset
+            .commit_existing_index_segments("value_btree_segments", "value", segments)
+            .await
+            .unwrap();
+
+        let committed = dataset
+            .load_indices_by_name("value_btree_segments")
+            .await
+            .unwrap();
+        assert_eq!(committed.len(), fragments.len());
+        for segment_uuid in &segment_uuids {
+            assert_canonical_btree_segment(&dataset, segment_uuid).await;
+        }
+
+        let logical = crate::index::scalar_logical::open_named_scalar_index(
+            &dataset,
+            "value",
+            "value_btree_segments",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+
+        let point_query = SargableQuery::Equals(ScalarValue::Int32(Some(33)));
+        let point_matches = match logical
+            .search(&point_query, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+        {
+            SearchResult::Exact(row_addrs) => row_addrs.true_rows().row_addrs().unwrap().count(),
+            other => panic!("expected exact point result, got {other:?}"),
+        };
+        assert_eq!(point_matches, 1);
+
+        let range_query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(14))),
+            Bound::Excluded(ScalarValue::Int32(Some(35))),
+        );
+        let range_row_addrs = match logical
+            .search(&range_query, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+        {
+            SearchResult::Exact(row_addrs) => row_addrs,
+            other => panic!("expected exact range result, got {other:?}"),
+        };
+        let searched_fragments = range_row_addrs
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(|row_addr| RowAddress::from(u64::from(row_addr)).fragment_id())
+            .collect::<Vec<_>>();
+        assert_eq!(searched_fragments.len(), 21);
+        assert_eq!(
+            searched_fragments.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1, 2])
+        );
+    }
+
+    #[tokio::test]
     async fn test_range_based_btree_index_create() {
         use crate::dataset::scanner::ColumnOrdering;
-        use datafusion::common::ScalarValue;
         use futures::TryStreamExt;
-        use lance_index::scalar::{SargableQuery, SearchResult};
-        use std::ops::Bound;
 
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());

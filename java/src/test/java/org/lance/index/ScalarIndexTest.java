@@ -18,9 +18,19 @@ import org.lance.Fragment;
 import org.lance.TestUtils;
 import org.lance.WriteParams;
 import org.lance.index.scalar.ScalarIndexParams;
+import org.lance.ipc.LanceScanner;
+import org.lance.ipc.ScanOptions;
 
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -28,7 +38,11 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -89,11 +103,7 @@ public class ScalarIndexTest {
   }
 
   @Test
-  public void testBtreeMergeIndexMetadataSoftBreak(@TempDir Path tempDir) throws Exception {
-    // The historical fragment-based distributed BTree flow (per-fragment build into a
-    // shared uuid + mergeIndexMetadata) has been retired in favor of the segmented flow.
-    // A fragment-scoped build still succeeds, but mergeIndexMetadata(BTREE) must now fail
-    // fast with a migration error.
+  public void testCreateBTreeIndexDistributively(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("build_index_distributedly").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -107,9 +117,154 @@ public class ScalarIndexTest {
 
         ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
         IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+        String indexName = "test_index";
+
+        List<Index> segments = new ArrayList<>();
+        for (Fragment fragment : fragments) {
+          segments.add(
+              dataset.createIndex(
+                  IndexOptions.builder(
+                          Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                      .withIndexName(indexName)
+                      .withFragmentIds(Collections.singletonList(fragment.getId()))
+                      .build()));
+        }
+
+        assertFalse(
+            dataset.listIndexes().contains(indexName),
+            "Partially created index should not present");
+
+        List<Index> committed = dataset.commitExistingIndexSegments(indexName, "name", segments);
+        assertEquals(2, committed.size());
+        assertTrue(dataset.listIndexes().contains(indexName));
+
+        assertEquals(2, dataset.countIndexedRows(indexName, "name = 'Person 5'", Optional.empty()));
+        assertEquals(
+            10,
+            dataset.countIndexedRows(
+                indexName, "name >= 'Person 3' AND name < 'Person 8'", Optional.empty()));
+      }
+    }
+  }
+
+  @Test
+  public void testRangedBTreeIndex(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("ranged_btree_map").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 100).close();
+      try (Dataset dataset = testDataset.write(2, 100)) {
+        List<Fragment> fragments = dataset.getFragments();
+        assertEquals(2, fragments.size());
+
+        List<Index> segments = new ArrayList<>();
+        for (Fragment fragment : fragments) {
+          List<long[]> data = new ArrayList<>();
+          try (LanceScanner scanner =
+                  dataset.newScan(
+                      new ScanOptions.Builder()
+                          .fragmentIds(Collections.singletonList(fragment.getId()))
+                          .withRowId(true)
+                          .columns(Collections.singletonList("id"))
+                          .build());
+              ArrowReader arrowReader = scanner.scanBatches(); ) {
+            while (arrowReader.loadNextBatch()) {
+              VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
+              UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+              IntVector idVec = (IntVector) root.getVector("id");
+              for (int i = 0; i < root.getRowCount(); i++) {
+                data.add(new long[] {idVec.get(i), rowIdVec.get(i)});
+              }
+            }
+          }
+
+          data.sort((d1, d2) -> Long.compare(d1[0], d2[0]));
+          segments.add(createBtreeIndexFromPreprocessedData(dataset, data, fragment, allocator));
+        }
+
+        String indexName = "test_index";
+        List<Index> committed = dataset.commitExistingIndexSegments(indexName, "id", segments);
+        assertEquals(2, committed.size());
+        assertTrue(dataset.listIndexes().contains(indexName));
+
+        assertEquals(
+            6, dataset.countIndexedRows(indexName, "id in (10, 20, 30)", Optional.empty()));
+        assertEquals(
+            20, dataset.countIndexedRows(indexName, "id >= 50 AND id < 60", Optional.empty()));
+      }
+    }
+  }
+
+  private Index createBtreeIndexFromPreprocessedData(
+      Dataset dataset,
+      List<long[]> preprocessedData,
+      Fragment fragment,
+      BufferAllocator allocator) {
+    Schema schema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("value", new ArrowType.Int(32, true)),
+                Field.nullable("_rowid", new ArrowType.Int(64, false))),
+            null);
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      IntVector idVec = (IntVector) root.getVector("value");
+      UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+      for (int i = 0; i < preprocessedData.size(); i++) {
+        long[] dataPair = preprocessedData.get(i);
+        idVec.setSafe(i, (int) dataPair[0]);
+        rowIdVec.setSafe(i, dataPair[1]);
+      }
+      root.setRowCount(preprocessedData.size());
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+        writer.start();
+        writer.writeBatch();
+        writer.end();
+      } catch (IOException e) {
+        throw new RuntimeException("Cannot write schema root", e);
+      }
+
+      byte[] arrowData = out.toByteArray();
+      ByteArrayInputStream in = new ByteArrayInputStream(arrowData);
+
+      try (ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+          ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, stream);
+
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 64}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+        return dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, indexParams)
+                .withIndexName("test_index")
+                .withFragmentIds(Collections.singletonList(fragment.getId()))
+                .withPreprocessedData(stream)
+                .build());
+      } catch (Exception e) {
+        throw new RuntimeException("Cannot read arrow stream.", e);
+      }
+    }
+  }
+
+  @Test
+  public void testBtreeMergeIndexMetadataSoftBreak(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("btree_merge_metadata_soft_break").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        List<Fragment> fragments = dataset.getFragments();
+        assertEquals(2, fragments.size());
+
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
         UUID uuid = UUID.randomUUID();
 
-        // 2. a distributed worker can still build one fragment-scoped segment (uncommitted).
         dataset.createIndex(
             IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
                 .withIndexName("test_index")
@@ -117,7 +272,6 @@ public class ScalarIndexTest {
                 .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
                 .build());
 
-        // 3. but the shard-then-merge commit step is no longer supported.
         Exception ex =
             Assertions.assertThrows(
                 Exception.class,

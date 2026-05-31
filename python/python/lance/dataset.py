@@ -2975,7 +2975,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
-    ):
+    ) -> Index:
         """Create a scalar index on a column.
 
         Scalar indices, like vector indices, can be used to speed up scans.  A scalar
@@ -3163,6 +3163,12 @@ class LanceDataset(pa.dataset.Dataset):
         that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
         ``MaterializeIndex`` operator.
 
+        Returns
+        -------
+        Index
+            Metadata for the index. When ``fragment_ids`` is provided the index is
+            built but not committed, and this is the resulting segment metadata to
+            pass to :meth:`commit_existing_index_segments`.
         """
         if isinstance(column, str):
             column = [column]
@@ -3264,7 +3270,9 @@ class LanceDataset(pa.dataset.Dataset):
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
 
-        self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
+        return self._ds.create_index(
+            [column], index_type, name, replace, train, None, kwargs
+        )
 
     def _create_index_impl(
         self,

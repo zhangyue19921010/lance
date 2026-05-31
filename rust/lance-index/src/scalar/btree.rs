@@ -2742,35 +2742,19 @@ pub struct BTreeParameters {
     /// The number of rows to include in each zone
     pub zone_size: Option<u64>,
 
-    /// DEPRECATED / UNSUPPORTED: range-based distributed BTree building has been retired.
-    /// Setting this to `Some(..)` is now rejected at build time (see `BTreeIndexPlugin::train_index`).
-    /// Build one segment per worker and commit them with `commit_existing_index_segments(...)`,
-    /// optionally consolidating with `merge_existing_index_segments(...)`. The field is retained
-    /// (rather than removed) so the plugin can detect and reject stale `range_id` inputs loudly
-    /// instead of serde silently dropping an unknown field.
-    /// The ordinal ID of a data partition for building a large, distributed BTree index.
+    /// DEPRECATED: range-based distributed BTree building has been retired.
+    /// Setting this to `Some(..)` now emits a warning and is ignored at build time
+    /// (see `BTreeIndexPlugin::train_index`). Build one segment per worker and
+    /// commit them with `commit_existing_index_segments(...)`, optionally
+    /// consolidating with `merge_existing_index_segments(...)`. The field is
+    /// retained (rather than removed) so the plugin can detect stale `range_id`
+    /// inputs and warn loudly instead of serde silently dropping an unknown field.
     ///
-    /// When building an index from multiple, pre-partitioned data chunks (for example,
-    /// in a distributed environment), this ID specifies which partition this particular
-    /// build operation corresponds to.
-    ///
-    /// # Data Distribution Requirements
-    ///
-    /// If this parameter is `Some(id)`, the caller **must** guarantee that the input data
-    /// is strictly global sorted. The input data, when considered as a whole across all
-    /// partitions ordered by `range_id`, must be sorted.
-    ///
-    /// Concretely, this means:
-    ///
-    /// All values in the data provided for `range_id: N` must be **less than or equal to**
-    /// all values in the data for `range_id: N+1`.
-    ///
-    /// Lance relies on this precondition to ensure the final, merged index is valid and
-    /// correctly ordered.
-    ///
-    /// # `None` Case
-    ///
-    /// If `range_id` is `None`, a single, monolithic index is built over the provided dataset.
+    /// Historically, this was the ordinal ID of a globally sorted range
+    /// partition. Lance used it to write `part_*` BTree files that were later
+    /// merged by `merge_index_metadata`. That flow has been retired. A
+    /// pre-sorted training stream is still accepted, but this field no longer
+    /// affects file names, commit behavior, or query semantics.
     pub range_id: Option<u32>,
 }
 

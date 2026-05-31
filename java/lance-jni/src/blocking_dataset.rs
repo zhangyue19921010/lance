@@ -959,9 +959,8 @@ fn inner_create_index<'local>(
         None
     };
 
-    // we should skip committing index when building distributed indices
-    // (one segment per worker; commit happens later via commit_existing_index_segments).
-    let skip_commit = fragment_ids.is_some();
+    // we should skip committing index when building distributed indices.
+    let mut skip_commit = fragment_ids.is_some();
 
     // Handle scalar vs vector indices differently and get params before borrowing dataset
     let params_result: Result<Box<dyn IndexParams>> = match index_type {
@@ -980,6 +979,7 @@ fn inner_create_index<'local>(
                 index_type: index_type_str,
                 params: params_opt.clone(),
             };
+            skip_commit = skip_commit || (index_type == IndexType::BTree && batch_reader.is_some());
             Ok(Box::new(scalar_params))
         }
         IndexType::FragmentReuse | IndexType::MemWal => {
