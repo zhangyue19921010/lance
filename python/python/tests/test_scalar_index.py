@@ -97,7 +97,7 @@ def data_table(indexed_dataset: lance.LanceDataset):
 
 def _commit_segmented_btree_index(dataset, column, index_name):
     segments = [
-        dataset.create_scalar_index(
+        dataset.create_index_uncommitted(
             column=column,
             index_type="BTREE",
             name=index_name,
@@ -3916,27 +3916,26 @@ def test_btree_fragment_ids_parameter_validation(tmp_path):
         tmp_path, num_fragments=2, rows_per_fragment=10000
     )
 
-    # Test with valid fragment IDs
     fragments = ds.get_fragments()
     valid_fragment_id = fragments[0].fragment_id
 
-    # This should work without errors
-    ds.create_scalar_index(
+    # create_scalar_index no longer accepts fragment_ids for BTREE; distributed
+    # builds must go through the segmented create_index_uncommitted path.
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
+        ds.create_scalar_index(
+            column="id",
+            index_type="BTREE",
+            fragment_ids=[valid_fragment_id],
+        )
+
+    # Building one uncommitted segment for a valid fragment should work and
+    # return the segment metadata without committing it.
+    segment = ds.create_index_uncommitted(
         column="id",
         index_type="BTREE",
         fragment_ids=[valid_fragment_id],
     )
-
-    # Test with invalid fragment ID (should handle gracefully)
-    try:
-        ds.create_scalar_index(
-            column="id",
-            index_type="BTREE",
-            fragment_ids=[999999],  # Non-existent fragment ID
-        )
-    except Exception as e:
-        # It's acceptable for this to fail with an appropriate error
-        print(f"Expected error for invalid fragment ID: {e}")
+    assert segment.fragment_ids == {valid_fragment_id}
 
 
 @pytest.mark.parametrize(

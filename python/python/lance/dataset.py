@@ -2975,7 +2975,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
-    ) -> Index:
+    ):
         """Create a scalar index on a column.
 
         Scalar indices, like vector indices, can be used to speed up scans.  A scalar
@@ -3065,11 +3065,11 @@ class LanceDataset(pa.dataset.Dataset):
             structure. If False, an empty index will be created that can be
             populated later.
         fragment_ids : List[int], optional
-            If provided, the index will be created only on the specified fragments.
-            This enables distributed/fragment-level indexing. When provided, the
-            method returns metadata for one segment but does not commit
-            the index to the dataset. The segment can be planned, merged, and
-            committed later using the segment builder and commit APIs.
+            If provided, the index will be created only on the specified fragments
+            using the legacy distributed scalar-index path. BTREE indices do not
+            support this path; build distributed BTREE segments with
+            :meth:`create_index_uncommitted` (``index_type="BTREE"``) and publish
+            them with :meth:`commit_existing_index_segments` instead.
             This parameter is passed via kwargs internally.
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
@@ -3163,12 +3163,6 @@ class LanceDataset(pa.dataset.Dataset):
         that use scalar indices will either have a ``ScalarIndexQuery`` relation or a
         ``MaterializeIndex`` operator.
 
-        Returns
-        -------
-        Index
-            Metadata for the index. When ``fragment_ids`` is provided the index is
-            built but not committed, and this is the resulting segment metadata to
-            pass to :meth:`commit_existing_index_segments`.
         """
         if isinstance(column, str):
             column = [column]
@@ -3256,11 +3250,22 @@ class LanceDataset(pa.dataset.Dataset):
                     f"Scalar index column {column} cannot currently be a duration"
                 )
         elif isinstance(index_type, IndexConfig):
+            if fragment_ids is not None and index_type.index_type.upper() == "BTREE":
+                raise ValueError(
+                    "BTree distributed indexing uses create_index_uncommitted(..., "
+                    'index_type="BTREE", fragment_ids=...)'
+                )
             config = json.dumps(index_type.parameters)
             kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
             index_type = "scalar"
         else:
             raise Exception("index_type must be str or IndexConfig")
+
+        if fragment_ids is not None and index_type == "BTREE":
+            raise ValueError(
+                "BTree distributed indexing uses create_index_uncommitted(..., "
+                'index_type="BTREE", fragment_ids=...)'
+            )
 
         # Add fragment_ids and index_uuid to kwargs if provided
         if fragment_ids is not None:
@@ -3270,9 +3275,7 @@ class LanceDataset(pa.dataset.Dataset):
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
 
-        return self._ds.create_index(
-            [column], index_type, name, replace, train, None, kwargs
-        )
+        self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
     def _create_index_impl(
         self,
@@ -3923,10 +3926,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Create one segment without publishing it and return its metadata.
 
-        This is the public distributed-build API for vector index
-        construction. Unlike :meth:`create_index`, this method does not publish
-        the index into the dataset manifest. Instead, it writes one segment
-        under ``_indices/<segment_uuid>/`` and returns the resulting
+        This is the public distributed-build API for vector and BTREE scalar
+        index construction. Unlike :meth:`create_index`, this method does not
+        publish the index into the dataset manifest. Instead, it writes one
+        segment under ``_indices/<segment_uuid>/`` and returns the resulting
         :class:`Index` metadata.
 
         Callers should:
@@ -3940,6 +3943,10 @@ class LanceDataset(pa.dataset.Dataset):
         5. build one or more physical segments and commit them with
            :meth:`commit_existing_index_segments`
 
+        BTREE segments do not yet support the segment builder (steps 3-4); collect
+        the returned segments and pass them straight to
+        :meth:`commit_existing_index_segments`.
+
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 
@@ -3950,6 +3957,32 @@ class LanceDataset(pa.dataset.Dataset):
         Index
             Metadata for the segment that was written by this call.
         """
+        if isinstance(index_type, str) and index_type.upper() == "BTREE":
+            if fragment_ids is None:
+                raise ValueError(
+                    "create_index_uncommitted requires fragment_ids "
+                    "for distributed index build"
+                )
+            if not isinstance(column, str):
+                raise NotImplementedError(
+                    "Scalar indices currently only support a single column"
+                )
+
+            kwargs = dict(kwargs)
+            kwargs["fragment_ids"] = fragment_ids
+            if index_uuid is not None:
+                kwargs["index_uuid"] = index_uuid
+
+            return self._ds.create_index(
+                [column],
+                "BTREE",
+                name,
+                replace,
+                train,
+                storage_options,
+                kwargs,
+            )
+
         return self._create_index_impl(
             column,
             index_type,
