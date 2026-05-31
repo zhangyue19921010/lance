@@ -2196,10 +2196,7 @@ public class DatasetTest {
             dataset.listIndexes().contains("test_index"),
             "Partially created index should not present");
 
-        // 3. merge metadata, which will still not be committed
-        dataset.mergeIndexMetadata(uuid.toString(), IndexType.BTREE, Optional.empty());
-
-        // 4. commit the index
+        // 3. commit the index
         int fieldId =
             dataset.getLanceSchema().fields().stream()
                 .filter(f -> f.getName().equals("name"))

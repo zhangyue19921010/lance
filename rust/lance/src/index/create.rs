@@ -1272,102 +1272,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_index_metadata_btree_reports_progress() {
+    async fn test_merge_index_metadata_btree_soft_break() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
-
         let reader = gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(
-                lance_datagen::RowCount::from(256),
-                lance_datagen::BatchCount::from(4),
+                lance_datagen::RowCount::from(8),
+                lance_datagen::BatchCount::from(1),
             );
-        let mut dataset = Dataset::write(
-            reader,
-            &dataset_uri,
-            Some(WriteParams {
-                max_rows_per_file: 64,
-                mode: WriteMode::Overwrite,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
 
-        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
-        let fragments = dataset.get_fragments();
-        let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
-        let shared_uuid = Uuid::new_v4().to_string();
-        let build_progress = Arc::new(RecordingProgress::default());
-
-        for &fragment_id in &fragment_ids {
-            CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
-                .name("distributed_btree".to_string())
-                .fragments(vec![fragment_id])
-                .index_uuid(shared_uuid.clone())
-                .progress(build_progress.clone())
-                .execute_uncommitted()
-                .await
-                .unwrap();
-        }
-
-        let merge_progress = Arc::new(RecordingProgress::default());
-        dataset
+        let err = dataset
             .merge_index_metadata(
-                &shared_uuid,
+                &Uuid::new_v4().to_string(),
                 IndexType::BTree,
-                Some(1),
-                merge_progress.clone(),
+                None,
+                Arc::new(NoopIndexBuildProgress),
             )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no longer supports merge_index_metadata"),
+            "expected BTree merge_index_metadata soft-break error, got: {err}"
+        );
+    }
+
+    /// Assert a committed segment directory holds exactly one canonical BTree
+    /// payload — one `page_data.lance` + one `page_lookup.lance` — and no `part_*`
+    /// shard files. Locks the "every segment has exactly one lookup" invariant.
+    async fn assert_canonical_btree_segment(dataset: &Dataset, uuid: &Uuid) {
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
+        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir)
+            .await
+            .unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|n| **n == "page_lookup.lance").count(),
+            1,
+            "segment must have exactly one canonical page_lookup.lance, got {names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| **n == "page_data.lance").count(),
+            1,
+            "segment must have exactly one canonical page_data.lance, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("part_")),
+            "segment must have no part_* shard files, got {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_range_based_btree_index_create() {
+        use crate::dataset::scanner::ColumnOrdering;
+        use datafusion::common::ScalarValue;
+        use futures::TryStreamExt;
+        use lance_index::scalar::{SargableQuery, SearchResult};
+        use std::ops::Bound;
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // Write the dataset with deliberately unsorted ids so the sort step is real.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let ids: Vec<i32> = (0..256).rev().collect();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(ids))]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+
+        // The worker scans the dataset's `(id, _rowid)` rows and sorts them by value,
+        // producing the BTree training stream `(value, _rowid)` externally — the "scan,
+        // sort, then hand a pre-sorted reader to the builder" path; no `range_id`.
+        let sorted_batches: Vec<RecordBatch> = {
+            let mut scan = dataset.scan();
+            scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "id".to_string(),
+            )]))
+            .unwrap();
+            scan.with_row_id();
+            scan.project_with_transform(&[("value", "id")]).unwrap();
+            scan.try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap()
+        };
+        let train_schema = sorted_batches[0].schema();
+        let sorted_reader =
+            RecordBatchIterator::new(sorted_batches.into_iter().map(Ok), train_schema);
+
+        // Build one self-contained segment directly from the sorted reader.
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let segment = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+            .name("id_btree".to_string())
+            .preprocessed_data(Box::new(sorted_reader))
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let segment_uuid = segment.uuid;
+
+        // Commit the segment via the segmented-index API — no merge step.
+        dataset
+            .commit_existing_index_segments("id_btree", "id", vec![segment])
             .await
             .unwrap();
 
-        let build_tags = build_progress
-            .recorded_events()
-            .iter()
-            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
-            .collect::<Vec<_>>();
-        assert!(
-            build_tags.iter().any(|e| e == "start:load_data"),
-            "expected load_data progress during public distributed build"
-        );
+        let committed = dataset.load_indices_by_name("id_btree").await.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].uuid, segment_uuid);
 
-        let merge_tags = merge_progress
-            .recorded_events()
-            .iter()
-            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
-            .collect::<Vec<_>>();
-        let pages_start = merge_tags
-            .iter()
-            .position(|e| e == "start:merge_pages")
-            .expect("missing merge_pages start");
-        let pages_complete = merge_tags
-            .iter()
-            .position(|e| e == "complete:merge_pages")
-            .expect("missing merge_pages complete");
-        let write_start = merge_tags
-            .iter()
-            .position(|e| e == "start:write_lookup_file")
-            .expect("missing write_lookup_file start");
-        let write_complete = merge_tags
-            .iter()
-            .position(|e| e == "complete:write_lookup_file")
-            .expect("missing write_lookup_file complete");
-        assert!(pages_start < pages_complete);
-        assert!(pages_complete < write_start);
-        assert!(write_start < write_complete);
-        assert!(
-            merge_tags.iter().any(|e| e == "progress:merge_pages"),
-            "expected merge_pages progress during public merge"
+        // Exactly one canonical data + one lookup, no shards.
+        assert_canonical_btree_segment(&dataset, &segment_uuid).await;
+
+        // The committed index answers a range query correctly.
+        let logical = crate::index::scalar_logical::open_named_scalar_index(
+            &dataset,
+            "id",
+            "id_btree",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(0))),
+            Bound::Excluded(ScalarValue::Int32(Some(64))),
         );
-        assert!(
-            merge_tags.iter().any(|e| e == "progress:write_lookup_file"),
-            "expected write_lookup_file progress during public merge"
-        );
-        assert!(
-            !merge_tags.iter().any(|e| e == "start:merge_lookups"),
-            "fragment-based distributed BTREE merge should not use merge_lookups"
-        );
+        let matched = match logical.search(&query, &NoOpMetricsCollector).await.unwrap() {
+            SearchResult::Exact(row_addrs) => row_addrs.true_rows().row_addrs().unwrap().count(),
+            other => panic!("expected exact result, got {other:?}"),
+        };
+        assert_eq!(matched, 64);
     }
 
     #[tokio::test]
