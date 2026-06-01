@@ -2952,6 +2952,107 @@ class LanceDataset(pa.dataset.Dataset):
             delete_rate_limit,
         )
 
+    def _prepare_scalar_index_request(
+        self,
+        column: Union[str, List[str]],
+        index_type: Union[str, IndexConfig],
+        kwargs: dict,
+    ) -> tuple[str, str, str]:
+        """Validate and normalize a scalar-index request for the native
+        ``create_index`` call.
+        """
+        if isinstance(column, str):
+            column = [column]
+
+        if len(column) > 1:
+            raise NotImplementedError(
+                "Scalar indices currently only support a single column"
+            )
+
+        column = column[0]
+        lance_field = self._ds.lance_schema.field_case_insensitive(column)
+        if lance_field is None:
+            raise KeyError(f"{column} not found in schema")
+
+        if isinstance(index_type, str):
+            index_type = index_type.upper()
+            if index_type not in [
+                "BTREE",
+                "BITMAP",
+                "NGRAM",
+                "ZONEMAP",
+                "LABEL_LIST",
+                "INVERTED",
+                "FTS",
+                "BLOOMFILTER",
+                "RTREE",
+            ]:
+                raise NotImplementedError(
+                    (
+                        'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
+                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
+                        f"scalar columns.  Received {index_type}",
+                    )
+                )
+
+            field = lance_field.to_arrow()
+
+            field_type = field.type
+            field_meta = field.metadata
+            if hasattr(field_type, "storage_type"):
+                field_type = field_type.storage_type
+
+            if index_type in ["BTREE", "BITMAP", "ZONEMAP"]:
+                if (
+                    not pa.types.is_integer(field_type)
+                    and not pa.types.is_floating(field_type)
+                    and not pa.types.is_boolean(field_type)
+                    and not pa.types.is_string(field_type)
+                    and not pa.types.is_temporal(field_type)
+                    and not pa.types.is_fixed_size_binary(field_type)
+                ):
+                    raise TypeError(
+                        f"BTREE/BITMAP index column {column} must be int",
+                        ", float, bool, str, fixed-size-binary, or temporal ",
+                    )
+            elif index_type == "LABEL_LIST":
+                if not pa.types.is_list(field_type):
+                    raise TypeError(f"LABEL_LIST index column {column} must be a list")
+            elif index_type == "NGRAM":
+                if not pa.types.is_string(field_type) and not pa.types.is_large_string(
+                    field_type
+                ):
+                    raise TypeError(f"NGRAM index column {column} must be a string")
+            elif index_type in ["INVERTED", "FTS"]:
+                value_type = field_type
+                if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
+                    value_type = field_type.value_type
+                if (
+                    not pa.types.is_string(value_type)
+                    and not pa.types.is_large_string(value_type)
+                    and not (
+                        pa.types.is_large_binary(value_type)
+                        and field_meta[b"ARROW:extension:name"] == b"lance.json"
+                    )
+                ):
+                    raise TypeError(
+                        f"INVERTED index column {column} must be string, large string"
+                        f" or list of strings, or json, but got {value_type}"
+                    )
+
+            if pa.types.is_duration(field_type):
+                raise TypeError(
+                    f"Scalar index column {column} cannot currently be a duration"
+                )
+            return column, index_type, index_type
+        elif isinstance(index_type, IndexConfig):
+            logical_index_type = index_type.index_type.upper()
+            config = json.dumps(index_type.parameters)
+            kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
+            return column, "scalar", logical_index_type
+        else:
+            raise Exception("index_type must be str or IndexConfig")
+
     def create_scalar_index(
         self,
         column: str,
@@ -3164,104 +3265,11 @@ class LanceDataset(pa.dataset.Dataset):
         ``MaterializeIndex`` operator.
 
         """
-        if isinstance(column, str):
-            column = [column]
+        column, index_type, logical_index_type = self._prepare_scalar_index_request(
+            column, index_type, kwargs
+        )
 
-        if len(column) > 1:
-            raise NotImplementedError(
-                "Scalar indices currently only support a single column"
-            )
-
-        column = column[0]
-        lance_field = self._ds.lance_schema.field_case_insensitive(column)
-        if lance_field is None:
-            raise KeyError(f"{column} not found in schema")
-
-        # TODO: Add documentation of IndexConfig approach for creating
-        # indexes that need parameterization
-        if isinstance(index_type, str):
-            index_type = index_type.upper()
-            if index_type not in [
-                "BTREE",
-                "BITMAP",
-                "NGRAM",
-                "ZONEMAP",
-                "LABEL_LIST",
-                "INVERTED",
-                "FTS",
-                "BLOOMFILTER",
-                "RTREE",
-            ]:
-                raise NotImplementedError(
-                    (
-                        'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
-                        f"scalar columns.  Received {index_type}",
-                    )
-                )
-
-            field = lance_field.to_arrow()
-
-            field_type = field.type
-            field_meta = field.metadata
-            if hasattr(field_type, "storage_type"):
-                field_type = field_type.storage_type
-
-            if index_type in ["BTREE", "BITMAP", "ZONEMAP"]:
-                if (
-                    not pa.types.is_integer(field_type)
-                    and not pa.types.is_floating(field_type)
-                    and not pa.types.is_boolean(field_type)
-                    and not pa.types.is_string(field_type)
-                    and not pa.types.is_temporal(field_type)
-                    and not pa.types.is_fixed_size_binary(field_type)
-                ):
-                    raise TypeError(
-                        f"BTREE/BITMAP index column {column} must be int",
-                        ", float, bool, str, fixed-size-binary, or temporal ",
-                    )
-            elif index_type == "LABEL_LIST":
-                if not pa.types.is_list(field_type):
-                    raise TypeError(f"LABEL_LIST index column {column} must be a list")
-            elif index_type == "NGRAM":
-                if not pa.types.is_string(field_type) and not pa.types.is_large_string(
-                    field_type
-                ):
-                    raise TypeError(f"NGRAM index column {column} must be a string")
-            elif index_type in ["INVERTED", "FTS"]:
-                value_type = field_type
-                if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
-                    value_type = field_type.value_type
-                if (
-                    not pa.types.is_string(value_type)
-                    and not pa.types.is_large_string(value_type)
-                    and not (
-                        pa.types.is_large_binary(value_type)
-                        and field_meta[b"ARROW:extension:name"] == b"lance.json"
-                    )
-                ):
-                    raise TypeError(
-                        f"INVERTED index column {column} must be string, large string"
-                        f" or list of strings, or json, but got {value_type}"
-                    )
-
-            if pa.types.is_duration(field_type):
-                raise TypeError(
-                    f"Scalar index column {column} cannot currently be a duration"
-                )
-        elif isinstance(index_type, IndexConfig):
-            if fragment_ids is not None and index_type.index_type.upper() == "BTREE":
-                raise ValueError(
-                    "BTree distributed indexing uses create_index_uncommitted(..., "
-                    'index_type="BTREE", fragment_ids=...)'
-                )
-            config = json.dumps(index_type.parameters)
-            kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
-            index_type = "scalar"
-        else:
-            raise Exception("index_type must be str or IndexConfig")
-
-        if fragment_ids is not None and index_type == "BTREE":
+        if fragment_ids is not None and logical_index_type == "BTREE":
             raise ValueError(
                 "BTree distributed indexing uses create_index_uncommitted(..., "
                 'index_type="BTREE", fragment_ids=...)'
@@ -3957,25 +3965,28 @@ class LanceDataset(pa.dataset.Dataset):
         Index
             Metadata for the segment that was written by this call.
         """
-        if isinstance(index_type, str) and index_type.upper() == "BTREE":
+        is_btree_request = (
+            isinstance(index_type, str) and index_type.upper() == "BTREE"
+        ) or (
+            isinstance(index_type, IndexConfig)
+            and index_type.index_type.upper() == "BTREE"
+        )
+        if is_btree_request:
             if fragment_ids is None:
                 raise ValueError(
                     "create_index_uncommitted requires fragment_ids "
                     "for distributed index build"
                 )
-            if not isinstance(column, str):
-                raise NotImplementedError(
-                    "Scalar indices currently only support a single column"
-                )
 
             kwargs = dict(kwargs)
+            column, rust_index_type, _ = self._prepare_scalar_index_request(
+                column, index_type, kwargs
+            )
             kwargs["fragment_ids"] = fragment_ids
-            if index_uuid is not None:
-                kwargs["index_uuid"] = index_uuid
 
             return self._ds.create_index(
                 [column],
-                "BTREE",
+                rust_index_type,
                 name,
                 replace,
                 train,
