@@ -5038,6 +5038,7 @@ version = "7.2.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-schema",
  "byteorder",
  "bytes",
  "criterion",
@@ -5047,6 +5048,7 @@ dependencies = [
  "proptest",
  "roaring",
  "rstest",
+ "tracing",
 ]
 
 [[package]]
