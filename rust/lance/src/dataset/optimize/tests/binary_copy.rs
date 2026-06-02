@@ -77,12 +77,19 @@ async fn do_test_binary_copy_empty_string_scalar_index(version: LanceFileVersion
     .await
     .unwrap();
 
+    let before = dataset.scan().try_into_batch().await.unwrap();
+
     let options = CompactionOptions {
         target_rows_per_fragment: 100_000,
         compaction_mode: Some(CompactionMode::ForceBinaryCopy),
         ..Default::default()
     };
     compact_files(&mut dataset, options, None).await.unwrap();
+
+    // Scanning the compacted data must round-trip the zero-length buffers
+    // untouched; a corrupted offsets table would surface as mismatched data here.
+    let after = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(before, after);
 
     dataset
         .create_index(
@@ -94,6 +101,16 @@ async fn do_test_binary_copy_empty_string_scalar_index(version: LanceFileVersion
         )
         .await
         .unwrap();
+
+    // The scalar index over the empty strings must also return the full set.
+    let indexed = dataset
+        .scan()
+        .filter("text = ''")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(indexed.num_rows(), 4_000);
 }
 
 #[tokio::test]
