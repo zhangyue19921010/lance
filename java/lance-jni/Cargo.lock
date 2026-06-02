@@ -2569,7 +2569,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -3721,7 +3721,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -3752,6 +3752,7 @@ dependencies = [
  "datafusion-physical-plan",
  "deepsize",
  "either",
+ "fst",
  "futures",
  "half",
  "humantime",
@@ -3779,6 +3780,7 @@ dependencies = [
  "rand 0.9.4",
  "rayon",
  "roaring",
+ "rustc-hash",
  "semver",
  "serde",
  "serde_json",
@@ -3793,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3835,7 +3837,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrayref",
  "paste",
@@ -3844,7 +3846,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3879,7 +3881,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3911,7 +3913,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3929,7 +3931,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3964,7 +3966,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3995,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4009,7 +4011,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4078,7 +4080,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4120,7 +4122,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4156,7 +4158,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4172,7 +4174,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4184,7 +4186,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4214,9 +4216,9 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-reqwest-client"
-version = "0.7.7"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6369eee4682fb11edf538388b43c61ce288b8302fe89bb40944d7daa7faaae99"
+checksum = "3eefb02ded2c3d4b6b60669bb74822d9fa628e144fc748c79ee31f13f566e87b"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -4228,7 +4230,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4244,7 +4246,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4282,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "7.2.0-beta.4"
+version = "7.2.0-beta.5"
 dependencies = [
  "icu_segmenter",
  "rust-stemmers",
