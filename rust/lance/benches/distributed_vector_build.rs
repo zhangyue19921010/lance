@@ -329,9 +329,6 @@ fn bench_distributed_merge_only(c: &mut Criterion) {
             |b, _| {
                 let dataset = dataset.clone();
                 let segments = fixture.segments.clone();
-                // iter_custom so we can drop the merged output directory after each
-                // timed iteration; the merge generates a fresh UUID per call, which
-                // would otherwise accumulate on disk.
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
