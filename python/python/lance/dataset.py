@@ -3983,6 +3983,8 @@ class LanceDataset(pa.dataset.Dataset):
                 column, index_type, kwargs
             )
             kwargs["fragment_ids"] = fragment_ids
+            if index_uuid is not None:
+                kwargs["index_uuid"] = index_uuid
 
             return self._ds.create_index(
                 [column],

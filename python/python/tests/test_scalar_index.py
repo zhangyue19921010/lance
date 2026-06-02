@@ -3928,6 +3928,14 @@ def test_btree_fragment_ids_parameter_validation(tmp_path):
             fragment_ids=[valid_fragment_id],
         )
 
+    with pytest.raises(ValueError, match="index_uuid is no longer accepted"):
+        ds.create_index_uncommitted(
+            column="id",
+            index_type="BTREE",
+            fragment_ids=[valid_fragment_id],
+            index_uuid=str(uuid.uuid4()),
+        )
+
     # Building one uncommitted segment for a valid fragment should work and
     # return the segment metadata without committing it.
     segment = ds.create_index_uncommitted(

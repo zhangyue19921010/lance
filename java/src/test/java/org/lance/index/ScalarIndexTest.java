@@ -258,25 +258,12 @@ public class ScalarIndexTest {
       testDataset.createEmptyDataset().close();
       testDataset.write(1, 10).close();
       try (Dataset dataset = testDataset.write(2, 10)) {
-        List<Fragment> fragments = dataset.getFragments();
-        assertEquals(2, fragments.size());
-
-        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
-        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
-        UUID uuid = UUID.randomUUID();
-
-        dataset.createIndex(
-            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
-                .withIndexName("test_index")
-                .withIndexUUID(uuid.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
-                .build());
-
         Exception ex =
             Assertions.assertThrows(
                 Exception.class,
                 () ->
-                    dataset.mergeIndexMetadata(uuid.toString(), IndexType.BTREE, Optional.empty()));
+                    dataset.mergeIndexMetadata(
+                        UUID.randomUUID().toString(), IndexType.BTREE, Optional.empty()));
         assertTrue(
             ex.getMessage() != null
                 && ex.getMessage().contains("no longer supports merge_index_metadata"),
