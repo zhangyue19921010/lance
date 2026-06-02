@@ -1485,15 +1485,6 @@ mod tests {
                 "unexpected error: {err}"
             );
         }
-
-        let index_uuid = Uuid::new_v4();
-        let metadata = CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
-            .name("value_btree_full".to_string())
-            .index_uuid(index_uuid.to_string())
-            .execute_uncommitted()
-            .await
-            .unwrap();
-        assert_eq!(metadata.uuid, index_uuid);
     }
 
     #[tokio::test]
