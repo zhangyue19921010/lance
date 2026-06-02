@@ -208,7 +208,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 please specify a different name or use replace=True"
             )));
         }
-        reject_user_specified_index_uuid(
+        reject_specified_index_uuid(
             self.index_type,
             self.params,
             self.fragments.as_ref(),
@@ -566,7 +566,7 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 }
 
-fn reject_user_specified_index_uuid(
+fn reject_specified_index_uuid(
     index_type: IndexType,
     params: &dyn IndexParams,
     fragments: Option<&Vec<u32>>,
