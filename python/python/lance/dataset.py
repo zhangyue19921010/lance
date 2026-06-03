@@ -3240,7 +3240,7 @@ class LanceDataset(pa.dataset.Dataset):
         ascii_folding: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.
-            This would remove accents like "é" - "e".
+            This would remove accents like "é" -> "e".
 
         Examples
         --------
