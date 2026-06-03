@@ -116,7 +116,7 @@ pub struct BitmapIndex {
     /// Maps each unique value to its bitmap location in the index file
     /// The usize value is the row offset in the bitmap_page_lookup.lance file
     /// for quickly locating the row and reading it out
-    index_map: BTreeMap<OrderableScalarValue, usize>,
+    index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
 
     null_map: Arc<RowAddrTreeMap>,
 
@@ -173,11 +173,17 @@ pub struct BitmapIndexState {
     /// Cached separately from the schema for the empty-index case where the
     /// `lookup_batch` is empty but we still need to remember the column type.
     value_type: DataType,
+    /// Parsed form of `lookup_batch`. Not serialized — populated eagerly in
+    /// both [`BitmapIndexState::from_index`] and [`CacheCodecImpl::deserialize`].
+    /// Stored as `Arc` so cloning into a new [`BitmapIndex`] is O(1).
+    index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
 }
 
 impl DeepSizeOf for BitmapIndexState {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.lookup_batch.get_array_memory_size() + self.null_map.deep_size_of_children(context)
+        self.lookup_batch.get_array_memory_size()
+            + self.null_map.deep_size_of_children(context)
+            + self.index_map.deep_size_of_children(context)
     }
 }
 
@@ -187,20 +193,20 @@ impl BitmapIndexState {
             lookup_batch: build_lookup_batch(&index.index_map, &index.value_type)?,
             null_map: index.null_map.clone(),
             value_type: index.value_type.clone(),
+            index_map: index.index_map.clone(),
         })
     }
 
-    pub(crate) fn into_bitmap_index(
-        self,
+    pub(crate) fn to_bitmap_index(
+        &self,
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Arc<BitmapIndex>> {
-        let index_map = parse_lookup_batch(&self.lookup_batch)?;
         Ok(Arc::new(BitmapIndex::new(
-            index_map,
-            self.null_map,
-            self.value_type,
+            self.index_map.clone(),
+            self.null_map.clone(),
+            self.value_type.clone(),
             store,
             WeakLanceCache::from(index_cache),
             frag_reuse_index,
@@ -265,10 +271,12 @@ impl CacheCodecImpl for BitmapIndexState {
         let null_map = Arc::new(RowAddrTreeMap::deserialize_from(null_bytes.as_ref())?);
         let lookup_batch = read_ipc_stream_single_at(data, &mut offset)?;
         let value_type = lookup_batch.schema().field(0).data_type().clone();
+        let index_map = Arc::new(parse_lookup_batch(&lookup_batch)?);
         Ok(Self {
             lookup_batch,
             null_map,
             value_type,
+            index_map,
         })
     }
 }
@@ -295,7 +303,7 @@ impl CacheKey for BitmapIndexStateKey {
 
 impl BitmapIndex {
     fn new(
-        index_map: BTreeMap<OrderableScalarValue, usize>,
+        index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
         null_map: Arc<RowAddrTreeMap>,
         value_type: DataType,
         store: Arc<dyn IndexStore>,
@@ -326,7 +334,7 @@ impl BitmapIndex {
             let schema = page_lookup_file.schema();
             let data_type = schema.fields[0].data_type();
             return Ok(Arc::new(Self::new(
-                BTreeMap::new(),
+                Arc::new(BTreeMap::new()),
                 Arc::new(RowAddrTreeMap::default()),
                 data_type,
                 store,
@@ -381,7 +389,7 @@ impl BitmapIndex {
         }
 
         Ok(Arc::new(Self::new(
-            index_map,
+            Arc::new(index_map),
             null_map,
             value_type,
             store,
@@ -466,12 +474,7 @@ impl BitmapIndex {
 
 impl DeepSizeOf for BitmapIndex {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        let mut total_size = 0;
-
-        total_size += self.index_map.deep_size_of_children(context);
-        total_size += self.store.deep_size_of_children(context);
-
-        total_size
+        self.index_map.deep_size_of_children(context) + self.store.deep_size_of_children(context)
     }
 }
 
@@ -1754,8 +1757,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         let Some(state) = cache.get_with_key(&BitmapIndexStateKey).await else {
             return Ok(None);
         };
-        let state = (*state).clone();
-        let index = state.into_bitmap_index(index_store, cache, frag_reuse_index)?;
+        let index = state.to_bitmap_index(index_store, cache, frag_reuse_index)?;
         Ok(Some(index as Arc<dyn ScalarIndex>))
     }
 
@@ -1843,6 +1845,7 @@ mod tests {
             lookup_batch: build_lookup_batch(&index_map, &DataType::Int32).unwrap(),
             null_map: Arc::new(null_map),
             value_type: DataType::Int32,
+            index_map: Arc::new(index_map),
         };
         assert_state_roundtrips(&state);
 
@@ -1851,6 +1854,7 @@ mod tests {
             lookup_batch: build_lookup_batch(&BTreeMap::new(), &DataType::Utf8).unwrap(),
             null_map: Arc::new(RowAddrTreeMap::new()),
             value_type: DataType::Utf8,
+            index_map: Arc::new(BTreeMap::new()),
         };
         assert_state_roundtrips(&empty_state);
     }
@@ -1987,6 +1991,85 @@ mod tests {
                 .collect();
             actual.sort();
             assert_eq!(actual, expected_in_rows);
+        }
+    }
+
+    // Regression test for the O(N log N) warm-cache rebuild introduced in
+    // commit 4de5ce67d.  BitmapIndexState now caches the parsed Arc<BTreeMap>
+    // so that get_from_cache skips parse_lookup_batch on warm hits.
+    // IS NULL is the worst case: the actual bitmap lookup is O(1) but
+    // reconstruction of the BTreeMap touched every row in the lookup batch.
+    #[tokio::test]
+    async fn test_bitmap_cache_fast_path() {
+        use arrow_array::Int32Array;
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // High-cardinality: 1 000 unique integers + 5 null rows.
+        const N: u64 = 1_000;
+        const NULL_COUNT: u64 = 5;
+        // nulls first (sorted batch: nulls precede values)
+        let null_values: Vec<Option<i32>> =
+            std::iter::repeat_n(None, NULL_COUNT as usize).collect();
+        let non_null_values: Vec<Option<i32>> = (0..N as i32).map(Some).collect();
+        let all_values: Vec<Option<i32>> = null_values.into_iter().chain(non_null_values).collect();
+        let all_row_ids: Vec<u64> = (0..N + NULL_COUNT).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, true),
+            Field::new("_rowid", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(all_values)),
+                Arc::new(UInt64Array::from(all_row_ids)),
+            ],
+        )
+        .unwrap();
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+
+        let cache = LanceCache::with_capacity(16 * 1024 * 1024);
+        let index = BitmapIndex::load(store.clone(), None, &cache)
+            .await
+            .unwrap();
+
+        let plugin = BitmapIndexPlugin;
+        let index_arc: Arc<dyn ScalarIndex> = index.clone() as Arc<dyn ScalarIndex>;
+        plugin.put_in_cache(&cache, index_arc).await.unwrap();
+
+        // get_from_cache must return Some, and the BitmapIndexState's OnceLock
+        // must have been populated by put_in_cache so no parse_lookup_batch occurs.
+        let cached = plugin
+            .get_from_cache(store.clone(), None, &cache)
+            .await
+            .unwrap()
+            .expect("get_from_cache must return Some after put_in_cache");
+
+        // IS NULL: trivial work once the index is in hand.
+        let query = SargableQuery::IsNull();
+        match cached.search(&query, &NoOpMetricsCollector).await.unwrap() {
+            SearchResult::Exact(row_set) => {
+                let mut null_rows: Vec<u64> = row_set
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                null_rows.sort();
+                let expected: Vec<u64> = (0..NULL_COUNT).collect();
+                assert_eq!(null_rows, expected);
+            }
+            _ => panic!("Expected Exact result for IS NULL"),
         }
     }
 
