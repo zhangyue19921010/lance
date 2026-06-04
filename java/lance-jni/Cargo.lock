@@ -1137,9 +1137,9 @@ dependencies = [
 
 [[package]]
 name = "chrono"
-version = "0.4.44"
+version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "js-sys",
@@ -2569,7 +2569,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -3721,7 +3721,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -3795,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3837,7 +3837,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrayref",
  "paste",
@@ -3846,7 +3846,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3881,7 +3881,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3913,7 +3913,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3931,7 +3931,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3966,7 +3966,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3997,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4011,7 +4011,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4056,6 +4056,7 @@ dependencies = [
  "lance-table",
  "lance-tokenizer",
  "libm",
+ "libsais-rs",
  "log",
  "ndarray",
  "num-traits",
@@ -4080,7 +4081,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4122,7 +4123,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4158,7 +4159,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4174,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4186,7 +4187,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4230,7 +4231,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4246,7 +4247,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4284,7 +4285,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.3"
 dependencies = [
  "icu_segmenter",
  "rust-stemmers",
@@ -4386,6 +4387,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsais-rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40fe164dbd47ea0c20e78a121c980ef673326905f1d4fba55e3645a20ef6717f"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "link-section"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4420,9 +4430,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.31"
+version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "113b30b4cd05f7c06868fdb2854f66a7b9fece9a48425351cd532e810d74024f"
+checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "loom"
@@ -4870,6 +4880,7 @@ dependencies = [
  "opendal-service-hf",
  "opendal-service-oss",
  "opendal-service-s3",
+ "opendal-service-tos",
 ]
 
 [[package]]
@@ -5085,6 +5096,23 @@ dependencies = [
  "reqsign-file-read-tokio",
  "serde",
  "url",
+]
+
+[[package]]
+name = "opendal-service-tos"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f2f7a4c32e5202eb4ac72e76c4b5e30c86ab60762811172f4111103b9d673a1"
+dependencies = [
+ "bytes",
+ "http 1.4.1",
+ "opendal-core",
+ "quick-xml 0.39.4",
+ "reqsign-core",
+ "reqsign-file-read-tokio",
+ "reqsign-volcengine-tos",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5992,6 +6020,19 @@ dependencies = [
  "reqsign-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "reqsign-volcengine-tos"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91d083a363b3577f519ce8425bb50f902622a28a83f7c4a26a5c990b66ec75b3"
+dependencies = [
+ "anyhow",
+ "http 1.4.1",
+ "log",
+ "percent-encoding",
+ "reqsign-core",
 ]
 
 [[package]]
