@@ -3327,6 +3327,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        rabitq_model: Optional[str] = None,
         require_commit: bool = True,
         **kwargs,
     ) -> Index:
@@ -3647,6 +3648,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         if skip_transpose:
             kwargs["skip_transpose"] = True
+
+        if rabitq_model is not None:
+            kwargs["rabitq_model"] = rabitq_model
 
         # Add fragment_ids and index_uuid to kwargs if provided for
         # distributed indexing
@@ -3970,6 +3974,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        rabitq_model: Optional[str] = None,
         **kwargs,
     ) -> Index:
         """
@@ -4000,6 +4005,12 @@ class LanceDataset(pa.dataset.Dataset):
         requirement:
 
         - ``fragment_ids`` must be provided
+        - ``rabitq_model`` (``IVF_RQ`` only): a JSON string produced by
+          ``lance.lance.indices.build_rq_model``. It must be identical across all
+          workers for their segments to be mergeable, since it pins the RaBitQ
+          rotation so every segment rotates vectors the same way. If omitted, each
+          call generates its own random rotation, which is only safe for a single,
+          non-merged segment.
 
         Returns
         -------
@@ -4063,6 +4074,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_coreset_rate=streaming_coreset_rate,
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
+            rabitq_model=rabitq_model,
             require_commit=False,
             **kwargs,
         )
