@@ -3279,12 +3279,12 @@ class LanceDataset(pa.dataset.Dataset):
             column, index_type, kwargs
         )
 
-        if fragment_ids is not None and logical_index_type == "BTREE":
+        if fragment_ids is not None and logical_index_type in {"BTREE", "BITMAP"}:
             raise ValueError(
-                "BTree distributed indexing uses create_index_uncommitted(..., "
-                'index_type="BTREE", fragment_ids=...)'
+                f"{logical_index_type} distributed indexing uses "
+                "create_index_uncommitted(..., "
+                f'index_type="{logical_index_type}", fragment_ids=...)'
             )
-
         # Add fragment_ids and index_uuid to kwargs if provided
         if fragment_ids is not None:
             kwargs["fragment_ids"] = fragment_ids
@@ -3975,10 +3975,11 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Create one segment without publishing it and return its metadata.
 
-        This is the public distributed-build API for vector and BTREE scalar
-        index construction. Unlike :meth:`create_index`, this method does not
-        publish the index into the dataset manifest. Instead, it writes one
-        segment under ``_indices/<segment_uuid>/`` and returns the resulting
+        This is the public distributed-build API for vector, BTREE scalar,
+        and canonical bitmap scalar index construction. Unlike
+        :meth:`create_index`, this method does not publish the index into the
+        dataset manifest. Instead, it writes one segment under
+        ``_indices/<segment_uuid>/`` and returns the resulting
         :class:`Index` metadata.
 
         Callers should:
@@ -3991,8 +3992,8 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE segments do not yet support the segment builder (steps 3-4); collect
-        the returned segments and pass them straight to
+        BTREE segments do not yet support merging; collect the returned
+        segments and pass them straight to
         :meth:`commit_existing_index_segments`.
 
         Parameters are the same as :meth:`create_index`, with one additional
@@ -4005,13 +4006,13 @@ class LanceDataset(pa.dataset.Dataset):
         Index
             Metadata for the segment that was written by this call.
         """
-        is_btree_request = (
-            isinstance(index_type, str) and index_type.upper() == "BTREE"
+        is_scalar_segment_request = (
+            isinstance(index_type, str) and index_type.upper() in {"BTREE", "BITMAP"}
         ) or (
             isinstance(index_type, IndexConfig)
-            and index_type.index_type.upper() == "BTREE"
+            and index_type.index_type.upper() in {"BTREE", "BITMAP"}
         )
-        if is_btree_request:
+        if is_scalar_segment_request:
             if fragment_ids is None:
                 raise ValueError(
                     "create_index_uncommitted requires fragment_ids "
@@ -4106,9 +4107,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Merge distributed scalar index metadata.
 
-        Vector distributed indexing no longer uses this API. For vector indices,
-        build segments with :meth:`create_index_uncommitted`, optionally merge
-        them with :meth:`merge_existing_index_segments`, and publish them with
+        Vector and Bitmap distributed indexing no longer use this API. For
+        those index families, build segments with
+        :meth:`create_index_uncommitted`, optionally merge caller-defined
+        groups with :meth:`merge_existing_index_segments`, and publish them with
         :meth:`commit_existing_index_segments`.
 
         This method does NOT commit changes.
@@ -4850,6 +4852,7 @@ class LanceDataset(pa.dataset.Dataset):
         async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
+        hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> None:
         """Initialize MemWAL on this dataset.
 
@@ -4873,6 +4876,15 @@ class LanceDataset(pa.dataset.Dataset):
         maintained_indexes : list of str, optional
             Names of existing indexes to keep updated as data is written
             through the MemWAL. Must reference indexes that already exist.
+        hnsw_params : dict, optional
+            Per-index HNSW build-parameter overrides recorded as writer-config
+            defaults, keyed by maintained vector index name. Each value is a dict
+            with any of ``num_edges`` (graph degree; level 0 keeps
+            ``2 * num_edges``, equivalent to FAISS's ``M``), ``ef_construction``,
+            and ``max_level``. Without an override an index uses the default
+            parameters. These are writer config — they affect the MemTable a
+            writer builds and may be overridden per-writer in
+            :meth:`mem_wal_writer`.
         bucket_column : str, optional
             With ``num_buckets``, hash-bucket writes by this scalar column.
         num_buckets : int, optional
@@ -4910,6 +4922,7 @@ class LanceDataset(pa.dataset.Dataset):
             async_index_interval_ms=async_index_interval_ms,
             backpressure_log_interval_ms=backpressure_log_interval_ms,
             stats_log_interval_ms=stats_log_interval_ms,
+            hnsw_params=hnsw_params,
         )
 
     def mem_wal_index_details(self) -> Optional[dict]:
@@ -4941,6 +4954,7 @@ class LanceDataset(pa.dataset.Dataset):
         async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
+        hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> "mem_wal.ShardWriter":
         """Get a ShardWriter for the specified shard.
 
@@ -4981,6 +4995,13 @@ class LanceDataset(pa.dataset.Dataset):
         stats_log_interval_ms : int, optional
             Interval for statistics log messages in milliseconds
             (default: 60 000).  Pass ``0`` to disable.
+        hnsw_params : dict, optional
+            Per-index HNSW build-parameter overrides for the MemTable this
+            writer builds, keyed by maintained vector index name. Each value is
+            a dict with any of ``num_edges`` (graph degree; level 0 keeps
+            ``2 * num_edges``, equivalent to FAISS's ``M``), ``ef_construction``,
+            and ``max_level``. Without an override an index uses the default
+            parameters.
 
         Returns
         -------
@@ -5027,6 +5048,7 @@ class LanceDataset(pa.dataset.Dataset):
                 ("async_index_interval_ms", async_index_interval_ms),
                 ("backpressure_log_interval_ms", backpressure_log_interval_ms),
                 ("stats_log_interval_ms", stats_log_interval_ms),
+                ("hnsw_params", hnsw_params),
             ]
             if val is not None
         }
@@ -6476,20 +6498,22 @@ class LanceScanner(pa.dataset.Scanner):
 
         return self._scanner.explain_plan(verbose=verbose)
 
-    def analyze_plan(self) -> str:
+    def analyze_plan(self, count_rows: bool = False) -> str:
         """Execute the plan for this scanner and display with runtime metrics.
 
         Parameters
         ----------
-        verbose : bool, default False
-            Use a verbose output format.
+        count_rows : bool, default False
+            If True, auto-apply a ``COUNT(*)`` aggregate before analyzing so
+            the returned plan reflects what :py:meth:`count_rows` would
+            execute (including the optimizer's count-pushdown decisions).
 
         Returns
         -------
         plan : str
         """
 
-        return self._scanner.analyze_plan()
+        return self._scanner.analyze_plan(count_rows=count_rows)
 
 
 class DatasetOptimizer:
