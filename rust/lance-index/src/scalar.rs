@@ -35,6 +35,7 @@ pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;
 pub mod expression;
+pub mod fmindex;
 pub mod inverted;
 pub mod json;
 pub mod label_list;
@@ -74,6 +75,7 @@ pub enum BuiltinIndexType {
     BloomFilter,
     RTree,
     Inverted,
+    FMIndex,
 }
 
 impl BuiltinIndexType {
@@ -87,6 +89,7 @@ impl BuiltinIndexType {
             Self::Inverted => "inverted",
             Self::BloomFilter => "bloomfilter",
             Self::RTree => "rtree",
+            Self::FMIndex => "fmindex",
         }
     }
 }
@@ -104,6 +107,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
             IndexType::RTree => Ok(Self::RTree),
+            IndexType::FMIndex => Ok(Self::FMIndex),
             _ => Err(Error::index("Invalid index type".to_string())),
         }
     }
