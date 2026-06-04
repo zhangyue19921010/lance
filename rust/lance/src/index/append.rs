@@ -11,7 +11,8 @@ use lance_index::{
     optimize::OptimizeOptions,
     progress::NoopIndexBuildProgress,
     scalar::{
-        CreatedIndex, OldIndexDataFilter, inverted::InvertedIndex, lance_format::LanceIndexStore,
+        CreatedIndex, OldIndexDataFilter, ScalarIndex, inverted::InvertedIndex,
+        lance_format::LanceIndexStore,
     },
 };
 use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -115,6 +116,40 @@ async fn load_unindexed_training_data(
     .await
 }
 
+/// Build a fresh, canonical (non-sharded) scalar index over `fragment_ids`,
+/// reusing `reference_index`'s params and training criteria.
+async fn rebuild_scalar_segment(
+    dataset: &Dataset,
+    reference_index: &Arc<dyn ScalarIndex>,
+    field_path: &str,
+    column_name: &str,
+    uuid: &str,
+    fragment_ids: Vec<u32>,
+) -> Result<CreatedIndex> {
+    let params = reference_index.derive_index_params()?;
+    let update_criteria = reference_index.update_criteria();
+    let training_data = load_training_data(
+        dataset,
+        field_path,
+        &update_criteria.data_criteria,
+        None,
+        true,
+        Some(fragment_ids),
+    )
+    .await?;
+    super::scalar::build_scalar_index(
+        dataset,
+        column_name,
+        uuid,
+        &params,
+        true,
+        None,
+        Some(training_data),
+        Arc::new(NoopIndexBuildProgress),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn merge_scalar_indices<'a>(
     dataset: Arc<Dataset>,
@@ -132,25 +167,10 @@ async fn merge_scalar_indices<'a>(
         ));
     }
 
-    let num_to_merge = match index_type {
-        IndexType::BTree => options
-            .num_indices_to_merge
-            .unwrap_or(1)
-            .min(old_indices.len()),
-        _ => {
-            if old_indices.len() > 1 {
-                return Err(Error::not_supported(format!(
-                    "Cannot optimize multi-segment {:?} scalar index \
-                     ({} segments): this index type lacks a k-way \
-                     segment merge primitive. Drop and recreate the \
-                     index to consolidate.",
-                    index_type,
-                    old_indices.len(),
-                )));
-            }
-            1
-        }
-    };
+    let num_to_merge = options
+        .num_indices_to_merge
+        .unwrap_or(1)
+        .min(old_indices.len());
 
     // No new data + ≤1 old selected = rewriting one segment to itself.
     if unindexed.is_empty() && num_to_merge <= 1 {
@@ -189,19 +209,29 @@ async fn merge_scalar_indices<'a>(
     frag_bitmap |= &effective_old_frags;
     let new_uuid = Uuid::new_v4();
 
-    let created_index = if selected_old_indices.is_empty() {
-        // Delta: build from new_data only. Old segments stay in manifest.
-        let params = reference_index.derive_index_params()?;
-        let unindexed_fragment_ids: Vec<u32> = base_unindexed_bitmap.iter().collect();
-        super::scalar::build_scalar_index(
+    // Scalar Index that expos an N:1 segment-merge primitive reachable without
+    // rescanning the dataset
+    let has_segment_merge_primitive = matches!(index_type, IndexType::BTree);
+
+    // Merge new data into the existing segment(s) instead of rebuilding from
+    // scratch, when both hold:
+    //   - `effective_old_frags`: the selected segments' coverage intersected
+    //     with live fragments is non-empty, i.e. there is old data worth keeping.
+    //   - `has_segment_merge_primitive` (Indices supports N:1 segments merge) OR
+    //     `selected_old_indices.len() == 1` (any scalar type can `update` one).
+    // Otherwise (e.g. ≥2 selected segments of a type without an N:1 merge
+    // primitive) the index is rebuilt from scratch over `frag_bitmap`.
+    let can_merge_segments = !effective_old_frags.is_empty()
+        && (has_segment_merge_primitive || selected_old_indices.len() == 1);
+
+    let created_index = if !can_merge_segments {
+        rebuild_scalar_segment(
             dataset.as_ref(),
+            &reference_index,
+            field_path,
             column_name,
             &new_uuid.to_string(),
-            &params,
-            true,
-            Some(unindexed_fragment_ids),
-            None,
-            Arc::new(NoopIndexBuildProgress),
+            frag_bitmap.iter().collect(),
         )
         .await?
     } else {
@@ -209,53 +239,27 @@ async fn merge_scalar_indices<'a>(
         let new_data_stream =
             load_unindexed_training_data(dataset.as_ref(), field_path, &update_criteria, unindexed)
                 .await?;
+        let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+        let old_data_filter =
+            build_old_data_filter(dataset.as_ref(), &effective_old_frags, &deleted_old_frags)
+                .await?;
 
-        if effective_old_frags.is_empty() {
-            // Stale: every selected segment's coverage was retired.
-            // Rebuild from new_data; `selected` is returned as
-            // `removed_indices` so the manifest drops them.
-            let params = reference_index.derive_index_params()?;
-            super::scalar::build_scalar_index(
-                dataset.as_ref(),
-                column_name,
-                &new_uuid.to_string(),
-                &params,
-                true,
-                None,
-                Some(new_data_stream),
-                Arc::new(NoopIndexBuildProgress),
-            )
-            .await?
-        } else {
-            let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
-            let old_data_filter =
-                build_old_data_filter(dataset.as_ref(), &effective_old_frags, &deleted_old_frags)
-                    .await?;
-
-            match index_type {
-                IndexType::BTree => {
-                    crate::index::scalar::btree::open_and_merge_segments(
-                        dataset.as_ref(),
-                        field_path,
-                        selected_old_indices,
-                        new_data_stream,
-                        &new_store,
-                        old_data_filter,
-                    )
+        match index_type {
+            IndexType::BTree => {
+                crate::index::scalar::btree::open_and_merge_segments(
+                    dataset.as_ref(),
+                    field_path,
+                    selected_old_indices,
+                    new_data_stream,
+                    &new_store,
+                    old_data_filter,
+                )
+                .await?
+            }
+            _ => {
+                reference_index
+                    .update(new_data_stream, &new_store, old_data_filter)
                     .await?
-                }
-                _ => {
-                    debug_assert_eq!(
-                        selected_old_indices.len(),
-                        1,
-                        "num_to_merge clamp invariant violated: index types \
-                         without a k-way merge primitive must reach \
-                         update() with exactly one selected segment"
-                    );
-                    reference_index
-                        .update(new_data_stream, &new_store, old_data_filter)
-                        .await?
-                }
             }
         }
     };
@@ -1662,32 +1666,37 @@ mod tests {
             .unwrap();
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
 
-        // Bitmap remains a single-segment logical index. The original UUID
-        // is replaced (because update() produces a new UUID), but we never
-        // grow to 2 segments.
+        // append() (= num_indices_to_merge: Some(0)) is now honored uniformly:
+        // Bitmap, like BTree, must keep the original segment untouched and add
+        // exactly one delta segment covering only the appended fragment.
         let committed = dataset.load_indices_by_name("cat_idx").await.unwrap();
         assert_eq!(
             committed.len(),
-            1,
-            "Bitmap optimize append() must silently merge instead of creating a 2nd segment, \
-             got {committed:?}"
+            2,
+            "Bitmap optimize append() must add a delta segment, not merge, got {committed:?}"
         );
-        // The merged segment should cover both fragments (old + new).
-        let frags: std::collections::BTreeSet<u32> = committed[0]
+        assert!(
+            committed.iter().any(|idx| idx.uuid == original_uuid),
+            "append() must preserve the pre-existing segment {original_uuid}, got {committed:?}"
+        );
+        let new_segment = committed
+            .iter()
+            .find(|idx| idx.uuid != original_uuid)
+            .expect("append() must add a new delta segment");
+        let new_segment_frags: std::collections::BTreeSet<u32> = new_segment
             .fragment_bitmap
             .as_ref()
-            .expect("merged Bitmap should carry fragment coverage")
+            .expect("delta Bitmap should carry fragment coverage")
             .iter()
             .collect();
-        assert_eq!(frags, [0u32, 1].into_iter().collect());
-        // Sanity: the original UUID was replaced by the merge.
-        assert_ne!(
-            committed[0].uuid, original_uuid,
-            "update() should produce a new UUID, but committed segment still has the original"
+        assert_eq!(
+            new_segment_frags,
+            [1u32].into_iter().collect(),
+            "the delta segment must cover only the appended fragment"
         );
 
         // Data correctness: a value that lives only in the appended fragment
-        // is queryable through the index.
+        // is queryable through the (now multi-segment) index.
         let rows = dataset
             .scan()
             .filter("category = 'd'")
