@@ -4655,6 +4655,7 @@ dependencies = [
  "itertools 0.13.0",
  "lance-arrow",
  "libc",
+ "libm",
  "log",
  "moka",
  "num_cpus",
@@ -4672,6 +4673,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "twox-hash",
  "url",
 ]
 
@@ -4905,7 +4907,6 @@ dependencies = [
  "lance-table",
  "lance-testing",
  "lance-tokenizer",
- "libm",
  "libsais-rs",
  "log",
  "ndarray",
@@ -4928,7 +4929,6 @@ dependencies = [
  "test-log",
  "tokio",
  "tracing",
- "twox-hash",
  "uuid",
 ]
 
