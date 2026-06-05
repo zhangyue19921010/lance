@@ -958,14 +958,14 @@ class LanceDataset(pa.dataset.Dataset):
         """Check out the latest version of the current branch."""
         self._ds.checkout_latest()
 
-    def list_indices(self) -> List[Index]:
+    def list_indices(self) -> List[IndexInformation]:
         """
         Returns index information for all indices in the dataset.
 
-        This method is deprecated as it requires loading the statistics for each index
-        which can be a very expensive operation.  Instead use describe_indices() to
-        list index information and index_statistics() to get the statistics for
-        individual indexes of interest.
+        This method is deprecated.  Use describe_indices() instead, which returns
+        richer per-index information.
+
+        Each returned :class:`IndexInformation` describes one index segment.
         """
         warnings.warn(
             "The 'list_indices' method is deprecated. It may be removed in a future "
@@ -973,7 +973,19 @@ class LanceDataset(pa.dataset.Dataset):
             DeprecationWarning,
         )
 
-        return self._ds.load_indices()
+        return [
+            {
+                "name": desc.name,
+                "type": desc.index_type,
+                "uuid": segment.uuid,
+                "fields": desc.field_names,
+                "version": segment.dataset_version_at_last_update,
+                "fragment_ids": segment.fragment_ids,
+                "base_id": segment.base_id,
+            }
+            for desc in self.describe_indices()
+            for segment in desc.segments
+        ]
 
     def describe_indices(self) -> List[IndexDescription]:
         """Returns index information for all indices in the dataset."""
@@ -5358,6 +5370,19 @@ class Index:
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
+
+
+class IndexInformation(TypedDict):
+    """Information about a single index segment, as returned by
+    :meth:`LanceDataset.list_indices`."""
+
+    name: str
+    type: str
+    uuid: str
+    fields: List[str]
+    version: int
+    fragment_ids: Set[int]
+    base_id: Optional[int]
 
 
 class AutoCleanupConfig(TypedDict):

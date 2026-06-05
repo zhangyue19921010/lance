@@ -24,7 +24,7 @@ use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
-use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString, PyTuple};
+use pyo3::types::{PyBytes, PyInt, PyList, PyString, PyTuple};
 use pyo3::{IntoPyObjectExt, prelude::*};
 use pyo3::{
     PyResult,
@@ -60,9 +60,7 @@ use lance::dataset::{
     transaction::{Operation, Transaction},
 };
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{
-    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, vector::VectorIndexParams,
-};
+use lance::index::{DatasetIndexExt, IndexSegment, vector::VectorIndexParams};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
@@ -70,6 +68,7 @@ use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
+use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
@@ -82,9 +81,6 @@ use lance_index::{
         DEFAULT_QUERY_PARALLELISM, Query as VectorQuery, hnsw::builder::HnswBuildParams,
         ivf::IvfBuildParams, pq::PQBuildParams, sq::builder::SQBuildParams,
     },
-};
-use lance_index::{
-    infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
 };
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStoreParams, StorageOptionsAccessor,
@@ -951,79 +947,6 @@ impl Dataset {
         }
 
         Ok(dict.into())
-    }
-
-    /// Load index metadata.
-    ///
-    /// This call will open the index and return its concrete index type.
-    fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<Py<PyAny>>> {
-        let index_metadata = rt()
-            .block_on(Some(self_.py()), self_.ds.load_indices())?
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        let py = self_.py();
-        index_metadata
-            .iter()
-            .map(|idx| {
-                let dict = PyDict::new(py);
-                let schema = self_.ds.schema();
-                let field_paths = idx
-                    .fields
-                    .iter()
-                    .map(|field_id| schema.field_path(*field_id).unwrap())
-                    .collect::<Vec<_>>();
-
-                let ds = self_.ds.clone();
-                let idx_type = match rt().block_on(Some(self_.py()), async {
-                    if let Some(system_index_type) = infer_system_index_type(idx) {
-                        Ok::<_, lance::Error>(system_index_type.to_string())
-                    } else {
-                        let idx = ds
-                            .open_generic_index(
-                                &field_paths[0],
-                                &idx.uuid.to_string(),
-                                &NoOpMetricsCollector,
-                            )
-                            .await?;
-                        Ok::<_, lance::Error>(idx.index_type().to_string())
-                    }
-                })? {
-                    Ok(r) => r,
-                    Err(error) => {
-                        log::warn!(
-                            "Cannot derive index type for index {} (uuid={}, type_url={:?}, version={}) on dataset {}: {}",
-                            idx.name,
-                            idx.uuid,
-                            idx.index_details.as_ref().map(|d| d.type_url.as_str()),
-                            idx.index_version,
-                            self_.ds.uri(),
-                            error,
-                        );
-                        // mark the type as unknown for any new index type
-                        "Unknown".to_owned()
-                    }
-                };
-
-                let fragment_set = PySet::empty(py).unwrap();
-                if let Some(bitmap) = &idx.fragment_bitmap {
-                    for fragment_id in bitmap.iter() {
-                        fragment_set.add(fragment_id).unwrap();
-                    }
-                }
-
-                dict.set_item("name", idx.name.clone()).unwrap();
-                // TODO: once we add more than vector indices, we need to:
-                // 1. Change protos and write path to persist index type
-                // 2. Use the new field from idx instead of hard coding it to Vector
-                dict.set_item("type", idx_type).unwrap();
-                dict.set_item("uuid", idx.uuid.to_string()).unwrap();
-                dict.set_item("fields", field_paths).unwrap();
-                dict.set_item("version", idx.dataset_version).unwrap();
-                dict.set_item("fragment_ids", fragment_set).unwrap();
-                dict.set_item("base_id", idx.base_id.map(|id| id as i64))
-                    .unwrap();
-                dict.into_py_any(py)
-            })
-            .collect::<PyResult<Vec<_>>>()
     }
 
     #[allow(clippy::too_many_arguments)]
