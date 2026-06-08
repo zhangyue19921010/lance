@@ -340,7 +340,7 @@ impl CacheKey for IvfIndexStateCacheKey<'_> {
 
 /// Wrapper that stores a live VectorIndex in the cache.
 /// Used for v0.1/v0.2 indices that don't support serializable caching.
-#[derive(Debug, deepsize::DeepSizeOf)]
+#[derive(Debug, lance_core::deepsize::DeepSizeOf)]
 pub(crate) struct CachedLegacyVectorIndex(Arc<dyn VectorIndex>);
 
 #[derive(Debug, Clone)]

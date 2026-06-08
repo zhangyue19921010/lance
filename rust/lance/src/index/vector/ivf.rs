@@ -35,7 +35,6 @@ use arrow_buffer::MutableBuffer;
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use deepsize::DeepSizeOf;
 use futures::TryFutureExt;
 use futures::{
     Stream, TryStreamExt,
@@ -43,6 +42,7 @@ use futures::{
 };
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID_FIELD, Result,
     cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
@@ -169,7 +169,7 @@ pub struct IVFIndex {
 }
 
 impl DeepSizeOf for IVFIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.uuid.deep_size_of_children(context)
             + self.reader.deep_size_of_children(context)
             + self.sub_index.deep_size_of_children(context)

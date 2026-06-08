@@ -40,9 +40,9 @@ use crate::scalar::FragReuseIndex;
 use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_core::Result;
+use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
@@ -66,7 +66,7 @@ struct ZoneMapStatistics {
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // Estimate sizes for ScalarValue
         let min_size = self.min.size() - std::mem::size_of::<ScalarValue>();
         let max_size = self.max.size() - std::mem::size_of::<ScalarValue>();
@@ -126,7 +126,7 @@ impl std::fmt::Debug for ZoneMapIndex {
 }
 
 impl DeepSizeOf for ZoneMapIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.zones.deep_size_of_children(context)
     }
 }

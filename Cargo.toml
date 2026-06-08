@@ -17,6 +17,7 @@ members = [
     "rust/lance-select",
     "rust/lance-tokenizer",
     "rust/lance-table",
+    "rust/lance-derive",
     "rust/lance-test-macros",
     "rust/lance-testing",
     "rust/lance-tools",
@@ -61,6 +62,7 @@ lance-arrow = { version = "=8.0.0-beta.7", path = "./rust/lance-arrow" }
 lance-core = { version = "=8.0.0-beta.7", path = "./rust/lance-core" }
 lance-datafusion = { version = "=8.0.0-beta.7", path = "./rust/lance-datafusion" }
 lance-datagen = { version = "=8.0.0-beta.7", path = "./rust/lance-datagen" }
+lance-derive = { version = "=8.0.0-beta.7", path = "./rust/lance-derive" }
 lance-encoding = { version = "=8.0.0-beta.7", path = "./rust/lance-encoding" }
 lance-file = { version = "=8.0.0-beta.7", path = "./rust/lance-file" }
 lance-geo = { version = "=8.0.0-beta.7", path = "./rust/lance-geo" }
@@ -138,7 +140,6 @@ datafusion-ffi = "53.0.0"
 datafusion-physical-expr = "53.0.0"
 datafusion-physical-plan = "53.0.0"
 datafusion-substrait = "53.0.0"
-deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }

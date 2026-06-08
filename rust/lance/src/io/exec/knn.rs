@@ -1892,7 +1892,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::error::Result as DataFusionResult;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use deepsize::DeepSizeOf;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;

@@ -28,9 +28,9 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use deepsize::DeepSizeOf;
 use futures::StreamExt;
 use lance_core::cache::LanceCache;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
@@ -631,7 +631,7 @@ pub struct FMIndex {
 }
 
 impl DeepSizeOf for FMIndex {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.wavelet.deep_size()
             + self.row_ids.len() * 8
             + self.sa_samples.len() * 8
@@ -1139,7 +1139,7 @@ pub struct FMIndexScalarIndex {
 }
 
 impl DeepSizeOf for FMIndexScalarIndex {
-    fn deep_size_of_children(&self, _ctx: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _ctx: &mut lance_core::deepsize::Context) -> usize {
         self.partitions.iter().map(|p| p.fm.deep_size()).sum()
     }
 }

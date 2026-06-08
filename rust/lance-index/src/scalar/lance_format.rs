@@ -8,8 +8,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use bytes::Bytes;
-use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_encoding::version::LanceFileVersion;
@@ -48,7 +48,7 @@ pub struct LanceIndexStore {
 }
 
 impl DeepSizeOf for LanceIndexStore {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.object_store.deep_size_of_children(context)
             + self.index_dir.as_ref().deep_size_of_children(context)
             + self.metadata_cache.deep_size_of_children(context)

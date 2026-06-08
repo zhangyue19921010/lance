@@ -29,10 +29,10 @@ use arrow_array::{BinaryArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use deepsize::DeepSizeOf;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::iter_str_array;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
@@ -155,7 +155,7 @@ pub struct NGramPostingList {
 }
 
 impl DeepSizeOf for NGramPostingList {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
         self.bitmap.serialized_size()
     }
 }
@@ -213,7 +213,7 @@ struct NGramPostingListReader {
 }
 
 impl DeepSizeOf for NGramPostingListReader {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
         0
     }
 }
@@ -285,7 +285,7 @@ impl std::fmt::Debug for NGramIndex {
 }
 
 impl DeepSizeOf for NGramIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.tokens.deep_size_of_children(context)
     }
 }

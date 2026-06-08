@@ -2703,26 +2703,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deepsize"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1cdb987ec36f6bf7bfbea3f928b75590b736fc42af8e54d97592481351b2b96c"
-dependencies = [
- "deepsize_derive",
-]
-
-[[package]]
-name = "deepsize_derive"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "990101d41f3bc8c1a45641024377ee284ecc338e5ecf3ea0f0e236d897c72796"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4516,7 +4496,6 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "datafusion-substrait",
- "deepsize",
  "either",
  "env_logger",
  "fst",
@@ -4644,16 +4623,17 @@ version = "8.0.0-beta.7"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-data",
  "arrow-schema",
  "async-trait",
  "byteorder",
  "bytes",
  "datafusion-common",
  "datafusion-sql",
- "deepsize",
  "futures",
  "itertools 0.13.0",
  "lance-arrow",
+ "lance-derive",
  "libc",
  "libm",
  "log",
@@ -4728,6 +4708,15 @@ dependencies = [
  "rand_distr",
  "rand_xoshiro",
  "random_word",
+]
+
+[[package]]
+name = "lance-derive"
+version = "8.0.0-beta.7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -4817,7 +4806,6 @@ dependencies = [
  "bytes",
  "criterion",
  "datafusion-common",
- "deepsize",
  "futures",
  "lance-arrow",
  "lance-core",
@@ -4880,7 +4868,6 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-physical-expr",
- "deepsize",
  "dirs",
  "env_logger",
  "fst",
@@ -4952,7 +4939,6 @@ dependencies = [
  "bytes",
  "chrono",
  "criterion",
- "deepsize",
  "futures",
  "http 1.4.2",
  "io-uring",
@@ -4991,7 +4977,6 @@ dependencies = [
  "arrow-schema",
  "cc",
  "criterion",
- "deepsize",
  "half",
  "lance-arrow",
  "lance-core",
@@ -5098,7 +5083,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "criterion",
- "deepsize",
  "itertools 0.13.0",
  "lance-core",
  "proptest",
@@ -5123,7 +5107,6 @@ dependencies = [
  "bytes",
  "chrono",
  "criterion",
- "deepsize",
  "futures",
  "lance-arrow",
  "lance-core",
