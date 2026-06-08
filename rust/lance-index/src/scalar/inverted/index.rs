@@ -4955,6 +4955,9 @@ pub async fn flat_bm25_search_stream_with_metrics(
     elapsed_compute: Option<Time>,
 ) -> DataFusionResult<SendableRecordBatchStream> {
     let mut tokenizer = tokenizer;
+
+    // Pre-await synchronous work: query tokenization + chunk-stream setup.
+    let pre_await_start = std::time::Instant::now();
     let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
 
     // A query that tokenizes to no terms (e.g. only stop words) has no
@@ -4984,6 +4987,9 @@ pub async fn flat_bm25_search_stream_with_metrics(
         ACCUMULATE_BYTES,
         SLICE_BYTES,
     );
+    if let Some(t) = &elapsed_compute {
+        t.add_duration(pre_await_start.elapsed());
+    }
 
     // Phase 2 - For each row we need to know the total number of tokens and the count of each
     // of the query tokens.  For example, if the query is "book" and the row is "the book shop"
@@ -4999,13 +5005,10 @@ pub async fn flat_bm25_search_stream_with_metrics(
     .await?;
 
     // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize).
-    // Synchronous and single-threaded, so we time it from this thread.
-    let scoring_start = std::time::Instant::now();
+    // All post-await work is synchronous; time the scorer + score + slicing loop together.
+    let post_await_start = std::time::Instant::now();
     let scorer = initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input);
     let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer)?;
-    if let Some(t) = &elapsed_compute {
-        t.add_duration(scoring_start.elapsed());
-    }
 
     // Finally we emit batches according to the target batch size
     let num_out_batches = scores.num_rows().div_ceil(target_batch_size);
@@ -5014,6 +5017,9 @@ pub async fn flat_bm25_search_stream_with_metrics(
         let start = i * target_batch_size;
         let len = (scores.num_rows() - start).min(target_batch_size);
         batches.push(Ok(scores.slice(start, len)));
+    }
+    if let Some(t) = &elapsed_compute {
+        t.add_duration(post_await_start.elapsed());
     }
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         FTS_SCHEMA.clone(),
