@@ -272,6 +272,13 @@ fn segment_has_btree_details(segment: &IndexMetadata) -> bool {
     )
 }
 
+fn segment_has_zonemap_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
+}
+
 // Cache keys for different index types
 #[derive(Debug, Clone)]
 pub(crate) struct LegacyVectorIndexCacheKey<'a> {
@@ -1127,7 +1134,8 @@ impl DatasetIndexExt for Dataset {
         let all_inverted = source_segments.iter().all(segment_has_inverted_details);
         let all_bitmap = source_segments.iter().all(segment_has_bitmap_details);
         let all_btree = source_segments.iter().all(segment_has_btree_details);
-        if !all_vector && !all_inverted && !all_bitmap && !all_btree {
+        let all_zonemap = source_segments.iter().all(segment_has_zonemap_details);
+        if !all_vector && !all_inverted && !all_bitmap && !all_btree && !all_zonemap {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
                     .to_string(),
@@ -1145,6 +1153,8 @@ impl DatasetIndexExt for Dataset {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
         } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
+        } else if all_zonemap {
+            crate::index::scalar::zonemap::merge_segments(self, source_segments).await?
         } else {
             crate::index::scalar::btree::merge_segments(self, source_segments).await?
         };
@@ -1211,7 +1221,8 @@ impl DatasetIndexExt for Dataset {
                     .is_none_or(|(details, expected)| details.type_url == expected)
             })
             .map(|idx| -> Result<Option<IndexMetadata>> {
-                let Some(existing_fragments) = idx.fragment_bitmap.as_ref() else {
+                let Some(existing_fragments) = idx.effective_fragment_bitmap(&dataset_fragments)
+                else {
                     if incoming_fragments != dataset_fragments {
                         return Err(Error::invalid_input(format!(
                             "CreateIndex: cannot replace legacy index segment {} for '{}' with partial fragment coverage; rebuild all fragments in one commit",
@@ -6796,7 +6807,18 @@ mod tests {
             )
             .into_reader_rows(RowCount::from(20), BatchCount::from(2));
 
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 20,
+                max_rows_per_group: 20,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
 
         let field_id = dataset.schema().field("vector").unwrap().id;
         let original = write_vector_segment_metadata(
