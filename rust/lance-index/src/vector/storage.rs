@@ -18,6 +18,7 @@ use lance_linalg::distance::DistanceType;
 use prost::Message;
 use std::{
     any::Any,
+    collections::BinaryHeap,
     mem::size_of,
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -63,6 +64,87 @@ pub trait DistCalculator {
     }
 
     fn prefetch(&self, _id: u32) {}
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_id: impl Fn(u32) -> u64,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        u16_scratch: &mut Vec<u16>,
+        u8_scratch: &mut Vec<u8>,
+    ) {
+        if k == 0 {
+            return;
+        }
+
+        self.distance_all_with_scratch(k, dists, u16_scratch, u8_scratch);
+        let lower_bound = lower_bound.unwrap_or(f32::MIN).into();
+        let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
+        let mut max_dist = res.peek().map(|node| node.dist);
+
+        for (id, dist) in dists.iter().copied().enumerate() {
+            let dist = OrderedFloat(dist);
+            if dist < lower_bound || dist >= upper_bound {
+                continue;
+            }
+            if res.len() < k {
+                res.push(OrderedNode::new(row_id(id as u32), dist));
+                if res.len() == k {
+                    max_dist = res.peek().map(|node| node.dist);
+                }
+            } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+                res.pop();
+                res.push(OrderedNode::new(row_id(id as u32), dist));
+                max_dist = res.peek().map(|node| node.dist);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_filtered_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_ids: impl Iterator<Item = (u32, u64)>,
+        accept_row: impl Fn(u64) -> bool,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        _dists: &mut Vec<f32>,
+        _u16_scratch: &mut Vec<u16>,
+        _u8_scratch: &mut Vec<u8>,
+    ) {
+        if k == 0 {
+            return;
+        }
+
+        let lower_bound = lower_bound.unwrap_or(f32::MIN).into();
+        let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
+        let mut max_dist = res.peek().map(|node| node.dist);
+
+        for (id, row_id) in row_ids {
+            if !accept_row(row_id) {
+                continue;
+            }
+            let dist = OrderedFloat(self.distance(id));
+            if dist < lower_bound || dist >= upper_bound {
+                continue;
+            }
+            if res.len() < k {
+                res.push(OrderedNode::new(row_id, dist));
+                if res.len() == k {
+                    max_dist = res.peek().map(|node| node.dist);
+                }
+            } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+                res.pop();
+                res.push(OrderedNode::new(row_id, dist));
+                max_dist = res.peek().map(|node| node.dist);
+            }
+        }
+    }
 }
 
 pub const STORAGE_METADATA_KEY: &str = "storage_metadata";
@@ -136,9 +218,23 @@ impl QueryScratchCapacity {
     }
 }
 
+#[derive(Debug)]
+pub struct RabitRawQueryContext {
+    pub code_dim: usize,
+    pub ex_bits: u8,
+    pub rotated_query: Vec<f32>,
+    pub dist_table: Vec<f32>,
+    pub ex_dist_table: Vec<f32>,
+    pub sum_q: f32,
+}
+
 #[derive(Clone, Copy)]
 pub enum QueryResidual<'a> {
     Centroid(&'a dyn arrow_array::Array),
+    RabitRawQuery {
+        rotated_centroid: Option<&'a [f32]>,
+        query: Option<&'a RabitRawQueryContext>,
+    },
 }
 
 #[derive(Debug)]
@@ -295,7 +391,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
         &'a self,
         query: ArrayRef,
         dist_q_c: f32,
-        _residual: Option<QueryResidual<'_>>,
+        _residual: Option<QueryResidual<'a>>,
         _f32_scratch: &'a mut Vec<f32>,
     ) -> Self::DistanceCalculator<'a> {
         self.dist_calculator(query, dist_q_c)

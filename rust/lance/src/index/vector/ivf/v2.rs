@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use std::{
     any::Any,
     collections::{BinaryHeap, HashMap},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crate::index::vector::{IndexFileVersion, builder::index_type_string};
@@ -38,6 +38,8 @@ use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
+use lance_index::vector::bq::{rabit_ex_bits, rabit_ex_code_bytes};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::hnsw::HNSW;
@@ -48,7 +50,8 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
-    QueryResidual, QueryScratch, QueryScratchCapacity, QueryScratchPool, VectorStore,
+    QueryResidual, QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext,
+    VectorStore,
 };
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
@@ -76,6 +79,8 @@ use tracing::{info, instrument};
 use uuid::Uuid;
 
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for_stats};
+
+pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
 
 /// Serializable state of an IVF index, sufficient to reconstruct the index
 /// without re-reading global buffers from object storage.
@@ -108,6 +113,8 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     /// when reconstructing from cache.
     pub(crate) index_file_size: u64,
     pub(crate) aux_file_size: u64,
+    /// Runtime-only cache, intentionally excluded from the CacheCodec wire format.
+    pub(crate) rq_search_cache: RabitSearchCacheCell,
 }
 
 struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
@@ -115,8 +122,59 @@ struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
     pre_filter: Arc<dyn PreFilter>,
     partition_id: usize,
     partition_centroid: Option<ArrayRef>,
+    rq_search_cache: Option<Arc<RabitSearchCache>>,
+    raw_query_context: Option<Arc<RabitRawQueryContext>>,
     part_entry: Arc<dyn VectorIndexCacheEntry>,
     _marker: PhantomData<(S, Q)>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RabitSearchCache {
+    rotated_centroids: Vec<f32>,
+    code_dim: usize,
+}
+
+pub(crate) fn empty_rabit_search_cache_cell() -> RabitSearchCacheCell {
+    Arc::new(Mutex::new(None))
+}
+
+fn rabit_search_cache_cell(cache: Option<Arc<RabitSearchCache>>) -> RabitSearchCacheCell {
+    Arc::new(Mutex::new(Some(cache)))
+}
+
+fn rotated_partition_centroid_slice(
+    cache: Option<&RabitSearchCache>,
+    partition_id: usize,
+) -> Option<&[f32]> {
+    let cache = cache?;
+    let start = partition_id.checked_mul(cache.code_dim)?;
+    let end = start.checked_add(cache.code_dim)?;
+    cache.rotated_centroids.get(start..end)
+}
+
+fn rabit_ex_dist_table_len(dim: usize, num_bits: u8) -> usize {
+    rabit_ex_bits(num_bits)
+        .map(|ex_bits| {
+            if ex_bits == 0 {
+                0
+            } else {
+                dim * (1usize << usize::from(ex_bits))
+            }
+        })
+        .unwrap_or(dim * 256)
+}
+
+fn rabit_u8_scratch_len(dim: usize, num_bits: u8) -> usize {
+    let binary_dist_table_len = dim * 4;
+    let ex_dist_table_len = rabit_ex_bits(num_bits)
+        .ok()
+        .and_then(|ex_bits| match ex_bits {
+            2 | 4 | 8 => rabit_ex_code_bytes(dim, ex_bits).ok(),
+            _ => None,
+        })
+        .map(|ex_code_len| ex_code_len * 2 * SEGMENT_NUM_CODES)
+        .unwrap_or_default();
+    binary_dist_table_len.max(ex_dist_table_len)
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
@@ -128,6 +186,13 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.metadata.deep_size_of_children(context)
             + self.cache_key_prefix.deep_size_of_children(context)
+            + self
+                .rq_search_cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.as_ref().and_then(|cache| cache.as_ref().cloned()))
+                .map(|cache| cache.rotated_centroids.len() * std::mem::size_of::<f32>())
+                .unwrap_or_default()
     }
 }
 
@@ -259,6 +324,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 cache_key_prefix: header.cache_key_prefix,
                 index_file_size: header.index_file_size,
                 aux_file_size: header.aux_file_size,
+                rq_search_cache: empty_rabit_search_cache_cell(),
             })))
         }
 
@@ -532,7 +598,9 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     io_parallelism: usize,
     scratch_pool: Arc<QueryScratchPool>,
+    use_query_residual: bool,
     use_residual_scratch: bool,
+    rq_search_cache: Option<Arc<RabitSearchCache>>,
 
     _marker: PhantomData<(S, Q)>,
 }
@@ -546,25 +614,84 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.storage.deep_size_of_children(context)
             + self.scratch_pool.deep_size_of_children(context)
+            + self
+                .rq_search_cache
+                .as_ref()
+                .map(|cache| cache.rotated_centroids.len() * std::mem::size_of::<f32>())
+                .unwrap_or_default()
         // Skipping session since it is a weak ref
     }
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
-    fn ensure_search_supported(&self) -> Result<()> {
-        if Q::quantization_type() == QuantizationType::Rabit {
-            let metadata = serde_json::to_value(self.storage.metadata())?;
-            let num_bits = metadata
-                .get("num_bits")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(1);
-            if num_bits > 1 {
-                return Err(Error::not_supported(
-                    "IVF_RQ num_bits>1 search is not supported until split-code query support is implemented",
-                ));
-            }
+    fn use_query_residual(
+        storage: &IvfQuantizationStorage<Q>,
+        distance_type: DistanceType,
+    ) -> bool {
+        if Q::quantization_type() == QuantizationType::Rabit
+            && let Ok(Quantizer::Rabit(rq)) = storage.quantizer()
+        {
+            return rq.metadata_ref().query_estimator == RabitQueryEstimator::ResidualQuery;
         }
-        Ok(())
+        Q::use_residual(distance_type)
+    }
+
+    fn build_rq_search_cache(
+        ivf: &IvfModel,
+        storage: &IvfQuantizationStorage<Q>,
+    ) -> Result<Option<Arc<RabitSearchCache>>> {
+        if Q::quantization_type() != QuantizationType::Rabit {
+            return Ok(None);
+        }
+        let Quantizer::Rabit(rq) = storage.quantizer()? else {
+            return Ok(None);
+        };
+        if rq.metadata_ref().query_estimator != RabitQueryEstimator::RawQuery {
+            return Ok(None);
+        }
+        let centroids = ivf
+            .centroids_array()
+            .ok_or_else(|| Error::index("IVF_RQ raw-query search requires centroids"))?;
+        let rotated_centroids = rq.rotate_fsl_to_f32(centroids)?;
+        Ok(Some(Arc::new(RabitSearchCache {
+            rotated_centroids,
+            code_dim: rq.code_dim(),
+        })))
+    }
+
+    fn rq_search_cache_from_state(
+        state: &IvfIndexState<Q>,
+        storage: &IvfQuantizationStorage<Q>,
+    ) -> Result<Option<Arc<RabitSearchCache>>> {
+        let mut cache = state
+            .rq_search_cache
+            .lock()
+            .map_err(|_| Error::internal("RQ search cache lock was poisoned".to_string()))?;
+        if let Some(cache) = cache.as_ref() {
+            return Ok(cache.clone());
+        }
+        let built = Self::build_rq_search_cache(&state.ivf, storage)?;
+        *cache = Some(built.clone());
+        Ok(built)
+    }
+
+    fn prepare_rq_raw_query_context(
+        &self,
+        query: &ArrayRef,
+    ) -> Result<Option<Arc<RabitRawQueryContext>>> {
+        if Q::quantization_type() != QuantizationType::Rabit || self.use_query_residual {
+            return Ok(None);
+        }
+        let Quantizer::Rabit(rq) = self.storage.quantizer()? else {
+            return Ok(None);
+        };
+        if rq.metadata_ref().query_estimator != RabitQueryEstimator::RawQuery {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(
+            rq.metadata_ref()
+                .prepare_raw_query_context(query.as_ref())?,
+        )))
     }
 
     async fn prepare_partition(
@@ -573,6 +700,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         query: &Query,
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
+        raw_query_context: Option<Arc<RabitRawQueryContext>>,
     ) -> Result<PreparedPartitionSearch<S, Q>> {
         let (part_entry, ()) = tokio::try_join!(
             self.load_partition(partition_id, true, metrics),
@@ -583,6 +711,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             pre_filter,
             partition_id,
             partition_centroid: self.ivf.centroid(partition_id),
+            rq_search_cache: self.rq_search_cache.clone(),
+            raw_query_context,
             part_entry,
             _marker: PhantomData,
         })
@@ -594,6 +724,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         query: &Query,
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
+        raw_query_context: Option<Arc<RabitRawQueryContext>>,
     ) -> Result<PreparedPartitionSearch<S, Q>> {
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
         Ok(PreparedPartitionSearch {
@@ -601,13 +732,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             pre_filter,
             partition_id,
             partition_centroid: self.ivf.centroid(partition_id),
+            rq_search_cache: self.rq_search_cache.clone(),
+            raw_query_context,
             part_entry,
             _marker: PhantomData,
         })
     }
 
     fn run_prepared_partition_search(
-        distance_type: DistanceType,
+        use_query_residual: bool,
         use_residual_scratch: bool,
         prepared: PreparedPartitionSearch<S, Q>,
         metrics: &dyn MetricsCollector,
@@ -618,16 +751,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             pre_filter,
             partition_id,
             partition_centroid,
+            rq_search_cache,
+            raw_query_context,
             part_entry,
             _marker: _,
         } = prepared;
-        let residual = Self::residual_for_scratch(
+        let rotated_partition_centroid =
+            rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
+        let residual = Self::query_context_for_scratch(
+            use_query_residual,
             use_residual_scratch,
             partition_id,
             partition_centroid.as_ref(),
+            rotated_partition_centroid,
+            raw_query_context.as_deref(),
         )?;
         let query = Self::preprocess_partition_query_owned(
-            distance_type,
+            use_query_residual,
             use_residual_scratch,
             partition_id,
             partition_centroid.as_ref(),
@@ -657,7 +797,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
     #[allow(clippy::too_many_arguments)]
     fn accumulate_prepared_partition_search(
-        distance_type: DistanceType,
+        use_query_residual: bool,
         use_residual_scratch: bool,
         prepared: PreparedPartitionSearch<S, Q>,
         heap: &mut BinaryHeap<OrderedNode<u64>>,
@@ -669,16 +809,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             pre_filter,
             partition_id,
             partition_centroid,
+            rq_search_cache,
+            raw_query_context,
             part_entry,
             _marker: _,
         } = prepared;
-        let residual = Self::residual_for_scratch(
+        let rotated_partition_centroid =
+            rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
+        let residual = Self::query_context_for_scratch(
+            use_query_residual,
             use_residual_scratch,
             partition_id,
             partition_centroid.as_ref(),
+            rotated_partition_centroid,
+            raw_query_context.as_deref(),
         )?;
         let query = Self::preprocess_partition_query_owned(
-            distance_type,
+            use_query_residual,
             use_residual_scratch,
             partition_id,
             partition_centroid.as_ref(),
@@ -706,16 +853,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         )
     }
 
-    fn residual_for_scratch<'a>(
+    fn query_context_for_scratch<'a>(
+        use_query_residual: bool,
         use_residual_scratch: bool,
         partition_id: usize,
         partition_centroid: Option<&'a ArrayRef>,
+        rotated_partition_centroid: Option<&'a [f32]>,
+        raw_query_context: Option<&'a RabitRawQueryContext>,
     ) -> Result<Option<QueryResidual<'a>>> {
         if use_residual_scratch {
             let partition_centroid = partition_centroid.ok_or_else(|| {
                 Error::index(format!("partition centroid {partition_id} does not exist"))
             })?;
             Ok(Some(QueryResidual::Centroid(partition_centroid.as_ref())))
+        } else if !use_query_residual
+            && (rotated_partition_centroid.is_some() || raw_query_context.is_some())
+        {
+            Ok(Some(QueryResidual::RabitRawQuery {
+                rotated_centroid: rotated_partition_centroid,
+                query: raw_query_context,
+            }))
         } else {
             Ok(None)
         }
@@ -733,14 +890,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     fn preprocess_partition_query(
-        distance_type: DistanceType,
+        use_query_residual: bool,
         use_residual_scratch: bool,
         partition_id: usize,
         partition_centroid: Option<&ArrayRef>,
         query: &Query,
     ) -> Result<Query> {
         Self::preprocess_partition_query_owned(
-            distance_type,
+            use_query_residual,
             use_residual_scratch,
             partition_id,
             partition_centroid,
@@ -749,13 +906,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     fn preprocess_partition_query_owned(
-        distance_type: DistanceType,
+        use_query_residual: bool,
         use_residual_scratch: bool,
         partition_id: usize,
         partition_centroid: Option<&ArrayRef>,
         mut query: Query,
     ) -> Result<Query> {
-        if Q::use_residual(distance_type) {
+        if use_query_residual {
             let partition_centroid = partition_centroid.ok_or_else(|| {
                 Error::index(format!("partition centroid {partition_id} does not exist"))
             })?;
@@ -768,36 +925,49 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Ok(query)
     }
 
-    fn query_scratch_capacity(ivf: &IvfModel) -> QueryScratchCapacity {
+    fn query_scratch_capacity(
+        ivf: &IvfModel,
+        storage: &IvfQuantizationStorage<Q>,
+    ) -> QueryScratchCapacity {
         if Q::quantization_type() != QuantizationType::Rabit {
             return QueryScratchCapacity::default();
         }
 
         let dim = ivf.dimension();
         let dist_table_len = dim * 4;
+        let (ex_dist_table_len, u8_scratch_len) = match storage.quantizer() {
+            Ok(Quantizer::Rabit(rq)) => {
+                let num_bits = rq.metadata_ref().num_bits;
+                (
+                    rabit_ex_dist_table_len(dim, num_bits),
+                    rabit_u8_scratch_len(dim, num_bits),
+                )
+            }
+            _ => (dim * 256, dim * 32),
+        };
         let max_partition_len = ivf.lengths.iter().copied().max().unwrap_or_default() as usize;
 
         QueryScratchCapacity::new(
             max_partition_len,
-            dim + dist_table_len,
+            dim + dist_table_len + ex_dist_table_len,
             max_partition_len,
-            dist_table_len,
+            u8_scratch_len,
         )
     }
 
-    fn use_residual_scratch(ivf: &IvfModel, distance_type: DistanceType) -> bool {
+    fn use_residual_scratch(ivf: &IvfModel, use_query_residual: bool) -> bool {
         Q::quantization_type() == QuantizationType::Rabit
-            && Q::use_residual(distance_type)
+            && use_query_residual
             && ivf
                 .centroids_array()
                 .map(|centroids| centroids.value_type() == DataType::Float32)
                 .unwrap_or(false)
     }
 
-    fn query_scratch_pool(ivf: &IvfModel) -> QueryScratchPool {
+    fn query_scratch_pool(ivf: &IvfModel, storage: &IvfQuantizationStorage<Q>) -> QueryScratchPool {
         QueryScratchPool::with_capacity(
             get_num_compute_intensive_cpus(),
-            Self::query_scratch_capacity(ivf),
+            Self::query_scratch_capacity(ivf, storage),
         )
     }
 
@@ -910,15 +1080,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             )
             .await;
 
-        let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf));
-        let use_residual_scratch = Self::use_residual_scratch(&ivf, distance_type);
+        let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf, &storage));
+        let use_query_residual = Self::use_query_residual(&storage, distance_type);
+        let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
+        let rq_search_cache = Self::build_rq_search_cache(&ivf, &storage)?;
 
         Ok(Self {
             uri: to_local_path(&uri),
             index_path: uri.as_ref().to_string(),
             uuid,
             scratch_pool,
+            use_query_residual,
             use_residual_scratch,
+            rq_search_cache,
             ivf,
             reader: index_reader,
             storage,
@@ -943,15 +1117,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         distance_type: DistanceType,
         index_cache: LanceCache,
         io_parallelism: usize,
+        rq_search_cache: Option<Arc<RabitSearchCache>>,
     ) -> Self {
-        let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf));
-        let use_residual_scratch = Self::use_residual_scratch(&ivf, distance_type);
+        let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf, &storage));
+        let use_query_residual = Self::use_query_residual(&storage, distance_type);
+        let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
         Self {
             uri,
             index_path,
             uuid,
             scratch_pool,
+            use_query_residual,
             use_residual_scratch,
+            rq_search_cache,
             ivf,
             reader,
             storage,
@@ -1046,7 +1224,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     #[instrument(level = "debug", skip(self))]
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
         Self::preprocess_partition_query(
-            self.distance_type,
+            self.use_query_residual,
             self.use_residual_scratch,
             partition_id,
             self.ivf.centroid(partition_id).as_ref(),
@@ -1070,6 +1248,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             cache_key_prefix: self.index_cache.prefix().to_string(),
             index_file_size: self.reader.metadata().file_size(),
             aux_file_size: self.storage.reader().metadata().file_size(),
+            rq_search_cache: rabit_search_cache_cell(self.rq_search_cache.clone()),
         }))
     }
 }
@@ -1228,19 +1407,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        self.ensure_search_supported()?;
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
         pre_filter.wait_for_ready().await?;
 
-        let residual_centroid = if self.use_residual_scratch {
-            Some(self.ivf.centroid(partition_id).ok_or_else(|| {
-                Error::index(format!("partition centroid {partition_id} does not exist"))
-            })?)
-        } else {
-            None
-        };
-        let query = self.preprocess_query(partition_id, query)?;
+        let partition_centroid = self.ivf.centroid(partition_id);
+        let rq_search_cache = self.rq_search_cache.clone();
+        let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
+        let query = Self::preprocess_partition_query(
+            self.use_query_residual,
+            self.use_residual_scratch,
+            partition_id,
+            partition_centroid.as_ref(),
+            query,
+        )?;
         let scratch_pool = self.scratch_pool.clone();
+        let use_query_residual = self.use_query_residual;
+        let use_residual_scratch = self.use_residual_scratch;
         let (batch, local_metrics) = spawn_cpu(move || {
             let param = (&query).into();
             let refine_factor = query.refine_factor.unwrap_or(1) as usize;
@@ -1252,7 +1434,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 .ok_or(Error::internal(
                     "failed to downcast partition entry".to_string(),
                 ))?;
-            let residual = residual_centroid.as_deref().map(QueryResidual::Centroid);
+            let rotated_partition_centroid =
+                rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
+            let residual = Self::query_context_for_scratch(
+                use_query_residual,
+                use_residual_scratch,
+                partition_id,
+                partition_centroid.as_ref(),
+                rotated_partition_centroid,
+                raw_query_context.as_deref(),
+            )?;
             let batch = scratch_pool.with_scratch(|scratch| {
                 part.index.search_with_scratch(
                     query.key,
@@ -1281,9 +1472,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<PreparedPartitionSearchHandle> {
-        self.ensure_search_supported()?;
+        let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
         Ok(Box::new(
-            self.prepare_partition(partition_id, query, pre_filter, metrics)
+            self.prepare_partition(partition_id, query, pre_filter, metrics, raw_query_context)
                 .await?,
         ))
     }
@@ -1293,13 +1484,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         prepared: PreparedPartitionSearchHandle,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        self.ensure_search_supported()?;
         let prepared = prepared
             .downcast::<PreparedPartitionSearch<S, Q>>()
             .map_err(|_| Error::internal("failed to downcast prepared partition search"))?;
         self.scratch_pool.with_scratch(|scratch| {
             Self::run_prepared_partition_search(
-                self.distance_type,
+                self.use_query_residual,
                 self.use_residual_scratch,
                 *prepared,
                 metrics,
@@ -1332,7 +1522,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         control: Option<Arc<dyn PartitionSearchControl>>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<SendableRecordBatchStream> {
-        self.ensure_search_supported()?;
         if partitions.len() != q_c_dists.len() {
             return Err(Error::invalid_input(format!(
                 "partition count {} does not match centroid distance count {}",
@@ -1348,12 +1537,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         }
 
         let prepare_parallelism = get_num_compute_intensive_cpus().max(1);
+        let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
 
         if control.is_none() && S::supports_global_topk_heap() {
             let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
             pre_filter.wait_for_ready().await?;
             let prepare_index = self.clone();
             let prepare_metrics = metrics.clone();
+            let prepare_raw_query_context = raw_query_context.clone();
             let prepared = stream::iter(start_idx..end_idx)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
@@ -1362,6 +1553,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let index = prepare_index.clone();
                     let pre_filter = pre_filter.clone();
                     let metrics = prepare_metrics.clone();
+                    let raw_query_context = prepare_raw_query_context.clone();
                     async move {
                         index
                             .prepare_partition_without_prefilter_wait(
@@ -1369,6 +1561,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                                 &query,
                                 pre_filter,
                                 metrics.as_ref(),
+                                raw_query_context,
                             )
                             .await
                     }
@@ -1377,7 +1570,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 .try_collect::<Vec<_>>()
                 .await?;
 
-            let distance_type = self.distance_type;
+            let use_query_residual = self.use_query_residual;
             let use_residual_scratch = self.use_residual_scratch;
             let search_metrics = metrics.clone();
             let scratch_pool = self.scratch_pool.clone();
@@ -1386,7 +1579,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 scratch_pool.with_scratch(|scratch| -> DataFusionResult<()> {
                     for prepared in prepared {
                         Self::accumulate_prepared_partition_search(
-                            distance_type,
+                            use_query_residual,
                             use_residual_scratch,
                             prepared,
                             &mut heap,
@@ -1413,6 +1606,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         let prepare_index = self.clone();
         let prepare_metrics = metrics.clone();
+        let prepare_raw_query_context = raw_query_context.clone();
         tokio::spawn(async move {
             let prepare_stream = stream::iter(start_idx..end_idx)
                 .map(move |idx| {
@@ -1422,6 +1616,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let index = prepare_index.clone();
                     let pre_filter = pre_filter.clone();
                     let metrics = prepare_metrics.clone();
+                    let raw_query_context = prepare_raw_query_context.clone();
                     async move {
                         index
                             .prepare_partition(
@@ -1429,6 +1624,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                                 &query,
                                 pre_filter,
                                 metrics.as_ref(),
+                                raw_query_context,
                             )
                             .await
                     }
@@ -1444,7 +1640,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             }
         });
 
-        let distance_type = self.distance_type;
+        let use_query_residual = self.use_query_residual;
         let use_residual_scratch = self.use_residual_scratch;
         let search_metrics = metrics.clone();
         let batch_tx_for_search = batch_tx.clone();
@@ -1472,7 +1668,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
                         let batch = {
                             Self::run_prepared_partition_search(
-                                distance_type,
+                                use_query_residual,
                                 use_residual_scratch,
                                 prepared,
                                 search_metrics.as_ref(),
@@ -1668,6 +1864,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         state.distance_type,
         None,
     );
+    let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
 
     let parsed_uuid = Uuid::parse_str(&state.uuid)
         .map_err(|e| Error::index(format!("Invalid UUID in IvfIndexState: {e}")))?;
@@ -1682,6 +1879,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         state.distance_type,
         index_cache,
         io_parallelism,
+        rq_search_cache,
     );
     Ok(Arc::new(index))
 }
@@ -1705,8 +1903,8 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::{
         RQBuildParams, RQRotationType,
-        storage::{RABIT_EX_CODE_COLUMN, RabitQuantizationMetadata},
-        transform::EX_SCALE_FACTORS_COLUMN,
+        storage::{RABIT_EX_CODE_COLUMN, RabitQuantizationMetadata, RabitQueryEstimator},
+        transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN},
     };
     use lance_index::vector::storage::VectorStore;
 
@@ -1725,7 +1923,7 @@ mod tests {
     };
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{Error, ROW_ID, Result};
+    use lance_core::{ROW_ID, Result};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
@@ -1763,6 +1961,43 @@ mod tests {
     const DIM: usize = 32;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
+
+    #[test]
+    fn test_rotated_partition_centroid_slice_borrows_cache() {
+        let cache = super::RabitSearchCache {
+            rotated_centroids: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            code_dim: 2,
+        };
+
+        let centroid = super::rotated_partition_centroid_slice(Some(&cache), 1).unwrap();
+
+        assert_eq!(centroid, &[3.0, 4.0]);
+        assert_eq!(centroid.as_ptr(), cache.rotated_centroids[2..].as_ptr());
+        assert!(super::rotated_partition_centroid_slice(Some(&cache), 3).is_none());
+        assert!(super::rotated_partition_centroid_slice(None, 0).is_none());
+    }
+
+    #[test]
+    fn test_rabit_ex_dist_table_len_uses_num_bits() {
+        let dim = 960;
+
+        assert_eq!(super::rabit_ex_dist_table_len(dim, 1), 0);
+        assert_eq!(super::rabit_ex_dist_table_len(dim, 3), dim * 4);
+        assert_eq!(super::rabit_ex_dist_table_len(dim, 5), dim * 16);
+        assert_eq!(super::rabit_ex_dist_table_len(dim, 7), dim * 64);
+        assert_eq!(super::rabit_ex_dist_table_len(dim, 9), dim * 256);
+    }
+
+    #[test]
+    fn test_rabit_u8_scratch_len_includes_ex_fastscan_tables() {
+        let dim = 960;
+
+        assert_eq!(super::rabit_u8_scratch_len(dim, 1), dim * 4);
+        assert_eq!(super::rabit_u8_scratch_len(dim, 3), dim * 8);
+        assert_eq!(super::rabit_u8_scratch_len(dim, 5), dim * 16);
+        assert_eq!(super::rabit_u8_scratch_len(dim, 7), dim * 4);
+        assert_eq!(super::rabit_u8_scratch_len(dim, 9), dim * 32);
+    }
 
     async fn generate_test_dataset<T: ArrowPrimitiveType>(
         test_uri: &str,
@@ -4007,16 +4242,20 @@ mod tests {
         test_remap(params.clone(), nlist, recall_requirement).await;
     }
 
+    #[rstest]
+    #[case::l2(DistanceType::L2)]
+    #[case::cosine(DistanceType::Cosine)]
     #[tokio::test]
-    #[ignore = "IVF_RQ num_bits>1 creation is gated until split-code search support is implemented"]
-    async fn test_build_ivf_rq_multi_bit_persists_split_codes_and_gates_search() {
+    async fn test_build_ivf_rq_multi_bit_persists_split_codes_and_searches(
+        #[case] distance_type: DistanceType,
+    ) {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         let ivf_params = IvfBuildParams::new(4);
         let rq_params = RQBuildParams::with_rotation_type(9, RQRotationType::Fast);
-        let params = VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params);
+        let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
             .await
@@ -4029,6 +4268,7 @@ mod tests {
         let index_uuid = indices[0].uuid.to_string();
         let rq_meta = get_rq_metadata(&dataset, scheduler.clone(), &index_uuid).await;
         assert_eq!(rq_meta.num_bits, 9);
+        assert_eq!(rq_meta.query_estimator, RabitQueryEstimator::RawQuery);
 
         let reader = open_rq_aux_reader(&dataset, scheduler, &index_uuid).await;
         let schema = reader.schema();
@@ -4037,22 +4277,10 @@ mod tests {
             panic!("RQ ex-code field should be FixedSizeList");
         };
         assert_eq!(ex_code_bytes, 32);
+        assert!(schema.field(EX_ADD_FACTORS_COLUMN).is_some());
         assert!(schema.field(EX_SCALE_FACTORS_COLUMN).is_some());
 
-        let query = vectors.value(0);
-        let err = dataset
-            .scan()
-            .nearest("vector", query.as_primitive::<Float32Type>(), 10)
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Execution { .. }), "{err}");
-        assert!(
-            err.to_string()
-                .contains("num_bits>1 search is not supported"),
-            "{err}"
-        );
+        test_recall::<Float32Type>(params, 4, 0.5, "vector", &dataset, vectors).await;
     }
 
     #[rstest]
