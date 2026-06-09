@@ -4127,7 +4127,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Merge distributed scalar index metadata.
 
-        Vector, BTree and Bitmap distributed indexing no longer use this API. For
+        Vector and Bitmap distributed indexing no longer use this API. For
         those index families, build segments with
         :meth:`create_index_uncommitted`, optionally merge caller-defined
         groups with :meth:`merge_existing_index_segments`, and publish them with
@@ -4136,7 +4136,7 @@ class LanceDataset(pa.dataset.Dataset):
         This method does NOT commit changes.
 
         This API merges temporary scalar index files (for example per-fragment
-        inverted index outputs).
+        BTree or inverted index outputs).
         After this method returns, callers MUST explicitly commit
         the index manifest using lance.LanceDataset.commit(...)
         with a LanceOperation.CreateIndex.
@@ -4150,7 +4150,7 @@ class LanceDataset(pa.dataset.Dataset):
             :class:`lance.indices.SupportedDistributedIndices`
             supported by scalar distributed merge.
         batch_readhead: int, optional
-            Prefetch concurrency used by the merge reader. Default: 1.
+            Prefetch concurrency used by BTREE merge reader. Default: 1.
         progress_callback: callable, optional
             A callback that receives :class:`lance.progress.IndexProgress` events while
             metadata is being merged.
