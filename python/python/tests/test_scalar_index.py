@@ -3996,17 +3996,8 @@ def test_merge_index_metadata_btree_soft_break(tmp_path):
         tmp_path, num_fragments=2, rows_per_fragment=100
     )
 
-    with pytest.raises(NotImplementedError, match="are supported"):
+    with pytest.raises(ValueError, match="no longer supports merge_index_metadata"):
         ds.merge_index_metadata(str(uuid.uuid4()), index_type="BTREE")
-
-
-def test_merge_index_metadata_bitmap_soft_break(tmp_path):
-    ds = generate_multi_fragment_dataset(
-        tmp_path, num_fragments=2, rows_per_fragment=100
-    )
-
-    with pytest.raises(NotImplementedError, match="are supported"):
-        ds.merge_index_metadata(str(uuid.uuid4()), index_type="BITMAP")
 
 
 def test_btree_fragment_ids_parameter_validation(tmp_path):

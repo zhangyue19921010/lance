@@ -29,6 +29,7 @@ class IndexFileVersion(str, Enum):
 
 class SupportedDistributedIndices(str, Enum):
     # Scalar index types
+    BTREE = "BTREE"
     INVERTED = "INVERTED"
 
     # Precise vector index types supported by distributed merge
