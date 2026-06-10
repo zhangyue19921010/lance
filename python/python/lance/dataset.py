@@ -4020,11 +4020,8 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE segments do not yet support merging; collect the returned
-        segments and pass them straight to
-        :meth:`commit_existing_index_segments`. BITMAP and INVERTED segments may
+        BTREE, BITMAP and INVERTED segments may
         be merged with :meth:`merge_existing_index_segments` before commit.
-
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 
