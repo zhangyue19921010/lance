@@ -928,6 +928,15 @@ impl OldIndexDataFilter {
                 .collect(),
         }
     }
+
+    /// Filter a posting list of row addresses in place, retaining only the rows
+    /// selected by this filter.
+    pub fn retain_row_addrs(&self, addrs: &mut RowAddrTreeMap) {
+        match self {
+            Self::Fragments { to_keep, .. } => addrs.retain_fragments_in(to_keep),
+            Self::RowIds(valid_row_ids) => *addrs &= valid_row_ids,
+        }
+    }
 }
 
 impl UpdateCriteria {

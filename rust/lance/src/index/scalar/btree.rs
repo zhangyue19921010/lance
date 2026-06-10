@@ -17,7 +17,6 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::scalar::{CreatedIndex, OldIndexDataFilter};
 use lance_table::format::IndexMetadata;
-use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
@@ -121,31 +120,8 @@ pub(crate) async fn merge_segments(
     // Intersect each segment's stored bitmap with the dataset's current
     // fragments so we don't claim coverage on IDs that compaction or pruning
     // has already retired.
-    let dataset_fragments = dataset.fragment_bitmap.as_ref();
-    let mut effective_old_frags = RoaringBitmap::new();
-    let mut deleted_old_frags = RoaringBitmap::new();
-    for segment in &segments {
-        if segment.fragment_bitmap.is_none() {
-            return Err(Error::invalid_input(format!(
-                "CreateIndex: segment {} is missing fragment coverage",
-                segment.uuid
-            )));
-        }
-        if let Some(effective) = segment.effective_fragment_bitmap(dataset_fragments) {
-            effective_old_frags |= effective;
-        }
-        if let Some(deleted) = segment.deleted_fragment_bitmap(dataset_fragments) {
-            deleted_old_frags |= deleted;
-        }
-    }
-
-    let fragment_bitmap = effective_old_frags.clone();
-    let old_data_filter = crate::index::append::build_old_data_filter(
-        dataset,
-        &effective_old_frags,
-        &deleted_old_frags,
-    )
-    .await?;
+    let (fragment_bitmap, old_data_filter) =
+        crate::index::append::effective_coverage_and_filter(dataset, &segments).await?;
 
     let output_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &output_uuid.to_string())?;
