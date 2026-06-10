@@ -2283,9 +2283,9 @@ class LanceDataset(pa.dataset.Dataset):
                 not changed.
             - "nullable": bool, optional
                 Whether the column should be nullable. If not specified, the column
-                nullability is not changed. Only non-nullable columns can be changed
-                to nullable. Currently, you cannot change a nullable column to
-                non-nullable.
+                nullability is not changed. A non-nullable column can always be made
+                nullable. A nullable column can be made non-nullable only if it
+                contains no NULL values; otherwise an error is raised.
             - "data_type": pyarrow.DataType, optional
                 The new data type to cast the column to. If not specified, the column
                 data type is not changed.
@@ -3262,7 +3262,7 @@ class LanceDataset(pa.dataset.Dataset):
             import lance
 
             dataset = lance.dataset("/tmp/images.lance")
-            dataset.create_index(
+            dataset.create_scalar_index(
                 "category",
                 "BTREE",
             )
@@ -3801,6 +3801,17 @@ class LanceDataset(pa.dataset.Dataset):
             to the dataset. The returned metadata can be passed to
             ``merge_existing_index_segments(...)`` if grouping is needed and then
             committed with ``commit_existing_index_segments(...)``.
+
+            Vector segments support both shared and independent model scopes. If
+            the caller provides the same IVF centroids, and for IVF_PQ the same
+            PQ codebook, to each worker, the resulting segments share model
+            semantics and are suitable for workflows that physically merge
+            compatible segments. If those artifacts are omitted, each segment can
+            train its own IVF/PQ model for its assigned fragments. Such segments
+            can be committed together and are queried independently by segment
+            UUID; partition ids are interpreted within each segment's own model.
+            Keep independently trained segments as separate physical segments
+            unless the merge workflow can preserve or reconcile the model state.
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated.
@@ -3993,7 +4004,7 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        and canonical bitmap scalar index construction. Unlike
+        canonical bitmap scalar, and INVERTED scalar index construction. Unlike
         :meth:`create_index`, this method does not publish the index into the
         dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4009,10 +4020,22 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
+        BTREE, BITMAP and INVERTED segments may
+        be merged with :meth:`merge_existing_index_segments` before commit.
+        
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 
         - ``fragment_ids`` must be provided
+        - Vector segments support both shared and independent model scopes. Pass
+          the same IVF centroids, and for IVF_PQ the same PQ codebook, to each
+          worker when segments need shared model semantics or physical merge
+          compatibility. If these artifacts are omitted, each segment may train
+          its own IVF/PQ model and can be committed with other segments as one
+          logical index; query execution searches each segment by UUID and
+          interprets partition ids within that segment. Keep independently
+          trained segments as separate physical segments unless the merge
+          workflow can preserve or reconcile the model state.
         - ``rabitq_model`` (``IVF_RQ`` only): a JSON string produced by
           ``lance.lance.indices.build_rq_model``. It must be identical across all
           workers for their segments to be mergeable, since it pins the RaBitQ
@@ -4026,10 +4049,11 @@ class LanceDataset(pa.dataset.Dataset):
             Metadata for the segment that was written by this call.
         """
         is_scalar_segment_request = (
-            isinstance(index_type, str) and index_type.upper() in {"BTREE", "BITMAP"}
+            isinstance(index_type, str)
+            and index_type.upper() in {"BTREE", "BITMAP", "INVERTED", "FTS"}
         ) or (
             isinstance(index_type, IndexConfig)
-            and index_type.index_type.upper() in {"BTREE", "BITMAP"}
+            and index_type.index_type.upper() in {"BTREE", "BITMAP", "INVERTED", "FTS"}
         )
         if is_scalar_segment_request:
             if fragment_ids is None:

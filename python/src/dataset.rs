@@ -2159,6 +2159,7 @@ impl Dataset {
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
             "INVERTED" | "FTS" => IndexType::Inverted,
+            "FM" => IndexType::Fm,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
@@ -2198,6 +2199,27 @@ impl Dataset {
                 index_type: "rtree".to_string(),
                 params: None,
             }),
+            "FM" => {
+                let mut params_json = serde_json::Map::new();
+                if let Some(kwargs) = kwargs
+                    && let Some(num_segments) = kwargs.get_item("num_segments")?
+                {
+                    let n: u32 = num_segments.extract()?;
+                    params_json.insert(
+                        "num_segments".to_string(),
+                        serde_json::Value::Number(n.into()),
+                    );
+                }
+                let params = if params_json.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(params_json).to_string())
+                };
+                Box::new(ScalarIndexParams {
+                    index_type: "fm".to_string(),
+                    params,
+                })
+            }
             "SCALAR" => {
                 let Some(kwargs) = kwargs else {
                     return Err(PyValueError::new_err(
@@ -2304,10 +2326,22 @@ impl Dataset {
             None
         };
 
-        let index_uuid: Option<String> = if let Some(kwargs) = kwargs {
+        let index_uuid: Option<Uuid> = if let Some(kwargs) = kwargs {
             kwargs
                 .get_item("index_uuid")?
-                .and_then(|v| if v.is_none() { None } else { Some(v.extract()) })
+                .and_then(|v| {
+                    if v.is_none() {
+                        None
+                    } else {
+                        Some(v.extract::<String>())
+                    }
+                })
+                .transpose()?
+                .map(|s| {
+                    Uuid::parse_str(&s).map_err(|e| {
+                        PyValueError::new_err(format!("Invalid UUID string for index_uuid: {e}"))
+                    })
+                })
                 .transpose()?
         } else {
             None
@@ -2410,6 +2444,9 @@ impl Dataset {
         batch_readhead: Option<usize>,
         progress_callback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        let parsed_uuid = Uuid::parse_str(index_uuid).map_err(|e| {
+            PyValueError::new_err(format!("Invalid UUID string for index_uuid: {e}"))
+        })?;
         let mut progress_handler =
             Self::make_index_progress_handler_from_callback(progress_callback)?;
         let progress: Arc<dyn IndexBuildProgress> = progress_handler
@@ -2421,7 +2458,7 @@ impl Dataset {
             async {
                 self.ds
                     .merge_index_metadata(
-                        index_uuid,
+                        &parsed_uuid,
                         IndexType::try_from(index_type)?,
                         batch_readhead,
                         progress,
@@ -3070,11 +3107,7 @@ impl Dataset {
 
             let vindex = self
                 .ds
-                .open_vector_index(
-                    column_name,
-                    &idx_meta.uuid.to_string(),
-                    &NoOpMetricsCollector,
-                )
+                .open_vector_index(column_name, &idx_meta.uuid, &NoOpMetricsCollector)
                 .await
                 .infer_error()?;
 
