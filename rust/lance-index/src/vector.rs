@@ -82,6 +82,23 @@ pub static CENTROID_DIST_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(||
 
 pub const DEFAULT_QUERY_PARALLELISM: i32 = 0;
 
+/// Controls the speed / accuracy tradeoff for approximate vector search.
+///
+/// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
+/// Other index types ignore this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApproxMode {
+    /// Prefer lower query latency, which can reduce recall.
+    Fast,
+
+    /// Use the default balance between query latency and recall.
+    #[default]
+    Normal,
+
+    /// Prefer higher recall, which can increase query latency.
+    Accurate,
+}
+
 /// Query parameters for the vector indices
 
 #[derive(Debug, Clone)]
@@ -141,6 +158,12 @@ pub struct Query {
     /// the distance between the query and the centroid
     /// this is only used for IVF index with Rabit quantization
     pub dist_q_c: f32,
+
+    /// Controls the speed / accuracy tradeoff for approximate vector search.
+    ///
+    /// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
+    /// Other index types ignore this setting.
+    pub approx_mode: ApproxMode,
 }
 
 impl From<pb::VectorMetricType> for DistanceType {

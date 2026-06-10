@@ -78,8 +78,9 @@ use lance_index::{
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
-        DEFAULT_QUERY_PARALLELISM, Query as VectorQuery, hnsw::builder::HnswBuildParams,
-        ivf::IvfBuildParams, pq::PQBuildParams, sq::builder::SQBuildParams,
+        ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
+        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+        sq::builder::SQBuildParams,
     },
 };
 use lance_io::object_store::{
@@ -1227,6 +1228,7 @@ impl Dataset {
                 use_index,
                 ef,
                 query_parallelism,
+                approx_mode,
             ) = vector_query_params_from_dict(nearest, default_k)?;
 
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
@@ -1293,6 +1295,7 @@ impl Dataset {
                         s = s.ef(ef);
                     }
                     s = s.query_parallelism(query_parallelism);
+                    s = s.approx_mode(approx_mode);
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
                         s.distance_range(lower, upper);
@@ -4706,6 +4709,7 @@ type VectorQueryParams = (
     bool,
     Option<usize>,
     i32,
+    ApproxMode,
 );
 
 fn extract_query_parallelism(value: &Bound<'_, PyAny>) -> PyResult<i32> {
@@ -4724,6 +4728,23 @@ fn vector_query_query_parallelism_from_dict(dict: &Bound<'_, PyDict>) -> PyResul
         extract_query_parallelism(&query_parallelism)
     } else {
         Ok(DEFAULT_QUERY_PARALLELISM)
+    }
+}
+
+fn vector_query_approx_mode_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<ApproxMode> {
+    if let Some(approx_mode) = dict.get_item("approx_mode")?
+        && !approx_mode.is_none()
+    {
+        match approx_mode.to_string().to_lowercase().as_str() {
+            "fast" => Ok(ApproxMode::Fast),
+            "normal" => Ok(ApproxMode::Normal),
+            "accurate" => Ok(ApproxMode::Accurate),
+            value => Err(PyValueError::new_err(format!(
+                "approx_mode must be one of 'fast', 'normal', or 'accurate', got '{value}'"
+            ))),
+        }
+    } else {
+        Ok(ApproxMode::Normal)
     }
 }
 
@@ -4833,6 +4854,7 @@ fn vector_query_params_from_dict(
     };
 
     let query_parallelism = vector_query_query_parallelism_from_dict(dict)?;
+    let approx_mode = vector_query_approx_mode_from_dict(dict)?;
 
     Ok((
         column,
@@ -4845,6 +4867,7 @@ fn vector_query_params_from_dict(
         use_index,
         ef,
         query_parallelism,
+        approx_mode,
     ))
 }
 
@@ -4881,6 +4904,7 @@ impl PySearchFilter {
             use_index,
             ef,
             query_parallelism,
+            approx_mode,
         ) = vector_query_params_from_dict(query, default_k)?;
 
         let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
@@ -4899,6 +4923,7 @@ impl PySearchFilter {
             use_index,
             query_parallelism,
             dist_q_c: 0.0,
+            approx_mode,
         };
 
         Ok(Self {
