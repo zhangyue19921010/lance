@@ -6,11 +6,15 @@
 
 pub(crate) mod bitmap;
 pub(crate) mod btree;
+pub(crate) mod fmindex;
 pub(crate) mod inverted;
+pub(crate) mod zonemap;
 
 pub use inverted::{load_segment_details, load_segments};
 
 use std::sync::{Arc, LazyLock};
+
+use uuid::Uuid;
 
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
@@ -272,7 +276,7 @@ impl IndexDetails {
 pub(super) async fn build_scalar_index(
     dataset: &Dataset,
     column: &str,
-    uuid: &str,
+    uuid: Uuid,
     params: &ScalarIndexParams,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
@@ -287,7 +291,7 @@ pub(super) async fn build_scalar_index(
         ))?;
     let field: arrow_schema::Field = field.into();
 
-    let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
+    let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
 
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
     let training_request =
@@ -385,7 +389,7 @@ pub async fn open_scalar_index(
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    let uuid_str = index.uuid.to_string();
+    let index_uuid = index.uuid;
     let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
 
     let index_details = fetch_index_details(dataset, column, index).await?;
@@ -395,7 +399,7 @@ pub async fn open_scalar_index(
 
     let index_cache = dataset
         .index_cache
-        .for_index(&uuid_str, frag_reuse_index.as_ref().map(|f| &f.uuid));
+        .for_index(&index.uuid, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
     if let Some(index) = plugin
         .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &index_cache)
@@ -415,7 +419,7 @@ pub async fn open_scalar_index(
         .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
         .await?;
 
-    tracing::info!(target: TRACE_IO_EVENTS, index_uuid = uuid_str, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
+    tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
     metrics.record_index_load();
 
     plugin.put_in_cache(&index_cache, index.clone()).await?;
@@ -427,13 +431,14 @@ pub(crate) async fn infer_scalar_index_details(
     column: &str,
     index: &IndexMetadata,
 ) -> Result<Arc<prost_types::Any>> {
-    let uuid = index.uuid.to_string();
-    let type_key = crate::session::index_caches::ScalarIndexDetailsKey { uuid: &uuid };
+    let type_key = crate::session::index_caches::ScalarIndexDetailsKey { uuid: &index.uuid };
     if let Some(index_details) = dataset.index_cache.get_with_key(&type_key).await {
         return Ok(index_details.0.clone());
     }
 
-    let index_dir = dataset.indice_files_dir(index)?.join(uuid.clone());
+    let index_dir = dataset
+        .indice_files_dir(index)?
+        .join(index.uuid.to_string());
     let col = dataset
         .schema()
         .field(column)
@@ -566,11 +571,7 @@ pub async fn initialize_scalar_index(
     let column_name = field_names[0];
 
     let source_scalar_index = source_dataset
-        .open_scalar_index(
-            column_name,
-            &source_index.uuid.to_string(),
-            &NoOpMetricsCollector,
-        )
+        .open_scalar_index(column_name, &source_index.uuid, &NoOpMetricsCollector)
         .await?;
 
     let params = source_scalar_index.derive_index_params()?;
@@ -1113,11 +1114,7 @@ mod tests {
 
         // Verify the index type is correct
         let target_scalar_index = target_dataset
-            .open_scalar_index(
-                "id",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_scalar_index("id", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -1191,7 +1188,7 @@ mod tests {
 
         // Verify the index type is correct
         let scalar_index = dataset
-            .open_scalar_index("id", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .open_scalar_index("id", &indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -1236,7 +1233,7 @@ mod tests {
         );
 
         let scalar_index = dataset
-            .open_scalar_index("id", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .open_scalar_index("id", &indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -1419,11 +1416,7 @@ mod tests {
 
         // Verify the index type is correct
         let target_scalar_index = target_dataset
-            .open_scalar_index(
-                "text",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_scalar_index("text", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -1557,11 +1550,7 @@ mod tests {
 
         // Verify the index type is correct
         let target_scalar_index = target_dataset
-            .open_scalar_index(
-                "value",
-                &target_indices[0].uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_scalar_index("value", &target_indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 

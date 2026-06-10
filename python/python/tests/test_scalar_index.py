@@ -108,6 +108,23 @@ def _commit_segmented_btree_index(dataset, column, index_name):
     return dataset.commit_existing_index_segments(index_name, column, segments)
 
 
+def test_create_scalar_index_rejects_invalid_uuid(tmp_path):
+    """Invalid UUID strings passed to create_scalar_index and merge_index_metadata
+    must surface as a Python ValueError at the FFI boundary."""
+    data = pa.table({"id": pa.array(range(100), type=pa.int64())})
+    dataset = lance.write_dataset(data, tmp_path / "ds")
+
+    with pytest.raises(ValueError, match="Invalid UUID"):
+        dataset.create_scalar_index(
+            column="id",
+            index_type="BTREE",
+            index_uuid="not-a-uuid",
+        )
+
+    with pytest.raises(ValueError, match="Invalid UUID"):
+        dataset.merge_index_metadata("also-not-a-uuid", index_type="BTREE")
+
+
 @pytest.fixture
 def btree_comparison_datasets(tmp_path):
     """Setup datasets for B-tree comparison tests"""
@@ -3358,6 +3375,52 @@ def test_build_distributed_fts_index_basic(tmp_path):
     ).to_table()
 
     assert results.num_rows > 0, "No results found for search term 'frodo'"
+
+
+@pytest.mark.parametrize("index_type", ["INVERTED", "FTS"])
+def test_segment_fts(tmp_path, index_type):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=3, rows_per_fragment=100
+    )
+
+    index_name = f"text_{index_type.lower()}_segment_idx"
+    segments = [
+        ds.create_index_uncommitted(
+            column="text",
+            index_type=index_type,
+            name=index_name,
+            fragment_ids=[fragment.fragment_id],
+            with_position=False,
+            remove_stop_words=False,
+        )
+        for fragment in ds.get_fragments()
+    ]
+    committed_ds = ds.commit_existing_index_segments(index_name, "text", segments)
+
+    query = MatchQuery("frodo", "text")
+    results_without_index = committed_ds.scanner(
+        full_text_query=query,
+        columns=["id", "text"],
+        use_scalar_index=False,
+    ).to_table()
+    results_with_index = committed_ds.scanner(
+        full_text_query=query,
+        columns=["id", "text"],
+        use_scalar_index=True,
+    ).to_table()
+
+    compare_fts_results(results_without_index, results_with_index)
+    assert any(
+        idx.name == index_name and idx.index_type == "Inverted"
+        for idx in committed_ds.describe_indices()
+    )
+    assert (
+        "FlatMatchQuery"
+        not in committed_ds.scanner(
+            full_text_query=query,
+            use_scalar_index=True,
+        ).explain_plan()
+    )
 
 
 def test_compare_fts_results_identical(tmp_path):
