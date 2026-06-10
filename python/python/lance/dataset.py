@@ -4022,7 +4022,6 @@ class LanceDataset(pa.dataset.Dataset):
 
         BTREE, BITMAP and INVERTED segments may
         be merged with :meth:`merge_existing_index_segments` before commit.
-        
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 
