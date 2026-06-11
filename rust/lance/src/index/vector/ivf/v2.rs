@@ -8,6 +8,7 @@ use std::io::Write as IoWrite;
 use std::marker::PhantomData;
 use std::{
     any::Any,
+    borrow::Cow,
     collections::{BinaryHeap, HashMap},
     sync::{Arc, Mutex},
 };
@@ -65,7 +66,7 @@ use lance_index::{
 };
 use lance_index::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
 use lance_io::local::to_local_path;
-use lance_io::scheduler::SchedulerConfig;
+use lance_io::scheduler::{IoStats, ScanStats, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::{
     ReadBatchParams, object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader,
@@ -176,6 +177,23 @@ fn rabit_u8_scratch_len(dim: usize, num_bits: u8) -> usize {
         .map(|ex_code_len| ex_code_len * 2 * SEGMENT_NUM_CODES)
         .unwrap_or_default();
     binary_dist_table_len.max(ex_dist_table_len)
+}
+
+fn rabit_query_scratch_capacity(
+    dim: usize,
+    max_partition_len: usize,
+    num_bits: u8,
+) -> QueryScratchCapacity {
+    let dist_table_len = dim * 4;
+    let ex_dist_table_len = rabit_ex_dist_table_len(dim, num_bits);
+    let u8_scratch_len = rabit_u8_scratch_len(dim, num_bits);
+
+    QueryScratchCapacity::new(
+        max_partition_len,
+        dim + dist_table_len + ex_dist_table_len,
+        max_partition_len.max(dist_table_len),
+        u8_scratch_len,
+    )
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
@@ -598,6 +616,11 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     index_cache: WeakLanceCache,
 
     io_parallelism: usize,
+    /// Cumulative I/O performed while opening this index (file footers, IVF
+    /// centroids, quantization metadata).  Captured once in `try_new`; exposed
+    /// via [`VectorIndex::open_io_stats`] so the opening query can attribute the
+    /// one-time open cost to its plan metrics.
+    open_io_stats: ScanStats,
     scratch_pool: Arc<QueryScratchPool>,
     use_query_residual: bool,
     use_residual_scratch: bool,
@@ -935,25 +958,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         }
 
         let dim = ivf.dimension();
-        let dist_table_len = dim * 4;
-        let (ex_dist_table_len, u8_scratch_len) = match storage.quantizer() {
-            Ok(Quantizer::Rabit(rq)) => {
-                let num_bits = rq.metadata_ref().num_bits;
-                (
-                    rabit_ex_dist_table_len(dim, num_bits),
-                    rabit_u8_scratch_len(dim, num_bits),
-                )
-            }
-            _ => (dim * 256, dim * 32),
-        };
         let max_partition_len = ivf.lengths.iter().copied().max().unwrap_or_default() as usize;
+        let num_bits = match storage.quantizer() {
+            Ok(Quantizer::Rabit(rq)) => rq.metadata_ref().num_bits,
+            _ => 9,
+        };
 
-        QueryScratchCapacity::new(
-            max_partition_len,
-            dim + dist_table_len + ex_dist_table_len,
-            max_partition_len,
-            u8_scratch_len,
-        )
+        rabit_query_scratch_capacity(dim, max_partition_len, num_bits)
     }
 
     fn use_residual_scratch(ivf: &IvfModel, use_query_residual: bool) -> bool {
@@ -1086,6 +1097,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
         let rq_search_cache = Self::build_rq_search_cache(&ivf, &storage)?;
 
+        // The scheduler is freshly created above and, at this point, has served
+        // only the open-time reads (file footers, IVF centroids, quantization
+        // metadata) -- partition reads happen later, during queries.  So its
+        // cumulative stats are exactly the one-time index-open I/O.
+        let open_io_stats = scheduler.stats();
+
         Ok(Self {
             uri: to_local_path(&uri),
             index_path: uri.as_ref().to_string(),
@@ -1101,6 +1118,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
             io_parallelism,
+            open_io_stats,
             _marker: PhantomData,
         })
     }
@@ -1138,6 +1156,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
             io_parallelism,
+            // Reconstruction from cached state re-opens readers on its own path;
+            // the open-time I/O is not attributed here (it is a one-time cost,
+            // and the first open via `try_new` already accounts for it).
+            open_io_stats: ScanStats::default(),
             _marker: PhantomData,
         }
     }
@@ -1165,7 +1187,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 .get_or_insert_with_key(cache_key, || async {
                     info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
                     metrics.record_part_load();
-                    self.load_partition_entry(partition_id).await
+                    self.load_partition_entry(partition_id, metrics.io_stats())
+                        .await
                 })
                 .await?;
             Ok(entry as Arc<dyn VectorIndexCacheEntry>)
@@ -1175,11 +1198,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             }
             info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
             metrics.record_part_load();
-            Ok(Arc::new(self.load_partition_entry(partition_id).await?))
+            Ok(Arc::new(
+                self.load_partition_entry(partition_id, metrics.io_stats())
+                    .await?,
+            ))
         }
     }
 
-    async fn load_partition_entry(&self, partition_id: usize) -> Result<PartitionEntry<S, Q>> {
+    async fn load_partition_entry(
+        &self,
+        partition_id: usize,
+        io_stats: Option<IoStats>,
+    ) -> Result<PartitionEntry<S, Q>> {
         let schema = Arc::new(self.reader.schema().as_ref().into());
         let batch = match self.reader.metadata().num_rows {
             0 => RecordBatch::new_empty(schema),
@@ -1188,8 +1218,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 if row_range.is_empty() {
                     RecordBatch::new_empty(schema)
                 } else {
-                    let batches = self
-                        .reader
+                    // When I/O is being measured, read through a reader whose
+                    // scheduler also records into the per-query sink (a cheap
+                    // clone sharing all cached metadata, no file re-open).
+                    // Otherwise borrow the shared reader as-is, with no clone.
+                    let reader = match &io_stats {
+                        Some(io_stats) => {
+                            Cow::Owned(self.reader.with_io_stats(io_stats.recorder()))
+                        }
+                        None => Cow::Borrowed(&self.reader),
+                    };
+                    let batches = reader
                         .read_stream(
                             ReadBatchParams::Range(row_range),
                             u32::MAX,
@@ -1208,15 +1247,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             self.sub_index_metadata[partition_id].clone(),
         )?;
         let idx = S::load(batch)?;
-        let storage = self.load_partition_storage(partition_id).await?;
+        let storage = self.load_partition_storage(partition_id, io_stats).await?;
         Ok(PartitionEntry {
             index: idx,
             storage,
         })
     }
 
-    pub async fn load_partition_storage(&self, partition_id: usize) -> Result<Q::Storage> {
-        self.storage.load_partition(partition_id).await
+    pub async fn load_partition_storage(
+        &self,
+        partition_id: usize,
+        io_stats: Option<IoStats>,
+    ) -> Result<Q::Storage> {
+        self.storage.load_partition(partition_id, io_stats).await
     }
 
     /// preprocess the query vector given the partition id.
@@ -1796,6 +1839,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     fn metric_type(&self) -> DistanceType {
         self.distance_type
     }
+
+    fn open_io_stats(&self) -> Option<ScanStats> {
+        Some(self.open_io_stats)
+    }
 }
 
 pub type IvfFlatIndex = IVFIndex<FlatIndex, FlatQuantizer>;
@@ -1998,6 +2045,20 @@ mod tests {
         assert_eq!(super::rabit_u8_scratch_len(dim, 5), dim * 16);
         assert_eq!(super::rabit_u8_scratch_len(dim, 7), dim * 4);
         assert_eq!(super::rabit_u8_scratch_len(dim, 9), dim * 32);
+    }
+
+    #[test]
+    fn test_rabit_query_scratch_capacity_does_not_preallocate_u32() {
+        let dim = 960;
+        let max_partition_len = 4096;
+
+        let capacity = super::rabit_query_scratch_capacity(dim, max_partition_len, 5);
+
+        assert_eq!(capacity.distances, max_partition_len);
+        assert_eq!(capacity.query_f32, dim + dim * 4 + dim * 16);
+        assert_eq!(capacity.u16, max_partition_len);
+        assert_eq!(capacity.u8, dim * 16);
+        assert_eq!(capacity.u32, 0);
     }
 
     async fn generate_test_dataset<T: ArrowPrimitiveType>(
@@ -2705,7 +2766,7 @@ mod tests {
     async fn load_partition_row_ids(index: &IvfPq, partition_idx: usize) -> Vec<u64> {
         index
             .storage
-            .load_partition(partition_idx)
+            .load_partition(partition_idx, None)
             .await
             .unwrap()
             .row_ids()
