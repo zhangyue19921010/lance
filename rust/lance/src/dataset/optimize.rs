@@ -80,6 +80,7 @@
 //! the successful tasks can be committed. You can also commit in batches if
 //! you wish. As long as the tasks don't rewrite any of the same fragments,
 //! they can be committed in any order.
+use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -1927,7 +1928,7 @@ pub async fn commit_compaction(
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
     let mut metrics = CompactionMetrics::default();
 
-    let mut row_id_map: HashMap<u64, Option<u64>> = HashMap::default();
+    let mut remap_group_inputs: Vec<GroupInput> = Vec::new();
     let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
 
@@ -1942,12 +1943,41 @@ pub async fn commit_compaction(
             if let Some(row_addrs_bytes) = task.row_addrs {
                 let row_addrs =
                     RoaringTreemap::deserialize_from(&mut Cursor::new(&row_addrs_bytes))?;
-                let transposed = remapping::transpose_row_addrs(
-                    row_addrs,
-                    &task.original_fragments,
-                    &task.new_fragments,
-                );
-                row_id_map.extend(transposed);
+                let new_frags = task
+                    .new_fragments
+                    .iter()
+                    .map(|f| {
+                        let physical_rows = f.physical_rows.ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "compacted fragment {} is missing physical_rows",
+                                f.id
+                            ))
+                        })?;
+                        Ok((f.id as u32, physical_rows as u32))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let new_rows: u64 = new_frags.iter().map(|(_, rows)| *rows as u64).sum();
+                if row_addrs.len() != new_rows {
+                    return Err(Error::invalid_input(format!(
+                        "compaction task rewrote fragments {:?} into {} rows but recorded {} rewritten old row addresses",
+                        task.original_fragments
+                            .iter()
+                            .map(|f| f.id)
+                            .collect::<Vec<_>>(),
+                        new_rows,
+                        row_addrs.len()
+                    )));
+                }
+                remap_group_inputs.push(GroupInput {
+                    rewritten_old_row_addrs: row_addrs,
+                    old_frag_ids: task
+                        .original_fragments
+                        .iter()
+                        .map(|f| f.id as u32)
+                        .collect(),
+                    new_frags,
+                });
             }
         } else if options.defer_index_remap {
             let changed_row_addrs = task.row_addrs.ok_or_else(|| {
@@ -1976,7 +2006,7 @@ pub async fn commit_compaction(
             .collect::<Vec<_>>();
 
         let remapped_indices = index_remapper
-            .remap_indices(row_id_map, &affected_ids)
+            .remap_indices(RowAddrRemap::compact(remap_group_inputs)?, &affected_ids)
             .await?;
         remapped_indices
             .into_iter()
@@ -2201,18 +2231,26 @@ mod tests {
     impl IndexRemapper for MockIndexRemapper {
         async fn remap_indices(
             &self,
-            index_map: HashMap<u64, Option<u64>>,
+            index_map: RowAddrRemap,
             _: &[u64],
         ) -> Result<Vec<RemappedIndex>> {
             for expectation in &self.expectations {
-                if expectation.expected == index_map {
+                let expected_frags: RoaringBitmap = expectation
+                    .expected
+                    .keys()
+                    .map(|addr| (addr >> 32) as u32)
+                    .collect();
+                if index_map.affected_fragments() == expected_frags
+                    && expectation
+                        .expected
+                        .iter()
+                        .all(|(k, v)| index_map.get(*k) == Some(*v))
+                {
                     return Ok(expectation.answer.clone());
                 }
             }
             panic!(
-                "Unexpected index map (len={}): {}\n  Options: {}",
-                index_map.len(),
-                Self::stringify_map(&index_map),
+                "Unexpected index map; expected one of:\n  {}",
                 self.expectations
                     .iter()
                     .map(|expectation| Self::stringify_map(&expectation.expected))
@@ -2697,11 +2735,7 @@ mod tests {
 
     #[async_trait]
     impl IndexRemapper for IgnoreRemap {
-        async fn remap_indices(
-            &self,
-            _: HashMap<u64, Option<u64>>,
-            _: &[u64],
-        ) -> Result<Vec<RemappedIndex>> {
+        async fn remap_indices(&self, _: RowAddrRemap, _: &[u64]) -> Result<Vec<RemappedIndex>> {
             Ok(Vec::new())
         }
     }

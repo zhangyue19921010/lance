@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::borrow::Cow;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::ops::Sub;
 use std::sync::{
     Arc, OnceLock,
@@ -2184,7 +2185,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         Self::try_from_batch(batch, metadata, distance_type, frag_reuse_index)
     }
 
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+    fn remap(&self, mapping: &RowAddrRemap) -> Result<Self> {
         let num_vectors = self.codes.len();
         let num_code_bytes = self.codes.value_length() as usize;
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
@@ -2194,10 +2195,10 @@ impl QuantizerStorage for RabitQuantizationStorage {
 
         let row_ids = self.row_ids.values();
         for (i, row_id) in row_ids.iter().enumerate() {
-            match mapping.get(row_id) {
+            match mapping.get(*row_id) {
                 Some(Some(new_id)) => {
                     indices.push(i as u32);
-                    new_row_ids.push(*new_id);
+                    new_row_ids.push(new_id);
                     new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
                 }
                 Some(None) => {}
@@ -2365,6 +2366,7 @@ fn get_rq_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::collections::{BinaryHeap, HashMap};
 
     use arrow_array::{ArrayRef, Float32Array, Float64Array, UInt64Array};
@@ -3236,7 +3238,7 @@ mod tests {
         mapping.insert(3, None);
         mapping.insert(4, Some(104));
 
-        let remapped = storage.remap(&mapping).unwrap();
+        let remapped = storage.remap(&RowAddrRemap::Explicit(mapping)).unwrap();
         assert!(remapped.metadata().packed);
 
         let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
@@ -3251,6 +3253,51 @@ mod tests {
         let remapped_codes = remapped_batch[RABIT_CODE_COLUMN].as_fixed_size_list();
         let repacked = pack_codes(&unpack_codes(remapped_codes));
         assert_codes_eq(remapped_codes, &repacked);
+    }
+
+    // Rows 0..25 of frag 0 are rewritten in order into frag 1; rows 25..50 are
+    // deleted. remap must behave the same in either RowAddrRemap mode.
+    fn rq_remap_compact() -> RowAddrRemap {
+        use lance_core::utils::row_addr_remap::GroupInput;
+        use roaring::RoaringTreemap;
+        RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::from_iter(0u64..25),
+            old_frag_ids: vec![0],
+            new_frags: vec![(1, 25)],
+        }])
+        .unwrap()
+    }
+
+    fn rq_remap_explicit() -> RowAddrRemap {
+        RowAddrRemap::Explicit(
+            (0u64..25)
+                .map(|i| (i, Some((1u64 << 32) | i)))
+                .chain((25u64..50).map(|i| (i, None)))
+                .collect(),
+        )
+    }
+
+    #[rstest]
+    #[case(rq_remap_compact())]
+    #[case(rq_remap_explicit())]
+    fn test_remap_compact_rewrites_old_row_addrs(#[case] remap: RowAddrRemap) {
+        let original_codes = make_test_codes(50, 64);
+        let metadata = make_test_metadata(original_codes.value_length() as usize * 8);
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch(original_codes),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+
+        let remapped = storage.remap(&remap).unwrap();
+        let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
+        let remapped_row_ids = remapped_batch[ROW_ID].as_primitive::<UInt64Type>().values();
+        // Rewritten rows 0..25 land at frag 1 offsets 0..25; the rest are dropped.
+        let expected_row_ids =
+            UInt64Array::from_iter_values((0..25).map(|i| (1u64 << 32) | i as u64));
+        assert_eq!(remapped_row_ids, expected_row_ids.values());
     }
 
     #[test]
@@ -3273,7 +3320,7 @@ mod tests {
         mapping.insert(3, None);
         mapping.insert(4, Some(104));
 
-        let remapped = storage.remap(&mapping).unwrap();
+        let remapped = storage.remap(&RowAddrRemap::Explicit(mapping)).unwrap();
         let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
         let remapped_row_ids = remapped_batch[ROW_ID].as_primitive::<UInt64Type>().values();
         let expected_row_ids = UInt64Array::from_iter_values(

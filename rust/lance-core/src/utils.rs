@@ -14,6 +14,7 @@ pub mod futures;
 pub mod hash;
 pub mod parse;
 pub mod path;
+pub mod row_addr_remap;
 pub mod tempfile;
 pub mod testing;
 pub mod tokio;

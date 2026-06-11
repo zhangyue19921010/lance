@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     any::Any,
     cmp::Ordering,
@@ -1894,7 +1895,7 @@ impl ScalarIndex for BTreeIndex {
 
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         // (part_id, path)
@@ -2061,7 +2062,7 @@ pub trait BTreeSubIndex: Debug + Send + Sync + DeepSizeOf {
     async fn remap_subindex(
         &self,
         serialized: RecordBatch,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
     ) -> Result<RecordBatch>;
 }
 
@@ -3006,6 +3007,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 
 #[cfg(test)]
 mod tests {
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};
 
@@ -3106,7 +3108,7 @@ mod tests {
 
         // Remap with a no-op mapping.  The remapped index should be identical to the original
         index
-            .remap(&HashMap::default(), remap_store.as_ref())
+            .remap(&RowAddrRemap::empty(), remap_store.as_ref())
             .await
             .unwrap();
 
@@ -4537,7 +4539,7 @@ mod tests {
 
         // Remap with a no-op mapping.  The remapped index should be identical to the original
         ranged_index
-            .remap(&HashMap::default(), remap_store.as_ref())
+            .remap(&RowAddrRemap::empty(), remap_store.as_ref())
             .await
             .unwrap();
 
@@ -4865,7 +4867,10 @@ mod tests {
         ));
 
         // Remap the index with our deletion mapping
-        index.remap(&mapping, remap_store.as_ref()).await.unwrap();
+        index
+            .remap(&RowAddrRemap::Explicit(mapping), remap_store.as_ref())
+            .await
+            .unwrap();
 
         let remapped_index = BTreeIndex::load(remap_store.clone(), None, &LanceCache::no_cache())
             .await
