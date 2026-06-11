@@ -3005,13 +3005,14 @@ class LanceDataset(pa.dataset.Dataset):
                 "LABEL_LIST",
                 "INVERTED",
                 "FTS",
+                "FM",
                 "BLOOMFILTER",
                 "RTREE",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
+                        '"INVERTED", "FM", "BLOOMFILTER" or "RTREE" are supported for '
                         f"scalar columns.  Received {index_type}",
                     )
                 )
@@ -3044,6 +3045,17 @@ class LanceDataset(pa.dataset.Dataset):
                     field_type
                 ):
                     raise TypeError(f"NGRAM index column {column} must be a string")
+            elif index_type == "FM":
+                if (
+                    not pa.types.is_string(field_type)
+                    and not pa.types.is_large_string(field_type)
+                    and not pa.types.is_binary(field_type)
+                    and not pa.types.is_large_binary(field_type)
+                ):
+                    raise TypeError(
+                        f"FM index column {column} must be string, large string, "
+                        "binary, or large binary"
+                    )
             elif index_type in ["INVERTED", "FTS"]:
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
@@ -3085,6 +3097,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["FTS"],
             Literal["NGRAM"],
             Literal["ZONEMAP"],
+            Literal["FM"],
             Literal["BLOOMFILTER"],
             Literal["RTREE"],
             IndexConfig,
@@ -3158,6 +3171,10 @@ class LanceDataset(pa.dataset.Dataset):
           index can conduct full-text searches. For example, a column that contains any
           word
           of query string "hello world". The results will be ranked by BM25.
+        * ``FM``. An FM-Index over a string or binary column that supports exact
+          substring search (the ``contains`` function) and returns exact row ids.
+          For distributed builds use :meth:`create_index_uncommitted` with
+          ``fragment_ids``.
         * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
              but can only handle filters with equals and not equals and may require
              more I/O than a btree or bitmap index```
@@ -3176,7 +3193,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``.
+            ``"FTS"``, ``"FM"``, ``"BLOOMFILTER"``, ``"RTREE"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -3291,7 +3308,7 @@ class LanceDataset(pa.dataset.Dataset):
             column, index_type, kwargs
         )
 
-        if fragment_ids is not None and logical_index_type in {"BTREE", "BITMAP"}:
+        if fragment_ids is not None and logical_index_type in {"BTREE", "BITMAP", "FM"}:
             raise ValueError(
                 f"{logical_index_type} distributed indexing uses "
                 "create_index_uncommitted(..., "
@@ -4004,7 +4021,8 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        canonical bitmap scalar, and INVERTED scalar index construction. Unlike
+        canonical bitmap scalar, INVERTED scalar, and FM scalar index
+        construction. Unlike
         :meth:`create_index`, this method does not publish the index into the
         dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4022,8 +4040,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         BTREE segments do not yet support merging; collect the returned
         segments and pass them straight to
-        :meth:`commit_existing_index_segments`. BITMAP and INVERTED segments may
-        be merged with :meth:`merge_existing_index_segments` before commit.
+        :meth:`commit_existing_index_segments`. BITMAP, INVERTED, and FM segments
+        may be merged with :meth:`merge_existing_index_segments` before commit.
 
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
@@ -4052,10 +4070,11 @@ class LanceDataset(pa.dataset.Dataset):
         """
         is_scalar_segment_request = (
             isinstance(index_type, str)
-            and index_type.upper() in {"BTREE", "BITMAP", "INVERTED", "FTS"}
+            and index_type.upper() in {"BTREE", "BITMAP", "INVERTED", "FTS", "FM"}
         ) or (
             isinstance(index_type, IndexConfig)
-            and index_type.index_type.upper() in {"BTREE", "BITMAP", "INVERTED", "FTS"}
+            and index_type.index_type.upper()
+            in {"BTREE", "BITMAP", "INVERTED", "FTS", "FM"}
         )
         if is_scalar_segment_request:
             if fragment_ids is None:
