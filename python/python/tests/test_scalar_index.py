@@ -4054,7 +4054,7 @@ def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
     )
 
 
-def test_fm_segment_merge_and_commit_from_python(tmp_path):
+def test_fm_segment_merge_and_commit(tmp_path):
     ds = generate_multi_fragment_dataset(
         tmp_path, num_fragments=3, rows_per_fragment=100
     )
