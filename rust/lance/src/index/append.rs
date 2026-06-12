@@ -114,12 +114,32 @@ pub fn split_segment_coverage<'a>(
     (effective, deleted)
 }
 
-/// Validate that every segment carries fragment coverage, split that coverage
-/// into still-live and retired fragments, and build the matching [`OldIndexDataFilter`].
-pub async fn effective_coverage_and_filter(
+/// Build one [`OldIndexDataFilter`] per segment, each derived from that
+/// segment's *own* effective (still-live) and retired fragment coverage.
+pub async fn build_per_segment_filters(
+    dataset: &Dataset,
+    segments: &[&IndexMetadata],
+) -> Result<Vec<Option<OldIndexDataFilter>>> {
+    let mut filters = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let effective = segment
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .unwrap_or_default();
+        let deleted = segment
+            .deleted_fragment_bitmap(&dataset.fragment_bitmap)
+            .unwrap_or_default();
+        filters.push(build_old_data_filter(dataset, &effective, &deleted).await?);
+    }
+    Ok(filters)
+}
+
+/// Validate that every segment carries fragment coverage, then return the
+/// combined still-live coverage (for the merged segment's fragment bitmap)
+/// together with one [`OldIndexDataFilter`] per segment.
+pub async fn effective_coverage_and_filters(
     dataset: &Dataset,
     segments: &[IndexMetadata],
-) -> Result<(RoaringBitmap, Option<OldIndexDataFilter>)> {
+) -> Result<(RoaringBitmap, Vec<Option<OldIndexDataFilter>>)> {
     for segment in segments {
         if segment.fragment_bitmap.is_none() {
             return Err(Error::invalid_input(format!(
@@ -128,9 +148,10 @@ pub async fn effective_coverage_and_filter(
             )));
         }
     }
-    let (effective, deleted) = split_segment_coverage(dataset, segments);
-    let old_data_filter = build_old_data_filter(dataset, &effective, &deleted).await?;
-    Ok((effective, old_data_filter))
+    let (effective, _deleted) = split_segment_coverage(dataset, segments);
+    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
+    let filters = build_per_segment_filters(dataset, &segment_refs).await?;
+    Ok((effective, filters))
 }
 
 async fn load_unindexed_training_data(
@@ -271,9 +292,8 @@ async fn merge_scalar_indices<'a>(
             load_unindexed_training_data(dataset.as_ref(), field_path, &update_criteria, unindexed)
                 .await?;
         let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
-        let old_data_filter =
-            build_old_data_filter(dataset.as_ref(), &effective_old_frags, &deleted_old_frags)
-                .await?;
+        let old_data_filters =
+            build_per_segment_filters(dataset.as_ref(), selected_old_indices).await?;
 
         match index_type {
             IndexType::BTree => {
@@ -283,7 +303,7 @@ async fn merge_scalar_indices<'a>(
                     selected_old_indices,
                     new_data_stream,
                     &new_store,
-                    old_data_filter,
+                    &old_data_filters,
                 )
                 .await?
             }
@@ -301,12 +321,22 @@ async fn merge_scalar_indices<'a>(
                         selected_old_indices,
                         new_data_stream,
                         &new_store,
-                        old_data_filter,
+                        &old_data_filters,
                     )
                     .await?
                 }
             }
             _ => {
+                // Non-segmented scalar types only reach this branch with a single
+                // selected segment, so the union filter equals that segment's
+                // filter. Built lazily here so the segmented BTree/Bitmap paths
+                // above don't pay an extra row-id-sequence load they never use.
+                let old_data_filter = build_old_data_filter(
+                    dataset.as_ref(),
+                    &effective_old_frags,
+                    &deleted_old_frags,
+                )
+                .await?;
                 reference_index
                     .update(new_data_stream, &new_store, old_data_filter)
                     .await?
@@ -790,7 +820,7 @@ mod tests {
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
+        FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
     };
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
@@ -1981,6 +2011,217 @@ mod tests {
         assert!(
             !coverage.contains(frag0_id),
             "retired frag0 must not appear in the consolidated coverage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_btree_no_duplicate_row_addr() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("payload", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Reordered source columns (payload, id) force the partial-schema
+        // RewriteColumns path instead of a row rewrite.
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("payload", DataType::Int32, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![100])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let merge_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .try_build()
+                .unwrap();
+        let source_reader = Box::new(RecordBatchIterator::new(
+            [Ok(source_batch)],
+            source_schema.clone(),
+        ));
+        merge_job
+            .execute(reader_to_stream(source_reader))
+            .await
+            .unwrap();
+
+        // Build a delta BTree segment over the now-unindexed fragment.
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("id_idx").await.unwrap().len(),
+            2,
+            "append must create a delta segment over the rewritten fragment"
+        );
+
+        // Force the old segment + delta segment to merge.
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let rows = dataset
+            .scan()
+            .filter("id = 1")
+            .unwrap()
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(rows, 1, "id = 1 must return exactly one row after merge");
+    }
+
+    #[tokio::test]
+    async fn test_optimize_bitmap_no_stale_postings() {
+        async fn query_count(dataset: &Dataset, value: &str) -> usize {
+            dataset
+                .scan()
+                .filter(&format!("cat = '{}'", value))
+                .unwrap()
+                .project(&["cat"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .num_rows()
+        }
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("cat", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // A scalar index on the join key forces merge_insert down the in-place
+        // RewriteColumns path, keeping the fragment live.
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::BTree,
+                Some("key_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["cat"],
+                IndexType::Bitmap,
+                Some("cat_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Reordered source columns (cat, key) force the in-place RewriteColumns
+        // path; the indexed `cat` value changes 'a' -> 'b' on the same row,
+        // pruning the cat index's coverage of the still-live fragment.
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("cat", DataType::Utf8, false),
+            Field::new("key", DataType::Int32, false),
+        ]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["b"])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let merge_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .try_build()
+                .unwrap();
+        let source_reader = Box::new(RecordBatchIterator::new(
+            [Ok(source_batch)],
+            source_schema.clone(),
+        ));
+        merge_job
+            .execute(reader_to_stream(source_reader))
+            .await
+            .unwrap();
+
+        let cat_only = || OptimizeOptions::append().index_names(vec!["cat_idx".to_string()]);
+
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        dataset.optimize_indices(&cat_only()).await.unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            2,
+            "append must create a delta segment over the rewritten fragment"
+        );
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2).index_names(vec!["cat_idx".to_string()]))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_eq!(
+            query_count(&dataset, "a").await,
+            0,
+            "stale 'a' posting must be filtered out of the consolidated segment"
+        );
+        assert_eq!(
+            query_count(&dataset, "b").await,
+            1,
+            "the updated 'b' row must remain queryable"
+        );
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            1,
+            "the segments must collapse into a single consolidated segment"
         );
     }
 

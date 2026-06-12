@@ -57,8 +57,8 @@ pub(in crate::index) async fn merge_segments(
     // Intersect each segment's stored coverage with the dataset's current
     // fragments so we don't claim coverage on row addresses that compaction or
     // pruning has already retired.
-    let (fragment_bitmap, old_data_filter) =
-        crate::index::append::effective_coverage_and_filter(dataset, &segments).await?;
+    let (fragment_bitmap, old_data_filters) =
+        crate::index::append::effective_coverage_and_filters(dataset, &segments).await?;
 
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
     let source_indices = open_bitmap_segments(dataset, &field_path, &segment_refs).await?;
@@ -69,7 +69,7 @@ pub(in crate::index) async fn merge_segments(
         &source_indices,
         None,
         &new_store,
-        old_data_filter,
+        &old_data_filters,
         lance_index::progress::noop_progress(),
     )
     .await?;
@@ -96,14 +96,14 @@ pub(in crate::index) async fn open_and_merge_segments(
     segments: &[&IndexMetadata],
     new_data: SendableRecordBatchStream,
     new_store: &LanceIndexStore,
-    old_data_filter: Option<OldIndexDataFilter>,
+    old_data_filters: &[Option<OldIndexDataFilter>],
 ) -> Result<CreatedIndex> {
     let source_indices = open_bitmap_segments(dataset, field_path, segments).await?;
     lance_index::scalar::bitmap::merge_bitmap_indices(
         &source_indices,
         Some(new_data),
         new_store,
-        old_data_filter,
+        old_data_filters,
         lance_index::progress::noop_progress(),
     )
     .await

@@ -1798,13 +1798,22 @@ impl BTreeIndex {
         segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        old_data_filter: Option<OldIndexDataFilter>,
+        old_data_filters: &[Option<OldIndexDataFilter>],
     ) -> Result<CreatedIndex> {
         let Some(first) = segments.first() else {
             return Err(Error::invalid_input(
                 "cannot merge BTree index without at least one source segment".to_string(),
             ));
         };
+
+        if old_data_filters.len() != segments.len() {
+            return Err(Error::invalid_input(format!(
+                "BTree merge: expected one old-data filter per source segment \
+                 ({} segments) but got {}",
+                segments.len(),
+                old_data_filters.len()
+            )));
+        }
 
         for segment in segments.iter().skip(1) {
             if segment.data_type != first.data_type {
@@ -1827,7 +1836,7 @@ impl BTreeIndex {
         }
 
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(segments.len() + 1);
-        for segment in segments {
+        for (segment, old_data_filter) in segments.iter().zip(old_data_filters) {
             let stream = segment.data_stream().await?;
             let stream = match old_data_filter.clone() {
                 Some(filter) => filter_row_ids(stream, filter),
@@ -2235,7 +2244,7 @@ impl ScalarIndex for BTreeIndex {
             &[Arc::new(self.clone())],
             new_data,
             dest_store,
-            old_data_filter,
+            &[old_data_filter],
         )
         .await
     }

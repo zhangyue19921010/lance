@@ -63,7 +63,7 @@ pub(crate) async fn open_and_merge_segments(
     segments: &[&IndexMetadata],
     new_data: SendableRecordBatchStream,
     new_store: &LanceIndexStore,
-    old_data_filter: Option<OldIndexDataFilter>,
+    old_data_filters: &[Option<OldIndexDataFilter>],
 ) -> Result<CreatedIndex> {
     let mut source_indices = Vec::with_capacity(segments.len());
     for &segment in segments {
@@ -81,7 +81,7 @@ pub(crate) async fn open_and_merge_segments(
             })?;
         source_indices.push(Arc::new(btree.clone()));
     }
-    BTreeIndex::merge_segments(&source_indices, new_data, new_store, old_data_filter).await
+    BTreeIndex::merge_segments(&source_indices, new_data, new_store, old_data_filters).await
 }
 
 /// Merge one caller-defined group of source BTree segments into a single
@@ -120,8 +120,8 @@ pub(crate) async fn merge_segments(
     // Intersect each segment's stored bitmap with the dataset's current
     // fragments so we don't claim coverage on IDs that compaction or pruning
     // has already retired.
-    let (fragment_bitmap, old_data_filter) =
-        crate::index::append::effective_coverage_and_filter(dataset, &segments).await?;
+    let (fragment_bitmap, old_data_filters) =
+        crate::index::append::effective_coverage_and_filters(dataset, &segments).await?;
 
     let output_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &output_uuid)?;
@@ -135,7 +135,7 @@ pub(crate) async fn merge_segments(
         &segment_refs,
         empty_new_data,
         &new_store,
-        old_data_filter,
+        &old_data_filters,
     )
     .await?;
 

@@ -1204,21 +1204,27 @@ impl BitmapIndexPlugin {
 /// optionally, a stream of not-yet-indexed `new_data`) into a single canonical
 /// bitmap written to `dest_store`.
 ///
-/// `old_data_filter` is applied only to the rows coming from `source_indices`,
-/// dropping row addresses whose fragments compaction/deletion has retired; rows
-/// from `new_data` are inserted unfiltered. The whole merged state is held in
-/// memory, as bitmap segment consolidation has always done.
+/// `old_data_filters` carries one optional filter per source segment
 pub async fn merge_bitmap_indices(
     source_indices: &[Arc<BitmapIndex>],
     new_data: Option<SendableRecordBatchStream>,
     dest_store: &dyn IndexStore,
-    old_data_filter: Option<OldIndexDataFilter>,
+    old_data_filters: &[Option<OldIndexDataFilter>],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
     if source_indices.is_empty() {
         return Err(Error::invalid_input(
             "Bitmap segment merge requires at least one source segment".to_string(),
         ));
+    }
+
+    if old_data_filters.len() != source_indices.len() {
+        return Err(Error::invalid_input(format!(
+            "Bitmap merge: expected one old-data filter per source segment \
+             ({} segments) but got {}",
+            source_indices.len(),
+            old_data_filters.len()
+        )));
     }
 
     let value_type = source_indices[0].value_type().clone();
@@ -1240,7 +1246,13 @@ pub async fn merge_bitmap_indices(
             )));
         }
 
-        let state = source_index.load_bitmap_index_state().await?;
+        let mut state = source_index.load_bitmap_index_state().await?;
+        if let Some(old_data_filter) = &old_data_filters[idx] {
+            state.retain(|_, postings| {
+                old_data_filter.retain_row_addrs(postings);
+                !postings.is_empty()
+            });
+        }
         for (key, bitmap) in state {
             merged_state
                 .entry(key)
@@ -1252,12 +1264,6 @@ pub async fn merge_bitmap_indices(
             .await?;
     }
     progress.stage_complete("merge_bitmap_segments").await?;
-    if let Some(old_data_filter) = old_data_filter {
-        merged_state.retain(|_, postings| {
-            old_data_filter.retain_row_addrs(postings);
-            !postings.is_empty()
-        });
-    }
 
     // Fold the not-yet-indexed rows into the same in-memory state.
     if let Some(new_data) = new_data {
