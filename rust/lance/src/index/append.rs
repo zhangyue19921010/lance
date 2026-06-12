@@ -208,7 +208,7 @@ async fn merge_scalar_indices<'a>(
 
     // Scalar Index that expos an N:1 segment-merge primitive reachable without
     // rescanning the dataset
-    let has_segment_merge_primitive = matches!(index_type, IndexType::BTree);
+    let has_segment_merge_primitive = matches!(index_type, IndexType::BTree | IndexType::NGram);
 
     // Merge new data into the existing segment(s) without rebuilding from
     // scratch, when all hold:
@@ -251,6 +251,17 @@ async fn merge_scalar_indices<'a>(
                     field_path,
                     selected_old_indices,
                     new_data_stream,
+                    &new_store,
+                    old_data_filter,
+                )
+                .await?
+            }
+            IndexType::NGram => {
+                crate::index::scalar::ngram::open_and_merge_segments(
+                    dataset.as_ref(),
+                    field_path,
+                    selected_old_indices,
+                    Some(new_data_stream),
                     &new_store,
                     old_data_filter,
                 )
@@ -1560,6 +1571,124 @@ mod tests {
                 "expected {expected} matches for {pattern}, got {count}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_optimize_ngram_merges_segments() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
+        let make_batch = |values: &[&str]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from_iter_values(
+                    values.iter().copied(),
+                ))],
+            )
+            .unwrap()
+        };
+
+        // Two fragments, each with its own committed NGram segment.
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(make_batch(&["alpha needle", "beta needle"])),
+                Ok(make_batch(&["gamma stack", "delta stack"])),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        let mut staged = Vec::new();
+        for fragment in dataset.get_fragments() {
+            staged.push(
+                crate::index::create::CreateIndexBuilder::new(
+                    &mut dataset,
+                    &["text"],
+                    IndexType::NGram,
+                    &params,
+                )
+                .name("text_ngram".into())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+            );
+        }
+        assert_eq!(staged.len(), 2);
+        dataset
+            .commit_existing_index_segments("text_ngram", "text", staged)
+            .await
+            .unwrap();
+
+        // Append a third fragment, leave it unindexed.
+        let appended =
+            RecordBatchIterator::new(vec![Ok(make_batch(&["epsilon needle"]))], schema.clone());
+        let mut dataset = Dataset::write(
+            appended,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Merging the latest 2 segments plus the new data consolidates everything
+        // through the NGram N->1 merge primitive (not a full rebuild).
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert!(
+            dataset
+                .unindexed_fragments("text_ngram")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
+        assert_eq!(committed.len(), 1, "optimize should merge into one segment");
+        assert_eq!(
+            committed[0].fragment_bitmap.as_ref().unwrap().len(),
+            3,
+            "merged segment must cover all three fragments"
+        );
+
+        let logical = crate::index::scalar_logical::open_named_scalar_index(
+            &dataset,
+            "text",
+            "text_ngram",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+
+        // "needle" appears in fragment 0 (two rows) and the appended fragment.
+        let query = TextQuery::StringContains("needle".to_string());
+        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let count = match result {
+            SearchResult::AtMost(row_addrs) | SearchResult::Exact(row_addrs) => {
+                row_addrs.true_rows().row_addrs().unwrap().count()
+            }
+            other => panic!("expected AtMost/Exact result, got {other:?}"),
+        };
+        assert_eq!(count, 3, "needle should match three rows across fragments");
     }
 
     #[tokio::test]

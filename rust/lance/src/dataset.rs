@@ -3152,6 +3152,15 @@ impl Dataset {
                         .to_string(),
                 ))
             }
+            IndexType::NGram => {
+                Err(Error::invalid_input(
+                    "NGram distributed indexing no longer supports merge_index_metadata; \
+                     build segments with create_index_uncommitted(...), merge them with \
+                     merge_existing_index_segments(...), and commit with \
+                     commit_existing_index_segments(...)"
+                        .to_string(),
+                ))
+            }
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
                 Err(Error::invalid_input(
                     "Vector distributed indexing no longer supports merge_index_metadata; \

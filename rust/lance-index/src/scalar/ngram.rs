@@ -51,7 +51,7 @@ use tracing::instrument;
 
 const TOKENS_COL: &str = "tokens";
 const POSTING_LIST_COL: &str = "posting_list";
-const POSTINGS_FILENAME: &str = "ngram_postings.lance";
+pub const POSTINGS_FILENAME: &str = "ngram_postings.lance";
 const NGRAM_INDEX_VERSION: u32 = 0;
 
 use std::sync::LazyLock;
@@ -379,6 +379,53 @@ impl NGramIndex {
             Self::from_store(store, frag_reuse_index, index_cache).await?,
         ))
     }
+
+    /// The store that backs this segment's canonical posting file.
+    pub fn store(&self) -> &Arc<dyn IndexStore> {
+        &self.store
+    }
+
+    /// Merge several already-built NGram segments (plus optional new data) into a
+    /// single canonical segment written to `dest_store`.
+    ///
+    /// This is the N->1 segment-merge primitive used by the segmented index
+    /// framework: it unions the segments' posting lists token-by-token without
+    /// rescanning the dataset. It only needs the segments' backing stores (their
+    /// canonical `ngram_postings.lance` files), so callers pass the stores
+    /// directly rather than the full index objects.
+    ///
+    /// Pass `None` for `new_data` to do a pure consolidation (no dataset scan and
+    /// no tokenization pipeline is spun up), or `Some(stream)` of newly appended
+    /// rows during optimize.
+    ///
+    /// When `old_data_filter` is set, rows from the source segments that the
+    /// filter rejects (fragments retired by compaction/deletion) are dropped from
+    /// the merged posting lists so they cannot surface in later queries. The
+    /// freshly tokenized `new_data` is always kept.
+    pub async fn merge_segments(
+        segment_stores: &[Arc<dyn IndexStore>],
+        new_data: Option<SendableRecordBatchStream>,
+        dest_store: &dyn IndexStore,
+        old_data_filter: Option<super::OldIndexDataFilter>,
+    ) -> Result<CreatedIndex> {
+        let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
+        // A pure consolidation has no new rows, so skip `train` entirely instead
+        // of spinning up the (worker-per-partition) tokenization pipeline to
+        // process zero rows.
+        let new_data_spills = match new_data {
+            Some(new_data) => builder.train(new_data).await?,
+            None => Vec::new(),
+        };
+        let file = builder
+            .merge_indices(new_data_spills, segment_stores, old_data_filter, dest_store)
+            .await?;
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
+                .unwrap(),
+            index_version: NGRAM_INDEX_VERSION,
+            files: vec![file],
+        })
+    }
 }
 
 #[async_trait]
@@ -625,6 +672,28 @@ impl NGramIndexSpillState {
             POSTINGS_SCHEMA.clone(),
             vec![Arc::new(self.tokens), Arc::new(bitmap_array)],
         )?)
+    }
+
+    /// Drop every row id rejected by `filter`, removing tokens that end up empty.
+    ///
+    /// Used during segment merge to evict rows belonging to fragments that
+    /// compaction/deletion retired, so the merged segment carries only live rows.
+    fn filter_rows(self, filter: &super::OldIndexDataFilter) -> Self {
+        let mut tokens = UInt32Builder::with_capacity(self.tokens.len());
+        let mut bitmaps = Vec::with_capacity(self.bitmaps.len());
+        for (token, bitmap) in self.tokens.values().iter().zip(self.bitmaps) {
+            let filtered = RoaringTreemap::from_iter(
+                bitmap.into_iter().filter(|row_id| filter.keeps(*row_id)),
+            );
+            if !filtered.is_empty() {
+                tokens.append_value(*token);
+                bitmaps.push(filtered);
+            }
+        }
+        Self {
+            tokens: tokens.finish(),
+            bitmaps,
+        }
     }
 }
 
@@ -1222,6 +1291,93 @@ impl NGramIndexBuilder {
 
         writer.finish().await
     }
+
+    /// Merge several already-materialized NGram segments (their canonical
+    /// `ngram_postings.lance` files), together with any freshly tokenized spill
+    /// files from new data, into a single canonical posting file in `dest_store`.
+    ///
+    /// Every input is sorted by token, so we 2-way cascade-merge them with
+    /// [`Self::merge_spill_streams`], unioning posting lists for equal tokens.
+    ///
+    /// When `old_data_filter` is set, rows from the source segments that the
+    /// filter rejects (e.g. fragments retired by compaction/deletion) are dropped
+    /// before merging. The freshly tokenized new data is always kept as-is.
+    async fn merge_indices(
+        mut self,
+        new_data_spills: Vec<usize>,
+        segment_stores: &[Arc<dyn IndexStore>],
+        old_data_filter: Option<super::OldIndexDataFilter>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<IndexFile> {
+        // Reduce the new-data spill files (if any) to a single sorted spill.
+        let mut pending = if new_data_spills.is_empty() {
+            None
+        } else {
+            Some(self.merge_spills(new_data_spills).await?)
+        };
+        // Spill ids are monotonically increasing; start past any id used above.
+        let mut next_spill = pending.map(|id| id + 1).unwrap_or(0);
+
+        for store in segment_stores {
+            let seg_reader = store.open_index_file(POSTINGS_FILENAME).await?;
+            let out = next_spill;
+            next_spill += 1;
+            let mut writer = self
+                .spill_store
+                .new_index_file(&Self::spill_filename(out), POSTINGS_SCHEMA.clone())
+                .await?;
+            // Apply the retired-row filter to this segment's posting lists.
+            let filter = old_data_filter.clone();
+            let seg_stream = Self::stream_spill_reader(seg_reader)
+                .await?
+                .map(move |res| {
+                    res.map(|state| match &filter {
+                        Some(filter) => state.filter_rows(filter),
+                        None => state,
+                    })
+                });
+            match pending.take() {
+                None => {
+                    // Seed the accumulator from the first source.
+                    let mut seg_stream = Box::pin(seg_stream);
+                    while let Some(state) = seg_stream.try_next().await? {
+                        writer.write_record_batch(state.try_into_batch()?).await?;
+                    }
+                    writer.finish().await?;
+                }
+                Some(prev) => {
+                    let left = Self::stream_spill(self.spill_store.clone(), prev).await?;
+                    Self::merge_spill_streams(left, Box::pin(seg_stream), writer.as_mut()).await?;
+                    self.spill_store
+                        .delete_index_file(&Self::spill_filename(prev))
+                        .await?;
+                }
+            }
+            pending = Some(out);
+        }
+
+        // Copy the final accumulator into the destination store.
+        let mut writer = dest_store
+            .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
+            .await?;
+        let Some(final_spill) = pending else {
+            // No segments and no new data: write an empty index.
+            return writer.finish().await;
+        };
+        let reader = self
+            .spill_store
+            .open_index_file(&Self::spill_filename(final_spill))
+            .await?;
+        let num_rows = reader.num_rows();
+        let mut offset = 0;
+        while offset < num_rows {
+            let batch_size = std::cmp::min(num_rows - offset, 64);
+            let batch = reader.read_range(offset..offset + batch_size, None).await?;
+            writer.write_record_batch(batch).await?;
+            offset += batch_size;
+        }
+        writer.finish().await
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1288,15 +1444,12 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         _request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
+        _fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        if fragment_ids.is_some() {
-            return Err(Error::invalid_input_source(
-                "NGram index does not support fragment training".into(),
-            ));
-        }
-
+        // `fragment_ids` only restricts which rows the caller scanned into `data`;
+        // the builder always writes a single canonical `ngram_postings.lance`, so
+        // a per-fragment build is naturally a canonical segment over those rows.
         let file = Self::train_ngram_index(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
