@@ -9,37 +9,20 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ngram::NGramIndex;
 use lance_index::scalar::{CreatedIndex, IndexStore, OldIndexDataFilter};
 use lance_table::format::IndexMetadata;
-use roaring::RoaringBitmap;
 use uuid::Uuid;
 
-use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
+use crate::{
+    Dataset, Error, Result, dataset::index::LanceIndexStoreExt, index::DatasetIndexInternalExt,
+};
 
-/// Open the given segments and collect the stores that back their canonical
-/// posting files.
-///
-/// The NGram merge primitive reads each segment's `ngram_postings.lance`
-/// directly, so we only need the backing stores — not the full (potentially
-/// large `tokens` map) index objects.
-async fn open_ngram_segment_stores(
+async fn collect_ngram_segment_stores(
     dataset: &Dataset,
-    field_path: &str,
     segments: &[IndexMetadata],
 ) -> Result<Vec<Arc<dyn IndexStore>>> {
     let mut stores: Vec<Arc<dyn IndexStore>> = Vec::with_capacity(segments.len());
     for segment in segments {
-        let scalar_index =
-            super::open_scalar_index(dataset, field_path, segment, &NoOpMetricsCollector).await?;
-        let ngram_index = scalar_index
-            .as_any()
-            .downcast_ref::<NGramIndex>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "merge_existing_index_segments: expected ngram segment {}, got {:?}",
-                    segment.uuid,
-                    scalar_index.index_type()
-                ))
-            })?;
-        stores.push(ngram_index.store().clone());
+        let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
+        stores.push(Arc::new(store));
     }
     Ok(stores)
 }
@@ -70,53 +53,16 @@ pub(in crate::index) async fn merge_segments(
             segments[0].uuid
         ))
     })?;
-    let field_path = dataset.schema().field_path(field_id)?;
 
-    // Drop fragments that compaction/deletion retired: the merged segment must
-    // cover only live fragments, and its posting lists must not carry rows from
-    // retired ones (mirroring the btree merge behavior). The merged segment is
-    // committed at the post-compaction version, so frag-reuse remapping is not
-    // applied to it at read time — stale rows would otherwise surface.
-    let dataset_fragments = dataset.fragment_bitmap.as_ref();
-    let mut effective_old_frags = RoaringBitmap::new();
-    let mut deleted_old_frags = RoaringBitmap::new();
-    for segment in &segments {
-        if segment.fragment_bitmap.is_none() {
-            return Err(Error::invalid_input(format!(
-                "CreateIndex: segment {} is missing fragment coverage",
-                segment.uuid
-            )));
-        }
-        if let Some(effective) = segment.effective_fragment_bitmap(dataset_fragments) {
-            effective_old_frags |= effective;
-        }
-        if let Some(deleted) = segment.deleted_fragment_bitmap(dataset_fragments) {
-            deleted_old_frags |= deleted;
-        }
-    }
-
-    let fragment_bitmap = effective_old_frags.clone();
-    let old_data_filter = crate::index::append::build_old_data_filter(
-        dataset,
-        &effective_old_frags,
-        &deleted_old_frags,
-    )
-    .await?;
+    let (fragment_bitmap, old_data_filters) =
+        crate::index::append::effective_coverage_and_filters(dataset, &segments).await?;
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
-    // Pure segment consolidation: no dataset scan, so there is no new data and
-    // the merge is driven entirely by the source posting lists.
+    // Pure consolidation: no new data, driven entirely by the source posting lists.
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
-    let created_index = open_and_merge_segments(
-        dataset,
-        &field_path,
-        &segment_refs,
-        None,
-        &new_store,
-        old_data_filter,
-    )
-    .await?;
+    let created_index =
+        open_and_merge_segments(dataset, &segment_refs, None, &new_store, &old_data_filters).await?;
 
     Ok(IndexMetadata {
         uuid: new_uuid,
@@ -132,19 +78,24 @@ pub(in crate::index) async fn merge_segments(
     })
 }
 
-/// Merge the given NGram segments with optionally newly appended data into a
-/// single canonical segment, used by the optimize/append decision tree.
-///
-/// Pass `None` for `new_data` to do a pure consolidation of the source segments.
+/// Merge the given NGram segments with optional newly appended data into a single
+/// canonical segment. Pass `None` for `new_data` for a pure consolidation.
 pub(in crate::index) async fn open_and_merge_segments(
     dataset: &Dataset,
-    field_path: &str,
     segments: &[&IndexMetadata],
     new_data: Option<SendableRecordBatchStream>,
     new_store: &LanceIndexStore,
-    old_data_filter: Option<OldIndexDataFilter>,
+    old_data_filters: &[Option<OldIndexDataFilter>],
 ) -> Result<CreatedIndex> {
     let segments = segments.iter().map(|&s| s.clone()).collect::<Vec<_>>();
-    let segment_stores = open_ngram_segment_stores(dataset, field_path, &segments).await?;
-    NGramIndex::merge_segments(&segment_stores, new_data, new_store, old_data_filter).await
+    let segment_stores = collect_ngram_segment_stores(dataset, &segments).await?;
+    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    NGramIndex::merge_segments(
+        &segment_stores,
+        new_data,
+        new_store,
+        old_data_filters,
+        frag_reuse_index,
+    )
+    .await
 }

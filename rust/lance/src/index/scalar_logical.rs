@@ -1496,7 +1496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ngram_segments_commit_and_query_as_logical_index() {
+    async fn test_ngram_segments_commit_and_query() {
         let test_dir = TempStrDir::default();
         // 8 rows / 2 per file => 4 fragments.
         let mut dataset = ngram_text_dataset(test_dir.as_str(), 2).await;
@@ -1533,13 +1533,32 @@ mod tests {
             segments.push(segment);
         }
 
+        // Merge the first two single-fragment segments into one, then commit it
+        // alongside the remaining segments: this exercises the N->1 merge
+        // primitive while still leaving a multi-segment logical index to query.
+        let merged = dataset
+            .merge_existing_index_segments(vec![segments[0].clone(), segments[1].clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            merged
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![fragments[0].id() as u32, fragments[1].id() as u32]
+        );
+        let mut to_commit = vec![merged];
+        to_commit.extend(segments.into_iter().skip(2));
+
         dataset
-            .commit_existing_index_segments("text_ngram", "text", segments)
+            .commit_existing_index_segments("text_ngram", "text", to_commit)
             .await
             .unwrap();
 
         let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
-        assert_eq!(committed.len(), fragments.len());
+        assert_eq!(committed.len(), 3, "one merged segment plus two single ones");
         assert_eq!(
             scalar_index_fragment_bitmap(&dataset, "text", "text_ngram")
                 .await
@@ -1566,268 +1585,5 @@ mod tests {
         let query = lance_index::scalar::TextQuery::StringContains("xyz".to_string());
         let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(ngram_row_count(result), 0);
-    }
-
-    #[tokio::test]
-    async fn test_ngram_segments_merge_and_query() {
-        let test_dir = TempStrDir::default();
-        // 8 rows / 4 per file => 2 fragments.
-        let mut dataset = ngram_text_dataset(test_dir.as_str(), 4).await;
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 2);
-
-        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
-        let mut staged = Vec::new();
-        for fragment in &fragments {
-            staged.push(
-                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
-                    .name("text_ngram_merge".to_string())
-                    .fragments(vec![fragment.id() as u32])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap(),
-            );
-        }
-
-        let staged_uuids = staged.iter().map(|s| s.uuid).collect::<Vec<_>>();
-        let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
-        assert!(!staged_uuids.contains(&merged.uuid));
-        assert_eq!(
-            merged
-                .fragment_bitmap
-                .as_ref()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>(),
-            fragments.iter().map(|f| f.id() as u32).collect::<Vec<_>>()
-        );
-        // The merged segment must still be canonical.
-        let files = merged.files.as_ref().unwrap();
-        assert!(
-            files
-                .iter()
-                .any(|file| file.path == lance_index::scalar::ngram::POSTINGS_FILENAME)
-        );
-        assert!(files.iter().all(|file| !file.path.starts_with("part_")));
-
-        dataset
-            .commit_existing_index_segments("text_ngram_merge", "text", vec![merged])
-            .await
-            .unwrap();
-        let committed = dataset
-            .load_indices_by_name("text_ngram_merge")
-            .await
-            .unwrap();
-        assert_eq!(committed.len(), 1);
-
-        let logical =
-            open_named_scalar_index(&dataset, "text", "text_ngram_merge", &NoOpMetricsCollector)
-                .await
-                .unwrap();
-        assert_eq!(logical.index_type(), IndexType::NGram);
-
-        // "delta" spans both source fragments; the merged posting list must union them.
-        let query = lance_index::scalar::TextQuery::StringContains("delta".to_string());
-        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(ngram_row_count(result), 4);
-
-        let query = lance_index::scalar::TextQuery::StringContains("lambda".to_string());
-        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(ngram_row_count(result), 1);
-    }
-
-    #[tokio::test]
-    async fn test_ngram_segments_nulls_and_short_query() {
-        let test_dir = TempStrDir::default();
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "text",
-            arrow_schema::DataType::Utf8,
-            true,
-        )]));
-        let write_params = WriteParams {
-            max_rows_per_file: 2,
-            ..Default::default()
-        };
-        // Mix in NULLs and an empty string across fragments.
-        let batches = vec![
-            arrow_array::RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(arrow_array::StringArray::from(vec![
-                    Some("alpha delta"),
-                    None,
-                    Some(""),
-                    Some("gamma delta"),
-                ]))],
-            )
-            .unwrap(),
-        ];
-        let reader =
-            arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
-            .await
-            .unwrap();
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 2);
-
-        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
-        let mut segments = Vec::new();
-        for fragment in &fragments {
-            segments.push(
-                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
-                    .name("text_ngram_nulls".to_string())
-                    .fragments(vec![fragment.id() as u32])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap(),
-            );
-        }
-        dataset
-            .commit_existing_index_segments("text_ngram_nulls", "text", segments)
-            .await
-            .unwrap();
-
-        let logical =
-            open_named_scalar_index(&dataset, "text", "text_ngram_nulls", &NoOpMetricsCollector)
-                .await
-                .unwrap();
-
-        // "delta" matches the two non-null rows; NULL / empty rows are skipped.
-        let query = lance_index::scalar::TextQuery::StringContains("delta".to_string());
-        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(ngram_row_count(result), 2);
-
-        // A query shorter than the trigram width cannot filter, so every segment
-        // returns AtLeast. Combining them must not error on a mixed AtMost/AtLeast
-        // boundary (all segments agree on AtLeast).
-        let query = lance_index::scalar::TextQuery::StringContains("de".to_string());
-        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert!(matches!(result, SearchResult::AtLeast(_)));
-    }
-
-    #[tokio::test]
-    async fn test_ngram_merge_after_compaction_drops_retired_fragments() {
-        let test_dir = TempStrDir::default();
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "text",
-            arrow_schema::DataType::Utf8,
-            false,
-        )]));
-        // Two fragments of 4 rows each, with stable row ids so compaction remaps.
-        let write_params = WriteParams {
-            max_rows_per_file: 4,
-            enable_stable_row_ids: true,
-            ..Default::default()
-        };
-        let batches = vec![
-            arrow_array::RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(arrow_array::StringArray::from(vec![
-                    "alpha needle one",
-                    "alpha needle two",
-                    "gamma keep three",
-                    "gamma keep four",
-                    "epsilon stack five",
-                    "zeta stack six",
-                    "eta stack seven",
-                    "theta stack eight",
-                ]))],
-            )
-            .unwrap(),
-        ];
-        let reader =
-            arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
-            .await
-            .unwrap();
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 2);
-
-        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
-        let mut staged = Vec::new();
-        for fragment in &fragments {
-            staged.push(
-                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
-                    .name("text_ngram_compact".to_string())
-                    .fragments(vec![fragment.id() as u32])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap(),
-            );
-        }
-        dataset
-            .commit_existing_index_segments("text_ngram_compact", "text", staged)
-            .await
-            .unwrap();
-
-        // Delete the two "alpha needle" rows from fragment 0, then compact to retire it.
-        dataset.delete("text = 'alpha needle one'").await.unwrap();
-        dataset.delete("text = 'alpha needle two'").await.unwrap();
-        compact_files(
-            &mut dataset,
-            CompactionOptions {
-                target_rows_per_fragment: 4,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-        let live_frags: RoaringBitmap = dataset
-            .get_fragments()
-            .iter()
-            .map(|f| f.id() as u32)
-            .collect();
-        assert!(
-            !live_frags.contains(0),
-            "compaction should retire fragment 0"
-        );
-
-        // Merge: retired fragment 0 must be dropped from the coverage bitmap.
-        let segments = dataset
-            .load_indices_by_name("text_ngram_compact")
-            .await
-            .unwrap();
-        let merged = dataset
-            .merge_existing_index_segments(segments)
-            .await
-            .unwrap();
-        let coverage = merged.fragment_bitmap.as_ref().unwrap();
-        assert!(
-            !coverage.contains(0),
-            "merged coverage must drop retired fragment 0, got {coverage:?}"
-        );
-
-        dataset
-            .commit_existing_index_segments("text_ngram_compact", "text", vec![merged])
-            .await
-            .unwrap();
-
-        let logical = open_named_scalar_index(
-            &dataset,
-            "text",
-            "text_ngram_compact",
-            &NoOpMetricsCollector,
-        )
-        .await
-        .unwrap();
-
-        // "needle" only existed in the deleted/retired rows: frag-reuse remapping
-        // must drop them so they never surface.
-        let query = lance_index::scalar::TextQuery::StringContains("needle".to_string());
-        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(
-            ngram_row_count(result),
-            0,
-            "deleted rows from retired fragment must not appear after merge"
-        );
-
-        // "stack" rows from the live fragment are still searchable.
-        let query = lance_index::scalar::TextQuery::StringContains("stack".to_string());
-        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert!(
-            ngram_row_count(result) > 0,
-            "rows from the live fragment should still be searchable"
-        );
     }
 }

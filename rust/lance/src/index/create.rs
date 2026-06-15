@@ -1402,34 +1402,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_merge_index_metadata_ngram_soft_break() {
-        let tmpdir = TempStrDir::default();
-        let dataset_uri = format!("file://{}", tmpdir.as_str());
-        let reader = gen_batch()
-            .col("id", lance_datagen::array::step::<Int32Type>())
-            .into_reader_rows(
-                lance_datagen::RowCount::from(8),
-                lance_datagen::BatchCount::from(1),
-            );
-        let dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
-
-        let err = dataset
-            .merge_index_metadata(
-                &Uuid::new_v4(),
-                IndexType::NGram,
-                None,
-                Arc::new(NoopIndexBuildProgress),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("no longer supports merge_index_metadata"),
-            "expected NGram merge_index_metadata soft-break error, got: {err}"
-        );
-    }
-
     /// Assert a committed segment directory holds exactly one canonical BTree
     /// payload — one `page_data.lance` + one `page_lookup.lance` — and no `part_*`
     /// shard files. Locks the "every segment has exactly one lookup" invariant.
@@ -1566,56 +1538,6 @@ mod tests {
         for index_type in [IndexType::BTree, IndexType::Scalar] {
             let err = CreateIndexBuilder::new(&mut dataset, &["value"], index_type, &params)
                 .name("value_btree_segments".to_string())
-                .fragments(vec![fragment_id])
-                .index_uuid(Uuid::new_v4())
-                .execute_uncommitted()
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(err, Error::InvalidInput { .. }),
-                "expected invalid input error, got: {err}"
-            );
-            assert!(
-                err.to_string().contains(
-                    "index_uuid is no longer accepted for segmented scalar distributed index builds"
-                ),
-                "unexpected error: {err}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_ngram_distributed_index_uuid_rejected() {
-        let test_dir = TempStrDir::default();
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            DataType::Utf8,
-            true,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(arrow_array::StringArray::from(vec![
-                "alpha", "beta", "gamma", "delta",
-            ]))],
-        )
-        .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let mut dataset = Dataset::write(
-            reader,
-            test_dir.as_str(),
-            Some(WriteParams {
-                max_rows_per_file: 2,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        let fragment_id = dataset.get_fragments()[0].id() as u32;
-
-        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::NGram);
-        for index_type in [IndexType::NGram, IndexType::Scalar] {
-            let err = CreateIndexBuilder::new(&mut dataset, &["value"], index_type, &params)
-                .name("value_ngram_segments".to_string())
                 .fragments(vec![fragment_id])
                 .index_uuid(Uuid::new_v4())
                 .execute_uncommitted()

@@ -39,8 +39,8 @@ use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_io::object_store::ObjectStore;
-use lance_select::RowAddrTreeMap;
 use lance_tokenizer::{
     AlphaNumOnlyFilter, AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, TextAnalyzer,
 };
@@ -380,44 +380,31 @@ impl NGramIndex {
         ))
     }
 
-    /// The store that backs this segment's canonical posting file.
-    pub fn store(&self) -> &Arc<dyn IndexStore> {
-        &self.store
-    }
-
-    /// Merge several already-built NGram segments (plus optional new data) into a
-    /// single canonical segment written to `dest_store`.
-    ///
-    /// This is the N->1 segment-merge primitive used by the segmented index
-    /// framework: it unions the segments' posting lists token-by-token without
-    /// rescanning the dataset. It only needs the segments' backing stores (their
-    /// canonical `ngram_postings.lance` files), so callers pass the stores
-    /// directly rather than the full index objects.
-    ///
-    /// Pass `None` for `new_data` to do a pure consolidation (no dataset scan and
-    /// no tokenization pipeline is spun up), or `Some(stream)` of newly appended
-    /// rows during optimize.
-    ///
-    /// When `old_data_filter` is set, rows from the source segments that the
-    /// filter rejects (fragments retired by compaction/deletion) are dropped from
-    /// the merged posting lists so they cannot surface in later queries. The
-    /// freshly tokenized `new_data` is always kept.
+    /// Merge several built NGram segments (and optional new data) into a single
+    /// canonical segment in `dest_store`, unioning their posting lists by token
+    /// without rescanning the dataset.
     pub async fn merge_segments(
         segment_stores: &[Arc<dyn IndexStore>],
         new_data: Option<SendableRecordBatchStream>,
         dest_store: &dyn IndexStore,
-        old_data_filter: Option<super::OldIndexDataFilter>,
+        old_data_filters: &[Option<super::OldIndexDataFilter>],
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<CreatedIndex> {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
-        // A pure consolidation has no new rows, so skip `train` entirely instead
-        // of spinning up the (worker-per-partition) tokenization pipeline to
-        // process zero rows.
+        // Pure consolidation has no new rows, so skip `train` (and its
+        // worker-per-partition tokenization pipeline) entirely.
         let new_data_spills = match new_data {
             Some(new_data) => builder.train(new_data).await?,
             None => Vec::new(),
         };
         let file = builder
-            .merge_indices(new_data_spills, segment_stores, old_data_filter, dest_store)
+            .merge_indices(
+                new_data_spills,
+                segment_stores,
+                old_data_filters,
+                frag_reuse_index,
+                dest_store,
+            )
             .await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
@@ -674,20 +661,84 @@ impl NGramIndexSpillState {
         )?)
     }
 
-    /// Drop every row id rejected by `filter`, removing tokens that end up empty.
-    ///
-    /// Used during segment merge to evict rows belonging to fragments that
-    /// compaction/deletion retired, so the merged segment carries only live rows.
-    fn filter_rows(self, filter: &super::OldIndexDataFilter) -> Self {
+    fn remap_and_filter_rows(
+        self,
+        frag_reuse_index: Option<&Arc<FragReuseIndex>>,
+        filter: Option<&super::OldIndexDataFilter>,
+    ) -> Self {
+        if let Some(fri) = frag_reuse_index {
+            return self.remap_then_keep(fri, filter);
+        }
+        match filter {
+            None => self,
+            Some(super::OldIndexDataFilter::Fragments { to_remove, .. }) => {
+                self.drop_fragments(to_remove)
+            }
+            Some(super::OldIndexDataFilter::RowIds(valid)) => self.retain_row_ids(valid),
+        }
+    }
+
+    /// Remap stale addresses per row, keeping only rows still selected by
+    /// `filter`. Used only under a pending deferred-remap compaction.
+    fn remap_then_keep(
+        self,
+        fri: &Arc<FragReuseIndex>,
+        filter: Option<&super::OldIndexDataFilter>,
+    ) -> Self {
         let mut tokens = UInt32Builder::with_capacity(self.tokens.len());
         let mut bitmaps = Vec::with_capacity(self.bitmaps.len());
         for (token, bitmap) in self.tokens.values().iter().zip(self.bitmaps) {
-            let filtered = RoaringTreemap::from_iter(
-                bitmap.into_iter().filter(|row_id| filter.keeps(*row_id)),
-            );
-            if !filtered.is_empty() {
+            let remapped = fri.remap_row_ids_roaring_tree_map(&bitmap);
+            let kept = match filter {
+                Some(filter) => RoaringTreemap::from_iter(
+                    remapped.into_iter().filter(|row_id| filter.keeps(*row_id)),
+                ),
+                None => remapped,
+            };
+            if !kept.is_empty() {
                 tokens.append_value(*token);
-                bitmaps.push(filtered);
+                bitmaps.push(kept);
+            }
+        }
+        Self {
+            tokens: tokens.finish(),
+            bitmaps,
+        }
+    }
+
+    fn drop_fragments(self, to_remove: &RoaringBitmap) -> Self {
+        if to_remove.is_empty() {
+            return self;
+        }
+        let mut tokens = UInt32Builder::with_capacity(self.tokens.len());
+        let mut bitmaps = Vec::with_capacity(self.bitmaps.len());
+        for (token, mut bitmap) in self.tokens.values().iter().zip(self.bitmaps) {
+            for frag in to_remove.iter() {
+                // The fragment's addresses span every low 32-bit offset; use an
+                // inclusive upper bound so `frag == u32::MAX` doesn't overflow u64.
+                let base = (frag as u64) << 32;
+                bitmap.remove_range(base..=base + u32::MAX as u64);
+            }
+            if !bitmap.is_empty() {
+                tokens.append_value(*token);
+                bitmaps.push(bitmap);
+            }
+        }
+        Self {
+            tokens: tokens.finish(),
+            bitmaps,
+        }
+    }
+
+    fn retain_row_ids(self, valid: &RowAddrTreeMap) -> Self {
+        let mut tokens = UInt32Builder::with_capacity(self.tokens.len());
+        let mut bitmaps = Vec::with_capacity(self.bitmaps.len());
+        for (token, bitmap) in self.tokens.values().iter().zip(self.bitmaps) {
+            let kept =
+                RoaringTreemap::from_iter(bitmap.into_iter().filter(|row_id| valid.contains(*row_id)));
+            if !kept.is_empty() {
+                tokens.append_value(*token);
+                bitmaps.push(kept);
             }
         }
         Self {
@@ -1292,23 +1343,29 @@ impl NGramIndexBuilder {
         writer.finish().await
     }
 
-    /// Merge several already-materialized NGram segments (their canonical
-    /// `ngram_postings.lance` files), together with any freshly tokenized spill
-    /// files from new data, into a single canonical posting file in `dest_store`.
-    ///
-    /// Every input is sorted by token, so we 2-way cascade-merge them with
-    /// [`Self::merge_spill_streams`], unioning posting lists for equal tokens.
-    ///
-    /// When `old_data_filter` is set, rows from the source segments that the
-    /// filter rejects (e.g. fragments retired by compaction/deletion) are dropped
-    /// before merging. The freshly tokenized new data is always kept as-is.
+    /// Cascade-merge the source segments' posting files with any new-data spills
+    /// into a single canonical posting file in `dest_store`. Inputs are
+    /// token-sorted, so equal tokens' posting lists are unioned (see
+    /// [`Self::merge_spill_streams`]); each segment's rows are filtered by its
+    /// own entry in `old_data_filters` (aligned with `segment_stores`), while
+    /// new data is kept as-is.
     async fn merge_indices(
         mut self,
         new_data_spills: Vec<usize>,
         segment_stores: &[Arc<dyn IndexStore>],
-        old_data_filter: Option<super::OldIndexDataFilter>,
+        old_data_filters: &[Option<super::OldIndexDataFilter>],
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
         dest_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
+        if old_data_filters.len() != segment_stores.len() {
+            return Err(Error::invalid_input(format!(
+                "NGram merge: expected one old-data filter per source segment \
+                 ({} segments) but got {}",
+                segment_stores.len(),
+                old_data_filters.len()
+            )));
+        }
+
         // Reduce the new-data spill files (if any) to a single sorted spill.
         let mut pending = if new_data_spills.is_empty() {
             None
@@ -1318,7 +1375,7 @@ impl NGramIndexBuilder {
         // Spill ids are monotonically increasing; start past any id used above.
         let mut next_spill = pending.map(|id| id + 1).unwrap_or(0);
 
-        for store in segment_stores {
+        for (store, old_data_filter) in segment_stores.iter().zip(old_data_filters) {
             let seg_reader = store.open_index_file(POSTINGS_FILENAME).await?;
             let out = next_spill;
             next_spill += 1;
@@ -1326,16 +1383,14 @@ impl NGramIndexBuilder {
                 .spill_store
                 .new_index_file(&Self::spill_filename(out), POSTINGS_SCHEMA.clone())
                 .await?;
-            // Apply the retired-row filter to this segment's posting lists.
+            // Remap addresses left stale by a deferred-remap compaction, then drop
+            // retired-fragment rows. New-data spills are already in the current
+            // address space, so only source segments go through this.
             let filter = old_data_filter.clone();
-            let seg_stream = Self::stream_spill_reader(seg_reader)
-                .await?
-                .map(move |res| {
-                    res.map(|state| match &filter {
-                        Some(filter) => state.filter_rows(filter),
-                        None => state,
-                    })
-                });
+            let fri = frag_reuse_index.clone();
+            let seg_stream = Self::stream_spill_reader(seg_reader).await?.map(move |res| {
+                res.map(|state| state.remap_and_filter_rows(fri.as_ref(), filter.as_ref()))
+            });
             match pending.take() {
                 None => {
                     // Seed the accumulator from the first source.
@@ -1447,9 +1502,8 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         _fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        // `fragment_ids` only restricts which rows the caller scanned into `data`;
-        // the builder always writes a single canonical `ngram_postings.lance`, so
-        // a per-fragment build is naturally a canonical segment over those rows.
+        // `fragment_ids` only scopes the rows scanned into `data`; the builder
+        // always writes one canonical file, so a per-fragment build is a segment.
         let file = Self::train_ngram_index(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
@@ -1859,6 +1913,90 @@ mod tests {
 
         let posting_list = get_null_posting_list(&index).await;
         assert_eq!(posting_list, vec![2, 3, 102]);
+    }
+
+    #[test]
+    fn test_retain_row_ids_filters_by_allow_list() {
+        use arrow_array::UInt32Array;
+        use roaring::RoaringTreemap;
+
+        use super::NGramIndexSpillState;
+        use crate::scalar::OldIndexDataFilter;
+
+        let addr = |frag: u32, local: u32| ((frag as u64) << 32) | local as u64;
+
+        // Three tokens whose postings span fragments 0, 1 and 2.
+        let state = NGramIndexSpillState {
+            tokens: UInt32Array::from(vec![10u32, 20, 30]),
+            bitmaps: vec![
+                RoaringTreemap::from_iter([addr(0, 0), addr(0, 1), addr(1, 0), addr(2, 0)]),
+                RoaringTreemap::from_iter([addr(2, 5)]),
+                RoaringTreemap::from_iter([addr(1, 0), addr(1, 1), addr(1, 2)]),
+            ],
+        };
+
+        // Allow-list: fragment 0 fully live, fragment 1 keeps only local row 0,
+        // fragment 2 absent (fully retired).
+        let mut valid = RowAddrTreeMap::new();
+        valid.insert_fragment(0);
+        valid.insert(addr(1, 0));
+
+        let filtered = state.remap_and_filter_rows(None, Some(&OldIndexDataFilter::RowIds(valid)));
+
+        // Token 20 lived only in retired fragment 2, so it is dropped entirely.
+        assert_eq!(filtered.tokens.values().to_vec(), vec![10u32, 30]);
+        // Token 10: fragment 0 kept whole, fragment 1 trimmed to local 0,
+        // fragment 2 dropped.
+        assert_eq!(
+            filtered.bitmaps[0].iter().collect::<Vec<_>>(),
+            vec![addr(0, 0), addr(0, 1), addr(1, 0)],
+        );
+        // Token 30: only the allow-listed local row 0 survives.
+        assert_eq!(filtered.bitmaps[1].iter().collect::<Vec<_>>(), vec![addr(1, 0)]);
+    }
+
+    #[test]
+    fn test_remap_then_keep_relocates_and_filters() {
+        use arrow_array::UInt32Array;
+        use roaring::{RoaringBitmap, RoaringTreemap};
+        use uuid::Uuid;
+
+        use super::NGramIndexSpillState;
+        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails};
+        use crate::scalar::OldIndexDataFilter;
+
+        let addr = |frag: u32, local: u32| ((frag as u64) << 32) | local as u64;
+
+        // One token spanning fragments 0 and 1.
+        let state = NGramIndexSpillState {
+            tokens: UInt32Array::from(vec![10u32]),
+            bitmaps: vec![RoaringTreemap::from_iter([addr(0, 0), addr(0, 1), addr(1, 0)])],
+        };
+
+        // Compaction fused fragment 0 into fragment 2: row (0,0) survives at
+        // (2,0), row (0,1) was deleted (maps to None). Row (1,0) isn't in the
+        // map, so remap passes it through unchanged.
+        let fri = Arc::new(FragReuseIndex::new(
+            Uuid::new_v4(),
+            vec![HashMap::from([
+                (addr(0, 0), Some(addr(2, 0))),
+                (addr(0, 1), None),
+            ])],
+            FragReuseIndexDetails { versions: vec![] },
+        ));
+
+        // After remap the live rows sit in fragments 2 and 1; fragment 1 is retired.
+        let filter = OldIndexDataFilter::Fragments {
+            to_keep: RoaringBitmap::from_iter([2u32]),
+            to_remove: RoaringBitmap::from_iter([1u32]),
+        };
+
+        let filtered = state.remap_and_filter_rows(Some(&fri), Some(&filter));
+
+        // Only the relocated, still-live row survives: (0,0) -> (2,0). (0,1) was
+        // dropped by remap; (1,0) was dropped by the retired-fragment filter.
+        assert_eq!(filtered.tokens.values().to_vec(), vec![10u32]);
+        assert_eq!(filtered.bitmaps[0].iter().collect::<Vec<_>>(), vec![addr(2, 0)]);
     }
 
     #[test_log::test(tokio::test)]

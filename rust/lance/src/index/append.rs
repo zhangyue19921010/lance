@@ -94,6 +94,63 @@ pub async fn build_old_data_filter(
     }
 }
 
+/// Split the stored fragment coverage of `segments` into fragments still live
+/// in `dataset` (`effective`) and fragments that compaction or deletion has
+/// already retired (`deleted`).
+pub fn split_segment_coverage<'a>(
+    dataset: &Dataset,
+    segments: impl IntoIterator<Item = &'a IndexMetadata>,
+) -> (RoaringBitmap, RoaringBitmap) {
+    let mut effective = RoaringBitmap::new();
+    let mut deleted = RoaringBitmap::new();
+    for segment in segments {
+        if let Some(eff) = segment.effective_fragment_bitmap(&dataset.fragment_bitmap) {
+            effective |= eff;
+        }
+        if let Some(del) = segment.deleted_fragment_bitmap(&dataset.fragment_bitmap) {
+            deleted |= del;
+        }
+    }
+    (effective, deleted)
+}
+
+/// Build one [`OldIndexDataFilter`] per segment, each derived from that
+/// segment's *own* effective (still-live) and retired fragment coverage.
+pub async fn build_per_segment_filters(
+    dataset: &Dataset,
+    segments: &[&IndexMetadata],
+) -> Result<Vec<Option<OldIndexDataFilter>>> {
+    let mut filters = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let effective = segment
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .unwrap_or_default();
+        let deleted = segment
+            .deleted_fragment_bitmap(&dataset.fragment_bitmap)
+            .unwrap_or_default();
+        filters.push(build_old_data_filter(dataset, &effective, &deleted).await?);
+    }
+    Ok(filters)
+}
+
+pub async fn effective_coverage_and_filters(
+    dataset: &Dataset,
+    segments: &[IndexMetadata],
+) -> Result<(RoaringBitmap, Vec<Option<OldIndexDataFilter>>)> {
+    for segment in segments {
+        if segment.fragment_bitmap.is_none() {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: segment {} is missing fragment coverage",
+                segment.uuid
+            )));
+        }
+    }
+    let (effective, _deleted) = split_segment_coverage(dataset, segments);
+    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
+    let filters = build_per_segment_filters(dataset, &segment_refs).await?;
+    Ok((effective, filters))
+}
+
 async fn load_unindexed_training_data(
     dataset: &Dataset,
     field_path: &str,
@@ -240,12 +297,15 @@ async fn merge_scalar_indices<'a>(
             load_unindexed_training_data(dataset.as_ref(), field_path, &update_criteria, unindexed)
                 .await?;
         let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
-        let old_data_filter =
-            build_old_data_filter(dataset.as_ref(), &effective_old_frags, &deleted_old_frags)
-                .await?;
 
         match index_type {
             IndexType::BTree => {
+                let old_data_filter = build_old_data_filter(
+                    dataset.as_ref(),
+                    &effective_old_frags,
+                    &deleted_old_frags,
+                )
+                .await?;
                 crate::index::scalar::btree::open_and_merge_segments(
                     dataset.as_ref(),
                     field_path,
@@ -257,17 +317,24 @@ async fn merge_scalar_indices<'a>(
                 .await?
             }
             IndexType::NGram => {
+                let old_data_filters =
+                    build_per_segment_filters(dataset.as_ref(), selected_old_indices).await?;
                 crate::index::scalar::ngram::open_and_merge_segments(
                     dataset.as_ref(),
-                    field_path,
                     selected_old_indices,
                     Some(new_data_stream),
                     &new_store,
-                    old_data_filter,
+                    &old_data_filters,
                 )
                 .await?
             }
             _ => {
+                let old_data_filter = build_old_data_filter(
+                    dataset.as_ref(),
+                    &effective_old_frags,
+                    &deleted_old_frags,
+                )
+                .await?;
                 reference_index
                     .update(new_data_stream, &new_store, old_data_filter)
                     .await?
@@ -1689,6 +1756,120 @@ mod tests {
             other => panic!("expected AtMost/Exact result, got {other:?}"),
         };
         assert_eq!(count, 3, "needle should match three rows across fragments");
+    }
+
+    #[tokio::test]
+    async fn test_optimize_ngram_merge_remaps_deferred_compaction() {
+        use crate::dataset::optimize::CompactionOptions;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, true)]));
+        let make_batch = |values: &[&str]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from_iter_values(
+                    values.iter().copied(),
+                ))],
+            )
+            .unwrap()
+        };
+
+        // Two fragments, both covered by a single NGram index; "needle" is in every row.
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(make_batch(&["alpha needle", "beta needle"])),
+                Ok(make_batch(&["gamma needle", "delta needle"])),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::NGram,
+                Some("text_ngram".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Deferred-remap compaction fuses the two fragments into one. The index's
+        // posting addresses now point at retired fragments; only the fragment-reuse
+        // index can map them to their post-compaction home.
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 10,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metrics.fragments_removed > 0 && metrics.fragments_added > 0);
+
+        // Append an unindexed fragment so optimize has new data to fold in, routing
+        // the stale segment through the NGram merge primitive (open_and_merge_segments).
+        let appended =
+            RecordBatchIterator::new(vec![Ok(make_batch(&["epsilon needle"]))], schema.clone());
+        let mut dataset = Dataset::write(
+            appended,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // merge(1) folds the stale segment together with the new fragment; append()
+        // would only stack a new delta and leave the stale segment untouched.
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let logical = crate::index::scalar_logical::open_named_scalar_index(
+            &dataset,
+            "text",
+            "text_ngram",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+
+        // Four relocated rows plus the appended row. Without frag-reuse remapping
+        // the merge would drop the relocated rows: their stale addresses fail the
+        // old_data_filter, which is keyed on the current fragment ids.
+        let query = TextQuery::StringContains("needle".to_string());
+        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let count = match result {
+            SearchResult::AtMost(row_addrs) | SearchResult::Exact(row_addrs) => {
+                row_addrs.true_rows().row_addrs().unwrap().count()
+            }
+            other => panic!("expected AtMost/Exact result, got {other:?}"),
+        };
+        assert_eq!(
+            count, 5,
+            "all four relocated rows plus the appended row must still match"
+        );
     }
 
     #[tokio::test]
