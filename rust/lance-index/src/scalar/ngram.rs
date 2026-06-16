@@ -1266,7 +1266,9 @@ impl NGramIndexBuilder {
                 spill_files.push(spill_counter + i);
             }
             spill_counter += new_spills.len();
-            futures::future::try_join_all(new_spills).await?;
+            for result in futures::future::try_join_all(new_spills).await? {
+                result?;
+            }
         }
 
         spill_files.pop().expect_ok()
