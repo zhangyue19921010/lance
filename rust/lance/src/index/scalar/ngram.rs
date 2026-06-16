@@ -62,7 +62,8 @@ pub(in crate::index) async fn merge_segments(
     // Pure consolidation: no new data, driven entirely by the source posting lists.
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
     let created_index =
-        open_and_merge_segments(dataset, &segment_refs, None, &new_store, &old_data_filters).await?;
+        open_and_merge_segments(dataset, &segment_refs, None, &new_store, &old_data_filters)
+            .await?;
 
     Ok(IndexMetadata {
         uuid: new_uuid,

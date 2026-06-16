@@ -4,6 +4,7 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::iter::once;
+use std::pin::Pin;
 use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
 
@@ -39,8 +40,8 @@ use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
-use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_io::object_store::ObjectStore;
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_tokenizer::{
     AlphaNumOnlyFilter, AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, TextAnalyzer,
 };
@@ -734,8 +735,9 @@ impl NGramIndexSpillState {
         let mut tokens = UInt32Builder::with_capacity(self.tokens.len());
         let mut bitmaps = Vec::with_capacity(self.bitmaps.len());
         for (token, bitmap) in self.tokens.values().iter().zip(self.bitmaps) {
-            let kept =
-                RoaringTreemap::from_iter(bitmap.into_iter().filter(|row_id| valid.contains(*row_id)));
+            let kept = RoaringTreemap::from_iter(
+                bitmap.into_iter().filter(|row_id| valid.contains(*row_id)),
+            );
             if !kept.is_empty() {
                 tokens.append_value(*token);
                 bitmaps.push(kept);
@@ -1343,12 +1345,20 @@ impl NGramIndexBuilder {
         writer.finish().await
     }
 
-    /// Cascade-merge the source segments' posting files with any new-data spills
-    /// into a single canonical posting file in `dest_store`. Inputs are
-    /// token-sorted, so equal tokens' posting lists are unioned (see
-    /// [`Self::merge_spill_streams`]); each segment's rows are filtered by its
-    /// own entry in `old_data_filters` (aligned with `segment_stores`), while
-    /// new data is kept as-is.
+    async fn open_segment_stream(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        filter: Option<super::OldIndexDataFilter>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<NGramIndexSpillState>> + Send>>> {
+        let reader = store.open_index_file(POSTINGS_FILENAME).await?;
+        let stream = Self::stream_spill_reader(reader).await?.map(move |res| {
+            res.map(|state| state.remap_and_filter_rows(frag_reuse_index.as_ref(), filter.as_ref()))
+        });
+        Ok(Box::pin(stream))
+    }
+
+    /// Merge the source segments' posting files with any new-data spills into a
+    /// single canonical posting file in `dest_store`.
     async fn merge_indices(
         mut self,
         new_data_spills: Vec<usize>,
@@ -1366,59 +1376,73 @@ impl NGramIndexBuilder {
             )));
         }
 
-        // Reduce the new-data spill files (if any) to a single sorted spill.
-        let mut pending = if new_data_spills.is_empty() {
-            None
-        } else {
-            Some(self.merge_spills(new_data_spills).await?)
-        };
-        // Spill ids are monotonically increasing; start past any id used above.
-        let mut next_spill = pending.map(|id| id + 1).unwrap_or(0);
-
-        for (store, old_data_filter) in segment_stores.iter().zip(old_data_filters) {
-            let seg_reader = store.open_index_file(POSTINGS_FILENAME).await?;
-            let out = next_spill;
-            next_spill += 1;
-            let mut writer = self
-                .spill_store
-                .new_index_file(&Self::spill_filename(out), POSTINGS_SCHEMA.clone())
-                .await?;
-            // Remap addresses left stale by a deferred-remap compaction, then drop
-            // retired-fragment rows. New-data spills are already in the current
-            // address space, so only source segments go through this.
-            let filter = old_data_filter.clone();
-            let fri = frag_reuse_index.clone();
-            let seg_stream = Self::stream_spill_reader(seg_reader).await?.map(move |res| {
-                res.map(|state| state.remap_and_filter_rows(fri.as_ref(), filter.as_ref()))
-            });
-            match pending.take() {
-                None => {
-                    // Seed the accumulator from the first source.
-                    let mut seg_stream = Box::pin(seg_stream);
-                    while let Some(state) = seg_stream.try_next().await? {
-                        writer.write_record_batch(state.try_into_batch()?).await?;
-                    }
-                    writer.finish().await?;
-                }
-                Some(prev) => {
-                    let left = Self::stream_spill(self.spill_store.clone(), prev).await?;
-                    Self::merge_spill_streams(left, Box::pin(seg_stream), writer.as_mut()).await?;
-                    self.spill_store
-                        .delete_index_file(&Self::spill_filename(prev))
-                        .await?;
-                }
-            }
-            pending = Some(out);
-        }
-
-        // Copy the final accumulator into the destination store.
         let mut writer = dest_store
             .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
             .await?;
-        let Some(final_spill) = pending else {
-            // No segments and no new data: write an empty index.
+
+        // No segments and no new data: write an empty index.
+        if segment_stores.is_empty() && new_data_spills.is_empty() {
             return writer.finish().await;
-        };
+        }
+
+        // Fast path
+        if segment_stores.len() == 1 {
+            let seg_stream = Self::open_segment_stream(
+                segment_stores[0].clone(),
+                frag_reuse_index,
+                old_data_filters[0].clone(),
+            )
+            .await?;
+            let new_data_stream: Pin<Box<dyn Stream<Item = Result<NGramIndexSpillState>> + Send>> =
+                if new_data_spills.is_empty() {
+                    Box::pin(stream::empty::<Result<NGramIndexSpillState>>())
+                } else {
+                    let new_data = self.merge_spills(new_data_spills).await?;
+                    Box::pin(Self::stream_spill(self.spill_store.clone(), new_data).await?)
+                };
+            return Self::merge_spill_streams(seg_stream, new_data_stream, writer.as_mut()).await;
+        }
+
+        let mut spills = new_data_spills;
+        let mut next_spill = spills.iter().copied().max().map_or(0, |id| id + 1);
+        let mut tasks = Vec::new();
+        for (stores, filters) in segment_stores.chunks(2).zip(old_data_filters.chunks(2)) {
+            let out = next_spill;
+            next_spill += 1;
+            spills.push(out);
+            let spill_store = self.spill_store.clone();
+            let fri = frag_reuse_index.clone();
+            let s0 = stores[0].clone();
+            let f0 = filters[0].clone();
+            let second = (stores.len() == 2).then(|| (stores[1].clone(), filters[1].clone()));
+            tasks.push(tokio::spawn(async move {
+                let mut writer = spill_store
+                    .new_index_file(&Self::spill_filename(out), POSTINGS_SCHEMA.clone())
+                    .await?;
+                let mut left = Self::open_segment_stream(s0, fri.clone(), f0).await?;
+                match second {
+                    Some((s1, f1)) => {
+                        let right = Self::open_segment_stream(s1, fri, f1).await?;
+                        // `merge_spill_streams` finishes the writer itself.
+                        Self::merge_spill_streams(left, right, writer.as_mut()).await?;
+                    }
+                    None => {
+                        // Odd segment out: materialize it alone (cost of one segment).
+                        while let Some(state) = left.try_next().await? {
+                            writer.write_record_batch(state.try_into_batch()?).await?;
+                        }
+                        writer.finish().await?;
+                    }
+                }
+                Result::Ok(())
+            }));
+        }
+        for result in futures::future::try_join_all(tasks).await? {
+            result?;
+        }
+
+        // Balanced parallel union of every spill (new data + paired segments).
+        let final_spill = self.merge_spills(spills).await?;
         let reader = self
             .spill_store
             .open_index_file(&Self::spill_filename(final_spill))
@@ -1952,7 +1976,10 @@ mod tests {
             vec![addr(0, 0), addr(0, 1), addr(1, 0)],
         );
         // Token 30: only the allow-listed local row 0 survives.
-        assert_eq!(filtered.bitmaps[1].iter().collect::<Vec<_>>(), vec![addr(1, 0)]);
+        assert_eq!(
+            filtered.bitmaps[1].iter().collect::<Vec<_>>(),
+            vec![addr(1, 0)]
+        );
     }
 
     #[test]
@@ -1970,7 +1997,11 @@ mod tests {
         // One token spanning fragments 0 and 1.
         let state = NGramIndexSpillState {
             tokens: UInt32Array::from(vec![10u32]),
-            bitmaps: vec![RoaringTreemap::from_iter([addr(0, 0), addr(0, 1), addr(1, 0)])],
+            bitmaps: vec![RoaringTreemap::from_iter([
+                addr(0, 0),
+                addr(0, 1),
+                addr(1, 0),
+            ])],
         };
 
         // Compaction fused fragment 0 into fragment 2: row (0,0) survives at
@@ -1996,7 +2027,10 @@ mod tests {
         // Only the relocated, still-live row survives: (0,0) -> (2,0). (0,1) was
         // dropped by remap; (1,0) was dropped by the retired-fragment filter.
         assert_eq!(filtered.tokens.values().to_vec(), vec![10u32]);
-        assert_eq!(filtered.bitmaps[0].iter().collect::<Vec<_>>(), vec![addr(2, 0)]);
+        assert_eq!(
+            filtered.bitmaps[0].iter().collect::<Vec<_>>(),
+            vec![addr(2, 0)]
+        );
     }
 
     #[test_log::test(tokio::test)]

@@ -1558,7 +1558,11 @@ mod tests {
             .unwrap();
 
         let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
-        assert_eq!(committed.len(), 3, "one merged segment plus two single ones");
+        assert_eq!(
+            committed.len(),
+            3,
+            "one merged segment plus two single ones"
+        );
         assert_eq!(
             scalar_index_fragment_bitmap(&dataset, "text", "text_ngram")
                 .await
