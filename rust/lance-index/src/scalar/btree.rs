@@ -1550,6 +1550,66 @@ impl BTreeIndex {
         }
     }
 
+    /// For each key in `keys`, whether this index contains it — a batched
+    /// existence check returning a mask aligned to `keys`.
+    ///
+    /// The per-key sibling of `search(Equals(..))`, but one call replaces N
+    /// probes: keys are grouped by page using the same page resolution as
+    /// [`ScalarIndex::search`] (`pages_eq`), each touched page is loaded once
+    /// (session-cached), and membership is tested against the page's values via
+    /// `FlatIndex::contains_values`. Avoids the per-key `SearchResult` /
+    /// `RowAddrTreeMap` allocation when the caller only wants a yes/no.
+    ///
+    /// Intended for primary-key dedup, where keys are non-null; a null key maps
+    /// to `false`.
+    pub async fn contains_keys(
+        &self,
+        keys: &[ScalarValue],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<bool>> {
+        // Group each key (by input position) under every page whose value range
+        // could hold it. Mirrors `search`'s page selection so the two agree.
+        let mut by_page: HashMap<u32, Vec<(usize, OrderableScalarValue)>> = HashMap::new();
+        for (idx, key) in keys.iter().enumerate() {
+            if key.is_null() {
+                continue;
+            }
+            let ov = OrderableScalarValue(key.clone());
+            for matches in self.page_lookup.pages_eq(&ov)? {
+                by_page
+                    .entry(matches.page_id())
+                    .or_default()
+                    .push((idx, ov.clone()));
+            }
+        }
+
+        let index_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
+        let page_tasks = by_page.into_iter().map(|(page_number, entries)| {
+            let index_reader = index_reader.clone();
+            async move {
+                let page = self.lookup_page(page_number, index_reader, metrics).await?;
+                let needles: Vec<OrderableScalarValue> =
+                    entries.iter().map(|(_, ov)| ov.clone()).collect();
+                let present = page.contains_values(&needles)?;
+                Result::Ok((entries, present))
+            }
+        });
+
+        let mut result = vec![false; keys.len()];
+        let page_results: Vec<_> = stream::iter(page_tasks)
+            .buffer_unordered(get_num_compute_intensive_cpus())
+            .try_collect()
+            .await?;
+        for (entries, present) in page_results {
+            for (idx, ov) in entries {
+                if present.contains(&ov) {
+                    result[idx] = true;
+                }
+            }
+        }
+        Ok(result)
+    }
+
     async fn lookup_page(
         &self,
         page_number: u32,
@@ -3427,6 +3487,86 @@ mod tests {
                 SearchResult::exact(RowAddrTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_contains_keys_matches_search() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // 1000 distinct Int32 values [0, 1000), spread across many small pages
+        // (batch_size 64) so the keys below exercise multi-page grouping.
+        let data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(100), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Present (range ends, mid, and adjacent values that straddle page
+        // boundaries), interleaved with absent (below/above range, and a gap).
+        let keys: Vec<i32> = vec![0, 999, 500, 1, 998, -1, 1000, 1500, 250, 251, 7, 64, 63, 65];
+        let scalar_keys: Vec<ScalarValue> =
+            keys.iter().map(|k| ScalarValue::Int32(Some(*k))).collect();
+
+        let batched = index
+            .contains_keys(&scalar_keys, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // Oracle: the per-key Equals search the batched path replaces.
+        let mut oracle = Vec::with_capacity(keys.len());
+        for k in &scalar_keys {
+            let result = index
+                .search(&SargableQuery::Equals(k.clone()), &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            oracle.push(!result.row_addrs().is_empty());
+        }
+        assert_eq!(
+            batched, oracle,
+            "contains_keys must agree with per-key Equals search; keys={keys:?}"
+        );
+
+        // And both must match ground truth: [0, 1000) present, others absent.
+        let expected: Vec<bool> = keys.iter().map(|k| (0..1000).contains(k)).collect();
+        assert_eq!(batched, expected);
+
+        // Empty input → empty mask.
+        assert!(
+            index
+                .contains_keys(&[], &NoOpMetricsCollector)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A null key maps to false (and must not panic).
+        let with_null = vec![ScalarValue::Int32(Some(5)), ScalarValue::Int32(None)];
+        assert_eq!(
+            index
+                .contains_keys(&with_null, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            vec![true, false]
+        );
     }
 
     #[tokio::test]

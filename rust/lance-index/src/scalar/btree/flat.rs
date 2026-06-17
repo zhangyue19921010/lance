@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::{ops::Bound, sync::Arc};
 
 use arrow_array::Array;
@@ -21,8 +21,10 @@ use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
+use datafusion_common::ScalarValue;
+
 use crate::metrics::MetricsCollector;
-use crate::scalar::btree::BTREE_VALUES_COLUMN;
+use crate::scalar::btree::{BTREE_VALUES_COLUMN, OrderableScalarValue};
 use crate::scalar::{AnyQuery, SargableQuery};
 
 const VALUES_COL_IDX: usize = 0;
@@ -80,6 +82,46 @@ impl FlatIndex {
 
     fn ids(&self) -> &ArrayRef {
         self.data.column(IDS_COL_IDX)
+    }
+
+    fn values(&self) -> &ArrayRef {
+        self.data.column(VALUES_COL_IDX)
+    }
+
+    /// Which of `needles` are present in this page.
+    ///
+    /// Batched existence sibling of [`Self::search`]: it runs the same `IsIn`
+    /// predicate over the page's `values` column, but returns the matched
+    /// *values* rather than row addresses — so the caller can map each result
+    /// back to the input key it asked about. The page scan stays vectorized;
+    /// only the (small) matched subset is lifted into `ScalarValue`.
+    ///
+    /// Nulls: a null `values` entry never matches a (non-null) primary-key
+    /// needle, so it is simply absent from the result.
+    pub(crate) fn contains_values(
+        &self,
+        needles: &[OrderableScalarValue],
+    ) -> Result<BTreeSet<OrderableScalarValue>> {
+        if needles.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let query = SargableQuery::IsIn(needles.iter().map(|v| v.0.clone()).collect());
+        let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
+        let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+        let predicate = expr.evaluate(&self.data)?;
+        let predicate = predicate.into_array(self.data.num_rows())?;
+        let predicate = predicate
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("Predicate should return boolean array");
+        let matched = arrow_select::filter::filter(self.values(), predicate)?;
+        (0..matched.len())
+            .map(|i| {
+                Ok(OrderableScalarValue(ScalarValue::try_from_array(
+                    &matched, i,
+                )?))
+            })
+            .collect()
     }
 
     pub fn all(&self) -> NullableRowAddrSet {
