@@ -776,14 +776,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 self.score(doc_length)
             };
 
-            let freqs = self.iter_term_freqs().collect();
             if candidates.len() < limit {
+                let freqs = self.iter_term_freqs().collect();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
                     let kth = candidates.peek().unwrap().0.0.score.0;
                     self.update_threshold(kth, params.wand_factor);
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
+                let freqs = self.iter_term_freqs().collect();
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 let kth = candidates.peek().unwrap().0.0.score.0;
@@ -894,15 +895,16 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             self.collect_tail_matches(doc_id);
             let score = self.score(doc_length);
-            let freqs = self.iter_term_freqs().collect();
 
             if candidates.len() < limit {
+                let freqs = self.iter_term_freqs().collect();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
                     let kth = candidates.peek().unwrap().0.0.score.0;
                     self.update_threshold(kth, params.wand_factor);
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
+                let freqs = self.iter_term_freqs().collect();
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 let kth = candidates.peek().unwrap().0.0.score.0;
