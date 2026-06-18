@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
 use super::data_source::{FreshTierWatermark, ShardSnapshot};
-use super::flushed_cache::FlushedMemTableCache;
+use super::flushed_cache::{DatasetCache, GenerationWarmer};
 use super::planner::LsmScanPlanner;
 use super::point_lookup::LsmPointLookupPlanner;
 use crate::dataset::Dataset;
@@ -124,7 +124,9 @@ pub struct LsmScanner {
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets. When set, repeated
     /// queries against the same generation skip the manifest read entirely.
-    flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<Arc<dyn DatasetCache>>,
+    /// Optional warmer fired on first open of a flushed generation.
+    warmer: Option<Arc<dyn GenerationWarmer>>,
     /// Over-fetch multiple for block-listed sources in search plans
     /// (see [`super::LsmFtsSearchPlanner::with_overfetch_factor`]).
     overfetch_factor: Option<f64>,
@@ -163,6 +165,7 @@ impl LsmScanner {
             pk_columns,
             session,
             flushed_cache: None,
+            warmer: None,
             overfetch_factor: None,
         }
     }
@@ -202,6 +205,7 @@ impl LsmScanner {
             pk_columns,
             session: None,
             flushed_cache: None,
+            warmer: None,
             overfetch_factor: None,
         }
     }
@@ -251,10 +255,18 @@ impl LsmScanner {
     ///
     /// With a cache, repeated queries against the same generation become a
     /// pure `Arc::clone` with no manifest read or object-store I/O. The cache
-    /// is owned and sized by the caller (see [`FlushedMemTableCache`]); not
-    /// set by default, so behavior is unchanged unless opted in.
-    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+    /// is owned and sized by the caller (any [`DatasetCache`] impl, e.g.
+    /// [`FlushedMemTableCache`](super::FlushedMemTableCache)); not set by
+    /// default, so behavior is unchanged unless opted in.
+    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
         self.flushed_cache = Some(cache);
+        self
+    }
+
+    /// Inject the warmer fired on first open of a flushed generation. Not set by
+    /// default, so behavior is unchanged unless opted in.
+    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+        self.warmer = Some(warmer);
         self
     }
 
@@ -367,6 +379,9 @@ impl LsmScanner {
             if let Some(cache) = &self.flushed_cache {
                 planner = planner.with_flushed_cache(cache.clone());
             }
+            if let Some(warmer) = &self.warmer {
+                planner = planner.with_warmer(warmer.clone());
+            }
             let plan = planner
                 .plan_point_lookup(&keys, self.projection.as_deref())
                 .await?;
@@ -382,6 +397,9 @@ impl LsmScanner {
         }
         if let Some(cache) = &self.flushed_cache {
             planner = planner.with_flushed_cache(cache.clone());
+        }
+        if let Some(warmer) = &self.warmer {
+            planner = planner.with_warmer(warmer.clone());
         }
         if let Some(factor) = self.overfetch_factor {
             planner = planner.with_overfetch_factor(factor);
@@ -420,6 +438,9 @@ impl LsmScanner {
         }
         if let Some(cache) = &self.flushed_cache {
             planner = planner.with_flushed_cache(cache.clone());
+        }
+        if let Some(warmer) = &self.warmer {
+            planner = planner.with_warmer(warmer.clone());
         }
         if let Some(factor) = self.overfetch_factor {
             planner = planner.with_overfetch_factor(factor);
@@ -473,7 +494,7 @@ impl LsmScanner {
     /// the primary-key columns; the returned `Vec<bool>` is aligned with its
     /// rows. Hashing matches the scanner's internal dedup, so the caller never
     /// hashes PKs itself. Flushed membership comes from the injected
-    /// [`FlushedMemTableCache`] when one is set.
+    /// [`DatasetCache`] when one is set.
     pub async fn contains_pks(&self, pks: &RecordBatch) -> Result<Vec<bool>> {
         self.contains_pks_at(pks, None).await
     }

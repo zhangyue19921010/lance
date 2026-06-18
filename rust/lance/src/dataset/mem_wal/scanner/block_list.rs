@@ -32,7 +32,7 @@ use lance_index::scalar::{
 use uuid::Uuid;
 
 use super::data_source::{FreshTierWatermark, LsmDataSource, LsmGeneration};
-use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
+use super::flushed_cache::{DatasetCache, open_flushed_dataset};
 use crate::dataset::mem_wal::index::encode_pk_tuple;
 use crate::dataset::mem_wal::util::PK_INDEX_DIR;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -157,7 +157,7 @@ type ShardGenSets = HashMap<Uuid, Vec<(LsmGeneration, GenMembership)>>;
 pub async fn compute_source_block_lists(
     sources: &[LsmDataSource],
     session: Option<&Arc<Session>>,
-    flushed_cache: Option<&Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<SourceBlockLists> {
     // Membership per non-base source, grouped by shard (generations are
     // per-shard, so supersession is within-shard only).
@@ -238,7 +238,7 @@ pub async fn compute_source_block_lists(
 pub async fn fresh_tier_block_list(
     sources: &[LsmDataSource],
     session: Option<&Arc<Session>>,
-    flushed_cache: Option<&Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<&Arc<dyn DatasetCache>>,
     watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
 ) -> Result<Vec<GenMembership>> {
     // Membership per source, in source order (`None` = skipped). Flushed
@@ -379,9 +379,9 @@ fn path_cache_uuid(path: &str) -> Uuid {
 async fn open_pk_index(
     path: &str,
     session: Option<&Arc<Session>>,
-    flushed_cache: Option<&Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    let dataset = open_flushed_dataset(path, session, flushed_cache).await?;
+    let dataset = open_flushed_dataset(path, session, flushed_cache, None).await?;
     // Namespace the session index cache by the (immutable) flushed path so this
     // sidecar's pages live alongside every other index instead of a bespoke
     // cache. `fri_uuid` is None — flushed generations carry no fragment-reuse.

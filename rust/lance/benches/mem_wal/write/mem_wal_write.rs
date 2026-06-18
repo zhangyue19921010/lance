@@ -652,6 +652,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                     frozen_memtable_grace: default_config.frozen_memtable_grace,
                                     enable_memtable,
                                     hnsw_params: default_config.hnsw_params,
+                                    warmer: None,
                                 };
 
                                 // Get writer through Dataset API (index configs loaded automatically)
