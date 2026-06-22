@@ -1246,6 +1246,19 @@ pub async fn merge_bitmap_indices(
             )));
         }
 
+        // A segment whose filter keeps nothing contributes no postings; skip the
+        // state load entirely. (Remapping for deferred compaction happens inside
+        // `load_bitmap`, so the loaded postings already reference live fragments.)
+        if old_data_filters[idx]
+            .as_ref()
+            .is_some_and(|f| f.keeps_nothing())
+        {
+            progress
+                .stage_progress("merge_bitmap_segments", (idx + 1) as u64)
+                .await?;
+            continue;
+        }
+
         let mut state = source_index.load_bitmap_index_state().await?;
         if let Some(old_data_filter) = &old_data_filters[idx] {
             state.retain(|_, postings| {

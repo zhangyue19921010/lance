@@ -1837,13 +1837,22 @@ impl BTreeIndex {
 
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(segments.len() + 1);
         for (segment, old_data_filter) in segments.iter().zip(old_data_filters) {
+            if old_data_filter.as_ref().is_some_and(|f| f.keeps_nothing()) {
+                continue;
+            }
             let stream = segment.data_stream().await?;
+            // Segments built before a deferred-remap compaction still carry the
+            // pre-compaction row addresses on disk; remap them to live fragments
+            // before the per-segment filter (which is keyed on live fragments).
+            let stream = match segment.frag_reuse_index.clone() {
+                Some(frag_reuse_index) => remap_row_ids(stream, frag_reuse_index),
+                None => stream,
+            };
             let stream = match old_data_filter.clone() {
                 Some(filter) => filter_row_ids(stream, filter),
                 None => stream,
             };
-            let exec = Arc::new(OneShotExec::new(stream));
-            inputs.push(exec);
+            inputs.push(Arc::new(OneShotExec::new(stream)));
         }
         inputs.push(Arc::new(OneShotExec::new(new_data)));
 
@@ -1896,6 +1905,21 @@ fn filter_row_ids(
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
+}
+
+/// Remap a segment's stream of row IDs through a pending [`FragReuseIndex`] so a
+/// segment produced before a deferred-remap compaction references live
+/// fragments. Column index `1` is the row-id column of the BTree page stream.
+fn remap_row_ids(
+    stream: SendableRecordBatchStream,
+    frag_reuse_index: Arc<FragReuseIndex>,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let remapped = stream.map(move |batch_result| {
+        let batch = batch_result?;
+        Ok(frag_reuse_index.remap_row_ids_record_batch(batch, 1)?)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
 }
 
 fn wrap_bound(bound: &Bound<ScalarValue>) -> Bound<OrderableScalarValue> {

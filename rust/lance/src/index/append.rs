@@ -840,7 +840,7 @@ mod tests {
     use rstest::rstest;
 
     use crate::dataset::builder::DatasetBuilder;
-    use crate::dataset::optimize::compact_files;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -2223,6 +2223,107 @@ mod tests {
             1,
             "the segments must collapse into a single consolidated segment"
         );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_bitmap_merge_remaps_deferred_compaction() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("cat", DataType::Int32, false)]));
+        let make = |range: std::ops::Range<i32>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(range))],
+            )
+            .unwrap()
+        };
+
+        // Two fragments: [0, 50) and [50, 100).
+        let reader =
+            RecordBatchIterator::new(vec![Ok(make(0..50)), Ok(make(50..100))], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        dataset
+            .create_index(
+                &["cat"],
+                IndexType::Bitmap,
+                Some("cat_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Deferred-remap compaction fuses the two fragments into one and leaves a
+        // pending FragReuseIndex; the bitmap segment is not eagerly remapped, so
+        // its on-disk postings still reference the pre-compaction fragments.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Append a third fragment, left unindexed.
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(make(100..150))], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Merge the deferred-remapped old segment with the new delta.
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        // A value from the compacted fragments must still be found via the index;
+        // a missing remap would point the posting at a retired fragment address.
+        let hit = dataset
+            .scan()
+            .filter("cat = 25")
+            .unwrap()
+            .project(&["cat"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(
+            hit, 1,
+            "compacted-then-merged row must remain queryable via the bitmap index"
+        );
+        let total = dataset
+            .scan()
+            .filter("cat >= 0")
+            .unwrap()
+            .project(&["cat"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(total, 150, "no rows may be lost across compaction + merge");
     }
 
     #[tokio::test]

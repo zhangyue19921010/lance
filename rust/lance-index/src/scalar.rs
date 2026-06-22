@@ -935,6 +935,15 @@ impl OldIndexDataFilter {
             Self::RowIds(valid_row_ids) => *addrs &= valid_row_ids,
         }
     }
+
+    /// True if this filter would keep no rows at all (its keep-set is empty),
+    /// letting a segment merge skip reading the source segment entirely.
+    pub fn keeps_nothing(&self) -> bool {
+        match self {
+            Self::Fragments { to_keep, .. } => to_keep.is_empty(),
+            Self::RowIds(valid_row_ids) => valid_row_ids.is_empty(),
+        }
+    }
 }
 
 impl UpdateCriteria {
