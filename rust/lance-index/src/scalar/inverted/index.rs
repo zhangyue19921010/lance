@@ -38,11 +38,12 @@ use datafusion::physical_plan::metrics::Time;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use lance_arrow::{RecordBatchExt, iter_str_array};
 use lance_core::cache::{CacheCodec, CacheKey, LanceCache, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::{DataFusionResult, LanceOptionExt};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
@@ -2948,10 +2949,9 @@ impl DeepSizeOf for CompressedPositionStorage {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SharedPositionStream {
     codec: PositionStreamCodec,
-    block_offsets: Vec<u32>,
-    // Stored as `Bytes` so that the cache deserialization path can hand
-    // ownership of an IPC-decoded slice in without copying. Cloning the
-    // stream is then an `Arc` bump rather than an O(N) buffer copy.
+    block_offsets: Arc<[u32]>,
+    // Stored with shared ownership so cache hits can clone position streams
+    // without copying either offsets or bytes.
     bytes: bytes::Bytes,
 }
 
@@ -2959,7 +2959,7 @@ impl SharedPositionStream {
     pub fn new(codec: PositionStreamCodec, block_offsets: Vec<u32>, bytes: bytes::Bytes) -> Self {
         Self {
             codec,
-            block_offsets,
+            block_offsets: Arc::from(block_offsets.into_boxed_slice()),
             bytes,
         }
     }
@@ -2992,11 +2992,11 @@ impl SharedPositionStream {
     }
 
     pub fn block_offsets(&self) -> &[u32] {
-        &self.block_offsets
+        self.block_offsets.as_ref()
     }
 
     pub fn size(&self) -> usize {
-        self.block_offsets.capacity() * std::mem::size_of::<u32>() + self.bytes.len()
+        self.block_offsets.len() * std::mem::size_of::<u32>() + self.bytes.len()
     }
 }
 
@@ -4616,18 +4616,25 @@ impl DocSet {
         self.row_ids[doc_id as usize]
     }
 
-    pub fn doc_id(&self, row_id: u64) -> Option<u64> {
+    /// Resolve a `row_id` to every `doc_id` it owns.
+    ///
+    /// A scalar column maps each row to a single document, but a
+    /// `list<string>` column indexes every element as its own document, so a
+    /// single `row_id` can own several `doc_id`s sharing that key in `inv`.
+    /// The prefilter path (`flat_search`) walks an allow-list of row_ids and
+    /// must evaluate *all* of a row's documents; resolving to one `doc_id`
+    /// silently drops matches at non-last list positions (lancedb#3352).
+    pub fn doc_ids(&self, row_id: u64) -> impl Iterator<Item = u64> + '_ {
         if self.inv.is_empty() {
-            // in legacy format, the row id is doc id
-            match self.row_ids.binary_search(&row_id) {
-                Ok(_) => Some(row_id),
-                Err(_) => None,
-            }
+            // in legacy format, the row id is doc id (one document per row)
+            let found = self.row_ids.binary_search(&row_id).is_ok();
+            Either::Left(found.then_some(row_id).into_iter())
         } else {
-            match self.inv.binary_search_by_key(&row_id, |x| x.0) {
-                Ok(idx) => Some(self.inv[idx].1 as u64),
-                Err(_) => None,
-            }
+            // `inv` is sorted by row_id, so the entries sharing this key form a
+            // contiguous run; yield the doc_id of each.
+            let lo = self.inv.partition_point(|entry| entry.0 < row_id);
+            let hi = self.inv.partition_point(|entry| entry.0 <= row_id);
+            Either::Right(self.inv[lo..hi].iter().map(|entry| entry.1 as u64))
         }
     }
     pub fn total_tokens_num(&self) -> u64 {
@@ -4751,23 +4758,36 @@ impl DocSet {
             });
         }
 
-        // if frag reuse happened, we'll need to remap the row_ids. And after row_ids been
-        // remapped, we'll need resort to make sure binary_search works.
+        // If frag reuse happened, remap the row_ids through it. Crucially we
+        // must NOT drop the rows the reuse index deleted, because the posting
+        // lists reference doc_ids *positionally* (a doc_id is an index into
+        // these arrays, fixed at build time). Dropping deleted rows would
+        // renumber every later doc_id and desync the posting lists, so wand
+        // would index `num_tokens`/`row_ids` out of bounds or score the wrong
+        // doc. Instead we tombstone deleted rows in place: their slot survives
+        // (so doc_ids stay aligned with the posting lists) carrying
+        // `RowAddress::TOMBSTONE_ROW`, which wand skips, and they are left out
+        // of `inv` so a row_id lookup never resolves to a deleted doc. The
+        // heavyweight physical remap (`DocSet::remap`) is what actually
+        // renumbers and compacts; this load-time path only has to stay
+        // consistent until then.
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             let mut row_ids = Vec::with_capacity(row_id_col.len());
-            let mut num_tokens = Vec::with_capacity(num_tokens_col.len());
-            for (row_id, num_token) in row_id_col.values().iter().zip(num_tokens_col.values()) {
-                if let Some(new_row_id) = frag_reuse_index_ref.remap_row_id(*row_id) {
-                    row_ids.push(new_row_id);
-                    num_tokens.push(*num_token);
+            let num_tokens = num_tokens_col.values().to_vec();
+            let mut inv = Vec::with_capacity(row_id_col.len());
+            for (doc_id, row_id) in row_id_col.values().iter().enumerate() {
+                match frag_reuse_index_ref.remap_row_id(*row_id) {
+                    Some(new_row_id) => {
+                        row_ids.push(new_row_id);
+                        inv.push((new_row_id, doc_id as u32));
+                    }
+                    None => {
+                        // Deleted: keep the slot (doc_ids must not shift) but
+                        // tombstone it and leave it out of `inv`.
+                        row_ids.push(RowAddress::TOMBSTONE_ROW);
+                    }
                 }
             }
-
-            let mut inv: Vec<(u64, u32)> = row_ids
-                .iter()
-                .enumerate()
-                .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
-                .collect();
             inv.sort_unstable_by_key(|entry| entry.0);
 
             let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
@@ -5474,6 +5494,21 @@ mod tests {
                 (2_u32, 1_u32, Some(vec![3_u32])),
             ]
         );
+    }
+
+    #[test]
+    fn test_shared_position_stream_clone_shares_block_offsets() {
+        let stream = SharedPositionStream::new(
+            PositionStreamCodec::PackedDelta,
+            vec![0_u32, 4, 11],
+            bytes::Bytes::from_static(b"shared position bytes"),
+        );
+        let original_offsets = stream.block_offsets().as_ptr();
+
+        let cloned = stream.clone();
+
+        assert_eq!(cloned.block_offsets(), stream.block_offsets());
+        assert_eq!(cloned.block_offsets().as_ptr(), original_offsets);
     }
 
     #[test]
@@ -6452,6 +6487,16 @@ mod tests {
             dest_store: &dyn IndexStore,
         ) -> Result<crate::scalar::IndexFile> {
             self.inner.copy_index_file(name, dest_store).await
+        }
+        async fn copy_index_file_to(
+            &self,
+            name: &str,
+            new_name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<crate::scalar::IndexFile> {
+            self.inner
+                .copy_index_file_to(name, new_name, dest_store)
+                .await
         }
         async fn rename_index_file(
             &self,
