@@ -1875,9 +1875,6 @@ impl BTreeIndex {
                 continue;
             }
             let stream = segment.data_stream().await?;
-            // Segments built before a deferred-remap compaction still carry the
-            // pre-compaction row addresses on disk; remap them to live fragments
-            // before the per-segment filter (which is keyed on live fragments).
             let stream = match segment.frag_reuse_index.clone() {
                 Some(frag_reuse_index) => remap_row_ids(stream, frag_reuse_index),
                 None => stream,
@@ -1941,9 +1938,6 @@ fn filter_row_ids(
     Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
 }
 
-/// Remap a segment's stream of row IDs through a pending [`FragReuseIndex`] so a
-/// segment produced before a deferred-remap compaction references live
-/// fragments. Column index `1` is the row-id column of the BTree page stream.
 fn remap_row_ids(
     stream: SendableRecordBatchStream,
     frag_reuse_index: Arc<FragReuseIndex>,
