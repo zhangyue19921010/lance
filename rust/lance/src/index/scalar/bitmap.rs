@@ -54,13 +54,10 @@ pub(in crate::index) async fn merge_segments(
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
 
-    // Intersect each segment's stored coverage with the dataset's current
-    // fragments so we don't claim coverage on row addresses that compaction or
-    // pruning has already retired.
-    let (fragment_bitmap, old_data_filters) =
-        crate::index::append::effective_coverage_and_filters(dataset, &segments).await?;
-
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
+    let (fragment_bitmap, old_data_filters) =
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs).await?;
+
     let source_indices = open_bitmap_segments(dataset, &field_path, &segment_refs).await?;
 
     let new_uuid = Uuid::new_v4();

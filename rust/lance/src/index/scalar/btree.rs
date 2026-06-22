@@ -117,18 +117,15 @@ pub(crate) async fn merge_segments(
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
 
-    // Intersect each segment's stored bitmap with the dataset's current
-    // fragments so we don't claim coverage on IDs that compaction or pruning
-    // has already retired.
+    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
     let (fragment_bitmap, old_data_filters) =
-        crate::index::append::effective_coverage_and_filters(dataset, &segments).await?;
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs).await?;
 
     let output_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &output_uuid)?;
     // Pure segment consolidation: no dataset scan, so `new_data` is an empty
     // stream and the merge is driven entirely by the source page data.
     let empty_new_data = empty_btree_update_stream(dataset, field_id)?;
-    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
     let created_index = open_and_merge_segments(
         dataset,
         &field_path,
