@@ -299,8 +299,14 @@ async fn merge_scalar_indices<'a>(
                 if selected_old_indices.len() == 1 {
                     // Memory optimization: a single segment can absorb the new data
                     // via `BitmapIndex::update` without loading all into memory at once.
+                    let old_data_filter = build_old_data_filter(
+                        dataset.as_ref(),
+                        &effective_old_frags,
+                        &deleted_old_frags,
+                    )
+                    .await?;
                     reference_index
-                        .update(new_data_stream, &new_store, None)
+                        .update(new_data_stream, &new_store, old_data_filter)
                         .await?
                 } else {
                     let (_, old_data_filters) =
