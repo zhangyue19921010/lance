@@ -3466,15 +3466,6 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
@@ -3699,7 +3690,7 @@ dependencies = [
  "futures",
  "half",
  "humantime",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "lance-arrow",
  "lance-core",
  "lance-datafusion",
@@ -3801,7 +3792,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-sql",
  "futures",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "lance-arrow",
  "lance-derive",
  "libc",
@@ -3901,7 +3892,7 @@ dependencies = [
  "futures",
  "hex",
  "hyperloglogplus",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "lance-arrow",
  "lance-bitpacking",
  "lance-core",
@@ -3992,7 +3983,7 @@ dependencies = [
  "geoarrow-array",
  "geoarrow-schema",
  "half",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "jsonb",
  "lance-arrow",
  "lance-arrow-stats",
@@ -4193,7 +4184,7 @@ dependencies = [
  "arrow-schema",
  "byteorder",
  "bytes",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "lance-core",
  "roaring",
  "tracing",
