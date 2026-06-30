@@ -313,7 +313,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         .map(|old_addr| (old_addr, frag_reuse_index.remap_row_id(old_addr)))
         .collect();
 
-    let remapper = RowAddrRemap::Explicit(composed_row_id_map);
+    let remapper = RowAddrRemap::Direct(composed_row_id_map);
     let remap_result = index::remap_index(dataset, index_id, &remapper).await?;
 
     let new_index_meta = match remap_result {

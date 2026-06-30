@@ -57,8 +57,11 @@ use std::collections::HashMap;
 /// * `Some(Some(addr))` — the row moved to `addr`
 #[derive(Clone)]
 pub enum RowAddrRemap {
+    /// Compact, `O(#fragments)` remap built from per-group rewritten-row
+    /// bitmaps and new-fragment layouts.
     Compact(CompactRowAddrRemap),
-    Explicit(HashMap<u64, Option<u64>>),
+    /// Full materialized old-to-new address map. Uses `O(#rows)` memory.
+    Direct(HashMap<u64, Option<u64>>),
 }
 
 impl RowAddrRemap {
@@ -66,9 +69,17 @@ impl RowAddrRemap {
         Ok(Self::Compact(CompactRowAddrRemap::new(groups)?))
     }
 
+    /// Build a remap from a fully materialized old-to-new address map.
+    ///
+    /// Mirrors [`compact`](Self::compact) (fallible, returns `Result`) so both
+    /// construction modes read symmetrically at call sites.
+    pub fn direct(map: HashMap<u64, Option<u64>>) -> Result<Self> {
+        Ok(Self::Direct(map))
+    }
+
     /// An empty remap that leaves every address unchanged.
     pub fn empty() -> Self {
-        Self::Explicit(HashMap::new())
+        Self::Direct(HashMap::new())
     }
 
     /// Look up `addr`. See [`RowAddrRemap`] for the tri-state return semantics.
@@ -76,28 +87,28 @@ impl RowAddrRemap {
     pub fn get(&self, addr: u64) -> Option<Option<u64>> {
         match self {
             Self::Compact(c) => c.get(addr),
-            Self::Explicit(m) => m.get(&addr).copied(),
+            Self::Direct(m) => m.get(&addr).copied(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Compact(c) => c.is_empty(),
-            Self::Explicit(m) => m.is_empty(),
+            Self::Direct(m) => m.is_empty(),
         }
     }
 
     pub fn affected_fragments(&self) -> RoaringBitmap {
         match self {
             Self::Compact(c) => RoaringBitmap::from_iter(c.frag_to_group.keys().copied()),
-            Self::Explicit(m) => RoaringBitmap::from_iter(m.keys().map(|addr| (addr >> 32) as u32)),
+            Self::Direct(m) => RoaringBitmap::from_iter(m.keys().map(|addr| (addr >> 32) as u32)),
         }
     }
 
     pub fn fully_deleted_fragments(&self) -> Option<RoaringBitmap> {
         match self {
             Self::Compact(c) => c.fully_deleted_fragments(),
-            Self::Explicit(m) => {
+            Self::Direct(m) => {
                 if m.values().all(|v| v.is_none()) {
                     Some(RoaringBitmap::from_iter(
                         m.keys().map(|addr| (addr >> 32) as u32),
@@ -112,7 +123,7 @@ impl RowAddrRemap {
 
 impl From<HashMap<u64, Option<u64>>> for RowAddrRemap {
     fn from(map: HashMap<u64, Option<u64>>) -> Self {
-        Self::Explicit(map)
+        Self::Direct(map)
     }
 }
 
@@ -354,12 +365,12 @@ mod tests {
     }
 
     #[test]
-    fn test_explicit_and_empty() {
-        // Explicit covers arbitrary maps the compact form can't express.
+    fn test_direct_and_empty() {
+        // Direct covers arbitrary maps the compact form can't express.
         let mut map = HashMap::new();
         map.insert(addr(2, 0), Some(addr(9, 9)));
         map.insert(addr(5, 1), None);
-        let remap = RowAddrRemap::Explicit(map);
+        let remap = RowAddrRemap::Direct(map);
         assert_eq!(remap.get(addr(2, 0)), Some(Some(addr(9, 9))));
         assert_eq!(remap.get(addr(5, 1)), Some(None));
         assert_eq!(remap.get(addr(2, 1)), None);

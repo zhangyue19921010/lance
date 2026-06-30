@@ -155,6 +155,39 @@ impl TryFrom<&str> for CompactionMode {
     }
 }
 
+/// Controls how the old-to-new row-address mapping is built when remapping
+/// indices during compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum IndexRemapMode {
+    /// Store a compact remap and compute row-address mappings during lookup.
+    ///
+    /// Best for large compactions where peak memory is the constraint. Uses
+    /// less memory, but each lookup does extra bitmap/range computation.
+    #[default]
+    Compact,
+    /// Store the full row-address remap in memory for fast direct lookups.
+    ///
+    /// Best when the remap fits comfortably in memory and remap speed is the
+    /// priority. Uses more peak memory because every rewritten/deleted row has
+    /// a materialized mapping entry.
+    Direct,
+}
+
+impl TryFrom<&str> for IndexRemapMode {
+    type Error = Error;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        match value.to_lowercase().as_str() {
+            "compact" => Ok(Self::Compact),
+            "direct" => Ok(Self::Direct),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid index remap mode \"{}\". Valid values: \"compact\", \"direct\"",
+                value
+            ))),
+        }
+    }
+}
+
 /// Options to be passed to [compact_files].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionOptions {
@@ -203,6 +236,10 @@ pub struct CompactionOptions {
     /// not be remapped during this compaction operation. Instead, the fragment reuse index
     /// is updated and will be used to perform remapping later.
     pub defer_index_remap: bool,
+    /// How the old-to-new row-address mapping used to remap indices is built.
+    /// Defaults to [`IndexRemapMode::Compact`].
+    #[serde(default)]
+    pub index_remap_mode: IndexRemapMode,
     /// The compaction mode to use. When set, this takes priority over the
     /// deprecated `enable_binary_copy` and `enable_binary_copy_force` fields.
     ///
@@ -247,6 +284,7 @@ impl Default for CompactionOptions {
             batch_size: None,
             io_buffer_size: None,
             defer_index_remap: false,
+            index_remap_mode: IndexRemapMode::Compact,
             compaction_mode: None,
             enable_binary_copy: false,
             enable_binary_copy_force: false,
@@ -272,6 +310,7 @@ impl CompactionOptions {
     /// - `lance.compaction.materialize_deletions`
     /// - `lance.compaction.materialize_deletions_threshold`
     /// - `lance.compaction.defer_index_remap`
+    /// - `lance.compaction.index_remap_mode`
     /// - `lance.compaction.batch_size`
     /// - `lance.compaction.io_buffer_size`
     /// - `lance.compaction.compaction_mode`
@@ -348,6 +387,9 @@ impl CompactionOptions {
                             )));
                         }
                     };
+                }
+                "index_remap_mode" => {
+                    self.index_remap_mode = IndexRemapMode::try_from(value.as_str())?;
                 }
                 "batch_size" => {
                     self.batch_size = Some(value.parse().map_err(|_| {
@@ -1953,6 +1995,7 @@ pub async fn commit_compaction(
     let mut metrics = CompactionMetrics::default();
 
     let mut remap_group_inputs: Vec<GroupInput> = Vec::new();
+    let mut direct_row_id_map: HashMap<u64, Option<u64>> = HashMap::new();
     let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
 
@@ -1967,41 +2010,53 @@ pub async fn commit_compaction(
             if let Some(row_addrs_bytes) = task.row_addrs {
                 let row_addrs =
                     RoaringTreemap::deserialize_from(&mut Cursor::new(&row_addrs_bytes))?;
-                let new_frags = task
-                    .new_fragments
-                    .iter()
-                    .map(|f| {
-                        let physical_rows = f.physical_rows.ok_or_else(|| {
-                            Error::invalid_input(format!(
-                                "compacted fragment {} is missing physical_rows",
-                                f.id
-                            ))
-                        })?;
-                        Ok((f.id as u32, physical_rows as u32))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                let new_rows: u64 = new_frags.iter().map(|(_, rows)| *rows as u64).sum();
-                if row_addrs.len() != new_rows {
-                    return Err(Error::invalid_input(format!(
-                        "compaction task rewrote fragments {:?} into {} rows but recorded {} rewritten old row addresses",
-                        task.original_fragments
+                match options.index_remap_mode {
+                    IndexRemapMode::Direct => {
+                        let transposed = remapping::transpose_row_addrs(
+                            row_addrs,
+                            &task.original_fragments,
+                            &task.new_fragments,
+                        );
+                        direct_row_id_map.extend(transposed);
+                    }
+                    IndexRemapMode::Compact => {
+                        let new_frags = task
+                            .new_fragments
                             .iter()
-                            .map(|f| f.id)
-                            .collect::<Vec<_>>(),
-                        new_rows,
-                        row_addrs.len()
-                    )));
+                            .map(|f| {
+                                let physical_rows = f.physical_rows.ok_or_else(|| {
+                                    Error::invalid_input(format!(
+                                        "compacted fragment {} is missing physical_rows",
+                                        f.id
+                                    ))
+                                })?;
+                                Ok((f.id as u32, physical_rows as u32))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        let new_rows: u64 = new_frags.iter().map(|(_, rows)| *rows as u64).sum();
+                        if row_addrs.len() != new_rows {
+                            return Err(Error::invalid_input(format!(
+                                "compaction task rewrote fragments {:?} into {} rows but recorded {} rewritten old row addresses",
+                                task.original_fragments
+                                    .iter()
+                                    .map(|f| f.id)
+                                    .collect::<Vec<_>>(),
+                                new_rows,
+                                row_addrs.len()
+                            )));
+                        }
+                        remap_group_inputs.push(GroupInput {
+                            rewritten_old_row_addrs: row_addrs,
+                            old_frag_ids: task
+                                .original_fragments
+                                .iter()
+                                .map(|f| f.id as u32)
+                                .collect(),
+                            new_frags,
+                        });
+                    }
                 }
-                remap_group_inputs.push(GroupInput {
-                    rewritten_old_row_addrs: row_addrs,
-                    old_frag_ids: task
-                        .original_fragments
-                        .iter()
-                        .map(|f| f.id as u32)
-                        .collect(),
-                    new_frags,
-                });
             }
         } else if options.defer_index_remap {
             let changed_row_addrs = task.row_addrs.ok_or_else(|| {
@@ -2029,9 +2084,11 @@ pub async fn commit_compaction(
             .flat_map(|group| group.old_fragments.iter().map(|frag| frag.id))
             .collect::<Vec<_>>();
 
-        let remapped_indices = index_remapper
-            .remap_indices(RowAddrRemap::compact(remap_group_inputs)?, &affected_ids)
-            .await?;
+        let remap = match options.index_remap_mode {
+            IndexRemapMode::Direct => RowAddrRemap::direct(direct_row_id_map)?,
+            IndexRemapMode::Compact => RowAddrRemap::compact(remap_group_inputs)?,
+        };
+        let remapped_indices = index_remapper.remap_indices(remap, &affected_ids).await?;
         remapped_indices
             .into_iter()
             .map(|rewritten| RewrittenIndex {
@@ -4198,6 +4255,94 @@ mod tests {
             plan
         );
     }
+    
+    #[rstest]
+    #[case(IndexRemapMode::Compact)]
+    #[case(IndexRemapMode::Direct)]
+    #[tokio::test]
+    async fn test_btree_index_remap_after_compaction(#[case] index_remap_mode: IndexRemapMode) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(32)),
+            )
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        // Delete rows scattered across fragments so the remap must drop some old
+        // addresses and shift the survivors.
+        dataset.delete("id % 10 == 0").await.unwrap();
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let count_low = dataset
+            .count_rows(Some("id < 1000".to_owned()))
+            .await
+            .unwrap();
+        let count_mid = dataset
+            .count_rows(Some("id >= 2000 and id < 3000".to_owned()))
+            .await
+            .unwrap();
+        let count_high = dataset
+            .count_rows(Some("id >= 5000".to_owned()))
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 50_000,
+            index_remap_mode,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert!(metrics.fragments_added > 0);
+
+        // The index was remapped inline and must still drive scans.
+        let mut scanner = dataset.scan();
+        scanner.filter("id >= 2000 and id < 3000").unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery: query=[id >= 2000 && id < 3000]@id_idx(BTree)"),
+            "Expected scalar index query in plan: {}",
+            plan
+        );
+
+        // Counts resolved through the remapped index match the pre-compaction
+        // values in both remap modes.
+        assert_eq!(
+            dataset
+                .count_rows(Some("id < 1000".to_owned()))
+                .await
+                .unwrap(),
+            count_low
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("id >= 2000 and id < 3000".to_owned()))
+                .await
+                .unwrap(),
+            count_mid
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("id >= 5000".to_owned()))
+                .await
+                .unwrap(),
+            count_high
+        );
+    }
 
     #[tokio::test]
     async fn test_read_inverted_index_with_defer_index_remap() {
@@ -5593,6 +5738,10 @@ mod tests {
                 "lance.compaction.binary_copy_read_batch_bytes".to_string(),
                 "8388608".to_string(),
             ),
+            (
+                "lance.compaction.index_remap_mode".to_string(),
+                "direct".to_string(),
+            ),
         ]);
 
         let opts = CompactionOptions::from_dataset_config(&config).unwrap();
@@ -5606,6 +5755,7 @@ mod tests {
         assert_eq!(opts.io_buffer_size, Some(1_073_741_824));
         assert_eq!(opts.compaction_mode, Some(CompactionMode::TryBinaryCopy));
         assert_eq!(opts.binary_copy_read_batch_bytes, Some(8_388_608));
+        assert_eq!(opts.index_remap_mode, IndexRemapMode::Direct);
     }
 
     #[test]
@@ -5625,6 +5775,8 @@ mod tests {
             defaults.materialize_deletions_threshold
         );
         assert_eq!(opts.defer_index_remap, defaults.defer_index_remap);
+        assert_eq!(opts.index_remap_mode, defaults.index_remap_mode);
+        assert_eq!(opts.index_remap_mode, IndexRemapMode::Compact);
         assert_eq!(opts.batch_size, defaults.batch_size);
         assert_eq!(opts.compaction_mode, defaults.compaction_mode);
         assert_eq!(

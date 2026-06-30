@@ -1315,7 +1315,7 @@ mod tests {
     }
 
     fn pq_remap_explicit() -> RowAddrRemap {
-        RowAddrRemap::Explicit(
+        RowAddrRemap::Direct(
             (0..TOTAL / 2)
                 .map(|i| (i as u64, Some((1u64 << 32) | i as u64)))
                 .chain((TOTAL / 2..TOTAL).map(|i| (i as u64, None)))

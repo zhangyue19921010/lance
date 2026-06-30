@@ -2535,7 +2535,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         };
 
         match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
-            Some(mapping) => storage.remap(&RowAddrRemap::Explicit(mapping)),
+            Some(mapping) => storage.remap(&RowAddrRemap::Direct(mapping)),
             None => Ok(storage),
         }
     }
@@ -4426,7 +4426,7 @@ mod tests {
         mapping.insert(3, None);
         mapping.insert(4, Some(104));
 
-        let remapped = storage.remap(&RowAddrRemap::Explicit(mapping)).unwrap();
+        let remapped = storage.remap(&RowAddrRemap::Direct(mapping)).unwrap();
         assert!(remapped.metadata().packed);
 
         let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
@@ -4457,7 +4457,7 @@ mod tests {
     }
 
     fn rq_remap_explicit() -> RowAddrRemap {
-        RowAddrRemap::Explicit(
+        RowAddrRemap::Direct(
             (0u64..25)
                 .map(|i| (i, Some((1u64 << 32) | i)))
                 .chain((25u64..50).map(|i| (i, None)))
@@ -4516,7 +4516,7 @@ mod tests {
         mapping.insert(3, None);
         mapping.insert(4, Some(104));
 
-        let remapped = storage.remap(&RowAddrRemap::Explicit(mapping)).unwrap();
+        let remapped = storage.remap(&RowAddrRemap::Direct(mapping)).unwrap();
         let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
         let remapped_row_ids = remapped_batch[ROW_ID].as_primitive::<UInt64Type>().values();
         let expected_row_ids = UInt64Array::from_iter_values(

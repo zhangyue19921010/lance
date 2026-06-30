@@ -1647,7 +1647,7 @@ mod tests {
         let remapped_dir = TempDir::default();
         let remapped_store = test_store(&remapped_dir);
         index
-            .remap(&RowAddrRemap::Explicit(mapping), remapped_store.as_ref())
+            .remap(&RowAddrRemap::Direct(mapping), remapped_store.as_ref())
             .await
             .unwrap();
         let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())
