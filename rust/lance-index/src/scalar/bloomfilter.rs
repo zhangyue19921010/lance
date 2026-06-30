@@ -30,7 +30,6 @@ use std::sync::Arc;
 
 use crate::scalar::FragReuseIndex;
 use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
@@ -376,12 +375,6 @@ impl Index for BloomFilterIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input_source(
-            "BloomFilter is not a vector index".into(),
-        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
