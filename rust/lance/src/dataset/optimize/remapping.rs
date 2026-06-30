@@ -313,7 +313,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         .map(|old_addr| (old_addr, frag_reuse_index.remap_row_id(old_addr)))
         .collect();
 
-    let remapper = RowAddrRemap::Direct(composed_row_id_map);
+    let remapper = RowAddrRemap::direct(composed_row_id_map);
     let remap_result = index::remap_index(dataset, index_id, &remapper).await?;
 
     let new_index_meta = match remap_result {
@@ -409,10 +409,6 @@ pub async fn remap_column_index(
 mod tests {
     use super::*;
 
-    /// The compact remap must agree with the materialized
-    /// `transpose_row_ids_from_digest` (the defer-path implementation) on every
-    /// real address — cross-checking rank/select against an independent map so a
-    /// shared mistake between the implementation and its unit test can't hide.
     #[test]
     fn test_compact_matches_transpose() {
         use lance_core::utils::row_addr_remap::GroupInput;

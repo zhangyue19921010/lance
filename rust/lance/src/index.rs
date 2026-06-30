@@ -4121,7 +4121,7 @@ mod tests {
         let remap_to_empty = (0..dataset.count_all_rows().await.unwrap())
             .map(|i| (i as u64, None))
             .collect::<HashMap<_, _>>();
-        let new_uuid = remap_index(&dataset, &index_uuid, &RowAddrRemap::Direct(remap_to_empty))
+        let new_uuid = remap_index(&dataset, &index_uuid, &RowAddrRemap::direct(remap_to_empty))
             .await
             .unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));

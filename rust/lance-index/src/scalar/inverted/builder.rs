@@ -913,7 +913,7 @@ impl InnerBuilder {
                 mapping.insert(*row_id, None);
             }
         }
-        self.remap(&RowAddrRemap::Direct(mapping)).await
+        self.remap(&RowAddrRemap::direct(mapping)).await
     }
 
     pub fn merge_from(&mut self, other: Self) -> Result<()> {
@@ -4075,7 +4075,7 @@ mod tests {
         use crate::scalar::ScalarIndex;
         let mapping = HashMap::from([(0u64, Some(50 << 32))]);
         index
-            .remap(&RowAddrRemap::Direct(mapping), dest_store.as_ref())
+            .remap(&RowAddrRemap::direct(mapping), dest_store.as_ref())
             .await
             .unwrap();
 

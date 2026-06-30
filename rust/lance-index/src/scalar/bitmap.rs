@@ -2445,7 +2445,7 @@ mod tests {
 
     fn bitmap_remap_explicit() -> RowAddrRemap {
         // The same mapping, listed out explicitly.
-        RowAddrRemap::Direct(
+        RowAddrRemap::direct(
             (0..6u32)
                 .map(|i| {
                     let (f, o) = if i < 3 { (1, i) } else { (2, i - 3) };

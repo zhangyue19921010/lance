@@ -492,7 +492,7 @@ mod tests {
         // Keep remaining as is
         let mapping = HashMap::<u64, Option<u64>>::from_iter(vec![(0, Some(2000)), (3, None)]);
         let remapped = FlatIndex::try_new(
-            FlatIndex::remap_batch((*index.data).clone(), &RowAddrRemap::Direct(mapping)).unwrap(),
+            FlatIndex::remap_batch((*index.data).clone(), &RowAddrRemap::direct(mapping)).unwrap(),
         )
         .unwrap();
 
@@ -517,7 +517,7 @@ mod tests {
         new_frags: vec![],
     }])
     .unwrap())]
-    #[case::explicit(RowAddrRemap::Direct(
+    #[case::explicit(RowAddrRemap::direct(
         [5u64, 0, 3, 100].into_iter().map(|id| (id, None)).collect(),
     ))]
     fn test_remap_to_nothing(#[case] remap: RowAddrRemap) {

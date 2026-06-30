@@ -5315,7 +5315,7 @@ mod tests {
 
         // Remap the index with our deletion mapping
         index
-            .remap(&RowAddrRemap::Direct(mapping), remap_store.as_ref())
+            .remap(&RowAddrRemap::direct(mapping), remap_store.as_ref())
             .await
             .unwrap();
 

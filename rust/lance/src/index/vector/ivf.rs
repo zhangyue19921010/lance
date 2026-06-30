@@ -5144,7 +5144,7 @@ mod tests {
             &new_uuid,
             dataset_mut.version().version,
             ivf_index,
-            &RowAddrRemap::Direct(mapping),
+            &RowAddrRemap::direct(mapping),
             INDEX_NAME.to_string(),
             WellKnownIvfPqData::COLUMN.to_string(),
             vec![],

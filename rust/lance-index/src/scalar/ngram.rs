@@ -1791,7 +1791,7 @@ mod tests {
 
         let remapping = HashMap::from([(2, Some(100)), (3, None), (4, Some(101))]);
         index
-            .remap(&RowAddrRemap::Direct(remapping), test_store.as_ref())
+            .remap(&RowAddrRemap::direct(remapping), test_store.as_ref())
             .await
             .unwrap();
 
@@ -1819,7 +1819,7 @@ mod tests {
     }
 
     fn ngram_remap_explicit() -> RowAddrRemap {
-        RowAddrRemap::Direct(
+        RowAddrRemap::direct(
             (0u64..4)
                 .map(|i| (i, Some((10u64 << 32) | i)))
                 .chain(std::iter::once((4u64, None)))

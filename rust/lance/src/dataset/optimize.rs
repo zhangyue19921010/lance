@@ -2004,7 +2004,7 @@ pub async fn commit_compaction(
     let mut metrics = CompactionMetrics::default();
 
     let mut remap_group_inputs: Vec<GroupInput> = Vec::new();
-    let mut direct_row_id_map: HashMap<u64, Option<u64>> = HashMap::new();
+    let mut direct_row_id_map: HashMap<u64, Option<u64>> = HashMap::default();
     let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
 
@@ -2094,7 +2094,7 @@ pub async fn commit_compaction(
             .collect::<Vec<_>>();
 
         let remap = match options.index_remap_mode {
-            IndexRemapMode::Direct => RowAddrRemap::direct(direct_row_id_map)?,
+            IndexRemapMode::Direct => RowAddrRemap::direct(direct_row_id_map),
             IndexRemapMode::Compact => RowAddrRemap::compact(remap_group_inputs)?,
         };
         let remapped_indices = index_remapper.remap_indices(remap, &affected_ids).await?;
@@ -4307,7 +4307,7 @@ mod tests {
             plan
         );
     }
-    
+
     #[rstest]
     #[case(IndexRemapMode::Compact)]
     #[case(IndexRemapMode::Direct)]
@@ -4394,6 +4394,268 @@ mod tests {
                 .unwrap(),
             count_high
         );
+    }
+
+    #[rstest]
+    #[case(IndexRemapMode::Compact)]
+    #[case(IndexRemapMode::Direct)]
+    #[tokio::test]
+    async fn test_ivf_pq_index_remap_after_compaction(#[case] index_remap_mode: IndexRemapMode) {
+        use arrow_array::cast::AsArray;
+        use lance_index::vector::pq::PQBuildParams;
+
+        const DIM: u32 = 32;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            small_ivf(),
+            PQBuildParams {
+                max_iters: 2,
+                num_sub_vectors: 2,
+                ..Default::default()
+            },
+        );
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        let original_uuid = dataset
+            .load_index_by_name("vec_idx")
+            .await
+            .unwrap()
+            .unwrap()
+            .uuid;
+
+        // Delete rows scattered across fragments so the remap must drop some old
+        // addresses and shift the survivors.
+        dataset.delete("id % 10 == 0").await.unwrap();
+
+        // Sample queries from surviving vectors and capture the pre-compaction
+        // KNN answer and the surviving id set.
+        let mut survivors: Vec<(i32, Vec<f32>)> = Vec::new();
+        {
+            let mut scanner = dataset.scan();
+            scanner.project(&["id", "vec"]).unwrap();
+            let batches = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            for batch in &batches {
+                let ids = batch["id"].as_primitive::<Int32Type>();
+                let vecs = batch["vec"].as_fixed_size_list();
+                for i in 0..batch.num_rows() {
+                    let v = vecs.value(i);
+                    survivors.push((
+                        ids.value(i),
+                        v.as_primitive::<Float32Type>().values().to_vec(),
+                    ));
+                }
+            }
+        }
+        let surviving_ids: std::collections::HashSet<i32> =
+            survivors.iter().map(|(id, _)| *id).collect();
+        let step = (survivors.len() / 16).max(1);
+        let queries: Vec<Vec<f32>> = survivors
+            .iter()
+            .step_by(step)
+            .map(|(_, v)| v.clone())
+            .collect();
+        let k = 10;
+        let mut baseline: Vec<Vec<i32>> = Vec::new();
+        for q in &queries {
+            baseline.push(vector_knn_ids(&dataset, q, k).await);
+        }
+
+        // Inline remap (defer_index_remap = false): compaction physically
+        // rebuilds the vector index through the configured remap mode.
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 50_000,
+                index_remap_mode,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert!(metrics.fragments_added > 0);
+
+        // The index was physically remapped inline, so its uuid must change.
+        assert_ne!(
+            dataset
+                .load_index_by_name("vec_idx")
+                .await
+                .unwrap()
+                .unwrap()
+                .uuid,
+            original_uuid,
+            "vector index must be physically remapped inline"
+        );
+
+        // The remap only relabels row addresses; it must not resurrect deleted
+        // rows, and KNN must stay close to the pre-compaction answer in both
+        // remap modes.
+        for (i, q) in queries.iter().enumerate() {
+            let after = vector_knn_ids(&dataset, q, k).await;
+            for id in &after {
+                assert!(
+                    surviving_ids.contains(id),
+                    "KNN returned id {id} that is not a surviving row (query #{i}, mode {index_remap_mode:?})"
+                );
+            }
+            let overlap = after.iter().filter(|id| baseline[i].contains(id)).count();
+            assert!(
+                overlap >= 8,
+                "KNN top-{k} diverged after compaction: overlap {overlap} < 8 (query #{i}, mode {index_remap_mode:?})"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case(IndexRemapMode::Compact)]
+    #[case(IndexRemapMode::Direct)]
+    #[tokio::test]
+    async fn test_inverted_index_remap_after_compaction(#[case] index_remap_mode: IndexRemapMode) {
+        use arrow_array::cast::AsArray;
+
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col("doc", lance_datagen::array::random_sentence(1, 100, false))
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["doc"],
+                IndexType::Inverted,
+                Some("doc_idx".into()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let original_uuid = dataset
+            .load_index_by_name("doc_idx")
+            .await
+            .unwrap()
+            .unwrap()
+            .uuid;
+
+        // Sample a few words from a real document to drive full-text searches.
+        let words: Vec<String> = {
+            let mut scanner = dataset.scan();
+            scanner
+                .project(&["doc"])
+                .unwrap()
+                .limit(Some(1), None)
+                .unwrap();
+            let batches = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut words: Vec<String> = batches[0]["doc"]
+                .as_string::<i32>()
+                .value(0)
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            words.sort();
+            words.dedup();
+            words.truncate(3);
+            words
+        };
+        assert!(!words.is_empty(), "sampled document must contain words");
+
+        // Delete rows scattered across fragments so the remap must drop some old
+        // addresses and shift the survivors.
+        dataset.delete("id % 10 == 0").await.unwrap();
+
+        // Capture the post-deletion full-text-search counts (resolved through the
+        // index + deletion vectors) before compaction physically remaps.
+        let mut before = Vec::new();
+        for word in &words {
+            let mut scanner = dataset.scan();
+            scanner
+                .full_text_search(FullTextSearchQuery::new(word.clone()))
+                .unwrap();
+            scanner.project::<String>(&[]).unwrap().with_row_id();
+            before.push(scanner.count_rows().await.unwrap());
+        }
+
+        // Inline remap (defer_index_remap = false): compaction physically rebuilds
+        // the inverted index through the configured remap mode.
+        let options = CompactionOptions {
+            target_rows_per_fragment: 50_000,
+            index_remap_mode,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert!(metrics.fragments_added > 0);
+
+        // The index was physically remapped inline, so its uuid must change.
+        assert_ne!(
+            dataset
+                .load_index_by_name("doc_idx")
+                .await
+                .unwrap()
+                .unwrap()
+                .uuid,
+            original_uuid,
+            "inverted index must be physically remapped inline (mode {index_remap_mode:?})"
+        );
+
+        // The remapped index must still drive full-text search.
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new(words[0].clone()))
+            .unwrap();
+        scanner.project::<String>(&[]).unwrap().with_row_id();
+        let plan = scanner.explain_plan(true).await.unwrap();
+        assert!(
+            plan.contains("MatchQuery"),
+            "Expected inverted index scan in plan: {}",
+            plan
+        );
+
+        // Counts resolved through the remapped index match the pre-compaction
+        // values in both remap modes.
+        for (word, expected) in words.iter().zip(before) {
+            let mut scanner = dataset.scan();
+            scanner
+                .full_text_search(FullTextSearchQuery::new(word.clone()))
+                .unwrap();
+            scanner.project::<String>(&[]).unwrap().with_row_id();
+            assert_eq!(
+                scanner.count_rows().await.unwrap(),
+                expected,
+                "full-text count for {word:?} changed after compaction (mode {index_remap_mode:?})"
+            );
+        }
     }
 
     #[tokio::test]

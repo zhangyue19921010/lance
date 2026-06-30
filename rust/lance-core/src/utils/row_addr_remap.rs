@@ -70,11 +70,8 @@ impl RowAddrRemap {
     }
 
     /// Build a remap from a fully materialized old-to-new address map.
-    ///
-    /// Mirrors [`compact`](Self::compact) (fallible, returns `Result`) so both
-    /// construction modes read symmetrically at call sites.
-    pub fn direct(map: HashMap<u64, Option<u64>>) -> Result<Self> {
-        Ok(Self::Direct(map))
+    pub fn direct(map: HashMap<u64, Option<u64>>) -> Self {
+        Self::Direct(map)
     }
 
     /// An empty remap that leaves every address unchanged.
@@ -121,12 +118,6 @@ impl RowAddrRemap {
     }
 }
 
-impl From<HashMap<u64, Option<u64>>> for RowAddrRemap {
-    fn from(map: HashMap<u64, Option<u64>>) -> Self {
-        Self::Direct(map)
-    }
-}
-
 /// Input describing one rewrite group: the old row addresses that were
 /// rewritten plus the fragment layout before/after the rewrite.
 pub struct GroupInput {
@@ -150,19 +141,30 @@ struct GroupRemap {
 
 impl GroupRemap {
     fn new(input: GroupInput) -> Result<Self> {
-        let new_frag_row_ranges = {
-            let mut rewritten_rows_before = 0u64;
-            input
-                .new_frags
-                .into_iter()
-                .filter(|(_, physical_rows)| *physical_rows > 0)
-                .map(|(frag_id, physical_rows)| {
-                    let range = (frag_id, rewritten_rows_before, physical_rows);
-                    rewritten_rows_before += physical_rows as u64;
-                    range
-                })
-                .collect()
-        };
+        // `compute_new_addr` maps a rewritten row's group-local index to a new
+        // address by accumulating `physical_rows` in `new_frags` order, so that
+        // order must be the order rows were written. New fragment ids are
+        // reserved monotonically in write order (see `reserve_fragment_ids` in
+        // compaction), so ascending id is a proxy for write order; reject any
+        // input that violates it before it can silently misplace addresses.
+        let mut new_frag_row_ranges = Vec::with_capacity(input.new_frags.len());
+        let mut rewritten_rows_before = 0u64;
+        let mut prev_frag_id: Option<u32> = None;
+        for (frag_id, physical_rows) in input.new_frags {
+            if physical_rows == 0 {
+                continue;
+            }
+            if let Some(prev) = prev_frag_id
+                && frag_id <= prev
+            {
+                return Err(Error::invalid_input(format!(
+                    "compaction new fragments must be in ascending id (write) order, but fragment {frag_id} follows {prev}",
+                )));
+            }
+            prev_frag_id = Some(frag_id);
+            new_frag_row_ranges.push((frag_id, rewritten_rows_before, physical_rows));
+            rewritten_rows_before += physical_rows as u64;
+        }
 
         let mut per_frag: HashMap<u32, RoaringBitmap> = input
             .rewritten_old_row_addrs
@@ -365,12 +367,25 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_rejects_new_frags_out_of_write_order() {
+        // New fragments out of ascending id (write) order would make
+        // `compute_new_addr` accumulate rows in the wrong order, silently
+        // misplacing addresses. A zero-row fragment between them is ignored.
+        let input = GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::from_iter([addr(0, 0), addr(0, 1)]),
+            old_frag_ids: vec![0],
+            new_frags: vec![(12, 1), (11, 1)],
+        };
+        assert!(RowAddrRemap::compact([input]).is_err());
+    }
+
+    #[test]
     fn test_direct_and_empty() {
         // Direct covers arbitrary maps the compact form can't express.
         let mut map = HashMap::new();
         map.insert(addr(2, 0), Some(addr(9, 9)));
         map.insert(addr(5, 1), None);
-        let remap = RowAddrRemap::Direct(map);
+        let remap = RowAddrRemap::direct(map);
         assert_eq!(remap.get(addr(2, 0)), Some(Some(addr(9, 9))));
         assert_eq!(remap.get(addr(5, 1)), Some(None));
         assert_eq!(remap.get(addr(2, 1)), None);

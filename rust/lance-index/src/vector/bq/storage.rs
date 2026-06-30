@@ -2535,7 +2535,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         };
 
         match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
-            Some(mapping) => storage.remap(&RowAddrRemap::Direct(mapping)),
+            Some(mapping) => storage.remap(&RowAddrRemap::direct(mapping)),
             None => Ok(storage),
         }
     }
@@ -4426,7 +4426,7 @@ mod tests {
         mapping.insert(3, None);
         mapping.insert(4, Some(104));
 
-        let remapped = storage.remap(&RowAddrRemap::Direct(mapping)).unwrap();
+        let remapped = storage.remap(&RowAddrRemap::direct(mapping)).unwrap();
         assert!(remapped.metadata().packed);
 
         let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
@@ -4441,51 +4441,6 @@ mod tests {
         let remapped_codes = remapped_batch[RABIT_CODE_COLUMN].as_fixed_size_list();
         let repacked = pack_codes(&unpack_codes(remapped_codes));
         assert_codes_eq(remapped_codes, &repacked);
-    }
-
-    // Rows 0..25 of frag 0 are rewritten in order into frag 1; rows 25..50 are
-    // deleted. remap must behave the same in either RowAddrRemap mode.
-    fn rq_remap_compact() -> RowAddrRemap {
-        use lance_core::utils::row_addr_remap::GroupInput;
-        use roaring::RoaringTreemap;
-        RowAddrRemap::compact([GroupInput {
-            rewritten_old_row_addrs: RoaringTreemap::from_iter(0u64..25),
-            old_frag_ids: vec![0],
-            new_frags: vec![(1, 25)],
-        }])
-        .unwrap()
-    }
-
-    fn rq_remap_explicit() -> RowAddrRemap {
-        RowAddrRemap::Direct(
-            (0u64..25)
-                .map(|i| (i, Some((1u64 << 32) | i)))
-                .chain((25u64..50).map(|i| (i, None)))
-                .collect(),
-        )
-    }
-
-    #[rstest]
-    #[case(rq_remap_compact())]
-    #[case(rq_remap_explicit())]
-    fn test_remap_compact_rewrites_old_row_addrs(#[case] remap: RowAddrRemap) {
-        let original_codes = make_test_codes(50, 64);
-        let metadata = make_test_metadata(original_codes.value_length() as usize * 8);
-        let storage = RabitQuantizationStorage::try_from_batch(
-            make_test_batch(original_codes),
-            &metadata,
-            DistanceType::L2,
-            None,
-        )
-        .unwrap();
-
-        let remapped = storage.remap(&remap).unwrap();
-        let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
-        let remapped_row_ids = remapped_batch[ROW_ID].as_primitive::<UInt64Type>().values();
-        // Rewritten rows 0..25 land at frag 1 offsets 0..25; the rest are dropped.
-        let expected_row_ids =
-            UInt64Array::from_iter_values((0..25).map(|i| (1u64 << 32) | i as u64));
-        assert_eq!(remapped_row_ids, expected_row_ids.values());
     }
 
     #[test]
@@ -4516,7 +4471,7 @@ mod tests {
         mapping.insert(3, None);
         mapping.insert(4, Some(104));
 
-        let remapped = storage.remap(&RowAddrRemap::Direct(mapping)).unwrap();
+        let remapped = storage.remap(&RowAddrRemap::direct(mapping)).unwrap();
         let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
         let remapped_row_ids = remapped_batch[ROW_ID].as_primitive::<UInt64Type>().values();
         let expected_row_ids = UInt64Array::from_iter_values(
