@@ -163,13 +163,13 @@ pub enum IndexRemapMode {
     ///
     /// Best for large compactions where peak memory is the constraint. Uses
     /// less memory, but each lookup does extra bitmap/range computation.
-    #[default]
     Compact,
     /// Store the full row-address remap in memory for fast direct lookups.
     ///
     /// Best when the remap fits comfortably in memory and remap speed is the
     /// priority. Uses more peak memory because every rewritten/deleted row has
     /// a materialized mapping entry.
+    #[default]
     Direct,
 }
 
@@ -237,7 +237,7 @@ pub struct CompactionOptions {
     /// is updated and will be used to perform remapping later.
     pub defer_index_remap: bool,
     /// How the old-to-new row-address mapping used to remap indices is built.
-    /// Defaults to [`IndexRemapMode::Compact`].
+    /// Defaults to [`IndexRemapMode::Direct`].
     #[serde(default)]
     pub index_remap_mode: IndexRemapMode,
     /// The compaction mode to use. When set, this takes priority over the
@@ -284,7 +284,7 @@ impl Default for CompactionOptions {
             batch_size: None,
             io_buffer_size: None,
             defer_index_remap: false,
-            index_remap_mode: IndexRemapMode::Compact,
+            index_remap_mode: IndexRemapMode::Direct,
             compaction_mode: None,
             enable_binary_copy: false,
             enable_binary_copy_force: false,
@@ -6054,7 +6054,7 @@ mod tests {
             ),
             (
                 "lance.compaction.index_remap_mode".to_string(),
-                "direct".to_string(),
+                "compact".to_string(),
             ),
         ]);
 
@@ -6069,7 +6069,8 @@ mod tests {
         assert_eq!(opts.io_buffer_size, Some(1_073_741_824));
         assert_eq!(opts.compaction_mode, Some(CompactionMode::TryBinaryCopy));
         assert_eq!(opts.binary_copy_read_batch_bytes, Some(8_388_608));
-        assert_eq!(opts.index_remap_mode, IndexRemapMode::Direct);
+        // A non-default value proves the config string was actually parsed.
+        assert_eq!(opts.index_remap_mode, IndexRemapMode::Compact);
     }
 
     #[test]
@@ -6090,7 +6091,7 @@ mod tests {
         );
         assert_eq!(opts.defer_index_remap, defaults.defer_index_remap);
         assert_eq!(opts.index_remap_mode, defaults.index_remap_mode);
-        assert_eq!(opts.index_remap_mode, IndexRemapMode::Compact);
+        assert_eq!(opts.index_remap_mode, IndexRemapMode::Direct);
         assert_eq!(opts.batch_size, defaults.batch_size);
         assert_eq!(opts.compaction_mode, defaults.compaction_mode);
         assert_eq!(
