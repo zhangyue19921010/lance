@@ -2043,18 +2043,6 @@ pub async fn commit_compaction(
                             })
                             .collect::<Result<Vec<_>>>()?;
 
-                        let new_rows: u64 = new_frags.iter().map(|(_, rows)| *rows as u64).sum();
-                        if row_addrs.len() != new_rows {
-                            return Err(Error::invalid_input(format!(
-                                "compaction task rewrote fragments {:?} into {} rows but recorded {} rewritten old row addresses",
-                                task.original_fragments
-                                    .iter()
-                                    .map(|f| f.id)
-                                    .collect::<Vec<_>>(),
-                                new_rows,
-                                row_addrs.len()
-                            )));
-                        }
                         remap_group_inputs.push(GroupInput {
                             rewritten_old_row_addrs: row_addrs,
                             old_frag_ids: task
@@ -2325,17 +2313,22 @@ mod tests {
             _: &[u64],
         ) -> Result<Vec<RemappedIndex>> {
             for expectation in &self.expectations {
-                let expected_frags: RoaringBitmap = expectation
-                    .expected
-                    .keys()
-                    .map(|addr| (addr >> 32) as u32)
-                    .collect();
-                if index_map.affected_fragments() == expected_frags
-                    && expectation
-                        .expected
-                        .iter()
-                        .all(|(k, v)| index_map.get(*k) == Some(*v))
-                {
+                let matches = match &index_map {
+                    RowAddrRemap::Direct(map) => map == &expectation.expected,
+                    RowAddrRemap::Compact(_) => {
+                        let expected_frags: RoaringBitmap = expectation
+                            .expected
+                            .keys()
+                            .map(|addr| (addr >> 32) as u32)
+                            .collect();
+                        index_map.affected_fragments() == expected_frags
+                            && expectation
+                                .expected
+                                .iter()
+                                .all(|(k, v)| index_map.get(*k) == Some(*v))
+                    }
+                };
+                if matches {
                     return Ok(expectation.answer.clone());
                 }
             }

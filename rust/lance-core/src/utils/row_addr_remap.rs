@@ -165,6 +165,7 @@ impl GroupRemap {
             new_frag_row_ranges.push((frag_id, rewritten_rows_before, physical_rows));
             rewritten_rows_before += physical_rows as u64;
         }
+        let total_new_rows = rewritten_rows_before;
 
         let mut per_frag: HashMap<u32, RoaringBitmap> = input
             .rewritten_old_row_addrs
@@ -187,6 +188,16 @@ impl GroupRemap {
             return Err(Error::invalid_input(format!(
                 "compaction rewritten old row addresses reference fragments {:?} not in the rewrite group's old fragments {:?}",
                 per_frag.keys().collect::<Vec<_>>(),
+                input.old_frag_ids,
+            )));
+        }
+
+        // Rewritten old rows are mapped positionally onto the new rows, so the
+        // two counts must match exactly
+        let total_rewritten_old_rows = input.rewritten_old_row_addrs.len();
+        if total_new_rows != total_rewritten_old_rows {
+            return Err(Error::invalid_input(format!(
+                "compaction rewrote {total_rewritten_old_rows} old rows from fragments {:?} but the new fragments hold {total_new_rows} rows",
                 input.old_frag_ids,
             )));
         }
