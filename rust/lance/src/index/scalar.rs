@@ -47,7 +47,7 @@ use lance_index::scalar::label_list::{
     LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
 };
 use lance_index::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
+    ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
 };
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
@@ -462,29 +462,32 @@ pub async fn open_scalar_index(
     let frag_reuse_index: Option<Arc<dyn RowIdRemapper>> =
         frag_reuse_index.map(|f| f as Arc<dyn RowIdRemapper>);
 
-    if let Some(index) = plugin
-        .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &index_cache)
-        .await?
-    {
-        // Compatibility check is only needed on first load; a cache hit means
-        // the index was already validated when it was originally opened in
-        // this session, so we can skip the extra `open_index_file` IOP.
-        return Ok(index);
-    }
+    // Runs only on a cold miss, and at most once even under concurrent opens
+    // (the plugin coalesces). The compat check lives here because a warm hit was
+    // already validated this session, saving the extra `open_index_file` IOP.
+    let load: ScalarIndexLoad = Box::pin({
+        let index_store = index_store.clone();
+        let frag_reuse_index = frag_reuse_index.clone();
+        let index_cache = index_cache.clone();
+        async move {
+            if index_details.type_url.ends_with("LabelListIndexDetails") {
+                validate_label_list_index_compatibility(dataset, column, index, &index_store)
+                    .await?;
+            }
 
-    if index_details.type_url.ends_with("LabelListIndexDetails") {
-        validate_label_list_index_compatibility(dataset, column, index, &index_store).await?;
-    }
+            let index = plugin
+                .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
+                .await?;
 
-    let index = plugin
-        .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
-        .await?;
+            tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
+            metrics.record_index_load();
+            Ok(index)
+        }
+    });
 
-    tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
-    metrics.record_index_load();
-
-    plugin.put_in_cache(&index_cache, index.clone()).await?;
-    Ok(index)
+    plugin
+        .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
+        .await
 }
 
 pub(crate) async fn infer_scalar_index_details(
@@ -1050,6 +1053,51 @@ mod tests {
             },
             other => panic!("expected Map type, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_open_scalar_index_coalesces_concurrent_cold_opens() {
+        use crate::dataset::builder::DatasetBuilder;
+        use arrow::datatypes::Int64Type;
+        use futures::future::try_join_all;
+        use lance_index::metrics::LocalMetricsCollector;
+        use std::sync::atomic::Ordering;
+
+        let dir = TempStrDir::default();
+        let uri = dir.as_ref();
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int64Type>())
+            .into_dataset(uri, FragmentCount::from(1), FragmentRowCount::from(200))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        ds.create_index(&["id"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Reopen so the index cache is cold for the concurrent opens below.
+        let ds = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        let id_field = ds.schema().field("id").unwrap().id;
+        let index_meta = ds
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|idx| idx.fields == [id_field])
+            .cloned()
+            .expect("btree index on `id`");
+
+        // Eight concurrent cold opens; single-flight means the loader (which calls
+        // `record_index_load`) runs exactly once, not once per open.
+        let metrics = LocalMetricsCollector::default();
+        let indices =
+            try_join_all((0..8).map(|_| open_scalar_index(&ds, "id", &index_meta, &metrics)))
+                .await
+                .unwrap();
+
+        assert_eq!(indices.len(), 8);
+        assert_eq!(metrics.index_loads.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
