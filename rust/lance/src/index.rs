@@ -4087,7 +4087,9 @@ mod tests {
         assert_io_eq!(stats, read_bytes, 0);
         assert_eq!(indices.len(), 1);
 
-        session.index_cache.clear().await; // Clear the cache
+        // Clear the cache
+        session.index_cache.clear().await;
+        session.file_metadata_cache().clear().await;
 
         let dataset2 = DatasetBuilder::from_uri(test_uri)
             .with_session(session.clone())
