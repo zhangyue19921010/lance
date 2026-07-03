@@ -8,6 +8,7 @@ import sys
 import tarfile
 import textwrap
 import uuid
+from pathlib import Path
 
 import lance
 import pandas as pd
@@ -595,10 +596,14 @@ def test_blob_field_threshold_metadata():
         "blob",
         inline_size_threshold=16 * 1024,
         dedicated_size_threshold=2 * 1024 * 1024,
+        pack_file_size_threshold=512 * 1024 * 1024,
     )
 
     assert field.metadata[b"lance-encoding:blob-inline-size-threshold"] == b"16384"
     assert field.metadata[b"lance-encoding:blob-dedicated-size-threshold"] == b"2097152"
+    assert (
+        field.metadata[b"lance-encoding:blob-pack-file-size-threshold"] == b"536870912"
+    )
 
 
 @pytest.mark.parametrize(
@@ -651,6 +656,30 @@ def test_blob_field_threshold_metadata():
             OverflowError,
             "dedicated_size_threshold must fit in a Rust usize",
             id="overflow_dedicated",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": 0},
+            ValueError,
+            "pack_file_size_threshold must be positive",
+            id="zero_pack_file",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": -1},
+            ValueError,
+            "pack_file_size_threshold must be positive",
+            id="negative_pack_file",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": True},
+            TypeError,
+            "pack_file_size_threshold must be an int",
+            id="bool_pack_file",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": 2**100},
+            OverflowError,
+            "pack_file_size_threshold must fit in a Rust usize",
+            id="overflow_pack_file",
         ),
     ],
 )
@@ -711,6 +740,50 @@ def test_blob_extension_append_rejects_explicit_threshold_mismatch(tmp_path):
     lance.write_dataset(initial, dataset_path, data_storage_version="2.2")
 
     append_schema = pa.schema([lance.blob_field("blob", inline_size_threshold=1024)])
+    append = pa.table(
+        {"blob": lance.blob_array([b"x" * 2048])},
+        schema=append_schema,
+    )
+
+    with pytest.raises(
+        OSError, match="Cannot append data with blob threshold metadata"
+    ):
+        lance.write_dataset(append, dataset_path, mode="append")
+
+
+def test_blob_extension_pack_file_threshold_metadata_persists_after_reopen(
+    tmp_path: Path,
+):
+    dataset_path = tmp_path / "test_ds_v2_pack_file_threshold_persists"
+    threshold = 512 * 1024 * 1024
+    schema = pa.schema([lance.blob_field("blob", pack_file_size_threshold=threshold)])
+    table = pa.table({"blob": lance.blob_array([b"x"])}, schema=schema)
+
+    lance.write_dataset(table, dataset_path, data_storage_version="2.2")
+    reopened = lance.dataset(dataset_path)
+
+    assert (
+        reopened.schema.field("blob").metadata[
+            b"lance-encoding:blob-pack-file-size-threshold"
+        ]
+        == str(threshold).encode()
+    )
+
+
+def test_blob_extension_append_rejects_pack_file_threshold_mismatch(tmp_path: Path):
+    dataset_path = tmp_path / "test_ds_v2_append_pack_file_mismatch"
+    initial_schema = pa.schema(
+        [lance.blob_field("blob", pack_file_size_threshold=512 * 1024 * 1024)]
+    )
+    initial = pa.table(
+        {"blob": lance.blob_array([b"x" * 2048])},
+        schema=initial_schema,
+    )
+    lance.write_dataset(initial, dataset_path, data_storage_version="2.2")
+
+    append_schema = pa.schema(
+        [lance.blob_field("blob", pack_file_size_threshold=256 * 1024 * 1024)]
+    )
     append = pa.table(
         {"blob": lance.blob_array([b"x" * 2048])},
         schema=append_schema,

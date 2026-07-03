@@ -64,6 +64,9 @@ pub const BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY: &str =
     "lance-encoding:blob-dedicated-size-threshold";
 /// Metadata key for overriding the inline blob size threshold (in bytes)
 pub const BLOB_INLINE_SIZE_THRESHOLD_META_KEY: &str = "lance-encoding:blob-inline-size-threshold";
+/// Metadata key for overriding the maximum size (in bytes) of a packed blob sidecar file
+pub const BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY: &str =
+    "lance-encoding:blob-pack-file-size-threshold";
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
