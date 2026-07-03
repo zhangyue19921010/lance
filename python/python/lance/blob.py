@@ -8,7 +8,21 @@ from typing import IO, Any, Iterator, Optional, Union
 
 import pyarrow as pa
 
-from .lance import LanceBlobFile
+from .lance import (
+    BlobDescriptor as BlobDescriptor,
+)
+from .lance import (
+    BlobDescriptorArrayBuilder as BlobDescriptorArrayBuilder,
+)
+from .lance import (
+    DedicatedBlobWriter as DedicatedBlobWriter,
+)
+from .lance import (
+    LanceBlobFile,
+)
+from .lance import (
+    PackedBlobWriter as PackedBlobWriter,
+)
 
 _BLOB_INLINE_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-inline-size-threshold"
 _BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY = (

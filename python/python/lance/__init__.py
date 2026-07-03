@@ -9,7 +9,18 @@ import warnings
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from . import io, log
-from .blob import Blob, BlobArray, BlobColumn, BlobFile, blob_array, blob_field
+from .blob import (
+    Blob,
+    BlobArray,
+    BlobColumn,
+    BlobDescriptor,
+    BlobDescriptorArrayBuilder,
+    BlobFile,
+    DedicatedBlobWriter,
+    PackedBlobWriter,
+    blob_array,
+    blob_field,
+)
 from .dataset import (
     DataStatistics,
     FieldStatistics,
@@ -72,6 +83,10 @@ __all__ = [
     "BlobArray",
     "BlobColumn",
     "BlobFile",
+    "DedicatedBlobWriter",
+    "BlobDescriptorArrayBuilder",
+    "PackedBlobWriter",
+    "BlobDescriptor",
     "blob_array",
     "blob_field",
     "CleanupCandidateFile",
