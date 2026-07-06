@@ -360,11 +360,16 @@ impl FilteredReadStream {
             .clone()
             .unwrap_or_else(|| dataset.fragments().clone());
 
+        let decode_parallelism = match threading_mode {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(n)
+            | FilteredReadThreadingMode::MultiplePartitions(n) => n,
+        };
         log::debug!(
-            "Filtered read on {} fragments with frag_readahead={} and io_parallelism={}",
+            "Filtered read on {} fragments with frag_readahead={}, io_parallelism={} and decode_parallelism={}",
             fragments.len(),
             fragment_readahead,
-            io_parallelism
+            io_parallelism,
+            decode_parallelism
         );
 
         // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
@@ -1480,6 +1485,16 @@ impl FilteredReadOptions {
     /// Only read fragments covered by a scalar index result.
     pub fn with_only_indexed_fragments(mut self) -> Self {
         self.only_indexed_fragments = true;
+        self
+    }
+
+    /// Specify the threading mode to use for the scan.
+    ///
+    /// This controls how decode work is parallelized.  For the default single-partition
+    /// scan, the parameter of [`FilteredReadThreadingMode::OnePartitionMultipleThreads`]
+    /// bounds how many batch-decode tasks are buffered in flight (via `try_buffered`).
+    pub fn with_threading_mode(mut self, threading_mode: FilteredReadThreadingMode) -> Self {
+        self.threading_mode = threading_mode;
         self
     }
 }
