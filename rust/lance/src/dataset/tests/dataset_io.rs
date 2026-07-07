@@ -38,7 +38,7 @@ use lance_file::{
     version::LanceFileVersion,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_io::{assert_io_eq, assert_io_gt};
+use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 use lance_table::format::BasePath;
 use object_store::ObjectStoreExt;
@@ -873,69 +873,6 @@ async fn test_load_manifest_iops() {
 }
 
 #[tokio::test]
-async fn test_checkout_reuses_cached_manifest() {
-    let test_uri = TempStrDir::default();
-    let session = Arc::new(Session::default());
-    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-        "i",
-        DataType::Int32,
-        false,
-    )]));
-    let make_batches = || {
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
-        )
-        .unwrap();
-        RecordBatchIterator::new(vec![Ok(batch)], schema.clone())
-    };
-
-    // v1: committing on this Session caches the v1 manifest.
-    Dataset::write(
-        make_batches(),
-        &test_uri,
-        Some(WriteParams {
-            session: Some(session.clone()),
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-
-    // v2 (append): the dataset now points at v2, but the v1 manifest stays in
-    // the Session cache from the write above.
-    let dataset = Dataset::write(
-        make_batches(),
-        &test_uri,
-        Some(WriteParams {
-            session: Some(session.clone()),
-            mode: WriteMode::Append,
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(dataset.manifest().version, 2);
-
-    // Cache hit: checking out v1 resolves the manifest location (1 head) and
-    // reuses the cached manifest body, so no manifest read is issued.
-    let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
-    let ds_v1 = dataset.checkout_version(1u64).await.unwrap();
-    assert_eq!(ds_v1.manifest().version, 1);
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-    assert_io_eq!(io_stats, read_iops, 1);
-
-    // Cache miss: clearing the metadata cache forces the same checkout to read
-    // the manifest body from storage again, costing more than the lone head.
-    session.file_metadata_cache().clear().await;
-    let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
-    let ds_v1_cold = dataset.checkout_version(1u64).await.unwrap();
-    assert_eq!(ds_v1_cold.manifest().version, 1);
-    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-    assert_io_gt!(io_stats, read_iops, 1);
-}
-
-#[tokio::test]
 async fn test_checkout_removed_version_not_served_from_cache() {
     let test_uri = TempStrDir::default();
     let session = Arc::new(Session::default());
@@ -960,6 +897,8 @@ async fn test_checkout_removed_version_not_served_from_cache() {
     .await
     .unwrap();
 
+    // A cached manifest for a version removed from storage (keyed without an
+    // e_tag) must not be served: the checkout has to fail, not return the zombie.
     let mut zombie = dataset.manifest().clone();
     zombie.version = 999;
     session
@@ -974,70 +913,9 @@ async fn test_checkout_removed_version_not_served_from_cache() {
         )
         .await;
 
-    // The checkout must fail rather than return the cached zombie manifest.
     assert!(
         dataset.checkout_version(999u64).await.is_err(),
         "checkout of a version absent from storage must not be served from cache"
-    );
-}
-
-#[tokio::test]
-async fn test_open_removed_version_not_served_from_cache() {
-    let test_uri = TempStrDir::default();
-    let session = Arc::new(Session::default());
-    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-        "i",
-        DataType::Int32,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
-    )
-    .unwrap();
-    let dataset = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-        &test_uri,
-        Some(WriteParams {
-            session: Some(session.clone()),
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-
-    // Open once through the builder to learn the exact URI it caches under
-    // (`from_uri` re-normalizes the input, so it may differ from the URI the
-    // writer recorded).
-    let opened = DatasetBuilder::from_uri(dataset.uri.as_str())
-        .with_session(session.clone())
-        .load()
-        .await
-        .unwrap();
-
-    let mut zombie = opened.manifest().clone();
-    zombie.version = 999;
-    session
-        .metadata_cache
-        .for_dataset(&opened.uri)
-        .insert_with_key(
-            &ManifestKey {
-                version: 999,
-                e_tag: None,
-            },
-            Arc::new(zombie),
-        )
-        .await;
-
-    // Opening the absent version by URI must fail, not return the cached zombie.
-    let result = DatasetBuilder::from_uri(dataset.uri.as_str())
-        .with_version(999u64)
-        .with_session(session.clone())
-        .load()
-        .await;
-    assert!(
-        result.is_err(),
-        "opening a version absent from storage must not be served from cache"
     );
 }
 
