@@ -937,12 +937,6 @@ async fn test_checkout_reuses_cached_manifest() {
 
 #[tokio::test]
 async fn test_checkout_removed_version_not_served_from_cache() {
-    // Regression: a version that no longer exists in storage (e.g. removed by
-    // auto-cleanup) must never be served from the session metadata cache.
-    // Version resolution falls back to an unchecked location (no `size`) for a
-    // missing version, and the cache key collapses to `manifest/{version}` when
-    // the store's head yields no e_tag, so a stale cached entry would otherwise
-    // be returned instead of surfacing a NotFound.
     let test_uri = TempStrDir::default();
     let session = Arc::new(Session::default());
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -966,11 +960,6 @@ async fn test_checkout_removed_version_not_served_from_cache() {
     .await
     .unwrap();
 
-    // Seed a zombie manifest for a version absent from storage, keyed without an
-    // e_tag to mimic a store whose head yields none (the key collapses to
-    // `manifest/999`, exactly what a missing version resolves to). Give it the
-    // matching version so it stands in for a version that was cached and then
-    // removed (the realistic auto-cleanup scenario).
     let mut zombie = dataset.manifest().clone();
     zombie.version = 999;
     session
@@ -994,10 +983,6 @@ async fn test_checkout_removed_version_not_served_from_cache() {
 
 #[tokio::test]
 async fn test_open_removed_version_not_served_from_cache() {
-    // Regression: the same zombie-cache hazard applies to opening a specific
-    // version by URI (`DatasetBuilder::with_version`), not just checkout — both
-    // resolve a missing version to an unchecked location and go through
-    // `get_manifest`.
     let test_uri = TempStrDir::default();
     let session = Arc::new(Session::default());
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -1030,10 +1015,6 @@ async fn test_open_removed_version_not_served_from_cache() {
         .await
         .unwrap();
 
-    // Seed a zombie manifest for a version absent from storage under that exact
-    // URI, keyed without an e_tag. Give it the matching version so it passes the
-    // builder's version-consistency check and would be returned if the cache
-    // were trusted — i.e. a version that was cached and then removed.
     let mut zombie = opened.manifest().clone();
     zombie.version = 999;
     session
