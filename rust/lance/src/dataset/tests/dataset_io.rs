@@ -37,7 +37,7 @@ use lance_file::{
     version::LanceFileVersion,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_io::assert_io_eq;
+use lance_io::{assert_io_eq, assert_io_gt};
 use lance_table::feature_flags;
 use lance_table::format::BasePath;
 use object_store::ObjectStoreExt;
@@ -869,6 +869,69 @@ async fn test_load_manifest_iops() {
     // The manifest body is served from the cache instead of being read from storage.
     let io_stats = _dataset.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 1);
+}
+
+#[tokio::test]
+async fn test_checkout_reuses_cached_manifest() {
+    let test_uri = TempStrDir::default();
+    let session = Arc::new(Session::default());
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let make_batches = || {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone())
+    };
+
+    // v1: committing on this Session caches the v1 manifest.
+    Dataset::write(
+        make_batches(),
+        &test_uri,
+        Some(WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // v2 (append): the dataset now points at v2, but the v1 manifest stays in
+    // the Session cache from the write above.
+    let dataset = Dataset::write(
+        make_batches(),
+        &test_uri,
+        Some(WriteParams {
+            session: Some(session.clone()),
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.manifest().version, 2);
+
+    // Cache hit: checking out v1 resolves the manifest location (1 head) and
+    // reuses the cached manifest body, so no manifest read is issued.
+    let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
+    let ds_v1 = dataset.checkout_version(1u64).await.unwrap();
+    assert_eq!(ds_v1.manifest().version, 1);
+    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(io_stats, read_iops, 1);
+
+    // Cache miss: clearing the metadata cache forces the same checkout to read
+    // the manifest body from storage again, costing more than the lone head.
+    session.file_metadata_cache().clear().await;
+    let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
+    let ds_v1_cold = dataset.checkout_version(1u64).await.unwrap();
+    assert_eq!(ds_v1_cold.manifest().version, 1);
+    let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_gt!(io_stats, read_iops, 1);
 }
 
 #[rstest]
