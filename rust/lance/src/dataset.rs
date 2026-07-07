@@ -765,6 +765,11 @@ impl Dataset {
         uri: &str,
         session: &Session,
     ) -> Result<Arc<Manifest>> {
+        if manifest_location.size.is_none() {
+            return Ok(Arc::new(
+                Self::load_manifest(object_store, manifest_location, uri, session).await?,
+            ));
+        }
         let metadata_cache = session.metadata_cache.for_dataset(uri);
         let manifest_key = ManifestKey {
             version: manifest_location.version,

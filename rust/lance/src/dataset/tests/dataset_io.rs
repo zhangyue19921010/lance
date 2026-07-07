@@ -12,6 +12,7 @@ use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::{ManifestWriteConfig, write_manifest_file};
 use crate::session::Session;
+use crate::session::caches::ManifestKey;
 use crate::{Dataset, Error, Result};
 use lance_table::format::DataStorageFormat;
 
@@ -932,6 +933,131 @@ async fn test_checkout_reuses_cached_manifest() {
     assert_eq!(ds_v1_cold.manifest().version, 1);
     let io_stats = dataset.object_store.as_ref().io_stats_incremental();
     assert_io_gt!(io_stats, read_iops, 1);
+}
+
+#[tokio::test]
+async fn test_checkout_removed_version_not_served_from_cache() {
+    // Regression: a version that no longer exists in storage (e.g. removed by
+    // auto-cleanup) must never be served from the session metadata cache.
+    // Version resolution falls back to an unchecked location (no `size`) for a
+    // missing version, and the cache key collapses to `manifest/{version}` when
+    // the store's head yields no e_tag, so a stale cached entry would otherwise
+    // be returned instead of surfacing a NotFound.
+    let test_uri = TempStrDir::default();
+    let session = Arc::new(Session::default());
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Seed a zombie manifest for a version absent from storage, keyed without an
+    // e_tag to mimic a store whose head yields none (the key collapses to
+    // `manifest/999`, exactly what a missing version resolves to). Give it the
+    // matching version so it stands in for a version that was cached and then
+    // removed (the realistic auto-cleanup scenario).
+    let mut zombie = dataset.manifest().clone();
+    zombie.version = 999;
+    session
+        .metadata_cache
+        .for_dataset(&dataset.uri)
+        .insert_with_key(
+            &ManifestKey {
+                version: 999,
+                e_tag: None,
+            },
+            Arc::new(zombie),
+        )
+        .await;
+
+    // The checkout must fail rather than return the cached zombie manifest.
+    assert!(
+        dataset.checkout_version(999u64).await.is_err(),
+        "checkout of a version absent from storage must not be served from cache"
+    );
+}
+
+#[tokio::test]
+async fn test_open_removed_version_not_served_from_cache() {
+    // Regression: the same zombie-cache hazard applies to opening a specific
+    // version by URI (`DatasetBuilder::with_version`), not just checkout — both
+    // resolve a missing version to an unchecked location and go through
+    // `get_manifest`.
+    let test_uri = TempStrDir::default();
+    let session = Arc::new(Session::default());
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Open once through the builder to learn the exact URI it caches under
+    // (`from_uri` re-normalizes the input, so it may differ from the URI the
+    // writer recorded).
+    let opened = DatasetBuilder::from_uri(dataset.uri.as_str())
+        .with_session(session.clone())
+        .load()
+        .await
+        .unwrap();
+
+    // Seed a zombie manifest for a version absent from storage under that exact
+    // URI, keyed without an e_tag. Give it the matching version so it passes the
+    // builder's version-consistency check and would be returned if the cache
+    // were trusted — i.e. a version that was cached and then removed.
+    let mut zombie = opened.manifest().clone();
+    zombie.version = 999;
+    session
+        .metadata_cache
+        .for_dataset(&opened.uri)
+        .insert_with_key(
+            &ManifestKey {
+                version: 999,
+                e_tag: None,
+            },
+            Arc::new(zombie),
+        )
+        .await;
+
+    // Opening the absent version by URI must fail, not return the cached zombie.
+    let result = DatasetBuilder::from_uri(dataset.uri.as_str())
+        .with_version(999u64)
+        .with_session(session.clone())
+        .load()
+        .await;
+    assert!(
+        result.is_err(),
+        "opening a version absent from storage must not be served from cache"
+    );
 }
 
 #[rstest]
