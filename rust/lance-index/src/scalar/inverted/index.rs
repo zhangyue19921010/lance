@@ -7838,6 +7838,85 @@ mod tests {
         );
     }
 
+    // Enough distinct tokens that `write_posting_lists` emits several posting-list
+    // batches (the default batch size is 256 rows), exercising the restructured
+    // producer and async send path.
+    const MANY_BATCH_TOKENS: u64 = 1000;
+    const MANY_BATCH_ROW_ID_BASE: u64 = 1000;
+
+    // Writes a single partition whose posting lists span many output batches. Each
+    // token `tok{i:05}` maps to row id `MANY_BATCH_ROW_ID_BASE + i`.
+    async fn write_partition_spanning_many_batches(store: &dyn IndexStore) {
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        for i in 0..MANY_BATCH_TOKENS {
+            // Zero-padded so tokens are inserted in sorted order, as the set expects.
+            builder.tokens.add(format!("tok{i:05}"));
+            let doc_id = builder.docs.append(MANY_BATCH_ROW_ID_BASE + i, 1);
+            let mut posting_list = PostingListBuilder::new(false);
+            posting_list.add(doc_id, PositionRecorder::Count(1));
+            builder.posting_lists.push(posting_list);
+        }
+        builder
+            .write(store)
+            .await
+            .expect("writing posting lists should succeed");
+    }
+
+    // Correctness guard for the restructured posting-list writer. The producer now
+    // builds each batch in its own `spawn_cpu` call, handing the builder and the
+    // remaining posting lists back out so state (the cross-batch cache-group
+    // accumulator) is preserved, and dispatches with an async `send().await`. This
+    // verifies that path over many batches by checking representative tokens after
+    // they cross the producer/consumer boundary.
+    //
+    // Note: this does not reproduce the single-thread-pool deadlock the async send
+    // fixes -- that requires a 1-thread CPU pool (a process-global singleton) plus
+    // ~8MB of buffered posting data to trigger a consumer-side encoder flush, which
+    // is impractical as a lightweight unit test.
+    #[tokio::test]
+    async fn test_write_many_posting_list_batches_preserves_all_batches() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        write_partition_spanning_many_batches(store.as_ref()).await;
+
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        // Probe tokens from the first, a middle, and the last batch to confirm they
+        // remain queryable after crossing the producer/consumer boundary.
+        for token_idx in [0u64, MANY_BATCH_TOKENS / 2, MANY_BATCH_TOKENS - 1] {
+            let tokens = Arc::new(Tokens::new(
+                vec![format!("tok{token_idx:05}")],
+                DocType::Text,
+            ));
+            let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+            let (row_ids, _) = index
+                .bm25_search(
+                    tokens,
+                    params,
+                    Operator::Or,
+                    Arc::new(NoFilter),
+                    Arc::new(NoOpMetricsCollector),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                row_ids,
+                vec![MANY_BATCH_ROW_ID_BASE + token_idx],
+                "token tok{token_idx:05} should map to its single document"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_and_query_skips_partition_missing_required_term() {
         let tmpdir = TempObjDir::default();

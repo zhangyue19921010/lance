@@ -1096,38 +1096,62 @@ impl InnerBuilder {
         let schema_for_batches = schema.clone();
         let batch_rows = *LANCE_FTS_POSTING_BATCH_ROWS;
         let (tx, rx) = async_channel::bounded(*LANCE_FTS_WRITE_QUEUE_SIZE);
-        let producer = spawn_cpu(move || {
+        // The producer builds posting-list batches on the CPU pool and hands them
+        // to the writer through a bounded channel. Each batch is built inside its
+        // own `spawn_cpu` call and dispatched with an async `send().await` instead
+        // of a blocking send: when the channel is full the producer *yields* its
+        // task rather than parking the pool thread it is running on. Parking would
+        // deadlock on hosts whose CPU pool has a single thread: once the consumer
+        // accumulates enough data to flush an encoded column, the flush also needs
+        // that pool. The parked producer and the starved consumer would then wait
+        // on each other forever.
+        let producer = tokio::spawn(async move {
             let mut batch_builder = PostingListBatchBuilder::new(
-                schema_for_batches.clone(),
+                schema_for_batches,
                 with_position,
                 format_version,
                 batch_rows,
                 group_config,
             );
-            for posting_list in posting_lists {
-                posting_list.append_to_batch_with_docs(
-                    &docs_for_batches,
-                    &mut batch_builder,
-                    format_version,
-                )?;
-                if batch_builder.len() < batch_rows {
-                    continue;
-                }
+            let mut posting_lists = posting_lists.into_iter();
+            loop {
+                let docs_for_batches = docs_for_batches.clone();
+                // Build the next batch on the CPU pool. The builder and the
+                // remaining posting lists are moved in and handed back so state
+                // persists across batches -- notably the cache-group accumulator,
+                // which spans every batch this builder produces.
+                let (next_builder, next_posting_lists, batch) = spawn_cpu(move || {
+                    let mut batch_builder = batch_builder;
+                    let mut posting_lists = posting_lists;
+                    let mut batch = None;
+                    for posting_list in posting_lists.by_ref() {
+                        posting_list.append_to_batch_with_docs(
+                            &docs_for_batches,
+                            &mut batch_builder,
+                            format_version,
+                        )?;
+                        if batch_builder.len() >= batch_rows {
+                            batch = Some(batch_builder.finish()?);
+                            break;
+                        }
+                    }
+                    if batch.is_none() && !batch_builder.is_empty() {
+                        batch = Some(batch_builder.finish()?);
+                    }
+                    Result::Ok((batch_builder, posting_lists, batch))
+                })
+                .await?;
+                batch_builder = next_builder;
+                posting_lists = next_posting_lists;
 
-                let batch = batch_builder.finish()?;
-                if let Err(err) = tx.send_blocking(batch) {
-                    return Err(Error::execution(format!(
-                        "failed to send posting list batch to writer: {err}"
-                    )));
-                }
-            }
-
-            if !batch_builder.is_empty() {
-                let batch = batch_builder.finish()?;
-                if let Err(err) = tx.send_blocking(batch) {
-                    return Err(Error::execution(format!(
-                        "failed to send posting list batch to writer: {err}"
-                    )));
+                let Some(batch) = batch else {
+                    // No more batches: the posting lists are exhausted.
+                    break;
+                };
+                if tx.send(batch).await.is_err() {
+                    // The receiver is gone, which only happens when the writer
+                    // failed; stop producing and let that error surface there.
+                    break;
                 }
             }
 
@@ -1143,7 +1167,7 @@ impl InnerBuilder {
             }
         }
         drop(rx);
-        let group_starts = producer.await?;
+        let group_starts = producer.await??;
 
         // Persist the posting-list cache-group boundaries as a global buffer,
         // recording its 1-indexed id in schema metadata so the reader can group
