@@ -93,8 +93,18 @@ impl DeepSizeOf for BloomFilterIndex {
 impl BloomFilterIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        Self::load_with_max_array_length(store, fri, index_cache, MAX_BLOOMFILTER_ARRAY_LENGTH)
+            .await
+    }
+
+    async fn load_with_max_array_length(
+        store: Arc<dyn IndexStore>,
         _fri: Option<Arc<dyn RowIdRemapper>>,
         _index_cache: &LanceCache,
+        max_array_length: usize,
     ) -> Result<Arc<Self>> {
         let index_file = store.open_index_file(BLOOMFILTER_FILENAME).await?;
         let file_schema = index_file.schema();
@@ -112,14 +122,14 @@ impl BloomFilterIndex {
             .unwrap_or(*DEFAULT_PROBABILITY);
 
         let read_batch_size =
-            Self::read_batch_size(number_of_items, probability, MAX_BLOOMFILTER_ARRAY_LENGTH)?;
+            Self::read_batch_size(number_of_items, probability, max_array_length)?;
 
         let mut zones = Vec::new();
         for start in (0..index_file.num_rows()).step_by(read_batch_size) {
             let end = (start + read_batch_size).min(index_file.num_rows());
             let mut bloom_data = index_file.read_range_stream(start..end, None).await?;
             while let Some(batch) = bloom_data.try_next().await? {
-                zones.extend(Self::try_from_serialized(batch)?);
+                zones.extend(Self::try_from_serialized(batch, max_array_length)?);
             }
         }
 
@@ -142,9 +152,7 @@ impl BloomFilterIndex {
             number_of_items,
             probability,
         };
-        let filter_size = BloomFilterProcessor::build_filter(&params)?
-            .to_bytes()
-            .len();
+        let filter_size = BloomFilterProcessor::build_filter(&params)?.size_bytes();
         if filter_size > max_array_length {
             return Err(Error::invalid_input(format!(
                 "Serialized bloom filter size {} exceeds max supported batch bytes {}",
@@ -154,7 +162,10 @@ impl BloomFilterIndex {
         Ok((max_array_length / filter_size).max(1))
     }
 
-    fn try_from_serialized(data: RecordBatch) -> Result<Vec<BloomFilterStatistics>> {
+    fn try_from_serialized(
+        data: RecordBatch,
+        max_array_length: usize,
+    ) -> Result<Vec<BloomFilterStatistics>> {
         if data.num_rows() == 0 {
             return Ok(Vec::new());
         }
@@ -196,6 +207,18 @@ impl BloomFilterIndex {
             .ok_or_else(|| {
                 Error::invalid_input("BloomFilterIndex: 'bloom_filter_data' column is not Binary")
             })?;
+
+        // Enforce the i32-offset cap on read, symmetric to the write side. A batch this
+        // large means the read chunking was bypassed; reject it before it overflows the
+        // BinaryArray offsets instead of panicking deep inside Arrow.
+        let offsets = bloom_filter_data_col.value_offsets();
+        let batch_bytes = (offsets[offsets.len() - 1] - offsets[0]) as usize;
+        if batch_bytes > max_array_length {
+            return Err(Error::invalid_input(format!(
+                "Serialized bloom filter batch size {} exceeds max supported batch bytes {}",
+                batch_bytes, max_array_length
+            )));
+        }
 
         let has_null_col = data
             .column_by_name("has_null")
@@ -474,9 +497,7 @@ impl ScalarIndex for BloomFilterIndex {
         // Write the combined zones back to storage
         let mut builder = BloomFilterIndexBuilder::try_new(params)?;
         builder.blocks = updated_blocks;
-        let file = builder
-            .write_index(dest_store, MAX_BLOOMFILTER_ARRAY_LENGTH)
-            .await?;
+        let file = builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
@@ -627,7 +648,12 @@ impl BloomFilterIndexBuilder {
         Ok(RecordBatch::try_new(Self::bloomfilter_schema(), columns)?)
     }
 
-    pub async fn write_index(
+    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<IndexFile> {
+        self.write_index_with_max_array_length(index_store, MAX_BLOOMFILTER_ARRAY_LENGTH)
+            .await
+    }
+
+    async fn write_index_with_max_array_length(
         self,
         index_store: &dyn IndexStore,
         max_array_length: usize,
@@ -1101,9 +1127,7 @@ impl BloomFilterIndexPlugin {
 
         builder.train(batches_source).await?;
 
-        builder
-            .write_index(index_store, MAX_BLOOMFILTER_ARRAY_LENGTH)
-            .await
+        builder.write_index(index_store).await
     }
 }
 
@@ -2319,11 +2343,27 @@ mod tests {
         builder.train(data_stream).await.unwrap();
         assert_eq!(builder.blocks.len(), row_count as usize);
 
-        builder.write_index(test_store.as_ref(), 64).await.unwrap();
+        // Small byte limit forces the writer to emit many on-disk batches and the
+        // reader to chunk its reads. The total payload is far larger than the limit,
+        // so a load that concatenated everything into one BinaryArray would trip the
+        // read-side cap; a correctly chunked load must still succeed.
+        let max_array_length = 64;
+        let filter_bytes = Sbbf::with_ndv_fpp(1, 0.25).unwrap().size_bytes();
+        assert!(filter_bytes * row_count as usize > max_array_length);
 
-        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        builder
+            .write_index_with_max_array_length(test_store.as_ref(), max_array_length)
             .await
-            .expect("Failed to load chunked BloomFilterIndex");
+            .unwrap();
+
+        let index = BloomFilterIndex::load_with_max_array_length(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            max_array_length,
+        )
+        .await
+        .expect("Failed to load chunked BloomFilterIndex");
 
         assert_eq!(index.zones.len(), row_count as usize);
         assert_eq!(index.zones[0].bound.start, 0);
@@ -2331,6 +2371,32 @@ mod tests {
         assert_eq!(index.zones[4999].bound.start, 4999);
         assert_eq!(index.zones[4999].bound.length, 1);
         assert!(!index.zones[4096].bloom_filter.to_bytes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_load_rejects_unchunked_oversized_read() {
+        // Guards the read-side invariant directly: a batch whose concatenated filter
+        // payload exceeds the cap must be rejected rather than building an oversized
+        // BinaryArray. This is what protects `load` if its chunking ever regresses.
+        let filter_bytes = Sbbf::with_ndv_fpp(1, 0.25).unwrap().to_bytes();
+        let batch = BloomFilterIndexBuilder::bloomfilter_stats_as_batch(
+            vec![0, 0],
+            vec![0, 1],
+            vec![1, 1],
+            vec![false, false],
+            vec![filter_bytes.clone(), filter_bytes.clone()],
+        )
+        .unwrap();
+
+        // One filter fits, two together do not.
+        let max_array_length = filter_bytes.len();
+        let error = BloomFilterIndex::try_from_serialized(batch, max_array_length).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds max supported batch bytes"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -2360,7 +2426,7 @@ mod tests {
         builder.train(data_stream).await.unwrap();
 
         let error = builder
-            .write_index(test_store.as_ref(), 16)
+            .write_index_with_max_array_length(test_store.as_ref(), 16)
             .await
             .unwrap_err();
         assert!(
