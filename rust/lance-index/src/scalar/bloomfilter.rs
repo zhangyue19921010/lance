@@ -444,6 +444,10 @@ impl ScalarIndex for BloomFilterIndex {
         })
     }
 
+    fn results_are_row_addresses(&self) -> bool {
+        true
+    }
+
     fn can_remap(&self) -> bool {
         false
     }
