@@ -36,10 +36,11 @@ impl ValueEncoder {
         };
 
         if size_bytes >= MAX_MINIBLOCK_BYTES {
+            let num_values = 2 * values_per_word;
             return Err(Error::invalid_input(format!(
-                "Value is too wide for miniblock encoding: 2 values require {} bytes but a \
+                "Value is too wide for miniblock encoding: {} values require {} bytes but a \
                  miniblock chunk is limited to {} bytes.",
-                size_bytes, MAX_MINIBLOCK_BYTES
+                num_values, size_bytes, MAX_MINIBLOCK_BYTES
             )));
         }
 
@@ -994,17 +995,52 @@ mod tests {
         assert_eq!(decompressed.as_ref(), &sample_list);
     }
 
-    #[test]
-    fn test_wide_value_miniblock_returns_error() {
+    fn wide_fixed_size_binary() -> ArrayRef {
         let wide_value = vec![0xABu8; 5000];
-        let array: ArrayRef = Arc::new(
+        Arc::new(
             arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
                 std::iter::repeat_n(Some(wide_value.as_slice()), 4),
                 5000,
             )
             .unwrap(),
-        );
+        )
+    }
 
+    fn wide_fixed_size_list() -> ArrayRef {
+        // A wide FSL<Int64> is byte-aligned, so it chunks one value per word.
+        let dimension = 1024;
+        let values = arrow_array::Int64Array::from(vec![0i64; dimension * 2]);
+        let field = Arc::new(Field::new("item", DataType::Int64, true));
+        Arc::new(FixedSizeListArray::new(
+            field,
+            dimension as i32,
+            Arc::new(values),
+            None,
+        ))
+    }
+
+    fn wide_fixed_size_list_bool() -> ArrayRef {
+        // A wide FSL<Boolean> is sub-byte, so it chunks eight values per word and the
+        // smallest unit is 16 values rather than 2.
+        let dimension = 4095;
+        let values = arrow_array::BooleanArray::from(vec![false; dimension * 2]);
+        let field = Arc::new(Field::new("item", DataType::Boolean, true));
+        Arc::new(FixedSizeListArray::new(
+            field,
+            dimension as i32,
+            Arc::new(values),
+            None,
+        ))
+    }
+
+    #[rstest::rstest]
+    #[case::fixed_size_binary(wide_fixed_size_binary(), 2)]
+    #[case::fixed_size_list(wide_fixed_size_list(), 2)]
+    #[case::fixed_size_list_bool(wide_fixed_size_list_bool(), 16)]
+    fn test_wide_value_miniblock_returns_error(
+        #[case] array: ArrayRef,
+        #[case] expected_min_values: u64,
+    ) {
         let starting_data = DataBlock::from_array(array);
 
         let encoder = ValueEncoder::default();
@@ -1015,9 +1051,14 @@ mod tests {
             matches!(err, lance_core::Error::InvalidInput { .. }),
             "expected InvalidInput, got {err:?}"
         );
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("too wide for miniblock encoding"),
-            "unexpected error message: {err}"
+            msg.contains("too wide for miniblock encoding"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{expected_min_values} values require")),
+            "unexpected error message: {msg}"
         );
     }
 
