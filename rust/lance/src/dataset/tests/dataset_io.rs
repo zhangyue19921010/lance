@@ -897,25 +897,48 @@ async fn test_checkout_removed_version_not_served_from_cache() {
     .await
     .unwrap();
 
-    // A cached manifest for a version removed from storage (keyed without an
-    // e_tag) must not be served: the checkout has to fail, not return the zombie.
-    let mut zombie = dataset.manifest().clone();
-    zombie.version = 999;
-    session
-        .metadata_cache
-        .for_dataset(&dataset.uri)
-        .insert_with_key(
-            &ManifestKey {
-                version: 999,
-                e_tag: None,
-            },
-            Arc::new(zombie),
-        )
-        .await;
+    let version = dataset.manifest().version;
+    let location = dataset.manifest_location().clone();
+    let cache = session.metadata_cache.for_dataset(&dataset.uri);
 
     assert!(
-        dataset.checkout_version(999u64).await.is_err(),
-        "checkout of a version absent from storage must not be served from cache"
+        cache
+            .get_with_key(&ManifestKey {
+                version,
+                e_tag: location.e_tag.as_deref(),
+            })
+            .await
+            .is_some(),
+        "manifest should be cached after the write"
+    );
+    dataset.checkout_version(version).await.unwrap();
+
+    // Remove the version from storage, as cleanup (or a manual delete) would.
+    dataset.object_store.delete(&location.path).await.unwrap();
+
+    let resolved = dataset
+        .commit_handler
+        .resolve_version_location(&dataset.base, version, &dataset.object_store.inner)
+        .await
+        .unwrap();
+    assert!(
+        resolved.size.is_none(),
+        "resolving a removed version must fall back to a size-less location, got {:?}",
+        resolved.size
+    );
+
+    cache
+        .insert_with_key(
+            &ManifestKey {
+                version,
+                e_tag: None,
+            },
+            Arc::new(dataset.manifest().clone()),
+        )
+        .await;
+    assert!(
+        dataset.checkout_version(version).await.is_err(),
+        "checkout of a version removed from storage must not be served from cache"
     );
 }
 
