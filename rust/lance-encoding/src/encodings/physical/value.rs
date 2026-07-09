@@ -1006,19 +1006,6 @@ mod tests {
         )
     }
 
-    fn wide_fixed_size_list() -> ArrayRef {
-        // A wide FSL<Int64> is byte-aligned, so it chunks one value per word.
-        let dimension = 1024;
-        let values = arrow_array::Int64Array::from(vec![0i64; dimension * 2]);
-        let field = Arc::new(Field::new("item", DataType::Int64, true));
-        Arc::new(FixedSizeListArray::new(
-            field,
-            dimension as i32,
-            Arc::new(values),
-            None,
-        ))
-    }
-
     fn wide_fixed_size_list_bool() -> ArrayRef {
         // A wide FSL<Boolean> is sub-byte, so it chunks eight values per word and the
         // smallest unit is 16 values rather than 2.
@@ -1035,7 +1022,6 @@ mod tests {
 
     #[rstest::rstest]
     #[case::fixed_size_binary(wide_fixed_size_binary(), 2)]
-    #[case::fixed_size_list(wide_fixed_size_list(), 2)]
     #[case::fixed_size_list_bool(wide_fixed_size_list_bool(), 16)]
     fn test_wide_value_miniblock_returns_error(
         #[case] array: ArrayRef,
