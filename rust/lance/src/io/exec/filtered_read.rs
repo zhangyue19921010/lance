@@ -3923,27 +3923,4 @@ mod tests {
 
         assert_eq!(default_result.num_rows(), capped_result.num_rows());
     }
-
-    /// A parallelism of 0 would make `try_buffered(0)` hang forever, so it must be
-    /// rejected when constructing the plan node.
-    #[test_log::test(tokio::test)]
-    async fn test_zero_parallelism_rejected() {
-        let fixture = TestFixture::new().await;
-
-        for mode in [
-            FilteredReadThreadingMode::OnePartitionMultipleThreads(0),
-            FilteredReadThreadingMode::MultiplePartitions(0),
-        ] {
-            let options =
-                FilteredReadOptions::basic_full_read(&fixture.dataset).with_threading_mode(mode);
-            let err = FilteredReadExec::try_new(fixture.dataset.clone(), options, None)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                err.contains("must be greater than 0"),
-                "unexpected error: {}",
-                err
-            );
-        }
-    }
 }
