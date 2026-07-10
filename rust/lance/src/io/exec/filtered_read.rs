@@ -360,16 +360,11 @@ impl FilteredReadStream {
             .clone()
             .unwrap_or_else(|| dataset.fragments().clone());
 
-        let decode_parallelism = match threading_mode {
-            FilteredReadThreadingMode::OnePartitionMultipleThreads(n)
-            | FilteredReadThreadingMode::MultiplePartitions(n) => n,
-        };
         log::debug!(
-            "Filtered read on {} fragments with frag_readahead={}, io_parallelism={} and decode_parallelism={}",
+            "Filtered read on {} fragments with frag_readahead={} and io_parallelism={}",
             fragments.len(),
             fragment_readahead,
-            io_parallelism,
-            decode_parallelism
+            io_parallelism
         );
 
         // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
@@ -1493,6 +1488,9 @@ impl FilteredReadOptions {
     /// This controls how decode work is parallelized.  For the default single-partition
     /// scan, the parameter of [`FilteredReadThreadingMode::OnePartitionMultipleThreads`]
     /// bounds how many batch-decode tasks are buffered in flight (via `try_buffered`).
+    ///
+    /// The parallelism must be greater than 0.  A value of 0 is rejected by
+    /// [`FilteredReadExec::try_new`].
     pub fn with_threading_mode(mut self, threading_mode: FilteredReadThreadingMode) -> Self {
         self.threading_mode = threading_mode;
         self
@@ -1586,6 +1584,23 @@ impl FilteredReadExec {
         if options.projection.is_empty() {
             return Err(Error::invalid_input_source("no columns were selected and with_row_id / with_row_address is false, there is nothing to scan"
                 .into()));
+        }
+
+        // A parallelism of 0 would cause `try_buffered(0)` to hang forever instead of erroring
+        match options.threading_mode {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(0) => {
+                return Err(Error::invalid_input_source(
+                    "FilteredReadThreadingMode::OnePartitionMultipleThreads must be greater than 0, got 0"
+                        .into(),
+                ));
+            }
+            FilteredReadThreadingMode::MultiplePartitions(0) => {
+                return Err(Error::invalid_input_source(
+                    "FilteredReadThreadingMode::MultiplePartitions must be greater than 0, got 0"
+                        .into(),
+                ));
+            }
+            _ => {}
         }
 
         if options.scan_range_after_filter.is_some() {
@@ -3907,5 +3922,28 @@ mod tests {
         let capped_result = concat_batches(&schema2, &batches2).unwrap();
 
         assert_eq!(default_result.num_rows(), capped_result.num_rows());
+    }
+
+    /// A parallelism of 0 would make `try_buffered(0)` hang forever, so it must be
+    /// rejected when constructing the plan node.
+    #[test_log::test(tokio::test)]
+    async fn test_zero_parallelism_rejected() {
+        let fixture = TestFixture::new().await;
+
+        for mode in [
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(0),
+            FilteredReadThreadingMode::MultiplePartitions(0),
+        ] {
+            let options =
+                FilteredReadOptions::basic_full_read(&fixture.dataset).with_threading_mode(mode);
+            let err = FilteredReadExec::try_new(fixture.dataset.clone(), options, None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("must be greater than 0"),
+                "unexpected error: {}",
+                err
+            );
+        }
     }
 }
