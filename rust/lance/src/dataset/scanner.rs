@@ -1380,6 +1380,8 @@ impl Scanner {
     ///
     /// This bounds the decode fan-out of the scan: at most this many batch-decode
     /// tasks run in flight at once. Defaults to `get_num_compute_intensive_cpus()`.
+    ///
+    /// `nbatches` must be greater than zero.
     pub fn batch_readahead(&mut self, nbatches: usize) -> &mut Self {
         self.batch_readahead = nbatches;
         self
@@ -2369,6 +2371,12 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
+        if self.batch_readahead == 0 {
+            return Err(Error::invalid_input_source(
+                "batch_readahead must be greater than 0, got 0".into(),
+            ));
+        }
+
         if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
             return Err(Error::invalid_input_source(
                 "include_deleted_rows is set but with_row_id is false".into(),
@@ -12410,6 +12418,17 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_eq!(
             filtered.options().threading_mode,
             FilteredReadThreadingMode::OnePartitionMultipleThreads(3),
+        );
+
+        let mut scanner = dataset.scan();
+        scanner.batch_readahead(0);
+        let Err(Error::InvalidInput { source, .. }) = scanner.create_plan().await else {
+            panic!("expected batch_readahead=0 to be rejected");
+        };
+        assert!(
+            source
+                .to_string()
+                .contains("batch_readahead must be greater than 0")
         );
     }
 
