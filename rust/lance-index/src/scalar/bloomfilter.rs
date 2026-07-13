@@ -49,6 +49,10 @@ const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
 const NULL_BITMAP_META_KEY: &str = "null_bitmap";
 const BLOOMFILTER_PROBABILITY_META_KEY: &str = "bloomfilter_probability";
+/// Upper bound on the total serialized bytes packed into a single bloom filter
+/// `BinaryArray`. Its offsets are `i32`, so the concatenated payload cannot exceed
+/// `i32::MAX`. We reserve a 1 MiB margin below that hard limit so per-row Arrow
+/// bookkeeping (offset and validity buffers) cannot push a batch over the edge.
 const MAX_BLOOMFILTER_ARRAY_LENGTH: usize = i32::MAX as usize - 1024 * 1024;
 const BLOOMFILTER_INDEX_VERSION: u32 = 0;
 
@@ -139,7 +143,7 @@ impl BloomFilterIndex {
         let read_batch_size =
             Self::read_batch_size(number_of_items, probability, max_array_length)?;
 
-        let mut zones = Vec::new();
+        let mut zones = Vec::with_capacity(index_file.num_rows());
         for start in (0..index_file.num_rows()).step_by(read_batch_size) {
             let end = (start + read_batch_size).min(index_file.num_rows());
             let mut bloom_data = index_file.read_range_stream(start..end, None).await?;
@@ -692,6 +696,13 @@ impl BloomFilterIndexBuilder {
         Ok(RecordBatch::try_new(Self::bloomfilter_schema(), columns)?)
     }
 
+    /// Serialize the trained bloom filter zone statistics into an index file in
+    /// `index_store`, returning the resulting [`IndexFile`]s.
+    ///
+    /// Zones are flushed as one or more record batches, each bounded by
+    /// [`MAX_BLOOMFILTER_ARRAY_LENGTH`] serialized bytes so the underlying Arrow
+    /// `BinaryArray` never overflows its `i32` offsets. Any optional null-row bitmap
+    /// is persisted as a global buffer on the same [`IndexFile`] via [`IndexStore`].
     pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<Vec<IndexFile>> {
         self.write_index_with_max_array_length(index_store, MAX_BLOOMFILTER_ARRAY_LENGTH)
             .await
@@ -1366,7 +1377,7 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::{StreamExt, stream};
-    use lance_core::{ROW_ADDR, cache::LanceCache, utils::tempfile::TempObjDir};
+    use lance_core::{Error, ROW_ADDR, cache::LanceCache, utils::tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
 
@@ -2368,6 +2379,10 @@ mod tests {
             BloomFilterIndex::read_batch_size(number_of_items, probability, filter_bytes.len() - 1)
                 .unwrap_err();
         assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(
             error
                 .to_string()
                 .contains("exceeds max supported batch bytes"),
@@ -2385,11 +2400,17 @@ mod tests {
         ));
 
         let row_count = 5_000;
-        let data = arrow_array::Int32Array::from_iter_values(0..row_count);
+        // Sprinkle nulls at known positions (none of which are asserted individually
+        // below) so the chunked write must carry a non-empty null-row bitmap through
+        // multiple flushes and reload it correctly via add_global_buffer.
+        let expected_null_count = (0..row_count).filter(|&i| i % 100 == 50).count();
+        let data = arrow_array::Int32Array::from_iter(
+            (0..row_count).map(|i| (i % 100 != 50).then_some(i)),
+        );
         let schema = Arc::new(Schema::new(vec![Field::new(
             VALUE_COLUMN_NAME,
             DataType::Int32,
-            false,
+            true,
         )]));
         let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
@@ -2431,6 +2452,18 @@ mod tests {
         assert_eq!(index.zones[4999].bound.start, 4999);
         assert_eq!(index.zones[4999].bound.length, 1);
         assert!(!index.zones[4096].bloom_filter.to_bytes().is_empty());
+
+        // The null-row bitmap is stored as a global buffer, independent of the chunked
+        // zone batches. Verify it survives the multi-flush write and reloads intact.
+        let null_rows = index
+            .null_rows
+            .as_ref()
+            .expect("chunked write must preserve the null-row bitmap");
+        let loaded_null_count = null_rows
+            .row_addrs()
+            .map(|addrs| addrs.count())
+            .unwrap_or(0);
+        assert_eq!(loaded_null_count, expected_null_count);
     }
 
     #[tokio::test]
@@ -2451,6 +2484,10 @@ mod tests {
         // One filter fits, two together do not.
         let max_array_length = filter_bytes.len();
         let error = BloomFilterIndex::try_from_serialized(batch, max_array_length).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
         assert!(
             error
                 .to_string()
@@ -2489,6 +2526,10 @@ mod tests {
             .write_index_with_max_array_length(test_store.as_ref(), 16)
             .await
             .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
         assert!(
             error
                 .to_string()
