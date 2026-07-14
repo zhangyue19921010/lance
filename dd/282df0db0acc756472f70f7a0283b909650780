@@ -1,0 +1,21 @@
+rust/lance-index/src/scalar/bloomfilter.rs
+  s_e17f749235c979::t_a7716e90fc6958 703,2407-2411,2504-2505
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dd282df0db0acc756472f70f7a0283b909650780",
+  "prompts": {},
+  "sessions": {
+    "s_e17f749235c979": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5f72-007d-7923-aa28-e0e1d7256366",
+        "model": "unknown"
+      },
+      "human_author": "zhangyue19921010 <zhangyue921010@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
