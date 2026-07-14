@@ -1470,6 +1470,20 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
     Ok(index_fragmaps)
 }
 
+/// Whether the dataset has any index that compaction would need to remap.
+///
+/// Only non-system indices are remapped per rewrite group; system indices
+/// (fragment-reuse, mem-wal) are handled separately. When there are none,
+/// compacting an address-style dataset has nothing to remap and
+/// therefore does not need to capture row addresses at all.
+async fn has_remappable_index(dataset: &Dataset) -> Result<bool> {
+    Ok(dataset
+        .load_indices()
+        .await?
+        .iter()
+        .any(|idx| !is_system_index(idx)))
+}
+
 pub async fn plan_compaction(
     dataset: &Dataset,
     options: &CompactionOptions,
@@ -1570,8 +1584,11 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
-    // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids();
+    // Capturing row addresses is only useful if something will consume them: an
+    // index to remap now, or deferred remap. With no index, skip it to avoid an
+    // extra scan column and a big treemap.
+    let capture_row_addrs = !dataset.manifest.uses_stable_row_ids()
+        && (options.defer_index_remap || has_remappable_index(dataset.as_ref()).await?);
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -1597,7 +1614,7 @@ async fn rewrite_files(
             options.batch_size,
             options.io_buffer_size,
             true,
-            needs_remapping,
+            capture_row_addrs,
         )
         .await?;
         row_ids_rx = rx_initial;
@@ -1701,7 +1718,7 @@ async fn rewrite_files(
             ));
         }
 
-        if needs_remapping {
+        if capture_row_addrs {
             let (tx, rx) = std::sync::mpsc::channel();
             let mut addrs = RoaringTreemap::new();
             for frag in &fragments {
@@ -1972,7 +1989,9 @@ pub async fn commit_compaction(
     }
 
     // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
+    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
+    let needs_remapping =
+        !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap && has_address_style;
 
     // Determine the earliest version at which compaction tasks were planned/executed.
     //
@@ -1996,7 +2015,6 @@ pub async fn commit_compaction(
     let mut completed_tasks = completed_tasks;
 
     // Single reserve_fragment_ids for all address-style tasks
-    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
     if has_address_style {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
@@ -2976,6 +2994,49 @@ mod tests {
         assert_eq!(dataset.manifest.uses_stable_row_ids(), use_stable_row_id,);
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn test_skip_rowid_capture_when_no_index(#[values(false, true)] has_index: bool) {
+        let test_dir = TempStrDir::default();
+
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9000))], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 3000, // 3 fragments
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, &test_dir, Some(write_params))
+            .await
+            .unwrap();
+        assert!(!dataset.manifest.uses_stable_row_ids());
+
+        if has_index {
+            dataset
+                .create_index(
+                    &["a"],
+                    IndexType::Scalar,
+                    Some("a_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 9000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+
+        let result = rewrite_files(Cow::Borrowed(&dataset), plan.tasks()[0].clone(), &options)
+            .await
+            .unwrap();
+        assert_eq!(result.row_addrs.is_some(), has_index);
+    }
+
     #[tokio::test]
     async fn test_stable_row_indices() {
         // Validate behavior of indices after compaction with stable row ids.
@@ -3227,6 +3288,16 @@ mod tests {
 
         // Create a scalar index to check this is not touched
         dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset2
             .create_index(
                 &["i"],
                 IndexType::Scalar,
