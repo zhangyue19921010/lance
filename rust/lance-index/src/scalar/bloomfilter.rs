@@ -700,7 +700,7 @@ impl BloomFilterIndexBuilder {
     /// `index_store`, returning the resulting [`IndexFile`]s.
     ///
     /// Zones are flushed as one or more record batches, each bounded by
-    /// [`MAX_BLOOMFILTER_ARRAY_LENGTH`] serialized bytes so the underlying Arrow
+    /// `MAX_BLOOMFILTER_ARRAY_LENGTH` serialized bytes so the underlying Arrow
     /// `BinaryArray` never overflows its `i32` offsets. Any optional null-row bitmap
     /// is persisted as a global buffer on the same [`IndexFile`] via [`IndexStore`].
     pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<Vec<IndexFile>> {
@@ -2404,15 +2404,11 @@ mod tests {
         // below) so the chunked write must carry a non-empty null-row bitmap through
         // multiple flushes and reload it correctly via add_global_buffer.
         let expected_null_count = (0..row_count).filter(|&i| i % 100 == 50).count();
-        let data = arrow_array::Int32Array::from_iter(
-            (0..row_count).map(|i| (i % 100 != 50).then_some(i)),
-        );
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::Int32,
-            true,
-        )]));
-        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
+        let values = (0..row_count)
+            .map(|i| (i % 100 != 50).then_some(i))
+            .collect::<Vec<_>>();
+        let data = record_batch!((VALUE_COLUMN_NAME, Int32, values)).unwrap();
+        let schema = data.schema();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::once(std::future::ready(Ok(data))),
@@ -2505,13 +2501,8 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let data = arrow_array::Int32Array::from_iter_values(0..1);
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            VALUE_COLUMN_NAME,
-            DataType::Int32,
-            false,
-        )]));
-        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
+        let data = record_batch!((VALUE_COLUMN_NAME, Int32, [0])).unwrap();
+        let schema = data.schema();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::once(std::future::ready(Ok(data))),
