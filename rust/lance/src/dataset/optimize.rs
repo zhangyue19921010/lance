@@ -1480,7 +1480,7 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
 /// Only non-system indices are remapped per rewrite group; system indices
 /// (fragment-reuse, mem-wal) are handled separately. When there are none,
 /// compacting an address-style dataset has nothing to remap and
-/// therefore does not need to capture row addresses at all.
+/// therefore does not need to capture row addresses at all
 async fn has_remappable_index(dataset: &Dataset) -> Result<bool> {
     Ok(dataset
         .load_indices()
