@@ -154,6 +154,7 @@ geoarrow-schema = "0.8"
 geodatafusion = "0.4.0"
 geo-traits = "0.3.0"
 geo-types = "0.7.16"
+goosefs-sdk = "=0.1.5"
 http = "1.1.0"
 humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
