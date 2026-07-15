@@ -1,0 +1,23 @@
+Cargo.toml
+  s_d551075033d4bd::t_0b01fdcad2d7bd 157
+rust/lance-io/Cargo.toml
+  s_d551075033d4bd::t_885b6bde0b0c39 38,80-81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0da704c38dca2cc2c78c6733b7283a11550e9791",
+  "prompts": {},
+  "sessions": {
+    "s_d551075033d4bd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f65c1-6545-78d3-91d1-7369f0568640",
+        "model": "unknown"
+      },
+      "human_author": "zhangyue19921010 <zhangyue.1010@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
