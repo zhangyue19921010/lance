@@ -1,0 +1,27 @@
+rust/lance-select/src/mask/nullable.rs
+  s_a2486cbbcd26c8::t_1a7b5f1128285b 81-87
+rust/lance/src/index/append.rs
+  s_a2486cbbcd26c8::t_fb4edd9a63b640 889-892,2706-3016
+rust/lance/src/index/scalar_logical.rs
+  s_a2486cbbcd26c8::t_c8fb2f7ddcba21 32-44,54-59,82,88,91-99,107-112,169-181,347-393,418,420-423
+rust/lance-select/src/mask.rs
+  s_a2486cbbcd26c8::t_395557dc40e7c9 575-581
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "961706e4aee064d7eaaec5b3025f57e1e64ae7e7",
+  "prompts": {},
+  "sessions": {
+    "s_a2486cbbcd26c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d199074a-30a0-44db-ab48-4ad9252fc0da",
+        "model": "unknown"
+      },
+      "human_author": "zhangyue19921010 <zhangyue921010@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
