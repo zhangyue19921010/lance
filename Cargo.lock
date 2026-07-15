@@ -4885,6 +4885,7 @@ dependencies = [
  "chrono",
  "criterion",
  "futures",
+ "goosefs-sdk",
  "http 1.4.2",
  "io-uring",
  "lance-arrow",
