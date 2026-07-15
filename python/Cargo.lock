@@ -4459,6 +4459,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "goosefs-sdk",
  "http 1.4.2",
  "io-uring",
  "lance-arrow",
