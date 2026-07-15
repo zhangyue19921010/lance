@@ -3054,8 +3054,10 @@ mod tests {
     }
 
     #[rstest]
+    #[case::without_index(false)]
+    #[case::with_index(true)]
     #[tokio::test]
-    async fn test_skip_rowid_capture_when_no_index(#[values(false, true)] has_index: bool) {
+    async fn test_skip_rowid_capture_when_no_index(#[case] has_index: bool) {
         let test_dir = TempStrDir::default();
 
         let data = sample_data();
@@ -3094,6 +3096,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.row_addrs.is_some(), has_index);
+        if let Some(row_addrs_bytes) = &result.row_addrs {
+            let row_addrs =
+                RoaringTreemap::deserialize_from(&mut Cursor::new(row_addrs_bytes)).unwrap();
+            assert_eq!(row_addrs.len(), 9000);
+        }
     }
 
     #[tokio::test]
