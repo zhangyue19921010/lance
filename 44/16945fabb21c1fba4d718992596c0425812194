@@ -1,0 +1,30 @@
+rust/lance/src/index/scalar_logical.rs
+  s_a2486cbbcd26c8::t_2a471548f89048 1846-1848
+  s_a2486cbbcd26c8::t_0edb03df83abc3 1850-1852,1857-1859
+  s_a2486cbbcd26c8::t_f6b07ddc964838 1861-1863,1904-1906
+  s_a2486cbbcd26c8::t_cea66bfd2ead9e 411-412,416,427,1730-1845,1853-1856,1864-1903
+  s_a2486cbbcd26c8::t_c8fb2f7ddcba21 32-33,65,71,74-82,90-95,152-164,330-370,395,397-400,1849,1860,1907
+rust/lance-select/src/mask/nullable.rs
+  s_a2486cbbcd26c8::t_1a7b5f1128285b 82-88
+  s_a2486cbbcd26c8::t_db0659baedf703 5
+rust/lance-select/src/mask.rs
+  s_a2486cbbcd26c8::t_395557dc40e7c9 575-582
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4416945fabb21c1fba4d718992596c0425812194",
+  "prompts": {},
+  "sessions": {
+    "s_a2486cbbcd26c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d199074a-30a0-44db-ab48-4ad9252fc0da",
+        "model": "unknown"
+      },
+      "human_author": "zhangyue19921010 <zhangyue921010@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
