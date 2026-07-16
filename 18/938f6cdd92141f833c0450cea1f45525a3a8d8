@@ -1,0 +1,25 @@
+Cargo.lock
+  s_d551075033d4bd::t_bdf57929c1c3c7 4888
+java/lance-jni/Cargo.lock
+  s_d551075033d4bd::t_571a2e0962bfbf 4052
+python/Cargo.lock
+  s_d551075033d4bd::t_089a6c2f095929 4462
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "18938f6cdd92141f833c0450cea1f45525a3a8d8",
+  "prompts": {},
+  "sessions": {
+    "s_d551075033d4bd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f65c1-6545-78d3-91d1-7369f0568640",
+        "model": "unknown"
+      },
+      "human_author": "zhangyue19921010 <zhangyue.1010@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
