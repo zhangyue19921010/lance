@@ -1,0 +1,21 @@
+rust/lance-table/src/io/commit.rs
+  s_d9d3dd69cfad45::t_49a4cef06a9796 1969-1979,1984-1989
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8ba0ef10b86f754aa7bd414b96e97ff415e4ba29",
+  "prompts": {},
+  "sessions": {
+    "s_d9d3dd69cfad45": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec282825-0993-498f-94ee-417bbb2e335a",
+        "model": "unknown"
+      },
+      "human_author": "zhangyue19921010 <zhangyue921010@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
