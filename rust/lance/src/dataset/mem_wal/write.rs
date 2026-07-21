@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 pub use super::index::{
     BTreeIndexConfig, BTreeMemIndex, FtsIndexConfig, HnswIndexConfig, IndexStore, MemIndexConfig,
+    validate_index_configs,
 };
 pub use super::memtable::CacheConfig;
 pub use super::memtable::MemTable;
@@ -926,7 +927,7 @@ async fn replay_memtable_from_wal(
                     stored.push(s.clone());
                 }
             }
-            tokio::task::spawn_blocking(move || indexes.insert_batches_parallel(&stored))
+            tokio::task::spawn_blocking(move || indexes.insert_batches(&stored))
                 .await
                 .map_err(|e| {
                     Error::internal(format!("WAL replay index update task panicked: {}", e))
@@ -1476,6 +1477,13 @@ impl ShardWriter {
         let pk_fields = lance_schema.unenforced_primary_key();
         let pk_field_ids: Vec<i32> = pk_fields.iter().map(|f| f.id).collect();
         let pk_columns: Vec<String> = pk_fields.iter().map(|f| f.name.clone()).collect();
+
+        // Reject an index config that disagrees with the schema *before* a
+        // single row is accepted. Such a config fails deterministically on every
+        // insert, including inserts replayed from the WAL — so once a row is
+        // durable the shard can never reopen. Fail the open instead.
+        validate_index_configs(index_configs, schema.as_ref(), &pk_columns)?;
+
         let mut memtable = MemTable::with_capacity(
             schema.clone(),
             manifest.current_generation,
@@ -2082,6 +2090,10 @@ impl ShardWriter {
 
     /// Get current MemTable statistics. Returns an error in WAL-only mode
     /// (no MemTable exists).
+    ///
+    /// Deliberately does *not* `check_poisoned`, unlike the read and write
+    /// paths: a poisoned writer is exactly when an operator most needs to see
+    /// its state, and the caller deciding whether to evict reads these stats.
     pub async fn memtable_stats(&self) -> Result<MemTableStats> {
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
@@ -2110,8 +2122,9 @@ impl ShardWriter {
     /// The scanner captures the current `max_visible_batch_position` from the
     /// `IndexStore` at construction time to ensure consistent visibility.
     ///
-    /// Returns an error in WAL-only mode.
+    /// Returns an error in WAL-only mode, or if the writer is poisoned.
     pub async fn scan(&self) -> Result<MemTableScanner> {
+        self.wal_flusher.check_poisoned()?;
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
         Ok(state.memtable.scan())
@@ -2121,10 +2134,11 @@ impl ShardWriter {
     /// Prefer [`Self::in_memory_memtable_refs`] on the read path — it also
     /// carries frozen-awaiting-flush generations.
     ///
-    /// Returns an error in WAL-only mode.
+    /// Returns an error in WAL-only mode, or if the writer is poisoned.
     pub async fn active_memtable_ref(
         &self,
     ) -> Result<crate::dataset::mem_wal::scanner::InMemoryMemTableRef> {
+        self.wal_flusher.check_poisoned()?;
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
         Ok(in_memory_ref(&state.memtable))
@@ -2136,10 +2150,11 @@ impl ShardWriter {
     /// path uses this instead of [`Self::active_memtable_ref`] so a
     /// concurrent reader sees no hole while a flush drains.
     ///
-    /// Returns an error in WAL-only mode.
+    /// Returns an error in WAL-only mode, or if the writer is poisoned.
     pub async fn in_memory_memtable_refs(
         &self,
     ) -> Result<crate::dataset::mem_wal::scanner::InMemoryMemTables> {
+        self.wal_flusher.check_poisoned()?;
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
         Ok(crate::dataset::mem_wal::scanner::InMemoryMemTables {
@@ -4918,8 +4933,9 @@ mod tests {
     }
 
     // A durable write whose WAL PUT keeps failing poisons the writer with a
-    // typed persistence failure; the next write fails fast with the same reason;
-    // and once storage heals, reopening replays the WAL and writes resume.
+    // typed persistence failure; the next write *and every read* fail fast with
+    // the same reason; and once storage heals, reopening replays the WAL and
+    // writes resume.
     #[tokio::test]
     async fn test_writer_poisons_on_persistence_failure_and_recovers_on_reopen() {
         let (store, base_path, controls) = failing_memory_store().await;
@@ -4958,6 +4974,31 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.fence_reason(), Some(FenceReason::PersistenceFailure));
+
+        // ...and rejects *reads* too. Batch 0 was committed to the BatchStore
+        // before its WAL PUT failed, so a poisoned writer that still served
+        // reads would hand out a row that is not durable and that replay will
+        // not reproduce — a divergent snapshot. Mirrors SlateDB's
+        // `check_closed()` at the top of every read.
+        for reason in [
+            writer.scan().await.err().and_then(|e| e.fence_reason()),
+            writer
+                .active_memtable_ref()
+                .await
+                .err()
+                .and_then(|e| e.fence_reason()),
+            writer
+                .in_memory_memtable_refs()
+                .await
+                .err()
+                .and_then(|e| e.fence_reason()),
+        ] {
+            assert_eq!(reason, Some(FenceReason::PersistenceFailure));
+        }
+
+        // Stats stay readable: this is what an operator (and the eviction path)
+        // inspects to decide what to do about the poisoned shard.
+        writer.memtable_stats().await.unwrap();
         drop(writer);
 
         // Storage heals: reopening replays the WAL and accepts writes again.
@@ -5031,6 +5072,45 @@ mod tests {
         );
 
         writer_b.close().await.unwrap();
+    }
+
+    /// An index config that disagrees with the schema fails `open()` outright.
+    /// It must not be allowed to accept writes: the insert would fail
+    /// deterministically on every batch, including batches replayed from the
+    /// WAL, so once a row was durable the shard could never reopen. Before this
+    /// check, an FTS index on a non-Utf8 column silently indexed nothing and the
+    /// shard reported healthy.
+    #[tokio::test]
+    async fn test_open_rejects_index_config_that_disagrees_with_schema() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // `id` is Int32, not a string column.
+        let bad_fts = MemIndexConfig::Fts(FtsIndexConfig::new(
+            "bad_fts".to_string(),
+            0,
+            "id".to_string(),
+        ));
+
+        let Err(err) = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema,
+            vec![bad_fts],
+        )
+        .await
+        else {
+            panic!("open must reject an FTS index on a non-Utf8 column");
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains("bad_fts") && message.contains("Utf8"),
+            "error must name the index and the constraint, got: {message}"
+        );
     }
 
     /// Replay is a no-op on a fresh shard: the MemTable starts empty.
