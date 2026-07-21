@@ -260,6 +260,46 @@ public class SessionTest {
   }
 
   @Test
+  void testMetadataCacheStats(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("dataset_metadata_cache_stats").toString();
+
+    try (BufferAllocator allocator = new RootAllocator();
+        Session session = Session.builder().build()) {
+      CacheStats initialStats = session.metadataCacheStats();
+      assertEquals(0, initialStats.getHits());
+      assertEquals(0, initialStats.getMisses());
+
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // First open populates the metadata cache, producing misses
+      try (Dataset ds =
+          Dataset.open().allocator(allocator).uri(datasetPath).session(session).build()) {
+        ds.countRows();
+      }
+      CacheStats statsAfterFirstOpen = session.metadataCacheStats();
+      assertTrue(statsAfterFirstOpen.getMisses() > 0);
+
+      // Reopening the same dataset should hit the shared metadata cache
+      try (Dataset ds =
+          Dataset.open().allocator(allocator).uri(datasetPath).session(session).build()) {
+        ds.countRows();
+      }
+      CacheStats statsAfterSecondOpen = session.metadataCacheStats();
+      assertTrue(statsAfterSecondOpen.getHits() > statsAfterFirstOpen.getHits());
+    }
+  }
+
+  @Test
+  void testMetadataCacheStatsAfterClose() {
+    Session session = Session.builder().build();
+    session.close();
+
+    assertThrows(IllegalArgumentException.class, session::metadataCacheStats);
+  }
+
+  @Test
   void testInvalidCacheSizes() {
     assertThrows(
         IllegalArgumentException.class, () -> Session.builder().indexCacheSizeBytes(-1).build());
