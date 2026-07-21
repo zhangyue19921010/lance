@@ -28,6 +28,7 @@ use std::time::Instant;
 use datafusion::common::ScalarValue;
 
 use super::memtable::batch_store::StoredBatch;
+use super::wal::WriterCursors;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use lance_core::datatypes::Schema as LanceSchema;
@@ -110,9 +111,17 @@ enum PkIndex {
 /// through `put`: `MemTable::insert_batches_only` does a full `Arc<Schema>`
 /// equality check, so a batch that would trip one is rejected before it reaches
 /// the batch store, let alone the WAL.
+///
+/// It also rejects a config whose `field_id` names a different column than its
+/// `column`. Index *selection* keys off `field_id` — a single-column PK reuses
+/// the BTree whose `field_id` matches its key — so a config resolved only by name
+/// could be bound under the wrong identity, serving stale reads and flushing the
+/// wrong column into the durable PK sidecar. `lance_schema` supplies the
+/// authoritative name→id mapping.
 pub fn validate_index_configs(
     configs: &[MemIndexConfig],
     schema: &ArrowSchema,
+    lance_schema: &LanceSchema,
     pk_columns: &[String],
 ) -> Result<()> {
     for config in configs {
@@ -185,24 +194,42 @@ pub fn validate_index_configs(
                 }
             },
         }
+
+        // The column resolves, but index selection keys off `field_id`, not name.
+        // A config whose `field_id` identifies a *different* column would be bound
+        // under the wrong identity (e.g. reused as the single-column PK index), so
+        // reject any `field_id` that does not name the resolved column.
+        let resolved_field_id = lance_schema
+            .field(column)
+            .expect("column resolved in the Arrow schema is present in the Lance schema")
+            .id;
+        if resolved_field_id != config.field_id() {
+            return Err(Error::invalid_input(format!(
+                "index '{}' is configured with field_id {} but its column '{}' has field_id {} \
+                 in the shard schema",
+                config.name(),
+                config.field_id(),
+                column,
+                resolved_field_id,
+            )));
+        }
     }
 
-    // A single-column PK aliases a BTree entry (any type). Only a *composite* PK
-    // builds an order-preserving encoded key, and only some types encode.
-    if pk_columns.len() > 1 {
-        for column in pk_columns {
-            let field = schema.field_with_name(column).map_err(|_| {
-                Error::invalid_input(format!(
-                    "primary-key column '{column}' is not in the shard schema"
-                ))
-            })?;
-            if !is_encodable_pk_type(field.data_type()) {
-                return Err(Error::invalid_input(format!(
-                    "composite primary-key column '{column}' has type {:?}, which has no \
-                     order-preserving key encoding",
-                    field.data_type()
-                )));
-            }
+    // Every PK column must exist in the schema. A single-column PK aliases a
+    // BTree entry (any type); only a *composite* PK builds an order-preserving
+    // encoded key, and only some types encode.
+    for column in pk_columns {
+        let field = schema.field_with_name(column).map_err(|_| {
+            Error::invalid_input(format!(
+                "primary-key column '{column}' is not in the shard schema"
+            ))
+        })?;
+        if pk_columns.len() > 1 && !is_encodable_pk_type(field.data_type()) {
+            return Err(Error::invalid_input(format!(
+                "composite primary-key column '{column}' has type {:?}, which has no \
+                 order-preserving key encoding",
+                field.data_type()
+            )));
         }
     }
 
@@ -393,9 +420,9 @@ impl MemIndexConfig {
 /// Indexes are keyed by index name. Each index stores its field_id for
 /// stable column-to-index resolution (column name → field_id → index).
 ///
-/// The store also carries the MemTable's `max_visible_batch_position`
-/// watermark — the highest batch position that is durable in the WAL and
-/// therefore safe for scanners to read. Scanners snapshot this at plan
+/// The store also carries the MemTable's two cursors: `indexed_count` (what the
+/// index layer has ingested) and `visible_count` (what is indexed *and* durable,
+/// and therefore safe for scanners to read). Scanners snapshot the latter at plan
 /// construction time so every plan keys on a stable MVCC cursor.
 pub struct IndexStore {
     /// BTree indexes keyed by index name. `Arc` so the primary-key BTrees can be
@@ -409,10 +436,23 @@ pub struct IndexStore {
     /// primary key. Queried via [`Self::pk_newest_visible`] (see
     /// [`Self::enable_pk_index`]).
     pk_index: Option<PkIndex>,
-    /// Maximum batch position that is durable in the WAL and therefore
-    /// visible to scanners. Advanced unconditionally after a WAL append
-    /// succeeds; not gated on whether any indexes are configured.
-    max_visible_batch_position: AtomicUsize,
+    /// How many batches of this memtable have been fully indexed. An exclusive
+    /// count: 0 means none.
+    ///
+    /// This has only ever been an *indexed* cursor — it is advanced at the end of
+    /// `insert_batches`, once every index insert for the batch has completed, and
+    /// never before. It was named `max_visible_batch_position` and treated as a
+    /// visibility cursor by five read sites, which is how rows became readable
+    /// before they were durable. Publishing is a separate step, and it is the
+    /// writer's to make — see `visible_count`.
+    indexed_count: AtomicUsize,
+
+    /// The writer's cursors, and this memtable's coordinate within them. `None`
+    /// for a bare `IndexStore` (tests, benches), where visibility is just the
+    /// indexed prefix.
+    ///
+    /// Visibility is **derived, never stored**: see `visible_count`.
+    durability: Option<(Arc<WriterCursors>, usize)>,
     /// Conservative flag set once this memtable has observed any primary-key
     /// rewrite while maintaining a search index. Search planners can push top-k
     /// into HNSW/FTS for append-only PK data, but must switch to
@@ -427,7 +467,8 @@ impl Default for IndexStore {
             hnsw_indexes: HashMap::new(),
             fts_indexes: HashMap::new(),
             pk_index: None,
-            max_visible_batch_position: AtomicUsize::new(0),
+            indexed_count: AtomicUsize::new(0),
+            durability: None,
             pk_has_overrides: AtomicBool::new(false),
         }
     }
@@ -455,10 +496,7 @@ impl std::fmt::Debug for IndexStore {
                     }
                 },
             )
-            .field(
-                "max_visible_batch_position",
-                &self.max_visible_batch_position.load(Ordering::Acquire),
-            )
+            .field("indexed_count", &self.indexed_count.load(Ordering::Acquire))
             .field(
                 "pk_has_overrides",
                 &self.pk_has_overrides.load(Ordering::Acquire),
@@ -850,26 +888,25 @@ impl IndexStore {
         let had_existing = self.insert_composite_pk(batch, row_offset, track_pk_overrides)?;
         self.mark_pk_overrides_if_needed(had_existing);
 
-        // Update global watermark after all indexes have been updated
+        // Update the indexed prefix after every index has been updated.
         if let Some(bp) = batch_position {
-            self.advance_max_visible_batch_position(bp);
+            self.advance_indexed_count(bp + 1);
         }
 
         Ok(())
     }
 
-    /// Advance the visibility watermark to at least `batch_pos`.
+    /// Advance the indexed prefix to at least `count` batches.
     ///
-    /// The watermark only ever moves forward (idempotent max). The vector
-    /// planner relies on the insert paths setting `pk_has_overrides` before
-    /// calling this method, so any snapshot that can see a PK rewrite also
-    /// observes `pk_has_overrides == true`.
-    pub(crate) fn advance_max_visible_batch_position(&self, batch_pos: usize) {
-        let mut current = self.max_visible_batch_position.load(Ordering::Acquire);
-        while batch_pos > current {
-            match self.max_visible_batch_position.compare_exchange_weak(
+    /// Only ever moves forward (idempotent max). The vector planner relies on the
+    /// insert paths setting `pk_has_overrides` before this is called, so any
+    /// snapshot that can see a PK rewrite also observes `pk_has_overrides == true`.
+    pub(crate) fn advance_indexed_count(&self, count: usize) {
+        let mut current = self.indexed_count.load(Ordering::Acquire);
+        while count > current {
+            match self.indexed_count.compare_exchange_weak(
                 current,
-                batch_pos,
+                count,
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
@@ -1014,9 +1051,10 @@ impl IndexStore {
         }
         self.mark_pk_overrides_if_needed(had_existing);
 
-        // Update global watermark to the max batch position
+        // The indexed prefix now covers every batch up to and including the
+        // highest position in this call, so the count is that position plus one.
         let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
-        self.advance_max_visible_batch_position(max_bp);
+        self.advance_indexed_count(max_bp + 1);
 
         Ok(duration_map)
     }
@@ -1096,15 +1134,36 @@ impl IndexStore {
         self.btree_indexes.len() + self.hnsw_indexes.len() + self.fts_indexes.len()
     }
 
-    /// Get the visibility watermark (max batch position safe to read).
+    /// How many batches of this memtable have been fully indexed (exclusive
+    /// count; 0 before any batch is indexed).
     ///
-    /// Returns the highest batch position whose data is durable in the WAL
-    /// and therefore visible to scanners. Scanners snapshot this at plan
-    /// construction time so every plan runs against a stable cursor.
+    /// This is the *indexed* cursor, not the visibility watermark: it advances
+    /// once every index insert for a batch completes, regardless of WAL
+    /// durability. Readers must snapshot [`Self::visible_count`], which derives
+    /// what is safe to read from this cursor and the writer's durability cursor.
+    pub fn indexed_count(&self) -> usize {
+        self.indexed_count.load(Ordering::Acquire)
+    }
+
+    /// The prefix of this memtable that readers may see. Snapshot this, never
+    /// `indexed_count`.
     ///
-    /// Returns 0 before any WAL flush has advanced the watermark.
-    pub fn max_visible_batch_position(&self) -> usize {
-        self.max_visible_batch_position.load(Ordering::Acquire)
+    /// Derived on every call from the two cursors rather than cached, so there is
+    /// no published value that can be left stale by a race between the two tasks
+    /// that advance them. A bare `IndexStore` has no writer, so its visible
+    /// prefix is simply what has been indexed.
+    pub fn visible_count(&self) -> usize {
+        let indexed = self.indexed_count();
+        match &self.durability {
+            Some((cursors, global_offset)) => cursors.visible_count(indexed, *global_offset),
+            None => indexed,
+        }
+    }
+
+    /// Bind this memtable's indexes to the writer's cursors. Called once at
+    /// construction, before the memtable is published.
+    pub(crate) fn set_durability(&mut self, cursors: Arc<WriterCursors>, global_offset: usize) {
+        self.durability = Some((cursors, global_offset));
     }
 }
 
@@ -1636,6 +1695,10 @@ mod tests {
     #[case::btree_missing_column(MemIndexConfig::BTree(BTreeIndexConfig {
         name: "idx".into(), field_id: 9, column: "nope".into(),
     }), Some("not in the shard schema"))]
+    // Column exists, but its field_id names a *different* column ("id" is 0, not 1).
+    #[case::btree_field_id_column_mismatch(MemIndexConfig::BTree(BTreeIndexConfig {
+        name: "idx".into(), field_id: 1, column: "id".into(),
+    }), Some("has field_id 0"))]
     #[case::fts_ok(MemIndexConfig::Fts(FtsIndexConfig::new(
         "idx".into(), 1, "description".into(),
     )), None)]
@@ -1662,7 +1725,8 @@ mod tests {
         #[case] expected_error: Option<&str>,
     ) {
         let schema = vector_schema();
-        let result = validate_index_configs(&[config], &schema, &[]);
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let result = validate_index_configs(&[config], &schema, &lance_schema, &[]);
         match expected_error {
             None => result.expect("valid config must pass validation"),
             Some(fragment) => {
@@ -1691,24 +1755,36 @@ mod tests {
                 true,
             ),
         ]));
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
 
-        validate_index_configs(&[], &schema, &["id".into(), "name".into()])
+        validate_index_configs(&[], &schema, &lance_schema, &["id".into(), "name".into()])
             .expect("Int32 + Utf8 composite PK must be encodable");
 
-        let err = validate_index_configs(&[], &schema, &["id".into(), "coords".into()])
-            .expect_err("a FixedSizeList PK column has no order-preserving encoding");
+        let err =
+            validate_index_configs(&[], &schema, &lance_schema, &["id".into(), "coords".into()])
+                .expect_err("a FixedSizeList PK column has no order-preserving encoding");
         assert!(
             err.to_string().contains("order-preserving key encoding"),
             "error must name the reason, got {err}"
         );
 
         // A single-column PK of the same type is fine: it aliases a BTree.
-        validate_index_configs(&[], &schema, &["coords".into()])
+        validate_index_configs(&[], &schema, &lance_schema, &["coords".into()])
             .expect("single-column PK aliases a BTree and accepts any type");
+
+        // But every PK column must exist. A single-column PK naming an absent
+        // column is rejected here, not left to fail deterministically on every
+        // later index build and WAL replay.
+        let err = validate_index_configs(&[], &schema, &lance_schema, &["missing".into()])
+            .expect_err("a single-column PK on an absent column must be rejected");
+        assert!(
+            err.to_string().contains("not in the shard schema"),
+            "error must name the missing column, got {err}"
+        );
     }
 
     #[test]
-    fn test_index_store_max_visible_batch_position() {
+    fn test_index_store_indexed_count() {
         let schema = create_test_schema();
         let mut registry = IndexStore::new();
 
@@ -1717,7 +1793,7 @@ mod tests {
         registry.add_fts("desc_idx".to_string(), 2, "description".to_string());
 
         // Initial watermark should be 0 (no data indexed yet)
-        assert_eq!(registry.max_visible_batch_position(), 0);
+        assert_eq!(registry.indexed_count(), 0);
 
         // Insert with batch position tracking
         let batch = create_test_batch(&schema, 0);
@@ -1725,20 +1801,20 @@ mod tests {
             .insert_with_batch_position(&batch, 0, Some(5))
             .unwrap();
 
-        // Now watermark should be 5
-        assert_eq!(registry.max_visible_batch_position(), 5);
+        // Indexing batch position 5 means the prefix [0, 6) is indexed.
+        assert_eq!(registry.indexed_count(), 6);
 
         // Insert with higher batch position
         registry
             .insert_with_batch_position(&batch, 3, Some(10))
             .unwrap();
 
-        // Watermark should advance to 10
-        assert_eq!(registry.max_visible_batch_position(), 10);
+        // Advances to cover batch position 10.
+        assert_eq!(registry.indexed_count(), 11);
 
-        // Insert without batch position shouldn't change watermark
+        // Insert without batch position shouldn't change the cursor
         registry.insert(&batch, 6).unwrap();
-        assert_eq!(registry.max_visible_batch_position(), 10);
+        assert_eq!(registry.indexed_count(), 11);
     }
 
     /// `insert_batches` picks the inline or the threaded path by row count, so
@@ -1772,7 +1848,7 @@ mod tests {
             );
         }
         assert_eq!(registry.get_fts("desc_idx").unwrap().doc_count(), num_rows);
-        assert_eq!(registry.max_visible_batch_position(), 2);
+        assert_eq!(registry.indexed_count(), 3);
     }
 
     #[test]
