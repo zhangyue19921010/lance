@@ -137,6 +137,26 @@ pub(crate) async fn write_transaction_file(
     Ok(file_name)
 }
 
+/// Transactions serialized above this size are not inlined into the manifest.
+pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
+
+/// Decide whether `transaction` is small enough to inline into the manifest,
+/// and derive the write config to commit it with: a transaction too large to
+/// inline must be written to the external transaction file unconditionally —
+/// it is then the only durable copy — even if the config asked to skip it.
+fn inline_transaction_config(
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+) -> (bool, ManifestWriteConfig) {
+    let inline = pb::Transaction::from(transaction).encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+    let write_config = if inline {
+        write_config.clone()
+    } else {
+        write_config.with_transaction_file_enabled()
+    };
+    (inline, write_config)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn do_commit_new_dataset(
     object_store: &ObjectStore,
@@ -148,6 +168,9 @@ async fn do_commit_new_dataset(
     metadata_cache: &DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    let (inline_transaction, write_config) = inline_transaction_config(transaction, write_config);
+    let write_config = &write_config;
+
     let transaction_file = if !write_config.disable_transaction_file() {
         write_transaction_file(object_store, base_path, transaction).await?
     } else {
@@ -215,6 +238,7 @@ async fn do_commit_new_dataset(
             new_manifest.branch = None;
             new_manifest.tag = None;
             new_manifest.index_section = None; // will be rewritten below
+            new_manifest.transaction_file = Some(transaction_file.clone());
             let mut new_frags = new_manifest.fragments.as_ref().clone();
             for f in &mut new_frags {
                 for df in &mut f.files {
@@ -262,7 +286,7 @@ async fn do_commit_new_dataset(
         },
         write_config,
         manifest_naming_scheme,
-        Some(transaction),
+        inline_transaction.then_some(transaction),
     )
     .await;
 
@@ -783,6 +807,9 @@ pub(crate) async fn do_commit_detached_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
 ) -> Result<(Manifest, ManifestLocation)> {
+    let (inline_transaction, write_config) = inline_transaction_config(transaction, write_config);
+    let write_config = &write_config;
+
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
     let transaction_file = if !write_config.disable_transaction_file() {
@@ -842,7 +869,7 @@ pub(crate) async fn do_commit_detached_transaction(
             },
             write_config,
             ManifestNamingScheme::V2,
-            Some(transaction),
+            inline_transaction.then_some(transaction),
         )
         .await;
 
@@ -981,6 +1008,12 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
+        // Recomputed every attempt: the rebase above may have rewritten the
+        // transaction.
+        let (inline_transaction, write_config) =
+            inline_transaction_config(&transaction, write_config);
+        let write_config = &write_config;
+
         current_transaction_file = if !write_config.disable_transaction_file() {
             write_transaction_file(object_store, &dataset.base, &transaction).await?
         } else {
@@ -1047,7 +1080,7 @@ pub(crate) async fn commit_transaction(
             },
             write_config,
             manifest_naming_scheme,
-            Some(&transaction),
+            inline_transaction.then_some(&transaction),
         )
         .await;
 
