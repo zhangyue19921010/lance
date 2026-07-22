@@ -85,17 +85,6 @@ pub struct ShardWriterConfig {
     /// - Lower latency, batched S3 operations
     pub durable_write: bool,
 
-    /// Whether to update indexes synchronously on each write.
-    ///
-    /// When true:
-    /// - Newly written data is immediately searchable via indexes
-    /// - Higher latency due to index update overhead
-    ///
-    /// When false:
-    /// - Index updates are deferred
-    /// - New data may not appear in index-accelerated queries immediately
-    pub sync_indexed_write: bool,
-
     /// Maximum WAL buffer size in bytes before triggering a flush.
     ///
     /// This is a soft threshold - write batches are atomic and won't be split.
@@ -167,23 +156,6 @@ pub struct ShardWriterConfig {
     /// Default: 30 seconds
     pub backpressure_log_interval: Duration,
 
-    /// Maximum rows to buffer before flushing to async indexes.
-    ///
-    /// Only applies when `sync_indexed_write` is false. Larger values enable
-    /// better vectorization but increase memory usage and latency before data
-    /// becomes searchable.
-    ///
-    /// Default: 10,000 rows
-    pub async_index_buffer_rows: usize,
-
-    /// Maximum time to buffer before flushing to async indexes.
-    ///
-    /// Only applies when `sync_indexed_write` is false. Ensures bounded latency
-    /// for data to become searchable even during low write throughput.
-    ///
-    /// Default: 1 second
-    pub async_index_interval: Duration,
-
     /// Interval for periodic stats logging.
     ///
     /// Stats (write throughput, backpressure events, memtable size) are logged
@@ -225,8 +197,7 @@ pub struct ShardWriterConfig {
     ///   `durable_write` settings as MemTable mode.
     ///
     /// MemTable-tied tunables (`max_memtable_size`, `max_memtable_rows`,
-    /// `max_memtable_batches`, `sync_indexed_write`, `async_index_buffer_rows`,
-    /// `async_index_interval`) are ignored when `enable_memtable == false`.
+    /// `max_memtable_batches`) are ignored when `enable_memtable == false`.
     ///
     /// For raw single-entry synchronous atomic appends with no buffering and
     /// no background tasks, use `WalAppender` directly — it is a strictly
@@ -270,7 +241,6 @@ impl Default for ShardWriterConfig {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: true,
             max_wal_buffer_size: 10 * 1024 * 1024, // 10MB
             max_wal_flush_interval: Some(Duration::from_millis(100)), // 100ms
             max_wal_persist_retries: 3,
@@ -281,8 +251,6 @@ impl Default for ShardWriterConfig {
             manifest_scan_batch_size: 2,
             max_unflushed_memtable_bytes: 1024 * 1024 * 1024, // 1GB
             backpressure_log_interval: Duration::from_secs(30),
-            async_index_buffer_rows: 10_000,
-            async_index_interval: Duration::from_secs(1),
             stats_log_interval: Some(Duration::from_secs(60)), // 1 minute
             frozen_memtable_grace: Duration::ZERO,
             enable_memtable: true,
@@ -312,12 +280,6 @@ impl ShardWriterConfig {
     /// Set durable writes mode.
     pub fn with_durable_write(mut self, durable: bool) -> Self {
         self.durable_write = durable;
-        self
-    }
-
-    /// Set indexed writes mode.
-    pub fn with_sync_indexed_write(mut self, indexed: bool) -> Self {
-        self.sync_indexed_write = indexed;
         self
     }
 
@@ -380,18 +342,6 @@ impl ShardWriterConfig {
     /// Set backpressure log interval.
     pub fn with_backpressure_log_interval(mut self, interval: Duration) -> Self {
         self.backpressure_log_interval = interval;
-        self
-    }
-
-    /// Set async index buffer rows.
-    pub fn with_async_index_buffer_rows(mut self, rows: usize) -> Self {
-        self.async_index_buffer_rows = rows;
-        self
-    }
-
-    /// Set async index interval.
-    pub fn with_async_index_interval(mut self, interval: Duration) -> Self {
-        self.async_index_interval = interval;
         self
     }
 
@@ -468,7 +418,13 @@ impl<T: Send + Debug + 'static> TaskDispatcher<T> {
         let mut ticker_intervals: Vec<(Interval, MessageFactory<T>)> = tickers
             .into_iter()
             .map(|(duration, factory)| {
-                let interval = interval_at(tokio::time::Instant::now() + duration, duration);
+                let mut interval = interval_at(tokio::time::Instant::now() + duration, duration);
+                // `Burst` (the default) replays every tick missed while `handle()`
+                // was running. A WAL append can easily outlast its own interval, so
+                // the missed ticks pile up, the ticker arm below is always ready,
+                // and — being `biased` — it starves `rx` indefinitely: freeze
+                // completion cells and `close()`'s final append never get handled.
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 (interval, factory)
             })
             .collect();
@@ -511,12 +467,12 @@ impl<T: Send + Debug + 'static> TaskDispatcher<T> {
                         debug!("Task '{}' received cancellation", self.name);
                         break Ok(());
                     }
-                    _ = first_interval.tick() => {
-                        let message = (ticker_intervals[0].1)();
-                        if let Err(e) = self.handler.handle(message).await {
-                            error!("Task '{}' error handling ticker message: {}", self.name, e);
-                        }
-                    }
+                    // Explicit messages outrank the ticker. A tick is a backstop
+                    // — it only ever *adds* an append that a real trigger would
+                    // have made anyway — whereas a message may be a freeze's
+                    // completion cell or `close()`'s final append, which nothing
+                    // else will deliver. Polling the ticker first (as this did)
+                    // lets a ready tick starve them.
                     msg = self.rx.recv() => {
                         match msg {
                             Some(message) => {
@@ -528,6 +484,12 @@ impl<T: Send + Debug + 'static> TaskDispatcher<T> {
                                 debug!("Task '{}' channel closed", self.name);
                                 break Ok(());
                             }
+                        }
+                    }
+                    _ = first_interval.tick() => {
+                        let message = (ticker_intervals[0].1)();
+                        if let Err(e) = self.handler.handle(message).await {
+                            error!("Task '{}' error handling ticker message: {}", self.name, e);
                         }
                     }
                 }
@@ -1543,6 +1505,21 @@ impl ShardWriter {
             ));
         }
 
+        // A durable writer needs a flush ticker to make progress, in either
+        // mode. With `durable_write` on, a put becomes durable only once its WAL
+        // append lands, and neither mode self-triggers that append per put — the
+        // background ticker drives it. Without an interval (or with a zero one,
+        // which tokio cannot schedule), a small put that never fills the
+        // size-triggered buffer would block until close. Reject the config here
+        // rather than let a put hang.
+        if config.durable_write && config.max_wal_flush_interval.is_none_or(|d| d.is_zero()) {
+            return Err(Error::invalid_input(
+                "durable_write requires a positive max_wal_flush_interval: with no \
+                 flush ticker a durable put has nothing to drive its WAL append and \
+                 would block until close",
+            ));
+        }
+
         // Callers pass the base schema; lance owns the `_tombstone` column and
         // appends it here so the memtable/generation schema = base + tombstone.
         // Idempotent, so a reopen that already extended the schema is a no-op.
@@ -1820,8 +1797,13 @@ impl ShardWriter {
         let backpressure = BackpressureController::new(config.clone());
 
         // Background WAL flush handler — parallel WAL I/O + index updates.
-        let wal_handler =
-            WalFlushHandler::new(wal_flusher.clone(), Some(state.clone()), stats.clone());
+        let wal_handler = WalFlushHandler::new(
+            wal_flusher.clone(),
+            Some(state.clone()),
+            None,
+            config.max_wal_flush_interval,
+            stats.clone(),
+        );
         task_executor.add_handler(
             "wal_flusher".to_string(),
             Box::new(wal_handler),
@@ -1891,9 +1873,25 @@ impl ShardWriter {
         stats: SharedWriteStats,
         task_executor: &Arc<TaskExecutor>,
     ) -> Result<WriterMode> {
+        // The pending queue is shared with the flush handler so a background
+        // tick can resolve to the batches still owed an append — the WAL-only
+        // analog of resolving a tick against the durability cursor in MemTable
+        // mode. A durable put waits on the durability cursor the handler's
+        // append advances, so the ticker must run (`open` rejects durable +
+        // no-interval); a non-durable writer may pass no interval and rely on
+        // the size/close triggers alone.
+        let state = Arc::new(WalOnlyState::default());
+
         // Background WAL flush handler — no MemTable state to consult, so
-        // pass `None` for the frozen-vs-active detection.
-        let wal_handler = WalFlushHandler::new(wal_flusher, None, stats);
+        // pass `None` for the frozen-vs-active detection; the pending queue and
+        // the flush interval drive the background append instead.
+        let wal_handler = WalFlushHandler::new(
+            wal_flusher,
+            None,
+            Some(state.clone()),
+            config.max_wal_flush_interval,
+            stats,
+        );
         task_executor.add_handler(
             "wal_flusher".to_string(),
             Box::new(wal_handler),
@@ -1908,7 +1906,7 @@ impl ShardWriter {
         let backpressure = BackpressureController::new(config.clone());
 
         Ok(WriterMode::WalOnly {
-            state: Arc::new(WalOnlyState::default()),
+            state,
             wal_flush_tx,
             trigger: StdRwLock::new(WalOnlyTriggerState::default()),
             backpressure,
@@ -2196,23 +2194,22 @@ impl ShardWriter {
         // (in-memory, ~ms), so there is no reason to batch it onto the WAL's
         // schedule — that schedule exists to bound S3 API cost, which an
         // in-memory index apply does not incur.
-        if let Some(indexes) = &indexes {
-            writer_state.trigger_index_apply(
-                batch_store.clone(),
-                indexes.clone(),
-                batch_positions.end,
-            )?;
+        if let Some(indexes) = indexes {
+            writer_state.trigger_index_apply(batch_store, indexes, batch_positions.end)?;
         }
 
-        // Trigger the WAL flush here (outside the lock) so the watcher can
-        // resolve; only the `wait()` is the caller's to schedule.
-        if self.config.durable_write {
-            self.wal_flusher.trigger_flush(
-                WalFlushSource::BatchStore { batch_store },
-                batch_positions.end,
-                None,
-            )?;
-        }
+        // The WAL append is *not* triggered here. It happens on the background
+        // ticker (and on the size trigger, and at freeze/close), which is the only
+        // way the flush interval can mean anything: while every durable put
+        // triggered its own append, the interval could add a redundant trigger but
+        // never delay or batch one.
+        //
+        // The cost is real and accepted: a single client's sequential *durable*
+        // throughput drops from ~10 writes/sec (one PUT round-trip) to roughly one
+        // per tick. That is a policy choice — the interval should mean what it
+        // says, and S3 API cost should be bounded. Latency-sensitive callers want
+        // `durable_write: false`, which now costs them durability only, not
+        // visibility.
 
         // The watcher is returned in both modes now. A non-durable put still
         // waits — for its index apply (~ms), not for an S3 PUT (~100ms).
@@ -2247,54 +2244,48 @@ impl ShardWriter {
         // Push batches into the pending queue and capture the assigned
         // [start, end) range. `next_batch_position` is monotonic across the
         // writer's lifetime; positions are not BatchStore indices but they
-        // are used the same way for durability tracking.
+        // are used the same way for durability tracking. Because the queue is
+        // strict FIFO with contiguous positions and its front always sits at
+        // the durability cursor, `end` is exactly the writer-global durable
+        // count this put reaches once its append lands — no globalizing offset
+        // as in MemTable mode, which restarts positions per generation.
         let batch_positions = state.push(batches);
 
-        // Time- and size-based triggers, mirroring MemTable mode but reading
-        // pending bytes from `WalOnlyState` instead of an active MemTable.
-        // Only fires for non-durable writes; durable writes go through the
-        // explicit done-cell path below so flush errors (e.g., fence) reach
-        // the caller.
-        if !self.config.durable_write {
-            let target_position = batch_positions.end;
-            let pending_bytes = state.estimated_size();
-            self.maybe_trigger_wal_flush_wal_only(
-                state,
-                wal_flush_tx,
-                trigger,
-                target_position,
-                pending_bytes,
-            );
-        }
+        // Under `durable_write` the put becomes durable only once its WAL
+        // append lands. Track it on the writer-global durability cursor *before*
+        // triggering, so a flush that completes between here and the wait is not
+        // missed: the watcher recomputes visibility from the cursor rather than
+        // latching a one-shot wake. WAL-only mode has no indexes, so the
+        // index-visibility half of the watcher is a no-op (`None`, target 0).
+        let durable_watcher = self
+            .config
+            .durable_write
+            .then(|| self.wal_flusher.track_batch(None, 0, batch_positions.end));
+
+        // Time- and size-based triggers on the write path, for durable and
+        // non-durable puts alike — mirroring MemTable mode's
+        // `maybe_trigger_wal_flush`. The background ticker drives the append
+        // too; whichever fires first wins, and a redundant trigger is a cheap
+        // no-op because the flush snapshot/commit is idempotent.
+        self.maybe_trigger_wal_flush_wal_only(
+            state,
+            wal_flush_tx,
+            trigger,
+            batch_positions.end,
+            state.estimated_size(),
+        );
 
         self.stats.record_put(start.elapsed());
 
-        // For durable writes, trigger an immediate flush and wait for the
-        // done cell. Using the done cell instead of the durability watermark
-        // watcher ensures flush errors (e.g., the WalAppender returning a
-        // fence error) propagate back to `put` instead of hanging.
-        if self.config.durable_write {
-            let done = WatchableOnceCell::new();
-            let reader = done.reader();
-            self.wal_flusher.trigger_flush(
-                WalFlushSource::WalOnly {
-                    state: state.clone(),
-                },
-                batch_positions.end,
-                Some(done),
-            )?;
-            let mut reader = reader;
-            match reader.await_value().await {
-                Some(Ok(_)) => {}
-                // Rebuild the typed error (peer fence vs. persistence-failure
-                // self-fence) so a WAL-only durable caller can tell them apart.
-                Some(Err(failure)) => return Err(failure.into_error()),
-                None => {
-                    return Err(Error::io(
-                        "WAL flush handler exited before reporting durability",
-                    ));
-                }
-            }
+        // Durable writes wait on the durability cursor, advanced by the append
+        // the ticker (or the trigger above) drives — the same watermark path
+        // MemTable mode uses. A terminal flush failure (a peer fence or an
+        // exhausted-retry persistence self-fence) poisons the writer and wakes
+        // the waiter with that typed error instead of leaving it to hang. This
+        // is why `open` rejects `durable_write` with no flush ticker: nothing
+        // else would advance the cursor a small put is parked on.
+        if let Some(mut watcher) = durable_watcher {
+            watcher.wait().await?;
         }
 
         Ok(WriteResult { batch_positions })
@@ -2825,10 +2816,28 @@ pub struct WalStats {
     pub next_wal_entry_position: u64,
 }
 
-/// Background handler for WAL flush operations.
+/// The oldest store that still owes the WAL an append, or `None` when everything
+/// is durable.
 ///
-/// This handler does parallel WAL I/O + index updates during flush.
-/// Indexes are passed through the TriggerWalFlush message.
+/// Ordering is the whole point. WAL entry positions are assigned in append-call
+/// order; replay walks them ascending; row positions follow; and primary-key
+/// recency is "newest visible row position wins". So appending a newer memtable
+/// ahead of an older one's tail silently inverts dedup after a crash.
+///
+/// Taking "the active memtable" would do exactly that, because a timer tick
+/// enqueued before a freeze is handled after it and would resolve to the incoming
+/// memtable. Selecting by cursor instead makes the target a function of what is
+/// actually durable, not of when the timer happened to fire.
+fn next_pending_store(
+    frozen: impl Iterator<Item = Arc<BatchStore>>,
+    active: Arc<BatchStore>,
+    durable: usize,
+) -> Option<Arc<BatchStore>> {
+    frozen
+        .chain(std::iter::once(active))
+        .find(|store| store.global_end() > durable)
+}
+
 /// The index-apply task: one sequential consumer of the index-apply channel.
 ///
 /// Sequential consumption is the safety property. `HnswGraph::insert_batch` hard-
@@ -2874,6 +2883,13 @@ struct WalFlushHandler {
     /// via Arc::ptr_eq on the active batch_store. `None` when running in
     /// WAL-only mode (no MemTable, no frozen-vs-active distinction).
     memtable_state: Option<Arc<RwLock<WriterState>>>,
+    /// WAL-only-mode pending queue, so a background tick can resolve to the
+    /// batches still owed an append. `None` in MemTable mode. Exactly one of
+    /// `memtable_state` / `wal_only_state` is `Some`.
+    wal_only_state: Option<Arc<WalOnlyState>>,
+    /// How often to append in the background. `None` disables the ticker, leaving
+    /// the append size-triggered (and freeze/close-triggered) only.
+    flush_interval: Option<Duration>,
     stats: SharedWriteStats,
 }
 
@@ -2881,11 +2897,15 @@ impl WalFlushHandler {
     fn new(
         wal_flusher: Arc<WalFlusher>,
         memtable_state: Option<Arc<RwLock<WriterState>>>,
+        wal_only_state: Option<Arc<WalOnlyState>>,
+        flush_interval: Option<Duration>,
         stats: SharedWriteStats,
     ) -> Self {
         Self {
             wal_flusher,
             memtable_state,
+            wal_only_state,
+            flush_interval,
             stats,
         }
     }
@@ -2893,12 +2913,49 @@ impl WalFlushHandler {
 
 #[async_trait]
 impl MessageHandler<TriggerWalFlush> for WalFlushHandler {
+    /// Append periodically in the background.
+    ///
+    /// This is what the flush interval was always supposed to mean. It routed to
+    /// a timer that was only ever *evaluated on the write path*, so it could add
+    /// a redundant trigger but never delay or batch one — with every durable put
+    /// triggering its own append, tuning the knob did nothing at all.
+    ///
+    /// The ticker exists to bound S3 API cost: an append is a PUT, billed per
+    /// call, and it is the only thing on this schedule. The index apply is not —
+    /// it is in-memory and free to batch, so it runs per-put on its own task.
+    fn tickers(&mut self) -> Vec<(Duration, MessageFactory<TriggerWalFlush>)> {
+        // No interval => no ticker. A zero interval would panic in tokio.
+        let Some(interval) = self.flush_interval.filter(|d| !d.is_zero()) else {
+            return vec![];
+        };
+        // The tick names no store: `MessageFactory` is synchronous and cannot take
+        // the async state lock. `handle()` resolves it against the cursor.
+        vec![(
+            interval,
+            Box::new(|| TriggerWalFlush {
+                source: WalFlushSource::NextPending,
+                end_batch_position: 0,
+                done: None,
+            }),
+        )]
+    }
+
     async fn handle(&mut self, message: TriggerWalFlush) -> Result<()> {
         let TriggerWalFlush {
             source,
             end_batch_position,
             done,
         } = message;
+
+        // A timer tick names no store — resolve it now, at handle time.
+        let (source, end_batch_position) = match source {
+            WalFlushSource::NextPending => match self.resolve_next_pending().await {
+                Some(resolved) => resolved,
+                // Everything is already durable; the tick has nothing to do.
+                None => return Ok(()),
+            },
+            other => (other, end_batch_position),
+        };
 
         let result = self.do_flush(source, end_batch_position).await;
 
@@ -2930,6 +2987,64 @@ impl MessageHandler<TriggerWalFlush> for WalFlushHandler {
 }
 
 impl WalFlushHandler {
+    /// Pick the store the WAL still owes an append, oldest first.
+    ///
+    /// **WAL entries must be appended in global batch-position order for the
+    /// writer's lifetime.** `WalAppender::append` assigns each entry's position
+    /// from its own counter, in call order; replay walks those positions
+    /// ascending and assigns row positions in that order; and primary-key recency
+    /// is "newest visible row position wins". So append order fixes dedup order.
+    /// Append two memtables out of order and replay silently hands the dedup to
+    /// the *stale* row — corruption that survives the crash that caused it, and
+    /// that a full scan cannot see.
+    ///
+    /// Resolving to "the active memtable" would break exactly that: a tick
+    /// enqueued before a freeze is handled after it, resolves to the incoming
+    /// memtable, and appends its batches ahead of the outgoing memtable's tail.
+    /// So the target is a function of `durable`, not of when the timer fired.
+    ///
+    /// Safe to walk the frozen list because a store that still owes an append
+    /// cannot be swept: its L0 flush is blocked on the completion cell that only
+    /// that append fires.
+    ///
+    /// In WAL-only mode there is a single FIFO pending queue and no memtable
+    /// rotation, so the ordering hazard above cannot arise: the tick resolves to
+    /// the queue whenever it holds un-appended batches.
+    async fn resolve_next_pending(&self) -> Option<(WalFlushSource, usize)> {
+        if let Some(state_lock) = self.memtable_state.as_ref() {
+            let state = state_lock.read().await;
+            let durable = self.wal_flusher.durable();
+
+            return next_pending_store(
+                state
+                    .frozen_memtables
+                    .iter()
+                    .map(|frozen| frozen.memtable.batch_store()),
+                state.memtable.batch_store(),
+                durable,
+            )
+            .map(|store| {
+                let end = store.len();
+                (WalFlushSource::BatchStore { batch_store: store }, end)
+            });
+        }
+
+        let state = self.wal_only_state.as_ref()?;
+        if state.batch_count() == 0 {
+            // Everything already appended; the tick has nothing to do.
+            return None;
+        }
+        // `flush_from_wal_only` snapshots the whole queue, so the end position
+        // is informational here; carry the next position for symmetry.
+        let end = state.next_batch_position();
+        Some((
+            WalFlushSource::WalOnly {
+                state: Arc::clone(state),
+            },
+            end,
+        ))
+    }
+
     /// Unified flush method for both active and frozen memtables and for
     /// WAL-only mode.
     ///
@@ -3878,7 +3993,6 @@ mod tests {
         ShardWriterConfig {
             shard_id,
             durable_write: false,
-            sync_indexed_write: true,
             manifest_scan_batch_size: 2,
             ..Default::default()
         }
@@ -4203,9 +4317,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4246,9 +4359,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4283,9 +4395,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4329,9 +4440,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4364,9 +4474,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: true,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4416,9 +4525,8 @@ mod tests {
             shard_id,
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: true,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4505,9 +4613,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 1024, // Very small - will trigger flush quickly
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4612,9 +4719,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -4657,9 +4763,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             // Tiny size threshold — every batch crosses it.
             max_memtable_size: 64,
             manifest_scan_batch_size: 2,
@@ -4724,9 +4829,8 @@ mod tests {
             shard_id,
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: usize::MAX,
             max_unflushed_memtable_bytes: usize::MAX,
             manifest_scan_batch_size: 2,
@@ -4804,7 +4908,6 @@ mod tests {
             shard_spec_id: 0,
             durable_write: false,
             enable_memtable,
-            sync_indexed_write: false,
             max_wal_buffer_size: usize::MAX,
             max_wal_flush_interval: None,
             max_wal_persist_retries: 0,
@@ -4855,9 +4958,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             // Tiny size threshold so a few batches cross it.
             max_memtable_size: 1024,
             manifest_scan_batch_size: 2,
@@ -4998,7 +5100,7 @@ mod tests {
             durable_write: true,
             enable_memtable: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             manifest_scan_batch_size: 2,
             ..Default::default()
         }
@@ -5023,8 +5125,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Two durable puts → two WAL entries (durable_write triggers an
-        // explicit flush per put).
+        // Two durable puts → two WAL entries. Each `put` awaits its own append
+        // (driven by the background ticker) before returning, so the second
+        // batch is only pushed after the first is durable — they never coalesce.
         let r1 = writer
             .put(vec![create_test_batch(&schema, 0, 4)])
             .await
@@ -5053,6 +5156,51 @@ mod tests {
         // Both entries from the same writer should have the same epoch.
         assert_eq!(e0.writer_epoch, e1.writer_epoch);
         assert!(e0.writer_epoch >= 1);
+    }
+
+    /// A durable WAL-only put is driven by the background ticker, not an inline
+    /// per-put flush: `put().await` must not return until the ticker's append
+    /// advances the durability watermark it waits on. With a long interval and a
+    /// buffer the write cannot cross, the ticker is the *only* thing that can
+    /// make the put durable — so if the WAL entry is present the instant `put`
+    /// returns (before any `close()`), the watermark-wait is doing its job.
+    #[tokio::test]
+    async fn test_wal_only_durable_put_waits_for_ticker_append() {
+        use crate::dataset::mem_wal::wal::WalTailer;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        let mut config = wal_only_config(shard_id);
+        config.max_wal_flush_interval = Some(Duration::from_millis(100));
+        config.max_wal_buffer_size = 100 * 1024 * 1024; // never crossed
+
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 4)])
+            .await
+            .unwrap();
+
+        // `put` returned, so the batch must already be durable — read the WAL
+        // directly, without closing the writer.
+        let tailer = WalTailer::new(store, base_path, shard_id);
+        assert_eq!(tailer.next_position().await.unwrap(), 2);
+        let entry = tailer.read_entry(1).await.unwrap().unwrap();
+        assert_eq!(entry.batches.len(), 1);
+        assert_eq!(entry.batches[0].num_rows(), 4);
+
+        writer.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -5289,9 +5437,8 @@ mod tests {
             shard_id,
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -5902,6 +6049,164 @@ mod tests {
         );
     }
 
+    /// A background tick must append the **oldest** store that still owes the WAL,
+    /// never "whatever memtable is active".
+    ///
+    /// A tick carries no store: it is enqueued by a timer and resolved when it is
+    /// handled. So a tick enqueued before a freeze is handled *after* it, and
+    /// resolving to the active memtable would append the incoming memtable's
+    /// batches ahead of the outgoing memtable's tail. WAL entry positions are
+    /// assigned in append-call order, replay walks them ascending, row positions
+    /// follow, and primary-key recency is "newest visible row position wins" — so
+    /// that inverts dedup after a crash, handing the key to the stale row. It
+    /// survives the crash that caused it, and a full scan cannot see it.
+    #[test]
+    fn test_next_pending_store_picks_the_oldest_owing_an_append() {
+        let schema = create_test_schema();
+
+        // A frozen store of 2 batches at coordinate 0, and the active store that
+        // rotated in behind it at coordinate 2.
+        let frozen = Arc::new(BatchStore::with_capacity(4));
+        frozen.append(create_test_batch(&schema, 0, 1)).unwrap();
+        frozen.append(create_test_batch(&schema, 1, 1)).unwrap();
+        let active = Arc::new(BatchStore::with_capacity_at(4, 2));
+        active.append(create_test_batch(&schema, 2, 1)).unwrap();
+
+        let frozen_list = || std::iter::once(Arc::clone(&frozen));
+
+        // Nothing durable: the frozen store owes the oldest append, so it wins —
+        // even though the active memtable also has un-appended batches.
+        let picked = next_pending_store(frozen_list(), Arc::clone(&active), 0).unwrap();
+        assert!(
+            Arc::ptr_eq(&picked, &frozen),
+            "the outgoing memtable's tail must be appended before the incoming one's head"
+        );
+
+        // Still true partway through the frozen store.
+        let picked = next_pending_store(frozen_list(), Arc::clone(&active), 1).unwrap();
+        assert!(Arc::ptr_eq(&picked, &frozen));
+
+        // Once the frozen store is fully durable, the active one is next.
+        let picked = next_pending_store(frozen_list(), Arc::clone(&active), 2).unwrap();
+        assert!(Arc::ptr_eq(&picked, &active));
+
+        // Everything durable: nothing to do.
+        assert!(next_pending_store(frozen_list(), Arc::clone(&active), 3).is_none());
+    }
+
+    /// A durable writer with no flush ticker cannot make progress in either
+    /// mode — the ticker is the only thing that drives the WAL append the put
+    /// waits on — so `open()` rejects it rather than letting a put block forever.
+    #[rstest]
+    #[case::memtable(true)]
+    #[case::wal_only(false)]
+    #[tokio::test]
+    async fn test_open_rejects_durable_write_without_a_ticker(#[case] enable_memtable: bool) {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        let config = ShardWriterConfig {
+            durable_write: true,
+            enable_memtable,
+            max_wal_flush_interval: None,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        let Err(err) = ShardWriter::open(store, base_path, base_uri, config, schema, vec![]).await
+        else {
+            panic!("durable_write with no ticker must be rejected");
+        };
+        assert!(
+            err.to_string().contains("max_wal_flush_interval"),
+            "the error must name the knob, got: {err}"
+        );
+    }
+
+    /// WAL entries must be appended in global batch-position order across a
+    /// memtable rotation, because append order *is* primary-key recency order.
+    ///
+    /// `WalAppender::append` assigns each entry's position from its own counter,
+    /// in call order. Replay walks those positions ascending and assigns row
+    /// positions in that order. Primary-key recency is "newest visible row
+    /// position wins". So an out-of-order append silently inverts dedup after a
+    /// crash — the stale row wins — and a full scan cannot see it.
+    ///
+    /// The hazard is the background ticker. If it resolved to "whatever memtable
+    /// is active" rather than to the oldest store still owing an append, a tick
+    /// enqueued before a freeze but handled after it would append the *incoming*
+    /// memtable's batches ahead of the outgoing memtable's tail. So the target is
+    /// resolved from the durability cursor, not from wall-clock timing.
+    #[tokio::test]
+    async fn test_wal_append_order_preserves_pk_recency_across_rotation() {
+        use crate::dataset::mem_wal::wal::WalTailer;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // Two batches per memtable, so the second put fills it and rotates.
+        let config = ShardWriterConfig {
+            max_memtable_batches: 2,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Memtable 1: ids 7 then 20 (the second fills it and triggers the freeze).
+        writer
+            .put(vec![create_test_batch(&schema, 7, 1)])
+            .await
+            .unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 20, 1)])
+            .await
+            .unwrap();
+        // Memtable 2 overwrites id=7 with a newer row. Its append must land in the
+        // WAL *after* memtable 1's, or replay would resolve id=7 to the stale copy.
+        writer
+            .put(vec![create_test_batch(&schema, 30, 1)])
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        // Walk the WAL in entry order and collect the ids as replay would see them.
+        let tailer = WalTailer::new(store, base_path, shard_id);
+        let first = tailer.first_position().await.unwrap();
+        let next = tailer.next_position().await.unwrap();
+        let mut ids: Vec<i32> = Vec::new();
+        for position in first..next {
+            let Some(entry) = tailer.read_entry(position).await.unwrap() else {
+                continue;
+            };
+            for batch in &entry.batches {
+                let column = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                ids.extend((0..column.len()).map(|i| column.value(i)));
+            }
+        }
+
+        assert_eq!(
+            ids,
+            vec![7, 20, 30],
+            "WAL entries must follow global batch-position order; memtable 1's rows must \
+             precede memtable 2's, or replay inverts primary-key recency"
+        );
+    }
+
     /// An index config that disagrees with the schema fails `open()` outright.
     /// It must not be allowed to accept writes: the insert would fail
     /// deterministically on every batch, including batches replayed from the
@@ -6277,8 +6582,9 @@ mod tests {
     /// fence), the drained batches were dropped — the next concurrent put
     /// would then see an empty pending queue and spuriously return Ok,
     /// hiding the data loss. With the snapshot/commit fix, the failed flush
-    /// leaves the batches in the queue, and the concurrent put gets a clean
-    /// fence error too (when its own flush attempts the same WAL position).
+    /// leaves the batches in the queue for retry, and — because the flush is
+    /// terminal — it poisons the writer, waking *both* parked durability
+    /// waiters with the typed fence error instead of either one hanging.
     #[tokio::test]
     async fn test_wal_only_fenced_concurrent_puts_do_not_silently_succeed() {
         use std::sync::Arc;
@@ -6329,9 +6635,10 @@ mod tests {
         // the destructive-drain bug, the first flush would consume both
         // pending batches into a failing append; the second flush would
         // see an empty queue and return spurious success, silently losing
-        // the second put's data. With the snapshot/commit fix, the failed
-        // append leaves both batches in the queue and the second flush
-        // also fails with the fence error.
+        // the second put's data. Now both puts park on the durability
+        // watermark; the ticker's append fails with the fence, poisons the
+        // writer, and both waiters wake with the fence error — batches intact
+        // in the queue.
         let a1 = writer_a.clone();
         let a2 = writer_a.clone();
         let schema1 = schema.clone();
@@ -6449,9 +6756,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 64 * 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -6504,9 +6810,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 64 * 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             ..Default::default()
@@ -6559,9 +6864,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 64 * 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             // Short grace so the sweep is observable without a slow test.
@@ -6619,9 +6923,8 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 64 * 1024 * 1024,
-            max_wal_flush_interval: None,
+            max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             frozen_memtable_grace: Duration::ZERO,
@@ -6930,9 +7233,7 @@ mod shard_writer_tests {
             Some("100")
         );
         // Every tunable field is present.
-        assert!(defaults.contains_key("sync_indexed_write"));
         assert!(defaults.contains_key("enable_memtable"));
-        assert!(defaults.contains_key("async_index_interval_ms"));
         // add_writer_config_default records arbitrary keys.
         assert_eq!(
             defaults.get("custom_knob").map(String::as_str),
@@ -7144,9 +7445,7 @@ mod shard_writer_tests {
             .expect("Failed to initialize MemWAL");
 
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_durable_write(true)
-            .with_sync_indexed_write(true);
+        let config = ShardWriterConfig::new(shard_id).with_durable_write(true);
         let writer = dataset
             .mem_wal_writer(shard_id, config)
             .await
@@ -7484,9 +7783,7 @@ mod shard_writer_tests {
 
         // Create shard writer
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_durable_write(false)
-            .with_sync_indexed_write(false);
+        let config = ShardWriterConfig::new(shard_id).with_durable_write(false);
 
         let writer = dataset
             .mem_wal_writer(shard_id, config)
@@ -7544,9 +7841,7 @@ mod shard_writer_tests {
             .expect("Failed to initialize MemWAL");
 
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_durable_write(true)
-            .with_sync_indexed_write(true);
+        let config = ShardWriterConfig::new(shard_id).with_durable_write(true);
 
         let writer = dataset
             .mem_wal_writer(shard_id, config)
@@ -7685,9 +7980,7 @@ mod shard_writer_tests {
 
         // Create shard writer with default config
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_durable_write(false)
-            .with_sync_indexed_write(false);
+        let config = ShardWriterConfig::new(shard_id).with_durable_write(false);
 
         let writer = dataset
             .mem_wal_writer(shard_id, config)
@@ -7764,7 +8057,6 @@ mod shard_writer_tests {
         let shard_id = Uuid::new_v4();
         let config = ShardWriterConfig::new(shard_id)
             .with_durable_write(true) // Ensure WAL files are written
-            .with_sync_indexed_write(true)
             .with_max_memtable_size(50 * 1024) // 50KB - triggers flush after ~8 batches
             .with_max_wal_buffer_size(10 * 1024) // 10KB WAL buffer
             .with_max_wal_flush_interval(Duration::from_millis(50)); // Fast flush
@@ -7894,9 +8186,7 @@ mod shard_writer_tests {
         // rows stay invisible until the next flush. This test used to pass with
         // `durable_write(false)` only because an un-advanced cursor of 0 was
         // misread as "batch 0 is visible" — it was asserting the dirty read.
-        let new_config = ShardWriterConfig::new(new_shard_id)
-            .with_durable_write(true)
-            .with_sync_indexed_write(true);
+        let new_config = ShardWriterConfig::new(new_shard_id).with_durable_write(true);
 
         let new_writer = dataset
             .mem_wal_writer(new_shard_id, new_config)
