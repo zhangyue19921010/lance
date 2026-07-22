@@ -268,6 +268,9 @@ public class SessionTest {
       CacheStats initialStats = session.metadataCacheStats();
       assertEquals(0, initialStats.getHits());
       assertEquals(0, initialStats.getMisses());
+      assertEquals(0, initialStats.getNumEntries());
+      assertEquals(0, initialStats.getSizeBytes());
+      assertEquals(0.0, initialStats.getHitRatio());
 
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
@@ -280,6 +283,8 @@ public class SessionTest {
       }
       CacheStats statsAfterFirstOpen = session.metadataCacheStats();
       assertTrue(statsAfterFirstOpen.getMisses() > 0);
+      assertTrue(statsAfterFirstOpen.getNumEntries() > 0);
+      assertTrue(statsAfterFirstOpen.getSizeBytes() > 0);
 
       // Reopening the same dataset should hit the shared metadata cache
       try (Dataset ds =
@@ -288,6 +293,12 @@ public class SessionTest {
       }
       CacheStats statsAfterSecondOpen = session.metadataCacheStats();
       assertTrue(statsAfterSecondOpen.getHits() > statsAfterFirstOpen.getHits());
+      assertTrue(statsAfterSecondOpen.getHitRatio() > 0.0);
+
+      // Stats are not accessible once the session is closed (close is idempotent,
+      // so the implicit close from try-with-resources remains safe)
+      session.close();
+      assertThrows(IllegalArgumentException.class, session::metadataCacheStats);
     }
   }
 

@@ -33,6 +33,13 @@ public class CacheStats {
    * @param sizeBytes total size in bytes of all entries in the cache
    */
   public CacheStats(long hits, long misses, long numEntries, long sizeBytes) {
+    if (hits < 0 || misses < 0 || numEntries < 0 || sizeBytes < 0) {
+      throw new IllegalArgumentException(
+          String.format(
+              "Cache statistics must be non-negative: "
+                  + "hits=%d, misses=%d, numEntries=%d, sizeBytes=%d",
+              hits, misses, numEntries, sizeBytes));
+    }
     this.hits = hits;
     this.misses = misses;
     this.numEntries = numEntries;
@@ -81,11 +88,12 @@ public class CacheStats {
    * @return the cache hit ratio in the range [0, 1]
    */
   public double getHitRatio() {
-    long total = hits + misses;
+    // Sum in double to avoid long overflow for very large counters
+    double total = (double) hits + (double) misses;
     if (total == 0) {
       return 0.0;
     }
-    return (double) hits / total;
+    return hits / total;
   }
 
   @Override
