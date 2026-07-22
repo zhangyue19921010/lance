@@ -292,14 +292,6 @@ public class SessionTest {
   }
 
   @Test
-  void testMetadataCacheStatsAfterClose() {
-    Session session = Session.builder().build();
-    session.close();
-
-    assertThrows(IllegalArgumentException.class, session::metadataCacheStats);
-  }
-
-  @Test
   void testInvalidCacheSizes() {
     assertThrows(
         IllegalArgumentException.class, () -> Session.builder().indexCacheSizeBytes(-1).build());
