@@ -1200,10 +1200,11 @@ async fn build_user_view_struct(
     )?)
 }
 
-async fn transform_blob_v2_batch(
+pub(crate) async fn transform_blob_v2_batch(
     dataset: &Arc<Dataset>,
     schema: &lance_core::datatypes::Schema,
     batch: RecordBatch,
+    keep_row_addr: bool,
 ) -> Result<RecordBatch> {
     let row_addr_idx = batch
         .schema()
@@ -1227,7 +1228,7 @@ async fn transform_blob_v2_batch(
 
     let batch_schema = batch.schema();
     for (col_idx, field) in batch_schema.fields().iter().enumerate() {
-        if field.name() == lance_core::ROW_ADDR {
+        if field.name() == lance_core::ROW_ADDR && !keep_row_addr {
             continue;
         }
 
@@ -1251,6 +1252,15 @@ async fn transform_blob_v2_batch(
                     batch.column(col_idx).data_type()
                 ))
             })?;
+
+        // Merge-insert may supply a blob v2 value directly from the source.
+        // Those values are already in the writer's user view and do not refer
+        // to a row in the target dataset, unlike descriptor values from scans.
+        if struct_arr.column_by_name("kind").is_none() {
+            new_columns.push(batch.column(col_idx).clone());
+            new_fields.push(field.clone());
+            continue;
+        }
 
         let column_name = field.name();
         let descriptor = BlobV2Descriptor::try_from_struct(struct_arr, column_name)?;
@@ -1671,7 +1681,7 @@ async fn rewrite_files(
                 let schema = dataset_schema.clone();
                 async move {
                     let batch = batch_result?;
-                    transform_blob_v2_batch(&dataset, &schema, batch)
+                    transform_blob_v2_batch(&dataset, &schema, batch, false)
                         .await
                         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
                 }

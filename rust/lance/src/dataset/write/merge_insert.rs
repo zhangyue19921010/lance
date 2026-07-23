@@ -1821,7 +1821,25 @@ impl MergeInsertJob {
         // Goal: we shouldn't have to add new branches in this code to handle
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
         let session_ctx = SessionContext::new();
-        let scan = session_ctx.read_lance_unordered(self.dataset.clone(), true, true)?;
+        let binary_blob_field_ids = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .filter(|field| field.is_blob() && !field.is_blob_v2())
+            .map(|field| field.id as u32)
+            .collect();
+        let target_provider = Arc::new(
+            crate::datafusion::dataframe::LanceTableProvider::new_with_ordering(
+                self.dataset.clone(),
+                true,
+                true,
+                false,
+            )
+            .with_blob_handling(lance_core::datatypes::BlobHandling::SomeBlobsBinary(
+                binary_blob_field_ids,
+            )),
+        );
+        let scan = session_ctx.read_table(target_provider)?;
         // Wrap column names in double quotes to preserve case (DataFusion lowercases unquoted identifiers)
         let on_cols = self
             .params
@@ -11944,5 +11962,141 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             "Expected fail-fast TooMuchWriteContention, got: {:?}",
             merge_result
         );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_with_blob_v1_source_provides_blob() {
+        use arrow_array::LargeBinaryArray;
+        use arrow_schema::Schema as ArrowSchema;
+        use lance_arrow::BLOB_META_KEY;
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("blobs", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )])),
+            Field::new("id", DataType::Int64, true),
+            Field::new("other", DataType::Int64, true),
+        ]));
+        let make_batch = |blob_values: Vec<Option<&[u8]>>, ids, others| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(LargeBinaryArray::from(blob_values)),
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int64Array::from(others)),
+                ],
+            )
+            .unwrap()
+        };
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(
+                    vec![Ok(make_batch(
+                        vec![Some(b"foo"), Some(b"bar")],
+                        vec![0, 1],
+                        vec![10, 20],
+                    ))],
+                    schema.clone(),
+                ),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_1),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let source = Box::new(RecordBatchIterator::new(
+            vec![Ok(make_batch(
+                vec![Some(b"baz"), Some(b"qux")],
+                vec![1, 2],
+                vec![200, 300],
+            ))],
+            schema,
+        ));
+
+        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        let (new_dataset, _) = job.execute_reader(source).await.unwrap();
+        let blobs = new_dataset
+            .take_blobs_by_indices(&[0, 1, 2], "blobs")
+            .await
+            .unwrap();
+        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"foo");
+        assert_eq!(blobs[1].read().await.unwrap().as_ref(), b"baz");
+        assert_eq!(blobs[2].read().await.unwrap().as_ref(), b"qux");
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_with_blob_v2_source_provides_blob() {
+        use crate::{BlobArrayBuilder, blob_field};
+        use arrow_schema::Schema as ArrowSchema;
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            blob_field("blobs", true),
+            Field::new("id", DataType::Int64, true),
+            Field::new("other", DataType::Int64, true),
+        ]));
+        let make_batch = |blob_values: &[&[u8]], ids, others| {
+            let mut blobs = BlobArrayBuilder::new(blob_values.len());
+            for value in blob_values {
+                blobs.push_bytes(value).unwrap();
+            }
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    blobs.finish().unwrap(),
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int64Array::from(others)),
+                ],
+            )
+            .unwrap()
+        };
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(
+                    vec![Ok(make_batch(&[b"foo", b"bar"], vec![0, 1], vec![10, 20]))],
+                    schema.clone(),
+                ),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let source = Box::new(RecordBatchIterator::new(
+            vec![Ok(make_batch(
+                &[b"baz", b"qux"],
+                vec![1, 2],
+                vec![200, 300],
+            ))],
+            schema,
+        ));
+
+        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        let (new_dataset, _) = job.execute_reader(source).await.unwrap();
+        let blobs = new_dataset
+            .take_blobs_by_indices(&[0, 1, 2], "blobs")
+            .await
+            .unwrap();
+        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"foo");
+        assert_eq!(blobs[1].read().await.unwrap().as_ref(), b"baz");
+        assert_eq!(blobs[2].read().await.unwrap().as_ref(), b"qux");
     }
 }
