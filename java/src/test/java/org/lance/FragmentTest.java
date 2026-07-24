@@ -151,6 +151,82 @@ public class FragmentTest {
   }
 
   @Test
+  void testWriteFragmentWithSession(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fragment_with_session").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset();
+          Session session = Session.builder().build()) {
+        // Write twice with the same session: APPEND-mode schema inference loads the
+        // manifest through the session's metadata cache instead of a fresh session
+        // per write.
+        for (int i = 0; i < 2; i++) {
+          try (VectorSchemaRoot root = VectorSchemaRoot.create(dataset.getSchema(), allocator)) {
+            root.allocateNew();
+            ((VarCharVector) root.getVector("name"))
+                .setSafe(0, ("Person " + i).getBytes(StandardCharsets.UTF_8));
+            ((IntVector) root.getVector("id")).setSafe(0, i);
+            root.setRowCount(1);
+
+            List<FragmentMetadata> fragments =
+                Fragment.write()
+                    .datasetUri(datasetPath)
+                    .allocator(allocator)
+                    .data(root)
+                    .mode(WriteParams.WriteMode.APPEND)
+                    .session(session)
+                    .execute();
+            assertEquals(1, fragments.size());
+            assertEquals(1, fragments.get(0).getPhysicalRows());
+          }
+        }
+        // Schema inference populated the session's metadata cache.
+        assertTrue(session.sizeBytes() > 0);
+
+        // An explicit schema skips inference; the session is still accepted (used for
+        // the object store registry).
+        try (VectorSchemaRoot root = VectorSchemaRoot.create(dataset.getSchema(), allocator)) {
+          root.allocateNew();
+          ((VarCharVector) root.getVector("name"))
+              .setSafe(0, "Person 2".getBytes(StandardCharsets.UTF_8));
+          ((IntVector) root.getVector("id")).setSafe(0, 2);
+          root.setRowCount(1);
+
+          List<FragmentMetadata> fragments =
+              Fragment.write()
+                  .datasetUri(datasetPath)
+                  .allocator(allocator)
+                  .data(root)
+                  .schema(dataset.getLanceSchema())
+                  .mode(WriteParams.WriteMode.APPEND)
+                  .session(session)
+                  .execute();
+          assertEquals(1, fragments.size());
+        }
+      }
+
+      // A closed session is rejected instead of silently degrading to no session.
+      Session closedSession = Session.builder().build();
+      closedSession.close();
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(testDataset.getSchema(), allocator)) {
+        root.allocateNew();
+        root.setRowCount(0);
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                Fragment.write()
+                    .datasetUri(datasetPath)
+                    .allocator(allocator)
+                    .data(root)
+                    .mode(WriteParams.WriteMode.APPEND)
+                    .session(closedSession)
+                    .execute());
+      }
+    }
+  }
+
+  @Test
   void commitWithoutVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("commit_without_version").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {

@@ -273,10 +273,35 @@ public class Fragment {
       LanceNamespace namespaceClient,
       List<String> tableId,
       LanceSchema schema) {
+    return create(datasetUri, allocator, root, params, namespaceClient, tableId, schema, null);
+  }
+
+  /**
+   * Create a fragment from the given arrow array with an explicit target schema and a shared
+   * session.
+   *
+   * <p>When a session is provided, its metadata cache and object store registry are reused across
+   * fragment writes, so repeated writes against the same dataset avoid cold manifest loads and
+   * object store re-creation.
+   */
+  static List<FragmentMetadata> create(
+      String datasetUri,
+      BufferAllocator allocator,
+      VectorSchemaRoot root,
+      WriteParams params,
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      LanceSchema schema,
+      Session session) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(root);
     Preconditions.checkNotNull(params);
+    long sessionHandle = 0L;
+    if (session != null) {
+      sessionHandle = session.getNativeHandle();
+      Preconditions.checkArgument(sessionHandle != 0, "Session is closed");
+    }
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
         ArrowArray arrowArray = ArrowArray.allocateNew(allocator)) {
       Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
@@ -301,7 +326,8 @@ public class Fragment {
               tableId,
               params.getAllowExternalBlobOutsideBases(),
               params.getBlobPackFileSizeThreshold(),
-              lanceSchema.memoryAddress());
+              lanceSchema.memoryAddress(),
+              sessionHandle);
         }
       }
       return createWithFfiArray(
@@ -322,7 +348,8 @@ public class Fragment {
           tableId,
           params.getAllowExternalBlobOutsideBases(),
           params.getBlobPackFileSizeThreshold(),
-          0L);
+          0L,
+          sessionHandle);
     }
   }
 
@@ -345,9 +372,34 @@ public class Fragment {
       LanceNamespace namespaceClient,
       List<String> tableId,
       LanceSchema schema) {
+    return create(datasetUri, allocator, stream, params, namespaceClient, tableId, schema, null);
+  }
+
+  /**
+   * Create a fragment from the given arrow stream with an explicit target schema and a shared
+   * session.
+   *
+   * <p>When a session is provided, its metadata cache and object store registry are reused across
+   * fragment writes, so repeated writes against the same dataset avoid cold manifest loads and
+   * object store re-creation.
+   */
+  static List<FragmentMetadata> create(
+      String datasetUri,
+      BufferAllocator allocator,
+      ArrowArrayStream stream,
+      WriteParams params,
+      LanceNamespace namespaceClient,
+      List<String> tableId,
+      LanceSchema schema,
+      Session session) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(params);
+    long sessionHandle = 0L;
+    if (session != null) {
+      sessionHandle = session.getNativeHandle();
+      Preconditions.checkArgument(sessionHandle != 0, "Session is closed");
+    }
     if (schema != null) {
       Preconditions.checkNotNull(allocator, "allocator is required with schema");
       try (ArrowSchema lanceSchema = ArrowSchema.allocateNew(allocator)) {
@@ -369,7 +421,8 @@ public class Fragment {
             tableId,
             params.getAllowExternalBlobOutsideBases(),
             params.getBlobPackFileSizeThreshold(),
-            lanceSchema.memoryAddress());
+            lanceSchema.memoryAddress(),
+            sessionHandle);
       }
     }
     return createWithFfiStream(
@@ -389,7 +442,8 @@ public class Fragment {
         tableId,
         params.getAllowExternalBlobOutsideBases(),
         params.getBlobPackFileSizeThreshold(),
-        0L);
+        0L,
+        sessionHandle);
   }
 
   /** Create a fragment from the given arrow array and schema. */
@@ -411,7 +465,8 @@ public class Fragment {
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
-      long schemaMemoryAddress);
+      long schemaMemoryAddress,
+      long sessionHandle);
 
   /** Create a fragment from the given arrow stream. */
   private static native List<FragmentMetadata> createWithFfiStream(
@@ -431,5 +486,6 @@ public class Fragment {
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
-      long schemaMemoryAddress);
+      long schemaMemoryAddress,
+      long sessionHandle);
 }

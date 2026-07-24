@@ -333,6 +333,11 @@ impl<'a> FragmentCreateBuilder<'a> {
         if let Some(accessor) = accessor {
             builder = builder.with_storage_options_accessor(accessor);
         }
+        // Reuse the caller-provided session so repeated fragment writes against the same
+        // dataset hit the session's metadata cache instead of cold-loading the manifest.
+        if let Some(session) = self.write_params.and_then(|p| p.session.clone()) {
+            builder = builder.with_session(session);
+        }
         match builder.load().await {
             Ok(dataset) => {
                 // Use the schema from the dataset, because it has the correct

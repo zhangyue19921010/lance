@@ -51,6 +51,7 @@ public class WriteFragmentBuilder {
   private WriteParams.Builder writeParamsBuilder;
   private LanceNamespace namespaceClient;
   private List<String> tableId;
+  private Session session;
 
   WriteFragmentBuilder() {}
 
@@ -115,6 +116,21 @@ public class WriteFragmentBuilder {
    */
   public WriteFragmentBuilder schema(LanceSchema schema) {
     this.schema = schema;
+    return this;
+  }
+
+  /**
+   * Set a shared session whose metadata cache and object store registry are reused for this write.
+   *
+   * <p>The session must be non-null and open, and must remain open for the duration of the write.
+   * Omit this call to write without a shared session.
+   *
+   * @param session the shared session
+   * @return this builder
+   */
+  public WriteFragmentBuilder session(Session session) {
+    Preconditions.checkNotNull(session, "session must not be null; omit session() to not use one");
+    this.session = session;
     return this;
   }
 
@@ -302,7 +318,8 @@ public class WriteFragmentBuilder {
           finalWriteParams,
           namespaceClient,
           tableId,
-          schema);
+          schema,
+          session);
     } else {
       return Fragment.create(
           datasetUri,
@@ -311,7 +328,8 @@ public class WriteFragmentBuilder {
           finalWriteParams,
           namespaceClient,
           tableId,
-          schema);
+          schema,
+          session);
     }
   }
 
