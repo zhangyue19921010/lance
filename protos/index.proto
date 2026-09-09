@@ -308,7 +308,9 @@ message MinHashLshIndexDetails {
   /* XXH64 fingerprint of the resources the tokenizer loads from the language
    * model home at build time (the jieba and lindera dictionaries), as
    * defined by the format specification. Present exactly when the tokenizer
-   * loads such resources. A reader recomputes it from its own deployment
+   * loads such resources, which must all lie below the tokenizer's directory:
+   * a configuration that reaches outside it, or relies on a fallback, is
+   * rejected. A reader recomputes the fingerprint from its own deployment
    * before signing a query and rejects a mismatch; a writer or reader that
    * does not implement the fingerprint rejects these tokenizers instead.
    */
