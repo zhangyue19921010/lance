@@ -97,6 +97,8 @@ file, and rejects the index when:
 - `signature_version` is not a version the reader implements (only 0 exists);
 - `tokenizer_fingerprint` is present for a tokenizer that loads no resources,
   or absent for one that does;
+- the tokenizer configuration names a resource outside its directory, or
+  depends on a fallback outside it;
 - the tokenizer loads resources and the reader does not implement the
   fingerprint.
 
@@ -129,9 +131,17 @@ The details identify every input of tokenization, in one of two ways:
   of `signature_version`, and `tokenizer_fingerprint` is absent.
 - **Tokenizers that load resources from the language model home**
   (`jieba`, `jieba/*`, `lindera/*`, which read the directory
-  `LANCE_LANGUAGE_MODEL_HOME/<base_tokenizer>/`): the details carry
-  `tokenizer_fingerprint`, the XXH64 hash (seed 0) of the directory's
-  contents. The hash consumes, for every regular file below the directory in
+  `LANCE_LANGUAGE_MODEL_HOME/<base_tokenizer>/`): the directory is the
+  complete set of resources. Its configuration file must exist (no
+  environment or built-in fallback, such as `LINDERA_CONFIG_PATH`, is
+  consulted), and every path the configuration names must be relative,
+  contain no `..` component and no URI scheme, and resolve to a regular file
+  below the directory; a configuration that reaches outside the directory is
+  rejected when an index is created or opened. Dictionaries compiled into
+  Lance (Lindera's built-in dictionary kinds) need no files and are part of
+  `signature_version`. The details carry `tokenizer_fingerprint`, the XXH64
+  hash (seed 0) of the directory's contents. The hash consumes, for every
+  regular file below the directory in
   ascending order of its relative path bytes, following symbolic links: the
   relative path as UTF-8 bytes with `/` separators, one `0x00` byte, the file
   length as 8 little-endian bytes, and the file contents. The writer computes
