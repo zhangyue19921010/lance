@@ -22,7 +22,11 @@
 //! └── bands.lance        one row per (band key, doc id), ascending
 //!       ├── band_key   UInt64   band id (high 8 bits) | hash of band values (low 56 bits)
 //!       └── doc_id     UInt32   row number in signatures.lance
-//!       (schema metadata: params json, page rows; global buffer: page table)
+//!       (schema metadata: details, doc count, page rows, page table buffer)
+//!
+//! Both files repeat the index details and the file format version in their
+//! schema metadata; a segment is opened only when both files match the
+//! details of the index metadata.
 //! ```
 //!
 //! A bucket is the run of rows sharing a band key; it may span pages. Lookups
@@ -87,8 +91,9 @@ use crate::{pb, pbold};
 /// On-disk format version of the index files. The format is unstable; bump
 /// on any layout change instead of adding compatibility paths.
 pub const MINHASH_LSH_INDEX_VERSION: u32 = 0;
-/// Version of the signature generation behavior (tokenizer pipeline, shingle
-/// hashing, permutation family and the 16-bit truncation); bumped whenever a
+/// Version of the signature generation behavior (the token streams of the
+/// tokenizers that ship with Lance, shingle hashing, permutation family, the
+/// 16-bit compression and the band keys); bumped whenever a
 /// change would make old and new signatures incomparable.
 pub const SIGNATURE_VERSION: u32 = 0;
 
@@ -371,36 +376,45 @@ impl MinHashLshIndexParams {
                 "MinHash LSH index requires shingle_size > 0".to_string(),
             ));
         }
-        // The index details record the tokenizer the way a full text search
-        // index does, which has no room for these; refusing them beats
-        // silently tokenizing queries differently from the index.
-        if self.tokenizer.custom_stop_words.is_some() {
-            return Err(Error::invalid_input(
-                "MinHash LSH index does not support custom_stop_words: they cannot be recorded in the index details".to_string(),
-            ));
-        }
-        if self.tokenizer.lance_tokenizer.is_some() {
-            return Err(Error::invalid_input(
-                "MinHash LSH index does not support lance_tokenizer: it cannot be recorded in the index details".to_string(),
-            ));
-        }
-        // These load dictionaries from LANCE_LANGUAGE_MODEL_HOME. The format
-        // pins such resources with `tokenizer_fingerprint`, which this version
-        // does not compute, so it must not write or read indexes using them.
-        let base_tokenizer = self.tokenizer.base_tokenizer.as_str();
-        if base_tokenizer == "jieba"
-            || base_tokenizer.starts_with("jieba/")
-            || base_tokenizer.starts_with("lindera/")
-        {
-            return Err(Error::not_supported(format!(
-                "MinHash LSH index does not support the {base_tokenizer} tokenizer yet: this version of Lance does not compute the tokenizer_fingerprint of its dictionary"
-            )));
-        }
+        self.validate_tokenizer()?;
         // Surface tokenizer configuration errors at index creation instead of
         // on the first batch.
         self.tokenizer.build()?;
         Ok(())
     }
+
+    /// The index details must identify the tokenizer completely: a query is
+    /// tokenized from the details alone, and a segment built elsewhere must
+    /// tokenize the same way. Settings the details cannot record, and
+    /// tokenizers whose data is not part of Lance, are therefore rejected
+    /// rather than silently tokenizing queries differently from the index.
+    fn validate_tokenizer(&self) -> Result<()> {
+        let unsupported = |reason: &str| {
+            Error::invalid_input(format!(
+                "MinHash LSH index cannot identify its tokenizer from the index details: {reason}"
+            ))
+        };
+        if self.tokenizer.custom_stop_words.is_some() {
+            return Err(unsupported("custom_stop_words are not recorded"));
+        }
+        if self.tokenizer.lance_tokenizer.is_some() {
+            return Err(unsupported("lance_tokenizer is not recorded"));
+        }
+        let base_tokenizer = self.tokenizer.base_tokenizer.as_str();
+        if base_tokenizer == "jieba"
+            || base_tokenizer.starts_with("jieba/")
+            || base_tokenizer.starts_with("lindera/")
+        {
+            return Err(unsupported(&format!(
+                "the {base_tokenizer} tokenizer loads a dictionary from LANCE_LANGUAGE_MODEL_HOME, outside Lance"
+            )));
+        }
+        Ok(())
+    }
+
+    // The details are the persisted identity of the signature procedure:
+    // stored as an `Any` in the index metadata and repeated, hex encoded, in
+    // the schema metadata of both index files.
 
     fn to_details(&self) -> Result<pb::MinHashLshIndexDetails> {
         Ok(pb::MinHashLshIndexDetails {
@@ -409,13 +423,7 @@ impl MinHashLshIndexParams {
             shingle_size: self.shingle_size,
             tokenizer: Some(pbold::InvertedIndexDetails::try_from(&self.tokenizer)?),
             signature_version: SIGNATURE_VERSION,
-            tokenizer_fingerprint: None,
         })
-    }
-
-    /// Parse the parameters stored in an index's details.
-    pub fn from_index_details(details: &prost_types::Any) -> Result<Self> {
-        Self::from_details(&details.to_msg::<pb::MinHashLshIndexDetails>()?)
     }
 
     fn from_details(details: &pb::MinHashLshIndexDetails) -> Result<Self> {
@@ -425,20 +433,14 @@ impl MinHashLshIndexParams {
                 details.signature_version, SIGNATURE_VERSION
             )));
         }
-        if details.tokenizer_fingerprint.is_some() {
-            return Err(Error::not_supported(
-                "MinHash LSH index details carry a tokenizer_fingerprint, which this version of Lance does not verify; rebuild the index with a tokenizer whose data ships with Lance".to_string(),
-            ));
-        }
         let tokenizer = details.tokenizer.as_ref().ok_or_else(|| {
             Error::invalid_input("MinHash LSH index details carry no tokenizer".to_string())
         })?;
-        let tokenizer = InvertedIndexParams::try_from(tokenizer)?;
         let params = Self {
             num_hashes: details.num_hashes,
             num_bands: details.num_bands,
             shingle_size: details.shingle_size,
-            tokenizer,
+            tokenizer: InvertedIndexParams::try_from(tokenizer)?,
         };
         params.validate()?;
         Ok(params)
@@ -448,8 +450,11 @@ impl MinHashLshIndexParams {
         Ok(prost_types::Any::from_msg(&self.to_details()?)?)
     }
 
-    /// The serialized details as lower-case hex, the form both index files
-    /// repeat in their schema metadata.
+    /// Parse the details stored in the index metadata.
+    pub fn from_details_any(details: &prost_types::Any) -> Result<Self> {
+        Self::from_details(&details.to_msg::<pb::MinHashLshIndexDetails>()?)
+    }
+
     fn details_hex(&self) -> Result<String> {
         Ok(hex::encode(self.to_details()?.encode_to_vec()))
     }
@@ -965,8 +970,7 @@ impl MinHashLshIndex {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<Self>> {
-        let details = details.to_msg::<pb::MinHashLshIndexDetails>()?;
-        let params = MinHashLshIndexParams::from_details(&details)?;
+        let params = MinHashLshIndexParams::from_details_any(details)?;
         let (bands, signatures) = futures::try_join!(
             store.open_index_file(BANDS_FILENAME),
             store.open_index_file(SIGNATURES_FILENAME)
@@ -2856,9 +2860,9 @@ impl ScalarIndexPlugin for MinHashLshIndexPlugin {
             }
             let reference = match &reference {
                 Some(reference) => reference,
-                None => reference.insert(MinHashLshIndexParams::from_index_details(first)?),
+                None => reference.insert(MinHashLshIndexParams::from_details_any(first)?),
             };
-            let params = MinHashLshIndexParams::from_index_details(details)?;
+            let params = MinHashLshIndexParams::from_details_any(details)?;
             if params != *reference {
                 return Err(Error::invalid_input(format!(
                     "MinHash LSH index segments must share identical parameters (signatures are only comparable under the same hash functions and tokenizer); found {reference:?} and {params:?}"
@@ -3163,17 +3167,14 @@ mod tests {
         "custom_stop_words"
     )]
     #[case::lance_tokenizer(r#"{"tokenizer": {"lance_tokenizer": "json"}}"#, "lance_tokenizer")]
-    #[case::jieba(
-        r#"{"tokenizer": {"base_tokenizer": "jieba"}}"#,
-        "tokenizer_fingerprint"
-    )]
+    #[case::jieba(r#"{"tokenizer": {"base_tokenizer": "jieba"}}"#, "outside Lance")]
     #[case::jieba_named(
         r#"{"tokenizer": {"base_tokenizer": "jieba/default"}}"#,
-        "tokenizer_fingerprint"
+        "outside Lance"
     )]
     #[case::lindera(
         r#"{"tokenizer": {"base_tokenizer": "lindera/ipadic"}}"#,
-        "tokenizer_fingerprint"
+        "outside Lance"
     )]
     #[case::unknown_key(r#"{"num_hash": 128}"#, "unknown field")]
     #[case::bad_tokenizer(
@@ -3182,15 +3183,12 @@ mod tests {
     )]
     fn test_params_validation(#[case] json: &str, #[case] message: &str) {
         let err = MinHashLshIndexParams::from_json(json).unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidInput { .. } | Error::NotSupported { .. }),
-            "{err}"
-        );
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
         assert!(err.to_string().contains(message), "{err}");
     }
 
     #[test]
-    fn test_details_round_trip_and_fingerprint_rejection() {
+    fn test_details_hex_round_trip() {
         let params = MinHashLshIndexParams::from_json(r#"{"num_hashes": 64}"#).unwrap();
         let hex = params.details_hex().unwrap();
         assert_eq!(
@@ -3198,14 +3196,6 @@ mod tests {
             params
         );
         assert!(MinHashLshIndexParams::from_details_hex("zz").is_err());
-
-        let details = pb::MinHashLshIndexDetails {
-            tokenizer_fingerprint: Some(1),
-            ..params.to_details().unwrap()
-        };
-        let err = MinHashLshIndexParams::from_details(&details).unwrap_err();
-        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
-        assert!(err.to_string().contains("tokenizer_fingerprint"), "{err}");
     }
 
     /// The vectors of the format specification

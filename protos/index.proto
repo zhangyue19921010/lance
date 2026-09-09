@@ -257,62 +257,49 @@ message RTreeIndexDetails {}
 
 message FMIndexDetails {}
 
-/* Details for a MinHash LSH index used for near-duplicate detection
- * (approximate Jaccard similarity top-k over text).
+/* Details of a MinHash LSH index (near-duplicate search over text).
  *
- * Every input of signature generation is identified here and nowhere else:
- * the parameters, the tokenizer configuration, the fingerprint of tokenizer
- * resources that do not ship with Lance, and the version of the procedure.
- * All segments of one logical index must carry identical details so that
- * signatures written by different segments (and computed on the query side)
- * are comparable; both index files repeat the serialized message as schema
- * metadata so that a file that does not belong to the details is detected. A
- * reader validates every field against the ranges below before it allocates
- * memory or reads an index file, and rejects details outside them.
+ * The message identifies every input of signature generation: the
+ * parameters, the tokenizer and the version of the procedure. All segments
+ * of one logical index carry identical details, so their signatures and the
+ * query signature are comparable; both index files repeat the serialized
+ * message in their schema metadata so that a file which does not belong to
+ * the details is detected. A reader validates every field against the ranges
+ * below before it allocates memory or reads an index file.
  */
 message MinHashLshIndexDetails {
-  /* Number of MinHash values per signature (k). Must be in [1, 4096] and a
-   * multiple of `num_bands`.
+  /* Number of MinHash values per signature (k): in [1, 4096] and a multiple
+   * of `num_bands`.
    */
   uint32 num_hashes = 1;
 
-  /* Number of LSH bands (b). Each band covers `num_hashes / num_bands`
-   * consecutive signature values. Must be in [1, 256].
+  /* Number of LSH bands (b), in [1, 256]. Each band covers
+   * `num_hashes / num_bands` consecutive signature values.
    */
   uint32 num_bands = 2;
 
-  /* Number of consecutive tokens joined into one shingle before hashing. Must
-   * be at least 1; a text with fewer tokens forms one shingle of all of them.
+  /* Number of consecutive tokens joined into one shingle; at least 1. A text
+   * with fewer tokens forms one shingle of all of them.
    */
   uint32 shingle_size = 3;
 
-  /* The tokenizer, recorded exactly like a full text search index records it
-   * and rebuilt from this message alone at query time. Required. Only the
-   * tokenization fields matter here; fields that shape full text search
-   * postings (`with_position`, `block_size`, `posting_format_version`,
-   * `document_granularity`) are carried unchanged and ignored. Settings the
-   * message cannot record (custom stop words, document-level text extraction)
-   * are rejected when the index is created. The token stream of a tokenizer
-   * whose data ships with Lance is fixed by `signature_version`.
+  /* The tokenizer, recorded as a full text search index records it and
+   * rebuilt from this message alone at query time. Required. Fields that only
+   * shape full text search postings (`with_position`, `block_size`,
+   * `posting_format_version`, `document_granularity`) are carried unchanged
+   * and ignored. The details must identify the tokenizer completely, so
+   * settings the message cannot record (custom stop words, document-level
+   * text extraction) and tokenizers that load data from outside Lance (the
+   * jieba and lindera dictionaries) are rejected.
    */
   lance.table.InvertedIndexDetails tokenizer = 4;
 
-  /* Version of the signature generation behavior (tokenize, shingle, hash,
-   * permute, compress and derive band keys, including the fixed seed the
-   * coefficients derive from). Bumped whenever any step changes in a way that
-   * makes old and new signatures incomparable; a reader rejects a version it
-   * does not implement. Independent of the index file format version.
+  /* Version of the signature procedure: the token streams of the tokenizers
+   * that ship with Lance, shingling, hashing, the permutation coefficients
+   * and their seed, compression and band keys. Bumped whenever any of them
+   * changes in a way that makes old and new signatures incomparable; a reader
+   * rejects a version it does not implement. Independent of the index file
+   * format version.
    */
   uint32 signature_version = 5;
-
-  /* XXH64 fingerprint of the resources the tokenizer loads from the language
-   * model home at build time (the jieba and lindera dictionaries), as
-   * defined by the format specification. Present exactly when the tokenizer
-   * loads such resources, which must all lie below the tokenizer's directory:
-   * a configuration that reaches outside it, or relies on a fallback, is
-   * rejected. A reader recomputes the fingerprint from its own deployment
-   * before signing a query and rejects a mismatch; a writer or reader that
-   * does not implement the fingerprint rejects these tokenizers instead.
-   */
-  optional uint64 tokenizer_fingerprint = 6;
 }

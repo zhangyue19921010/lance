@@ -3918,7 +3918,7 @@ impl Scanner {
                     index.name, query.column
                 ))
             })?;
-        let params = MinHashLshIndexParams::from_index_details(details)?;
+        let params = MinHashLshIndexParams::from_details_any(details)?;
 
         let target_fragments: &[Fragment] = self
             .fragments
