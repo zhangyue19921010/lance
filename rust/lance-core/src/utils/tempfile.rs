@@ -23,6 +23,30 @@ use tempfile::NamedTempFile;
 
 use crate::Result;
 
+/// Bytes available to this process on the file system holding `path`.
+///
+/// Used to fail an operation that needs a known amount of temporary space
+/// before it starts writing. On platforms without `statvfs` the space is
+/// reported as unlimited.
+#[cfg(unix)]
+pub fn available_space_bytes(path: &StdPath) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated path and `stats` is a zeroed
+    // struct that the call fills in.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stats) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(stats.f_bavail as u64 * stats.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+pub fn available_space_bytes(_path: &StdPath) -> std::io::Result<u64> {
+    Ok(u64::MAX)
+}
+
 /// A temporary directory
 ///
 /// This create a temporary directory using [`tempfile::tempdir`].  It will

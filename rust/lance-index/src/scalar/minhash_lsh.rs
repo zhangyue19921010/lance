@@ -36,6 +36,7 @@ use std::any::Any;
 use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use arrow_array::cast::AsArray;
@@ -47,12 +48,12 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::future::try_join_all;
 use futures::stream::FuturesOrdered;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_core::utils::tempfile::available_space_bytes;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
@@ -146,9 +147,23 @@ const SIGNATURE_SCAN_ROWS: usize = 32 * 1024;
 const SCAN_READ_CONCURRENCY: usize = 4;
 
 /// Memory budget for one in-memory sort run of (band key, doc id) records.
-/// Runs beyond this are sorted and spilled to temporary index files that are
-/// merged when the bands file is written.
+/// Runs beyond this are sorted and spilled to files in a temporary directory
+/// that are merged when the bands file is written.
 const DEFAULT_SORT_RUN_BYTES: usize = 256 * 1024 * 1024;
+/// Memory budget of the sort (bytes), shared with the DataFusion-backed index
+/// builds: runs get three fifths of it, merge groups the rest.
+const SORT_MEMORY_ENV: &str = "LANCE_MEM_POOL_SIZE";
+/// Limit on the temporary disk space of one build (bytes), the variable the
+/// DataFusion-backed builds honor as well.
+const SPILL_LIMIT_ENV: &str = "LANCE_MAX_TEMP_DIRECTORY_SIZE";
+const DEFAULT_SPILL_LIMIT_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+/// Below this run size the merge reads a small slice of many files per
+/// group and the build slows down; still correct, so only warned about.
+const MIN_EFFICIENT_RUN_BYTES: usize = 64 * 1024 * 1024;
+/// Bytes of one spilled record: the key and the doc id, little-endian.
+const SPILL_RECORD_BYTES: usize = 12;
+/// Records serialized per write while spilling a run.
+const SPILL_WRITE_RECORDS: usize = 1 << 20;
 /// Runs sorted and written concurrently with signing. Each holds a full run
 /// in memory, so this bounds the backlog when signing outpaces the disk.
 const MAX_INFLIGHT_SPILLS: usize = 4;
@@ -159,8 +174,6 @@ const SIGNED_BATCH_QUEUE: usize = 16;
 /// the scan's 8192-row batches; the writer's per-batch cost makes larger
 /// batches noticeably faster (about 15% on the signing stage at 10^8 rows).
 const SIGNATURE_WRITE_BATCH_ROWS: usize = 1 << 16;
-/// Rows per batch when writing sort runs.
-const SPILL_BATCH_ROWS: usize = 1 << 20;
 /// Every sorted run records the row at which each key-range partition
 /// starts, so the merge can gather one partition from every run, sort it in
 /// memory and write it, partitions processed independently and in key order.
@@ -170,14 +183,14 @@ const SPILL_BATCH_ROWS: usize = 1 << 20;
 const SPILL_PARTITIONS: usize = 1 << 16;
 /// Records of adjacent partitions merged as one group (about 32 MiB), each
 /// group sorted in memory on the CPU pool.
-const MERGE_GROUP_RECORDS: usize = (32 * 1024 * 1024) / std::mem::size_of::<(u64, u32)>();
+const DEFAULT_MERGE_GROUP_RECORDS: usize = (32 * 1024 * 1024) / std::mem::size_of::<(u64, u32)>();
 /// Upper bound on groups gathered and sorted concurrently; the actual count
 /// is a quarter of the CPU pool, so the in-flight reads (two per group) stay
 /// at half the runtime workers, each of which a read can park while its
 /// decode waits for IO.
 const MERGE_GROUPS_IN_FLIGHT: usize = 16;
 /// Reads in flight while a group gathers its records from the runs.
-const MERGE_GROUP_READ_CONCURRENCY: usize = 2;
+const MERGE_GROUP_READ_CONCURRENCY: usize = 4;
 /// Records per batch written to the bands file from a resident run.
 const BANDS_WRITE_BATCH_RECORDS: usize = 1 << 20;
 /// Highest band count representable in the 8-bit band id prefix of a band key.
@@ -196,15 +209,6 @@ static BANDS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             COMPRESSION_META_KEY.to_string(),
             "none".to_string(),
         )])),
-    ]))
-});
-
-/// Sort runs hold the same columns with the default lightweight encodings:
-/// they are written once and read back in large sequential ranges.
-static SPILL_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(Schema::new(vec![
-        Field::new(BAND_KEY_COL, DataType::UInt64, false),
-        Field::new(DOC_ID_COL, DataType::UInt32, false),
     ]))
 });
 
@@ -1963,12 +1967,126 @@ impl BandsWriter {
     }
 }
 
-/// A sorted run of (band key, doc id) records in a temporary index file, with
-/// the row at which each key-range partition starts (`SPILL_PARTITIONS + 1`
-/// entries, the last one being the row count).
+/// A sorted run of (band key, doc id) records in a spill file, with the row
+/// at which each key-range partition starts (`SPILL_PARTITIONS + 1` entries,
+/// the last one being the row count).
 struct SpilledRun {
-    name: String,
+    file: Arc<std::fs::File>,
     partition_starts: Vec<usize>,
+}
+
+/// The temporary directory holding the spill files of one build, removed
+/// when dropped. Every spill is accounted against the configured limit and
+/// the free space of the file system before it is written, so a build that
+/// cannot fit fails with a clear error instead of an ENOSPC halfway through.
+struct SpillDir {
+    dir: tempfile::TempDir,
+    limit_bytes: u64,
+    written_bytes: AtomicU64,
+}
+
+impl SpillDir {
+    fn create(limit_bytes: u64) -> Result<Self> {
+        let base = std::env::temp_dir();
+        let dir = tempfile::Builder::new()
+            .prefix("lance-minhash-lsh-")
+            .tempdir_in(&base)
+            .map_err(|err| {
+                Error::io(format!(
+                    "cannot create the MinHash LSH spill directory in {}: {err}",
+                    base.display()
+                ))
+            })?;
+        Ok(Self {
+            dir,
+            limit_bytes,
+            written_bytes: AtomicU64::new(0),
+        })
+    }
+
+    /// Create the file of run `run` after accounting its `bytes`.
+    fn new_run_file(&self, run: usize, bytes: u64) -> Result<std::fs::File> {
+        let written = self.written_bytes.fetch_add(bytes, Ordering::SeqCst);
+        if written + bytes > self.limit_bytes {
+            return Err(Error::io(format!(
+                "MinHash LSH build needs {} bytes of temporary disk in {} ({written} already written) but {SPILL_LIMIT_ENV} limits it to {}",
+                written + bytes,
+                self.dir.path().display(),
+                self.limit_bytes
+            )));
+        }
+        let free = available_space_bytes(self.dir.path()).map_err(|err| {
+            Error::io(format!(
+                "cannot stat the spill directory {}: {err}",
+                self.dir.path().display()
+            ))
+        })?;
+        if free < bytes {
+            return Err(Error::io(format!(
+                "MinHash LSH build needs {bytes} more bytes of temporary disk in {} but only {free} are free; set TMPDIR to a larger file system",
+                self.dir.path().display()
+            )));
+        }
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(self.dir.path().join(format!("run-{run}.bin")))
+            .map_err(|err| Error::io(format!("cannot create MinHash LSH spill file: {err}")))
+    }
+}
+
+/// Write sorted records to `file` as little-endian (key, doc id) pairs.
+fn write_spill_records(file: &mut std::fs::File, records: &[(u64, u32)]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut bytes = Vec::with_capacity(SPILL_WRITE_RECORDS.min(records.len()) * SPILL_RECORD_BYTES);
+    for chunk in records.chunks(SPILL_WRITE_RECORDS) {
+        bytes.clear();
+        for (key, doc_id) in chunk {
+            bytes.extend_from_slice(&key.to_le_bytes());
+            bytes.extend_from_slice(&doc_id.to_le_bytes());
+        }
+        file.write_all(&bytes)?;
+    }
+    Ok(())
+}
+
+/// Read the records of `rows` back from a spill file.
+fn read_spill_records(
+    file: &std::fs::File,
+    rows: Range<usize>,
+) -> std::io::Result<Vec<(u64, u32)>> {
+    let mut bytes = vec![0u8; rows.len() * SPILL_RECORD_BYTES];
+    let offset = (rows.start * SPILL_RECORD_BYTES) as u64;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut bytes, offset)?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut read = 0;
+        while read < bytes.len() {
+            let n = file.seek_read(&mut bytes[read..], offset + read as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "spill file ended early",
+                ));
+            }
+            read += n;
+        }
+    }
+    Ok(bytes
+        .chunks_exact(SPILL_RECORD_BYTES)
+        .map(|record| {
+            (
+                u64::from_le_bytes(record[..8].try_into().unwrap()),
+                u32::from_le_bytes(record[8..].try_into().unwrap()),
+            )
+        })
+        .collect())
 }
 
 impl SpilledRun {
@@ -2026,32 +2144,30 @@ fn merge_groups(runs: &[SpilledRun], group_records: usize) -> Vec<Range<usize>> 
 /// them into the key and doc id columns.
 async fn merge_group(
     runs: &[SpilledRun],
-    readers: &[Arc<dyn IndexReader>],
     partitions: Range<usize>,
 ) -> Result<(Vec<u64>, Vec<u32>)> {
     let mut records: Vec<(u64, u32)> =
         Vec::with_capacity(runs.iter().map(|run| run.rows(&partitions).len()).sum());
     let reads: Vec<_> = runs
         .iter()
-        .zip(readers)
-        .filter_map(|(run, reader)| {
+        .filter_map(|run| {
             let rows = run.rows(&partitions);
             if rows.is_empty() {
                 return None;
             }
-            let reader = reader.clone();
-            Some(async move { reader.read_range(rows, None).await })
+            let file = run.file.clone();
+            // Spill reads are blocking file IO, kept off the runtime workers.
+            Some(async move {
+                tokio::task::spawn_blocking(move || read_spill_records(&file, rows))
+                    .await
+                    .map_err(|err| Error::internal(format!("spill read task failed: {err}")))?
+                    .map_err(|err| Error::io(format!("cannot read MinHash LSH spill file: {err}")))
+            })
         })
         .collect();
-    let mut batches = futures::stream::iter(reads).buffered(MERGE_GROUP_READ_CONCURRENCY);
-    while let Some(batch) = batches.try_next().await? {
-        let (keys, doc_ids) = band_columns(&batch, "bands spill run")?;
-        records.extend(
-            keys.values()
-                .iter()
-                .copied()
-                .zip(doc_ids.values().iter().copied()),
-        );
+    let mut chunks = futures::stream::iter(reads).buffered(MERGE_GROUP_READ_CONCURRENCY);
+    while let Some(chunk) = chunks.try_next().await? {
+        records.extend(chunk);
     }
     spawn_cpu(move || {
         records.sort_unstable();
@@ -2067,16 +2183,58 @@ pub struct MinHashLshIndexBuilder {
     page_rows: usize,
     /// Maximum records held in memory before a sort run is spilled.
     sort_run_records: usize,
+    /// Records merged as one group while writing the bands file.
+    merge_group_records: usize,
+    /// Temporary disk space one build may use for its spill files.
+    spill_limit_bytes: u64,
 }
 
 impl MinHashLshIndexBuilder {
+    /// A builder with the default memory budget, or the one in
+    /// `LANCE_MEM_POOL_SIZE`, and the spill limit of
+    /// `LANCE_MAX_TEMP_DIRECTORY_SIZE` (100 GiB by default).
     pub fn try_new(params: MinHashLshIndexParams) -> Result<Self> {
         params.validate()?;
-        Ok(Self {
+        let mut builder = Self {
             params,
             page_rows: DEFAULT_PAGE_ROWS,
             sort_run_records: DEFAULT_SORT_RUN_BYTES / std::mem::size_of::<(u64, u32)>(),
-        })
+            merge_group_records: DEFAULT_MERGE_GROUP_RECORDS,
+            spill_limit_bytes: DEFAULT_SPILL_LIMIT_BYTES,
+        };
+        if let Some(bytes) = env_bytes(SORT_MEMORY_ENV) {
+            builder = builder.with_sort_memory_bytes(bytes as usize)?;
+        }
+        if let Some(bytes) = env_bytes(SPILL_LIMIT_ENV) {
+            builder = builder.with_spill_limit_bytes(bytes);
+        }
+        Ok(builder)
+    }
+
+    /// Bound the memory of the sort: the run being filled, the runs being
+    /// spilled and the merge groups together stay within `bytes`.
+    pub fn with_sort_memory_bytes(mut self, bytes: usize) -> Result<Self> {
+        let (sort_run_records, merge_group_records) = sort_budget(bytes);
+        if sort_run_records == 0 || merge_group_records == 0 {
+            return Err(Error::invalid_input(format!(
+                "MinHash LSH sort memory budget of {bytes} bytes is too small"
+            )));
+        }
+        if sort_run_records * std::mem::size_of::<(u64, u32)>() < MIN_EFFICIENT_RUN_BYTES {
+            log::warn!(
+                "MinHash LSH sort memory budget of {bytes} bytes gives sort runs under {MIN_EFFICIENT_RUN_BYTES} bytes; the build stays correct but merges many small spill slices"
+            );
+        }
+        self.sort_run_records = sort_run_records;
+        self.merge_group_records = merge_group_records;
+        Ok(self)
+    }
+
+    /// Bound the temporary disk space of the build; a build that would
+    /// exceed it fails before writing the spill that crosses the limit.
+    pub fn with_spill_limit_bytes(mut self, bytes: u64) -> Self {
+        self.spill_limit_bytes = bytes;
+        self
     }
 
     /// Rows per logical page of `bands.lance`; exposed so tests can force
@@ -2102,13 +2260,9 @@ impl MinHashLshIndexBuilder {
         Ok(self)
     }
 
-    fn spill_filename(run: usize) -> String {
-        format!("bands-spill-{run}.lance")
-    }
-
-    /// Sort one run and write it to a temporary index file, returning its name.
+    /// Sort one run and write it to a spill file.
     async fn spill_run(
-        store: Arc<dyn IndexStore>,
+        spill_dir: Arc<SpillDir>,
         run: usize,
         records: Vec<(u64, u32)>,
         partitions_per_band: usize,
@@ -2120,20 +2274,17 @@ impl MinHashLshIndexBuilder {
             Ok::<_, Error>((records, partition_starts))
         })
         .await?;
-        let name = Self::spill_filename(run);
-        let mut writer = store.new_index_file(&name, SPILL_SCHEMA.clone()).await?;
-        for chunk in records.chunks(SPILL_BATCH_ROWS) {
-            let keys = UInt64Array::from_iter_values(chunk.iter().map(|(key, _)| *key));
-            let doc_ids = UInt32Array::from_iter_values(chunk.iter().map(|(_, doc_id)| *doc_id));
-            let batch = RecordBatch::try_new(
-                SPILL_SCHEMA.clone(),
-                vec![Arc::new(keys) as ArrayRef, Arc::new(doc_ids) as ArrayRef],
-            )?;
-            writer.write_record_batch(batch).await?;
-        }
-        writer.finish().await?;
+        let mut file = spill_dir.new_run_file(run, (records.len() * SPILL_RECORD_BYTES) as u64)?;
+        // Blocking file IO stays off the runtime workers.
+        let file = tokio::task::spawn_blocking(move || {
+            write_spill_records(&mut file, &records)?;
+            Ok::<_, std::io::Error>(file)
+        })
+        .await
+        .map_err(|err| Error::internal(format!("spill write task failed: {err}")))?
+        .map_err(|err| Error::io(format!("cannot write MinHash LSH spill file: {err}")))?;
         Ok(SpilledRun {
-            name,
+            file: Arc::new(file),
             partition_starts,
         })
     }
@@ -2220,8 +2371,10 @@ impl MinHashLshIndexBuilder {
             let mut spills: FuturesOrdered<tokio::task::JoinHandle<Result<SpilledRun>>> =
                 FuturesOrdered::new();
             let mut spilled_runs: Vec<SpilledRun> = Vec::new();
-            // The run state is returned on failure too so spill files can be
-            // cleaned up.
+            // Created by the first spill; dropping it removes the spill files.
+            let mut spill_dir: Option<Arc<SpillDir>> = None;
+            // The run state is returned on failure too so in-flight spills
+            // can be waited for before their directory is removed.
             let outcome = async {
                 let mut num_docs: u64 = 0;
                 let mut wrote_signatures = false;
@@ -2241,10 +2394,15 @@ impl MinHashLshIndexBuilder {
                                 &mut run,
                                 Vec::with_capacity(self.sort_run_records),
                             );
-                            let store = store.clone_arc();
+                            let dir = match &spill_dir {
+                                Some(dir) => dir.clone(),
+                                None => spill_dir
+                                    .insert(Arc::new(SpillDir::create(self.spill_limit_bytes)?))
+                                    .clone(),
+                            };
                             let run_index = spilled_runs.len() + spills.len();
                             spills.push_back(tokio::spawn(Self::spill_run(
-                                store,
+                                dir,
                                 run_index,
                                 records,
                                 partitions_per_band,
@@ -2291,9 +2449,9 @@ impl MinHashLshIndexBuilder {
             // Dropping the sender ends the writer task; dropping the receiver
             // (with this block) ends the driver.
             drop(batch_tx);
-            (outcome, run, spills, spilled_runs)
+            (outcome, run, spills, spilled_runs, spill_dir)
         };
-        let ((), (outcome, mut run, mut spills, mut spilled_runs)) =
+        let ((), (outcome, mut run, mut spills, mut spilled_runs, spill_dir)) =
             futures::join!(driver, consumer);
         // The writer's own error explains a consumer that failed to send.
         let writer_result = writer_task
@@ -2303,7 +2461,7 @@ impl MinHashLshIndexBuilder {
         let (mut signatures_writer, (num_docs, wrote_signatures)) = match (writer_result, outcome) {
             (Ok(writer), Ok(counts)) => (writer, counts),
             (Err(err), _) | (_, Err(err)) => {
-                abandon_spills(store, spills, spilled_runs).await;
+                abandon_spills(spills).await;
                 return Err(err);
             }
         };
@@ -2338,9 +2496,12 @@ impl MinHashLshIndexBuilder {
             SortedRuns::Resident(sorted)
         } else {
             if !run.is_empty() {
+                let dir = spill_dir
+                    .clone()
+                    .ok_or_else(|| Error::internal("spill directory missing".to_string()))?;
                 let run_index = spilled_runs.len() + spills.len();
                 spills.push_back(tokio::spawn(Self::spill_run(
-                    store.clone_arc(),
+                    dir,
                     run_index,
                     run,
                     partitions_per_band,
@@ -2350,7 +2511,7 @@ impl MinHashLshIndexBuilder {
                 match joined_spill(spilled) {
                     Ok(run) => spilled_runs.push(run),
                     Err(err) => {
-                        abandon_spills(store, spills, spilled_runs).await;
+                        abandon_spills(spills).await;
                         return Err(err);
                     }
                 }
@@ -2363,11 +2524,11 @@ impl MinHashLshIndexBuilder {
             SortedRuns::Spilled(spilled_runs.into())
         };
 
-        let bands_file = self.write_bands(store, &runs, num_docs).await;
-        if let SortedRuns::Spilled(spilled_runs) = &runs {
-            delete_spill_files(store, spilled_runs).await;
-        }
-        Ok(vec![signatures_file, bands_file?])
+        let bands_file = self.write_bands(store, &runs, num_docs).await?;
+        // The spill files go with their directory, after the last read.
+        drop(runs);
+        drop(spill_dir);
+        Ok(vec![signatures_file, bands_file])
     }
 
     /// Write the sorted records to `bands.lance`; spilled runs are merged one
@@ -2396,20 +2557,17 @@ impl MinHashLshIndexBuilder {
                 }
             }
             SortedRuns::Spilled(runs) => {
-                let readers = Arc::new(
-                    try_join_all(runs.iter().map(|run| store.open_index_file(&run.name))).await?,
-                );
                 // Each group is its own task so gathering and sorting proceed
                 // while this loop waits on the writer.
-                let mut merged = futures::stream::iter(merge_groups(runs, MERGE_GROUP_RECORDS))
-                    .map(|group| {
-                        let runs = runs.clone();
-                        let readers = readers.clone();
-                        tokio::spawn(async move { merge_group(&runs, &readers, group).await })
-                    })
-                    .buffered(
-                        (get_num_compute_intensive_cpus() / 4).clamp(1, MERGE_GROUPS_IN_FLIGHT),
-                    );
+                let mut merged =
+                    futures::stream::iter(merge_groups(runs, self.merge_group_records))
+                        .map(|group| {
+                            let runs = runs.clone();
+                            tokio::spawn(async move { merge_group(&runs, group).await })
+                        })
+                        .buffered(
+                            (get_num_compute_intensive_cpus() / 4).clamp(1, MERGE_GROUPS_IN_FLIGHT),
+                        );
                 while let Some(joined) = merged.next().await {
                     let (keys, doc_ids) = joined
                         .map_err(|err| Error::internal(format!("merge task failed: {err}")))??;
@@ -2431,31 +2589,31 @@ enum SortedRuns {
     Spilled(Arc<[SpilledRun]>),
 }
 
-/// Delete spill files, best effort: a leftover only wastes space.
-async fn delete_spill_files(store: &dyn IndexStore, runs: &[SpilledRun]) {
-    for run in runs {
-        if let Err(err) = store.delete_index_file(&run.name).await {
-            log::warn!(
-                "failed to delete MinHash LSH spill file {}: {err}",
-                run.name
-            );
-        }
-    }
+/// Wait for the in-flight spills of a failed build so that no task still
+/// writes into the spill directory when it is removed.
+async fn abandon_spills(mut spills: FuturesOrdered<tokio::task::JoinHandle<Result<SpilledRun>>>) {
+    while spills.next().await.is_some() {}
 }
 
-/// Wait for the in-flight spills of a failed build and delete every spill
-/// file it wrote.
-async fn abandon_spills(
-    store: &dyn IndexStore,
-    mut spills: FuturesOrdered<tokio::task::JoinHandle<Result<SpilledRun>>>,
-    mut spilled_runs: Vec<SpilledRun>,
-) {
-    while let Some(spilled) = spills.next().await {
-        if let Ok(Ok(run)) = spilled {
-            spilled_runs.push(run);
+/// Split a sort memory budget between the runs (the one being filled plus
+/// the in-flight spills) and the merge groups, in records.
+fn sort_budget(bytes: usize) -> (usize, usize) {
+    let record = std::mem::size_of::<(u64, u32)>();
+    let run_records = bytes * 3 / 5 / (MAX_INFLIGHT_SPILLS + 1) / record;
+    let group_records = bytes * 2 / 5 / MERGE_GROUPS_IN_FLIGHT / record;
+    (run_records, group_records)
+}
+
+/// A byte count from the environment, if set and valid.
+fn env_bytes(name: &str) -> Option<u64> {
+    let value = std::env::var(name).ok()?;
+    match value.parse::<u64>() {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            log::warn!("ignoring {name}={value}: {err}");
+            None
         }
     }
-    delete_spill_files(store, &spilled_runs).await;
 }
 
 /// Total documents of a merge, rejected when a segment could not address
@@ -2999,7 +3157,7 @@ mod tests {
         let mut state = 3u64;
         // Three sorted runs of random 56-bit hashes over eight bands
         let runs: Vec<SpilledRun> = (0..3)
-            .map(|run| {
+            .map(|_| {
                 let mut records: Vec<(u64, u32)> = (0..100_000u32)
                     .map(|doc| {
                         let band = splitmix64(&mut state) % num_bands as u64;
@@ -3015,7 +3173,7 @@ mod tests {
                 assert!(partitions.is_sorted(), "partitions must follow key order");
                 assert!(partitions.iter().all(|&p| p < SPILL_PARTITIONS));
                 SpilledRun {
-                    name: format!("run-{run}"),
+                    file: Arc::new(tempfile::tempfile().unwrap()),
                     partition_starts: partition_starts(&records, partitions_per_band),
                 }
             })
@@ -3272,6 +3430,44 @@ mod tests {
         assert_eq!(index.num_docs(), 0);
         assert!(search(&index, "anything at all here", 5).await.is_empty());
         assert_eq!(index.statistics().unwrap()["num_pages"], 0);
+    }
+
+    #[test]
+    fn test_sort_budget_splits_runs_and_merge_groups() {
+        let record = std::mem::size_of::<(u64, u32)>();
+        let (run, group) = sort_budget(1 << 30);
+        // Three fifths for the filling run and the in-flight spills, two
+        // fifths for the merge groups.
+        assert_eq!(run, (1 << 30) * 3 / 5 / (MAX_INFLIGHT_SPILLS + 1) / record);
+        assert_eq!(group, (1 << 30) * 2 / 5 / MERGE_GROUPS_IN_FLIGHT / record);
+        assert!(
+            default_builder().with_sort_memory_bytes(100).is_err(),
+            "a budget below one record per run must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spill_limit_fails_before_writing() {
+        let (_tmpdir, store) = test_store();
+        let texts: Vec<String> = (0..2_000)
+            .map(|i| format!("doc {i} words {} {}", i % 7, i % 11))
+            .collect();
+        let rows = rows_from(&texts.iter().map(String::as_str).collect::<Vec<_>>());
+        let err = default_builder()
+            .with_sort_run_records(50)
+            .unwrap()
+            .with_spill_limit_bytes(100)
+            .train(text_stream(&rows, 64), store.as_ref())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::IO { .. }), "{err}");
+        assert!(err.to_string().contains(SPILL_LIMIT_ENV), "{err}");
+        // Nothing but the signature file was left in the store
+        let files = store.list_files_with_sizes().await.unwrap();
+        assert!(
+            files.iter().all(|file| !file.path.contains("run-")),
+            "{files:?}"
+        );
     }
 
     #[tokio::test]
