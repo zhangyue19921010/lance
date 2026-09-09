@@ -4022,11 +4022,6 @@ impl Scanner {
         ))
     }
 
-    /// Score the rows the MinHash index does not cover by computing their
-    /// signatures on the fly (see [`FlatMinHashExec`]). Mirrors
-    /// [`Self::plan_flat_match_query`]: only the unindexed fragments and the
-    /// overlay-stale rows are read, projected to the text column, `_rowid` and
-    /// the filter's columns, with the prefilter pushed into the scan.
     /// One plan over the rows an index does not cover: whole unindexed
     /// fragments (filtered while reading) and stale rows of a data overlay
     /// (taken by address, then filtered), projected to `_rowid` plus

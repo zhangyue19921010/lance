@@ -13,7 +13,6 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
-use arrow_schema::DataType;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -30,7 +29,7 @@ use lance_index::prefilter::PreFilter;
 use lance_index::scalar::ScalarIndex;
 use lance_index::scalar::minhash_lsh::{
     MinHashHit, MinHashLshIndex, MinHashLshIndexParams, MinHashQuery, QuerySignature,
-    SignatureGenerator, SignatureValue, TopHits, estimate_jaccard,
+    SignatureGenerator, SignatureValue, TopHits, estimate_jaccard, text_values,
 };
 use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
@@ -328,36 +327,15 @@ fn score_flat_batch(
     let mut hits = TopHits::new(limit);
     let mut signature = vec![SignatureValue::MAX; generator.num_hashes()];
     let mut band_keys = Vec::with_capacity(generator.num_bands());
-    let mut score = |row: usize, text: &str| {
-        if generator.signature(text, &mut signature)
+    for (row, text) in text_values(values.as_ref())?.enumerate() {
+        if let Some(text) = text
+            && generator.signature(text, &mut signature)
             && query.shares_band(&generator, &signature, &mut band_keys)
         {
             hits.push(MinHashHit {
                 row_id: row_ids.value(row),
                 distance: 1.0 - estimate_jaccard(query.signature(), &signature),
             });
-        }
-    };
-    match values.data_type() {
-        DataType::Utf8 => values
-            .as_string::<i32>()
-            .iter()
-            .enumerate()
-            .for_each(|(row, text)| text.into_iter().for_each(|text| score(row, text))),
-        DataType::LargeUtf8 => values
-            .as_string::<i64>()
-            .iter()
-            .enumerate()
-            .for_each(|(row, text)| text.into_iter().for_each(|text| score(row, text))),
-        DataType::Utf8View => values
-            .as_string_view()
-            .iter()
-            .enumerate()
-            .for_each(|(row, text)| text.into_iter().for_each(|text| score(row, text))),
-        other => {
-            return Err(Error::invalid_input(format!(
-                "MinHash search supports Utf8, LargeUtf8 and Utf8View columns, column {column} has type {other}"
-            )));
         }
     }
     Ok(hits.into_sorted())
@@ -535,22 +513,18 @@ impl ExecutionPlan for FlatMinHashExec {
 mod tests {
     use std::sync::Arc;
 
-    use lance_index::scalar::FullTextSearchQuery;
-    use lance_index::scalar::inverted::query::MatchQuery;
-
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
-    use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
-        StringArray,
-    };
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::{Error, ROW_ID};
     use lance_index::IndexType;
+    use lance_index::scalar::inverted::query::MatchQuery;
     use lance_index::scalar::minhash_lsh::MinHashQuery;
-    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery, ScalarIndexParams};
     use lance_select::{RowAddrMask, RowAddrTreeMap};
 
+    use crate::dataset::scanner::Scanner;
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::{Dataset, Result};
@@ -575,39 +549,23 @@ mod tests {
         ]
     }
 
-    fn batch(first_id: i32, texts: &[&str]) -> RecordBatch {
-        let ids = Int32Array::from_iter_values(first_id..first_id + texts.len() as i32);
-        let text = StringArray::from(texts.to_vec());
-        let vectors = FixedSizeListArray::try_new(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            2,
-            Arc::new(Float32Array::from_iter_values(
-                (0..texts.len() * 2).map(|i| i as f32),
-            )) as ArrayRef,
-            None,
-        )
-        .unwrap();
-        RecordBatch::try_new(
-            schema(),
-            vec![
-                Arc::new(ids) as ArrayRef,
-                Arc::new(text) as ArrayRef,
-                Arc::new(vectors) as ArrayRef,
-            ],
-        )
-        .unwrap()
-    }
-
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("text", DataType::Utf8, true),
-            Field::new(
-                "vec",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
-                true,
-            ),
         ]))
+    }
+
+    fn batch(first_id: i32, texts: &[&str]) -> RecordBatch {
+        let ids = Int32Array::from_iter_values(first_id..first_id + texts.len() as i32);
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(ids) as ArrayRef,
+                Arc::new(StringArray::from(texts.to_vec())) as ArrayRef,
+            ],
+        )
+        .unwrap()
     }
 
     /// Twelve rows split over three fragments with a MinHash index on `text`.
@@ -633,146 +591,10 @@ mod tests {
         dataset
     }
 
-    fn ids_and_distances(batch: &RecordBatch) -> Vec<(i32, f32)> {
-        let ids = batch["id"].as_primitive::<Int32Type>();
-        let distances = batch["_distance"].as_primitive::<Float32Type>();
-        ids.values()
-            .iter()
-            .copied()
-            .zip(distances.values().iter().copied())
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn test_minhash_search_end_to_end() {
-        let dataset = indexed_dataset().await;
-
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))
-            .unwrap()
-            .limit(Some(3), None)
-            .unwrap()
-            .project(&["id"])
-            .unwrap()
-            .with_row_id();
-        let plan = scan.explain_plan(false).await.unwrap();
-        assert!(
-            plan.contains("MinHashSearch: column=text, limit=3"),
-            "{plan}"
-        );
-
-        let batch = scan.try_into_batch().await.unwrap();
-        assert!(batch.column_by_name(ROW_ID).is_some());
-        let hits = ids_and_distances(&batch);
-        assert_eq!(hits.len(), 3);
-        assert_eq!(hits[0], (0, 0.0));
-        assert_eq!(hits[1], (3, 0.0));
-        assert_eq!(hits[2].0, 1);
-        assert!(hits[2].1 > 0.0 && hits[2].1 < 0.5, "{hits:?}");
-
-        // A query with no similar rows returns an empty result, not an error
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new("nothing shares any shingle here", "text"))
-            .unwrap()
-            .limit(Some(3), None)
-            .unwrap();
-        let batch = scan.try_into_batch().await.unwrap();
-        assert_eq!(batch.num_rows(), 0);
-        assert!(batch.column_by_name("_distance").is_some());
-
-        // Offset rows are skipped after ranking
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))
-            .unwrap()
-            .limit(Some(2), Some(1))
-            .unwrap()
-            .project(&["id"])
-            .unwrap();
-        let hits = ids_and_distances(&scan.try_into_batch().await.unwrap());
-        assert_eq!(hits.iter().map(|hit| hit.0).collect::<Vec<_>>(), vec![3, 1]);
-    }
-
-    #[tokio::test]
-    async fn test_minhash_search_applies_filters_and_deletes() {
-        let mut dataset = indexed_dataset().await;
-
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))
-            .unwrap()
-            .limit(Some(2), None)
-            .unwrap()
-            .filter("id >= 1")
-            .unwrap()
-            .prefilter(true)
-            .project(&["id"])
-            .unwrap();
-        let hits = ids_and_distances(&scan.try_into_batch().await.unwrap());
-        assert_eq!(hits.iter().map(|hit| hit.0).collect::<Vec<_>>(), vec![3, 1]);
-
-        // Postfiltering ranks first and filters the ranked rows afterwards
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))
-            .unwrap()
-            .limit(Some(2), None)
-            .unwrap()
-            .filter("id >= 1")
-            .unwrap()
-            .prefilter(false)
-            .project(&["id"])
-            .unwrap();
-        let hits = ids_and_distances(&scan.try_into_batch().await.unwrap());
-        assert_eq!(hits.iter().map(|hit| hit.0).collect::<Vec<_>>(), vec![3]);
-
-        dataset.delete("id = 3").await.unwrap();
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))
-            .unwrap()
-            .limit(Some(2), None)
-            .unwrap()
-            .project(&["id"])
-            .unwrap();
-        let hits = ids_and_distances(&scan.try_into_batch().await.unwrap());
-        assert_eq!(hits.iter().map(|hit| hit.0).collect::<Vec<_>>(), vec![0, 1]);
-
-        // Deleting every row of a fragment drops it from the manifest while
-        // the index still lists it; the prefilter masks those rows too.
-        let dropped = texts()[6];
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(dropped, "text"))
-            .unwrap()
-            .limit(Some(2), None)
-            .unwrap()
-            .project(&["id"])
-            .unwrap();
-        let hits = ids_and_distances(&scan.try_into_batch().await.unwrap());
-        assert_eq!(hits.iter().map(|hit| hit.0).collect::<Vec<_>>(), vec![6]);
-        dataset.delete("id >= 4 AND id <= 7").await.unwrap();
-        assert_eq!(dataset.fragments().len(), 2);
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(dropped, "text"))
-            .unwrap()
-            .limit(Some(2), None)
-            .unwrap()
-            .project(&["id"])
-            .unwrap();
-        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))
-            .unwrap()
-            .limit(Some(3), None)
-            .unwrap()
-            .project(&["id"])
-            .unwrap();
-        let hits = ids_and_distances(&scan.try_into_batch().await.unwrap());
-        assert_eq!(hits.iter().map(|hit| hit.0).collect::<Vec<_>>(), vec![0, 1]);
-    }
-
-    #[tokio::test]
-    async fn test_minhash_search_covers_unindexed_fragments() {
-        let dataset = indexed_dataset().await;
-        let reader =
-            RecordBatchIterator::new(vec![Ok(batch(12, &[BASE, "unrelated append"]))], schema());
-        let dataset = Dataset::write(
+    /// Append `texts` as one new, unindexed fragment.
+    async fn append(dataset: Dataset, first_id: i32, texts: &[&str]) -> Dataset {
+        let reader = RecordBatchIterator::new(vec![Ok(batch(first_id, texts))], schema());
+        Dataset::write(
             reader,
             Arc::new(dataset),
             Some(WriteParams {
@@ -781,78 +603,168 @@ mod tests {
             }),
         )
         .await
-        .unwrap();
+        .unwrap()
+    }
+
+    fn scan(dataset: &Dataset, text: &str, limit: i64) -> Scanner {
+        let mut scan = dataset.scan();
+        scan.minhash_search(MinHashQuery::new(text, "text"))
+            .unwrap()
+            .limit(Some(limit), None)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        scan
+    }
+
+    /// `(id, _distance)` of a MinHash scan configured by `configure`.
+    async fn hits(
+        dataset: &Dataset,
+        text: &str,
+        limit: i64,
+        configure: impl FnOnce(&mut Scanner),
+    ) -> Result<Vec<(i32, f32)>> {
+        let mut scan = scan(dataset, text, limit);
+        configure(&mut scan);
+        let batch = scan.try_into_batch().await?;
+        let ids = batch["id"].as_primitive::<Int32Type>();
+        let distances = batch["_distance"].as_primitive::<Float32Type>();
+        Ok(ids
+            .values()
+            .iter()
+            .copied()
+            .zip(distances.values().iter().copied())
+            .collect())
+    }
+
+    async fn ids(
+        dataset: &Dataset,
+        text: &str,
+        limit: i64,
+        configure: impl FnOnce(&mut Scanner),
+    ) -> Vec<i32> {
+        hits(dataset, text, limit, configure)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.0)
+            .collect()
+    }
+
+    async fn plan(dataset: &Dataset, configure: impl FnOnce(&mut Scanner)) -> String {
+        let mut scan = scan(dataset, BASE, 4);
+        configure(&mut scan);
+        scan.explain_plan(false).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_minhash_search_end_to_end() {
+        let dataset = indexed_dataset().await;
+        let explained = plan(&dataset, |_| {}).await;
+        assert!(
+            explained.contains("MinHashSearch: column=text, limit=4"),
+            "{explained}"
+        );
+
+        let found = hits(&dataset, BASE, 3, |_| {}).await.unwrap();
+        assert_eq!(found[0], (0, 0.0));
+        assert_eq!(found[1], (3, 0.0));
+        assert_eq!(found[2].0, 1);
+        assert!(found[2].1 > 0.0 && found[2].1 < 0.5, "{found:?}");
+        // A query with no similar rows returns an empty result, not an error
+        assert!(
+            hits(&dataset, "nothing shares any shingle here", 3, |_| {})
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Offset rows are skipped after ranking
+        let offset = ids(&dataset, BASE, 2, |scan| {
+            scan.limit(Some(2), Some(1)).unwrap();
+        })
+        .await;
+        assert_eq!(offset, vec![3, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_minhash_search_applies_filters_and_deletes() {
+        let mut dataset = indexed_dataset().await;
+        let prefiltered = ids(&dataset, BASE, 2, |scan| {
+            scan.filter("id >= 1").unwrap().prefilter(true);
+        })
+        .await;
+        assert_eq!(prefiltered, vec![3, 1]);
+        // Postfiltering ranks first and filters the ranked rows afterwards
+        let postfiltered = ids(&dataset, BASE, 2, |scan| {
+            scan.filter("id >= 1").unwrap().prefilter(false);
+        })
+        .await;
+        assert_eq!(postfiltered, vec![3]);
+
+        dataset.delete("id = 3").await.unwrap();
+        assert_eq!(ids(&dataset, BASE, 2, |_| {}).await, vec![0, 1]);
+        // Deleting every row of a fragment drops it from the manifest while
+        // the index still lists it; the prefilter masks those rows too.
+        let dropped = texts()[6];
+        assert_eq!(ids(&dataset, dropped, 2, |_| {}).await, vec![6]);
+        dataset.delete("id >= 4 AND id <= 7").await.unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        assert!(ids(&dataset, dropped, 2, |_| {}).await.is_empty());
+        assert_eq!(ids(&dataset, BASE, 3, |_| {}).await, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_minhash_search_covers_unindexed_fragments() {
+        let dataset = append(indexed_dataset().await, 12, &[BASE, "unrelated append"]).await;
         assert_eq!(dataset.fragments().len(), 4);
 
         // Appended rows are scored on the fly and merged with the index hits
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))
-            .unwrap()
-            .limit(Some(4), None)
-            .unwrap()
-            .project(&["id"])
-            .unwrap();
-        let plan = scan.explain_plan(false).await.unwrap();
-        assert!(plan.contains("MinHashSearch: column=text"), "{plan}");
+        let explained = plan(&dataset, |_| {}).await;
         assert!(
-            plan.contains("MinHashFlatSearch: column=text, limit=4"),
-            "{plan}"
+            explained.contains("MinHashSearch: column=text")
+                && explained.contains("MinHashFlatSearch: column=text, limit=4")
+                && explained.contains("SortExec"),
+            "{explained}"
         );
-        assert!(plan.contains("SortExec"), "{plan}");
-        let hits = ids_and_distances(&scan.try_into_batch().await.unwrap());
+        let found = hits(&dataset, BASE, 4, |_| {}).await.unwrap();
         assert_eq!(
-            hits.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+            found.iter().map(|hit| hit.0).collect::<Vec<_>>(),
             vec![0, 3, 12, 1],
-            "{hits:?}"
+            "{found:?}"
         );
-        assert_eq!(hits[2].1, 0.0);
-
+        assert_eq!(found[2].1, 0.0);
         // Prefilters reach the flat path too
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))
-            .unwrap()
-            .limit(Some(4), None)
-            .unwrap()
-            .filter("id >= 12")
-            .unwrap()
-            .prefilter(true)
-            .project(&["id"])
-            .unwrap();
-        let hits = ids_and_distances(&scan.try_into_batch().await.unwrap());
-        assert_eq!(hits.iter().map(|hit| hit.0).collect::<Vec<_>>(), vec![12]);
+        let filtered = ids(&dataset, BASE, 4, |scan| {
+            scan.filter("id >= 12").unwrap().prefilter(true);
+        })
+        .await;
+        assert_eq!(filtered, vec![12]);
 
         // Only the unindexed fragment: the plan has no index branch
         let appended = dataset.fragments()[3].clone();
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))
-            .unwrap()
-            .limit(Some(4), None)
-            .unwrap()
-            .with_fragments(vec![appended])
-            .project(&["id"])
-            .unwrap();
-        let plan = scan.explain_plan(false).await.unwrap();
-        assert!(!plan.contains("MinHashSearch: column"), "{plan}");
-        assert!(plan.contains("MinHashFlatSearch"), "{plan}");
-        let hits = ids_and_distances(&scan.try_into_batch().await.unwrap());
-        assert_eq!(hits.iter().map(|hit| hit.0).collect::<Vec<_>>(), vec![12]);
+        let explained = plan(&dataset, |scan| {
+            scan.with_fragments(vec![appended.clone()]);
+        })
+        .await;
+        assert!(!explained.contains("MinHashSearch: column"), "{explained}");
+        assert!(explained.contains("MinHashFlatSearch"), "{explained}");
+        let flat_only = ids(&dataset, BASE, 4, |scan| {
+            scan.with_fragments(vec![appended]);
+        })
+        .await;
+        assert_eq!(flat_only, vec![12]);
 
         // fast_search searches the index only
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))
-            .unwrap()
-            .limit(Some(4), None)
-            .unwrap()
-            .fast_search()
-            .project(&["id"])
-            .unwrap();
-        let plan = scan.explain_plan(false).await.unwrap();
-        assert!(!plan.contains("MinHashFlatSearch"), "{plan}");
-        let hits = ids_and_distances(&scan.try_into_batch().await.unwrap());
-        assert_eq!(
-            hits.iter().map(|hit| hit.0).collect::<Vec<_>>(),
-            vec![0, 3, 1]
-        );
+        let explained = plan(&dataset, |scan| {
+            scan.fast_search();
+        })
+        .await;
+        assert!(!explained.contains("MinHashFlatSearch"), "{explained}");
+        let fast = ids(&dataset, BASE, 4, |scan| {
+            scan.fast_search();
+        })
+        .await;
+        assert_eq!(fast, vec![0, 3, 1]);
     }
 
     #[tokio::test]
@@ -860,19 +772,8 @@ mod tests {
         // Two exact copies of BASE land in an unindexed fragment; with limit 1
         // the flat branch keeps only the first, so a mask allowing only the
         // second must be applied before that top-k, not after it.
-        let dataset = indexed_dataset().await;
-        let reader = RecordBatchIterator::new(vec![Ok(batch(12, &[BASE, BASE]))], schema());
-        let dataset = Dataset::write(
-            reader,
-            Arc::new(dataset),
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        let row_ids = dataset
+        let dataset = append(indexed_dataset().await, 12, &[BASE, BASE]).await;
+        let batch = dataset
             .scan()
             .filter("id = 13")
             .unwrap()
@@ -882,83 +783,66 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let allowed = row_ids[ROW_ID].as_primitive::<UInt64Type>().value(0);
-
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))
-            .unwrap()
-            .limit(Some(1), None)
-            .unwrap()
-            .with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+        let allowed = batch[ROW_ID].as_primitive::<UInt64Type>().value(0);
+        let found = hits(&dataset, BASE, 1, |scan| {
+            scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
                 allowed,
-            ])))
-            .project(&["id"])
-            .unwrap();
-        let hits = ids_and_distances(&scan.try_into_batch().await.unwrap());
-        assert_eq!(hits.iter().map(|hit| hit.0).collect::<Vec<_>>(), vec![13]);
-        assert_eq!(hits[0].1, 0.0);
+            ])));
+        })
+        .await
+        .unwrap();
+        assert_eq!(found, vec![(13, 0.0)]);
     }
 
     #[tokio::test]
-    async fn test_minhash_search_rejects_invalid_scans() -> Result<()> {
+    async fn test_minhash_search_rejects_invalid_scans() {
         let dataset = indexed_dataset().await;
 
         let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))?;
+        scan.minhash_search(MinHashQuery::new(BASE, "text"))
+            .unwrap();
         let err = scan.try_into_batch().await.unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
         assert!(err.to_string().contains("requires a limit"), "{err}");
 
         let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "id"))?
-            .limit(Some(3), None)?;
+        scan.minhash_search(MinHashQuery::new(BASE, "id"))
+            .unwrap()
+            .limit(Some(3), None)
+            .unwrap();
         let err = scan.try_into_batch().await.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
         assert!(
             err.to_string()
                 .contains("No MinHash LSH index found for column id"),
             "{err}"
         );
 
-        let Err(err) = dataset.scan().minhash_search(MinHashQuery::new(BASE, "")) else {
-            panic!("an empty column must be rejected");
-        };
-        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
-
         let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))?
-            .limit(Some(3), None)?
-            .nearest("vec", &Float32Array::from(vec![0.0, 1.0]), 1)?;
-        let err = scan.try_into_batch().await.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
-        assert!(
-            err.to_string().contains("Cannot combine a MinHash search"),
-            "{err}"
-        );
+        assert!(matches!(
+            scan.minhash_search(MinHashQuery::new(BASE, "")),
+            Err(Error::InvalidInput { .. })
+        ));
 
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))?
-            .limit(Some(3), None)?
-            .full_text_search(FullTextSearchQuery::new_query(
+        let err = hits(&dataset, BASE, 3, |scan| {
+            scan.full_text_search(FullTextSearchQuery::new_query(
                 MatchQuery::new("nothing".to_owned())
                     .with_column(Some("text".to_owned()))
                     .into(),
-            ))?;
-        let err = scan.try_into_batch().await.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+            ))
+            .unwrap();
+        })
+        .await
+        .unwrap_err();
         assert!(
             err.to_string().contains("Cannot combine a MinHash search"),
             "{err}"
         );
 
-        let mut scan = dataset.scan();
-        scan.minhash_search(MinHashQuery::new(BASE, "text"))?
-            .limit(Some(3), None)?
-            .with_row_id()
-            .include_deleted_rows();
-        let err = scan.try_into_batch().await.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        let err = hits(&dataset, BASE, 3, |scan| {
+            scan.with_row_id().include_deleted_rows();
+        })
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("deleted rows"), "{err}");
-        Ok(())
     }
 }

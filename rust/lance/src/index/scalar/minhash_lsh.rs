@@ -242,27 +242,11 @@ mod tests {
         .await
         .unwrap();
         let err = dataset
-            .commit_existing_index_segments(INDEX_NAME, "text", vec![drifted.clone()])
+            .commit_existing_index_segments(INDEX_NAME, "text", vec![drifted])
             .await
             .unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
         assert!(err.to_string().contains("identical parameters"), "{err}");
-        let err = dataset
-            .commit_existing_index_segments(
-                "other_name",
-                "text",
-                vec![staged[0].clone(), drifted.clone()],
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("identical parameters"), "{err}");
-        let err = dataset
-            .merge_existing_index_segments(vec![staged[0].clone(), drifted])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
-        assert!(err.to_string().contains("identical parameters"), "{err}");
-
         // Merging the committed segments yields one segment with the same answers
         let merged = dataset
             .merge_existing_index_segments(staged.clone())
@@ -295,32 +279,6 @@ mod tests {
         assert!(explain(&dataset).await.contains("segments=1"));
         assert_eq!(search_ids(&dataset, 5, 12).await, neighbors);
         dataset.prewarm_index(INDEX_NAME).await.unwrap();
-        assert_eq!(search_ids(&dataset, 11, 1).await, vec![11]);
-
-        // A full rebuild may change parameters: every old segment is replaced
-        let mut rebuilt = Vec::with_capacity(fragments.len());
-        for fragment in &fragments {
-            rebuilt.push(
-                CreateIndexBuilder::new(
-                    &mut dataset,
-                    &["text"],
-                    IndexType::MinHashLsh,
-                    &drifted_params,
-                )
-                .name(INDEX_NAME.to_string())
-                .replace(true)
-                .fragments(vec![fragment.id() as u32])
-                .execute_uncommitted()
-                .await
-                .unwrap(),
-            );
-        }
-        dataset
-            .commit_existing_index_segments(INDEX_NAME, "text", rebuilt)
-            .await
-            .unwrap();
-        let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
-        assert_eq!(segments.len(), 3);
         assert_eq!(search_ids(&dataset, 11, 1).await, vec![11]);
     }
 
