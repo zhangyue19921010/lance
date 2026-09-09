@@ -51,6 +51,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::FuturesOrdered;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, WeakLanceCache};
+use lance_core::datatypes::SchemaCompareOptions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::available_space_bytes;
@@ -450,25 +451,13 @@ impl MinHashLshIndexParams {
     /// The serialized details as lower-case hex, the form both index files
     /// repeat in their schema metadata.
     fn details_hex(&self) -> Result<String> {
-        Ok(self
-            .to_details()?
-            .encode_to_vec()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect())
+        Ok(hex::encode(self.to_details()?.encode_to_vec()))
     }
 
     fn from_details_hex(hex: &str) -> Result<Self> {
-        let bytes = (0..hex.len())
-            .step_by(2)
-            .map(|i| {
-                hex.get(i..i + 2)
-                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-                    .ok_or_else(|| {
-                        Error::invalid_input(format!("{hex:?} is not a hex-encoded message"))
-                    })
-            })
-            .collect::<Result<Vec<u8>>>()?;
+        let bytes = hex::decode(hex).map_err(|err| {
+            Error::invalid_input(format!("{hex:?} is not a hex-encoded message: {err}"))
+        })?;
         let details = pb::MinHashLshIndexDetails::decode(bytes.as_slice()).map_err(|err| {
             Error::invalid_input(format!("invalid MinHash LSH index details: {err}"))
         })?;
@@ -945,32 +934,11 @@ fn check_index_file(
     params: &MinHashLshIndexParams,
 ) -> Result<()> {
     let corrupt = |message: String| Error::corrupt_file_named(file, message);
-    let schema = Schema::from(reader.schema());
-    // Lance's logical types do not record the nullability of a fixed-size
-    // list item, so the item read back is always nullable; the values are
-    // checked for nulls when a batch is decoded instead.
-    let same_type = |actual: &DataType, expected: &DataType| match (actual, expected) {
-        (DataType::FixedSizeList(actual, n), DataType::FixedSizeList(expected, m)) => {
-            actual.data_type() == expected.data_type() && n == m
-        }
-        _ => actual == expected,
-    };
-    let same_field = |actual: &Field, expected: &Field| {
-        actual.name() == expected.name()
-            && same_type(actual.data_type(), expected.data_type())
-            && actual.is_nullable() == expected.is_nullable()
-    };
-    if schema.fields().len() != expected.fields().len()
-        || !schema
-            .fields()
-            .iter()
-            .zip(expected.fields())
-            .all(|(actual, expected)| same_field(actual, expected))
-    {
-        return Err(corrupt(format!(
-            "schema {schema} does not match the expected schema {expected}"
-        )));
-    }
+    let expected = lance_core::datatypes::Schema::try_from(expected)?;
+    reader
+        .schema()
+        .check_compatible(&expected, &SchemaCompareOptions::default())
+        .map_err(|err| corrupt(format!("schema does not match the expected schema: {err}")))?;
     let metadata = &reader.schema().metadata;
     let index_version: u32 = metadata_value(metadata, file, INDEX_VERSION_META_KEY)?
         .parse()
