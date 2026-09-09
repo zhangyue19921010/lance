@@ -171,6 +171,11 @@ const SPILL_PARTITIONS: usize = 1 << 16;
 const MERGE_GROUPS_IN_FLIGHT: usize = 16;
 /// Highest band count representable in the 8-bit band id prefix of a band key.
 const MAX_NUM_BANDS: u32 = 256;
+/// Highest signature width. Beyond it the estimate gains nothing (the error
+/// is already ~1.5%) while every derived size keeps growing; the bound keeps
+/// them all small enough that no parameter combination can overflow or
+/// allocate unboundedly before validation runs.
+const MAX_NUM_HASHES: u32 = 4096;
 
 /// Rows of `row_bytes` each that fit one IO batch.
 fn rows_per_batch(row_bytes: usize) -> usize {
@@ -249,7 +254,7 @@ impl MinHashQuery {
 /// in the index details and re-read on the query side.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MinHashLshIndexParams {
-    /// Number of MinHash values per signature (k). Must be a positive
+    /// Number of MinHash values per signature (k), in `[1, 4096]` and a
     /// multiple of `num_bands`. The Jaccard estimate has error ~1/sqrt(k).
     pub num_hashes: u32,
     /// Number of LSH bands (b), in `[1, 256]`. Two rows become candidates when
@@ -341,10 +346,11 @@ impl MinHashLshIndexParams {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.num_hashes == 0 {
-            return Err(Error::invalid_input(
-                "MinHash LSH index requires num_hashes > 0".to_string(),
-            ));
+        if self.num_hashes == 0 || self.num_hashes > MAX_NUM_HASHES {
+            return Err(Error::invalid_input(format!(
+                "MinHash LSH index requires 1 <= num_hashes <= {MAX_NUM_HASHES}, got num_hashes={}",
+                self.num_hashes
+            )));
         }
         if self.num_bands == 0 || self.num_bands > MAX_NUM_BANDS {
             return Err(Error::invalid_input(format!(
@@ -356,13 +362,6 @@ impl MinHashLshIndexParams {
             return Err(Error::invalid_input(format!(
                 "MinHash LSH index requires num_hashes to be a multiple of num_bands, got num_hashes={} num_bands={}",
                 self.num_hashes, self.num_bands
-            )));
-        }
-        if i32::try_from(self.num_hashes).is_err() {
-            return Err(Error::invalid_input(format!(
-                "MinHash LSH index num_hashes={} exceeds the maximum signature width {}",
-                self.num_hashes,
-                i32::MAX
             )));
         }
         if self.shingle_size == 0 {
@@ -3089,7 +3088,8 @@ mod tests {
 
     #[rstest]
     #[case::not_divisible(r#"{"num_hashes": 100, "num_bands": 16}"#, "multiple of num_bands")]
-    #[case::zero_hashes(r#"{"num_hashes": 0}"#, "num_hashes > 0")]
+    #[case::zero_hashes(r#"{"num_hashes": 0}"#, "num_hashes <= 4096")]
+    #[case::too_many_hashes(r#"{"num_hashes": 8192, "num_bands": 16}"#, "num_hashes <= 4096")]
     #[case::zero_bands(r#"{"num_bands": 0}"#, "num_bands")]
     #[case::too_many_bands(r#"{"num_hashes": 512, "num_bands": 512}"#, "num_bands <= 256")]
     #[case::zero_shingle(r#"{"shingle_size": 0}"#, "shingle_size > 0")]
@@ -3107,6 +3107,38 @@ mod tests {
         let err = MinHashLshIndexParams::from_json(json).unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
         assert!(err.to_string().contains(message), "{err}");
+    }
+
+    /// The vectors of the format specification
+    /// (`docs/src/format/index/scalar/minhash_lsh.md`, "Known-Answer
+    /// Vectors"); any change here is a `SIGNATURE_VERSION` bump.
+    #[test]
+    fn test_signature_known_answer_vectors() {
+        let params = MinHashLshIndexParams::from_json(
+            r#"{"num_hashes": 4, "num_bands": 2, "shingle_size": 2}"#,
+        )
+        .unwrap();
+        let mut generator = SignatureGenerator::try_new(&params).unwrap();
+        assert_eq!(generator.multipliers[0], 0xbdd7_3226_2feb_6e95);
+        assert_eq!(generator.increments[0], 0x28ef_e333_b266_f103);
+        assert_eq!(generator.compressors[0], 0x5705_b877_0b3d_7dd5);
+
+        let mut signature = [0u16; 4];
+        let mut keys = Vec::new();
+        assert!(generator.signature("The quick brown fox", &mut signature));
+        assert_eq!(signature, [0xb00f, 0x59d6, 0x511a, 0xcd2c]);
+        generator.band_keys(&signature, &mut keys);
+        assert_eq!(keys, [0x00f3_0f35_01d4_58ea, 0x01ae_c5df_28d0_4915]);
+
+        // Fewer tokens than the shingle size: one shingle of all tokens.
+        assert!(generator.signature("Fox", &mut signature));
+        assert_eq!(signature, [0x2970, 0xd6db, 0x65f8, 0xadfc]);
+        keys.clear();
+        generator.band_keys(&signature, &mut keys);
+        assert_eq!(keys, [0x003c_f6e8_0331_2eca, 0x017c_5504_fbc8_3f36]);
+
+        assert!(!generator.signature("", &mut signature));
+        assert!(!generator.signature("  \n", &mut signature));
     }
 
     #[test]
