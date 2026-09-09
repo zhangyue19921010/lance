@@ -124,32 +124,26 @@ const DEFAULT_PAGE_ROWS: usize = 4096;
 /// Byte inserted between the tokens of one shingle so that different token
 /// splits of the same characters hash differently.
 const SHINGLE_SEPARATOR: u8 = 0x1F;
-/// Rows per read while collecting the interior pages of a bucket that spans
-/// pages. Those pages hold nothing but that bucket, so only their doc ids are
-/// read (1 MiB per window), merged into the candidate set and dropped; the
-/// memory of a query does not grow with the size of a bucket.
-const BUCKET_READ_ROWS: usize = 1 << 18;
+/// Bytes per read or write batch of an index file. Scattered candidate reads,
+/// the doc-id windows of a bucket that spans pages, sequential scans and the
+/// batches handed to the file writers all size themselves from it by their
+/// row width: large enough to amortize a request, small enough to bound the
+/// transient memory of a query or of a build stage.
+const IO_BATCH_BYTES: usize = 8 * 1024 * 1024;
+/// Bytes per resident chunk of the signature table and per prewarm read of
+/// band pages. Chunks are separate cache entries, so a prewarm keeps as many
+/// as the cache holds and a query scores candidates in resident chunks from
+/// memory.
+const RESIDENT_CHUNK_BYTES: usize = 128 * 1024 * 1024;
+/// Reads in flight while a scan or a merge group gathers its rows.
+const READ_CONCURRENCY: usize = 4;
 /// A candidate set covering more than this percentage of a segment is refined
 /// with a sequential scan of the signature file instead of a scattered read.
 const SPARSE_REFINE_READ_PERCENT: u64 = 10;
-/// Candidate rows per scattered read while refining: a candidate set just
-/// under the dense threshold is still a tenth of the segment.
-const REFINE_READ_ROWS: usize = 1 << 16;
-/// Documents per resident chunk of the signature table (136 MB at 64 hashes).
-/// Chunks are separate cache entries, so a prewarm keeps as many as the
-/// cache holds and a query scores candidates in resident chunks from memory.
-const SIGNATURE_CHUNK_DOCS: usize = 1 << 20;
-/// Rows per read while scanning the signature table end to end (16 MiB at
-/// the default width); `IndexReader::read_range_stream` reads 4096-row
-/// batches only two deep, which leaves the scheduler mostly idle.
-const SIGNATURE_SCAN_ROWS: usize = 32 * 1024;
-/// Reads in flight while scanning an index file end to end.
-const SCAN_READ_CONCURRENCY: usize = 4;
 
-/// Memory budget for one in-memory sort run of (band key, doc id) records.
-/// Runs beyond this are sorted and spilled to files in a temporary directory
-/// that are merged when the bands file is written.
-const DEFAULT_SORT_RUN_BYTES: usize = 256 * 1024 * 1024;
+/// Default memory budget of the sort: the run being filled, the runs being
+/// spilled and the merge groups together (see [`sort_budget`]).
+const DEFAULT_SORT_MEMORY_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// Memory budget of the sort (bytes), shared with the DataFusion-backed index
 /// builds: runs get three fifths of it, merge groups the rest.
 const SORT_MEMORY_ENV: &str = "LANCE_MEM_POOL_SIZE";
@@ -157,23 +151,14 @@ const SORT_MEMORY_ENV: &str = "LANCE_MEM_POOL_SIZE";
 /// DataFusion-backed builds honor as well.
 const SPILL_LIMIT_ENV: &str = "LANCE_MAX_TEMP_DIRECTORY_SIZE";
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 100 * 1024 * 1024 * 1024;
-/// Below this run size the merge reads a small slice of many files per
-/// group and the build slows down; still correct, so only warned about.
-const MIN_EFFICIENT_RUN_BYTES: usize = 64 * 1024 * 1024;
 /// Bytes of one spilled record: the key and the doc id, little-endian.
-const SPILL_RECORD_BYTES: usize = 12;
-/// Records serialized per write while spilling a run.
-const SPILL_WRITE_RECORDS: usize = 1 << 20;
+const SPILL_RECORD_BYTES: usize = std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
 /// Runs sorted and written concurrently with signing. Each holds a full run
 /// in memory, so this bounds the backlog when signing outpaces the disk.
 const MAX_INFLIGHT_SPILLS: usize = 4;
 /// Signed batches queued between the driver that polls the signing stream
 /// and the loop that consumes them.
 const SIGNED_BATCH_QUEUE: usize = 16;
-/// Rows per batch handed to the signature file writer. Signed batches follow
-/// the scan's 8192-row batches; the writer's per-batch cost makes larger
-/// batches noticeably faster (about 15% on the signing stage at 10^8 rows).
-const SIGNATURE_WRITE_BATCH_ROWS: usize = 1 << 16;
 /// Every sorted run records the row at which each key-range partition
 /// starts, so the merge can gather one partition from every run, sort it in
 /// memory and write it, partitions processed independently and in key order.
@@ -181,20 +166,22 @@ const SIGNATURE_WRITE_BATCH_ROWS: usize = 1 << 16;
 /// bits below the band id, so a partition holds `num_bands / SPILL_PARTITIONS`
 /// of all records: 1.5 MB per 10^9 rows at eight bands, 47 MB at 256.
 const SPILL_PARTITIONS: usize = 1 << 16;
-/// Records of adjacent partitions merged as one group (about 32 MiB), each
-/// group sorted in memory on the CPU pool.
-const DEFAULT_MERGE_GROUP_RECORDS: usize = (32 * 1024 * 1024) / std::mem::size_of::<(u64, u32)>();
-/// Upper bound on groups gathered and sorted concurrently; the actual count
-/// is a quarter of the CPU pool, so the in-flight reads (two per group) stay
-/// at half the runtime workers, each of which a read can park while its
-/// decode waits for IO.
+/// Upper bound on merge groups gathered and sorted concurrently; the actual
+/// count is a quarter of the CPU pool.
 const MERGE_GROUPS_IN_FLIGHT: usize = 16;
-/// Reads in flight while a group gathers its records from the runs.
-const MERGE_GROUP_READ_CONCURRENCY: usize = 4;
-/// Records per batch written to the bands file from a resident run.
-const BANDS_WRITE_BATCH_RECORDS: usize = 1 << 20;
 /// Highest band count representable in the 8-bit band id prefix of a band key.
 const MAX_NUM_BANDS: u32 = 256;
+
+/// Rows of `row_bytes` each that fit one IO batch.
+fn rows_per_batch(row_bytes: usize) -> usize {
+    (IO_BATCH_BYTES / row_bytes.max(1)).max(1)
+}
+
+/// Bytes of one row of the signature table: the row id and `num_hashes`
+/// stored values.
+fn signature_row_bytes(num_hashes: usize) -> usize {
+    std::mem::size_of::<u64>() + num_hashes * std::mem::size_of::<SignatureValue>()
+}
 
 /// `bands.lance`: (band key, doc id) records in ascending order. Both columns
 /// are fixed width and stored raw, so a page is one exact ranged read that
@@ -729,10 +716,6 @@ impl CacheKey for SignatureChunkKey {
     }
 }
 
-/// Bytes read per prewarm chunk of band pages; bounds the transient memory of
-/// a prewarm to roughly one chunk.
-const PREWARM_CHUNK_BYTES: usize = 128 * 1024 * 1024;
-
 impl CacheKey for BandPageKey {
     type ValueType = BandPage;
 
@@ -872,7 +855,7 @@ pub struct MinHashLshIndex {
     /// Largest band key of each logical page of `bands.lance`.
     page_max_keys: Vec<u64>,
     num_docs: usize,
-    /// Documents per resident signature chunk; see [`SIGNATURE_CHUNK_DOCS`].
+    /// Documents per resident signature chunk; see [`RESIDENT_CHUNK_BYTES`].
     signature_chunk_docs: usize,
     cache: WeakLanceCache,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
@@ -977,6 +960,8 @@ impl MinHashLshIndex {
         }
 
         let generator = SignatureGenerator::try_new(&params)?;
+        let signature_chunk_docs =
+            (RESIDENT_CHUNK_BYTES / signature_row_bytes(params.num_hashes as usize)).max(1);
         Ok(Arc::new(Self {
             params,
             generator,
@@ -985,7 +970,7 @@ impl MinHashLshIndex {
             page_rows,
             page_max_keys,
             num_docs,
-            signature_chunk_docs: SIGNATURE_CHUNK_DOCS,
+            signature_chunk_docs,
             cache: WeakLanceCache::from(cache),
             frag_reuse_index,
         }))
@@ -1162,7 +1147,7 @@ impl MinHashLshIndex {
         let mut from = pages.start as usize * self.page_rows;
         let end = (pages.end as usize * self.page_rows).min(self.bands.num_rows());
         while from < end {
-            let to = (from + BUCKET_READ_ROWS).min(end);
+            let to = (from + rows_per_batch(std::mem::size_of::<u32>())).min(end);
             metrics.record_parts_loaded(1);
             tracing::info!(
                 target: TRACE_IO_EVENTS,
@@ -1365,7 +1350,11 @@ impl MinHashLshIndex {
         {
             let mut doc_ids = candidates.iter();
             loop {
-                let ranges = doc_id_ranges(doc_ids.by_ref().take(REFINE_READ_ROWS));
+                let ranges = doc_id_ranges(
+                    doc_ids
+                        .by_ref()
+                        .take(rows_per_batch(signature_row_bytes(num_hashes))),
+                );
                 if ranges.is_empty() {
                     break;
                 }
@@ -1390,7 +1379,7 @@ impl MinHashLshIndex {
                 self.signatures.clone(),
                 self.num_docs,
                 Some(projection.iter().map(|column| column.to_string()).collect()),
-                SIGNATURE_SCAN_ROWS,
+                rows_per_batch(signature_row_bytes(num_hashes)),
             ));
             // The scan and the candidate set are both ascending, so walk them
             // in lockstep instead of probing the bitmap for every row.
@@ -1492,7 +1481,7 @@ fn scan_rows(
                 reader.read_range(range, columns.as_deref()).await
             }
         })
-        .buffered(SCAN_READ_CONCURRENCY)
+        .buffered(READ_CONCURRENCY)
 }
 
 #[async_trait]
@@ -1508,8 +1497,8 @@ impl Index for MinHashLshIndex {
     async fn prewarm(&self) -> Result<()> {
         // Load what the cache can hold, signature chunks first: a scattered
         // signature read costs a query far more than a page read, and a chunk
-        // is one allocation of `SIGNATURE_CHUNK_DOCS * (8 + 2 * num_hashes)`
-        // bytes. A cache without capacity has nothing to warm.
+        // is one allocation of about `RESIDENT_CHUNK_BYTES`. A cache without
+        // capacity has nothing to warm.
         let capacity = self.cache.capacity_bytes();
         if capacity == Some(0) {
             return Ok(());
@@ -1555,7 +1544,7 @@ impl Index for MinHashLshIndex {
             .map(|bytes| (bytes as usize / num_rows.max(1)).max(1))
             .unwrap_or(64);
         let pages_to_load = fits(bytes_per_row * self.page_rows, num_pages);
-        let pages_per_read = (PREWARM_CHUNK_BYTES / (bytes_per_row * self.page_rows)).max(1);
+        let pages_per_read = (RESIDENT_CHUNK_BYTES / (bytes_per_row * self.page_rows)).max(1);
         for first_page in (0..pages_to_load).step_by(pages_per_read) {
             let last_page = (first_page + pages_per_read).min(pages_to_load);
             let rows = first_page * self.page_rows..(last_page * self.page_rows).min(num_rows);
@@ -1823,7 +1812,7 @@ impl SignatureSource<'_> {
             self.reader.clone(),
             self.num_docs,
             None,
-            SIGNATURE_SCAN_ROWS,
+            rows_per_batch(signature_row_bytes(num_hashes)),
         );
         let transform = &self.transform;
         let frag_reuse_index = self.frag_reuse_index.as_deref();
@@ -2039,8 +2028,9 @@ impl SpillDir {
 /// Write sorted records to `file` as little-endian (key, doc id) pairs.
 fn write_spill_records(file: &mut std::fs::File, records: &[(u64, u32)]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut bytes = Vec::with_capacity(SPILL_WRITE_RECORDS.min(records.len()) * SPILL_RECORD_BYTES);
-    for chunk in records.chunks(SPILL_WRITE_RECORDS) {
+    let records_per_write = rows_per_batch(SPILL_RECORD_BYTES);
+    let mut bytes = Vec::with_capacity(records_per_write.min(records.len()) * SPILL_RECORD_BYTES);
+    for chunk in records.chunks(records_per_write) {
         bytes.clear();
         for (key, doc_id) in chunk {
             bytes.extend_from_slice(&key.to_le_bytes());
@@ -2165,7 +2155,7 @@ async fn merge_group(
             })
         })
         .collect();
-    let mut chunks = futures::stream::iter(reads).buffered(MERGE_GROUP_READ_CONCURRENCY);
+    let mut chunks = futures::stream::iter(reads).buffered(READ_CONCURRENCY);
     while let Some(chunk) = chunks.try_next().await? {
         records.extend(chunk);
     }
@@ -2195,11 +2185,12 @@ impl MinHashLshIndexBuilder {
     /// `LANCE_MAX_TEMP_DIRECTORY_SIZE` (100 GiB by default).
     pub fn try_new(params: MinHashLshIndexParams) -> Result<Self> {
         params.validate()?;
+        let (sort_run_records, merge_group_records) = sort_budget(DEFAULT_SORT_MEMORY_BYTES);
         let mut builder = Self {
             params,
             page_rows: DEFAULT_PAGE_ROWS,
-            sort_run_records: DEFAULT_SORT_RUN_BYTES / std::mem::size_of::<(u64, u32)>(),
-            merge_group_records: DEFAULT_MERGE_GROUP_RECORDS,
+            sort_run_records,
+            merge_group_records,
             spill_limit_bytes: DEFAULT_SPILL_LIMIT_BYTES,
         };
         if let Some(bytes) = env_bytes(SORT_MEMORY_ENV) {
@@ -2219,11 +2210,6 @@ impl MinHashLshIndexBuilder {
             return Err(Error::invalid_input(format!(
                 "MinHash LSH sort memory budget of {bytes} bytes is too small"
             )));
-        }
-        if sort_run_records * std::mem::size_of::<(u64, u32)>() < MIN_EFFICIENT_RUN_BYTES {
-            log::warn!(
-                "MinHash LSH sort memory budget of {bytes} bytes gives sort runs under {MIN_EFFICIENT_RUN_BYTES} bytes; the build stays correct but merges many small spill slices"
-            );
         }
         self.sort_run_records = sort_run_records;
         self.merge_group_records = merge_group_records;
@@ -2335,6 +2321,7 @@ impl MinHashLshIndexBuilder {
             Error::invalid_input(format!("num_hashes {num_hashes} exceeds i32::MAX"))
         })?;
         let signatures_schema = signatures_schema(num_hashes_i32);
+        let signature_write_rows = rows_per_batch(signature_row_bytes(num_hashes));
         let mut signatures_writer = store
             .new_index_file(SIGNATURES_FILENAME, signatures_schema.clone())
             .await?;
@@ -2417,7 +2404,7 @@ impl MinHashLshIndexBuilder {
                     num_docs += signed.row_ids.len() as u64;
                     pending_row_ids.extend_from_slice(&signed.row_ids);
                     pending_signatures.extend_from_slice(&signed.signatures);
-                    if pending_row_ids.len() < SIGNATURE_WRITE_BATCH_ROWS {
+                    if pending_row_ids.len() < signature_write_rows {
                         continue;
                     }
                     let batch = signatures_batch(
@@ -2551,7 +2538,7 @@ impl MinHashLshIndexBuilder {
         };
         match runs {
             SortedRuns::Resident(records) => {
-                for chunk in records.chunks(BANDS_WRITE_BATCH_RECORDS) {
+                for chunk in records.chunks(rows_per_batch(SPILL_RECORD_BYTES)) {
                     let (keys, doc_ids) = chunk.iter().copied().unzip();
                     bands.write_batch(keys, doc_ids).await?;
                 }
