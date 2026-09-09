@@ -55,25 +55,15 @@ pub const IVF_RQ_INDEX_VERSION: u32 = 2;
 pub const MAX_PARTITION_SIZE_FACTOR: usize = 4;
 pub const MIN_PARTITION_SIZE_PERCENT: usize = 25;
 
-// The generated modules nest like their proto packages so that a message in
-// `lance.index.pb` can reference one in `lance.table` (prost emits relative
-// `super::` paths); `crate::pb` and `crate::pbold` remain the public paths.
-mod lance {
-    pub mod index {
-        pub mod pb {
-            #![allow(clippy::use_self)]
-            include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
-        }
-    }
-
-    pub mod table {
-        #![allow(clippy::use_self)]
-        include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
-    }
+pub mod pb {
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
 }
 
-pub use lance::index::pb;
-pub use lance::table as pbold;
+pub mod pbold {
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
+}
 
 /// Protobuf headers for serialized index cache entries (FTS posting lists,
 /// scalar indices, and IVF vector partitions).
