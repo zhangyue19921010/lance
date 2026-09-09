@@ -62,6 +62,7 @@ use lance_encoding::constants::{
 };
 use lance_select::RowAddrMask;
 use lance_tokenizer::TokenStream;
+use prost::Message;
 use rayon::slice::ParallelSliceMut;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -110,7 +111,7 @@ pub const SIGNATURE_COL: &str = "signature";
 pub const BAND_KEY_COL: &str = "band_key";
 pub const DOC_ID_COL: &str = "doc_id";
 
-const PARAMS_META_KEY: &str = "minhash_lsh_params";
+const DETAILS_META_KEY: &str = "minhash_lsh_details";
 const INDEX_VERSION_META_KEY: &str = "minhash_lsh_index_version";
 const PAGE_ROWS_META_KEY: &str = "minhash_lsh_page_rows";
 const PAGE_TABLE_BUFFER_META_KEY: &str = "minhash_lsh_page_table_buffer";
@@ -382,6 +383,18 @@ impl MinHashLshIndexParams {
                 "MinHash LSH index does not support lance_tokenizer: it cannot be recorded in the index details".to_string(),
             ));
         }
+        // These load dictionaries from LANCE_LANGUAGE_MODEL_HOME. The format
+        // pins such resources with `tokenizer_fingerprint`, which this version
+        // does not compute, so it must not write or read indexes using them.
+        let base_tokenizer = self.tokenizer.base_tokenizer.as_str();
+        if base_tokenizer == "jieba"
+            || base_tokenizer.starts_with("jieba/")
+            || base_tokenizer.starts_with("lindera/")
+        {
+            return Err(Error::not_supported(format!(
+                "MinHash LSH index does not support the {base_tokenizer} tokenizer yet: this version of Lance does not compute the tokenizer_fingerprint of its dictionary"
+            )));
+        }
         // Surface tokenizer configuration errors at index creation instead of
         // on the first batch.
         self.tokenizer.build()?;
@@ -395,6 +408,7 @@ impl MinHashLshIndexParams {
             shingle_size: self.shingle_size,
             tokenizer: Some(pbold::InvertedIndexDetails::try_from(&self.tokenizer)?),
             signature_version: SIGNATURE_VERSION,
+            tokenizer_fingerprint: None,
         })
     }
 
@@ -409,6 +423,11 @@ impl MinHashLshIndexParams {
                 "MinHash LSH index was built with signature_version {} but this version of Lance produces signature_version {}; rebuild the index",
                 details.signature_version, SIGNATURE_VERSION
             )));
+        }
+        if details.tokenizer_fingerprint.is_some() {
+            return Err(Error::not_supported(
+                "MinHash LSH index details carry a tokenizer_fingerprint, which this version of Lance does not verify; rebuild the index with a tokenizer whose data ships with Lance".to_string(),
+            ));
         }
         let tokenizer = details.tokenizer.as_ref().ok_or_else(|| {
             Error::invalid_input("MinHash LSH index details carry no tokenizer".to_string())
@@ -426,6 +445,34 @@ impl MinHashLshIndexParams {
 
     fn details_any(&self) -> Result<prost_types::Any> {
         Ok(prost_types::Any::from_msg(&self.to_details()?)?)
+    }
+
+    /// The serialized details as lower-case hex, the form both index files
+    /// repeat in their schema metadata.
+    fn details_hex(&self) -> Result<String> {
+        Ok(self
+            .to_details()?
+            .encode_to_vec()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    fn from_details_hex(hex: &str) -> Result<Self> {
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| {
+                hex.get(i..i + 2)
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!("{hex:?} is not a hex-encoded message"))
+                    })
+            })
+            .collect::<Result<Vec<u8>>>()?;
+        let details = pb::MinHashLshIndexDetails::decode(bytes.as_slice()).map_err(|err| {
+            Error::invalid_input(format!("invalid MinHash LSH index details: {err}"))
+        })?;
+        Self::from_details(&details)
     }
 }
 
@@ -879,10 +926,68 @@ impl DeepSizeOf for MinHashLshIndex {
     }
 }
 
-fn metadata_value<'a>(metadata: &'a HashMap<String, String>, key: &str) -> Result<&'a String> {
+fn metadata_value<'a>(
+    metadata: &'a HashMap<String, String>,
+    file: &str,
+    key: &str,
+) -> Result<&'a String> {
     metadata.get(key).ok_or_else(|| {
-        Error::corrupt_file_named(BANDS_FILENAME, format!("missing schema metadata key {key}"))
+        Error::corrupt_file_named(file, format!("missing schema metadata key {key}"))
     })
+}
+
+/// Checks that `reader` is `file` of a segment built from `params`: the exact
+/// schema, the details repeated in the metadata and the layout version.
+fn check_index_file(
+    reader: &dyn IndexReader,
+    file: &str,
+    expected: &Schema,
+    params: &MinHashLshIndexParams,
+) -> Result<()> {
+    let corrupt = |message: String| Error::corrupt_file_named(file, message);
+    let schema = Schema::from(reader.schema());
+    // Lance's logical types do not record the nullability of a fixed-size
+    // list item, so the item read back is always nullable; the values are
+    // checked for nulls when a batch is decoded instead.
+    let same_type = |actual: &DataType, expected: &DataType| match (actual, expected) {
+        (DataType::FixedSizeList(actual, n), DataType::FixedSizeList(expected, m)) => {
+            actual.data_type() == expected.data_type() && n == m
+        }
+        _ => actual == expected,
+    };
+    let same_field = |actual: &Field, expected: &Field| {
+        actual.name() == expected.name()
+            && same_type(actual.data_type(), expected.data_type())
+            && actual.is_nullable() == expected.is_nullable()
+    };
+    if schema.fields().len() != expected.fields().len()
+        || !schema
+            .fields()
+            .iter()
+            .zip(expected.fields())
+            .all(|(actual, expected)| same_field(actual, expected))
+    {
+        return Err(corrupt(format!(
+            "schema {schema} does not match the expected schema {expected}"
+        )));
+    }
+    let metadata = &reader.schema().metadata;
+    let index_version: u32 = metadata_value(metadata, file, INDEX_VERSION_META_KEY)?
+        .parse()
+        .map_err(|err| corrupt(format!("invalid {INDEX_VERSION_META_KEY}: {err}")))?;
+    if index_version > MINHASH_LSH_INDEX_VERSION {
+        return Err(Error::not_supported(format!(
+            "MinHash LSH index version {index_version} is newer than the supported version {MINHASH_LSH_INDEX_VERSION}"
+        )));
+    }
+    let file_params =
+        MinHashLshIndexParams::from_details_hex(metadata_value(metadata, file, DETAILS_META_KEY)?)?;
+    if file_params != *params {
+        return Err(corrupt(format!(
+            "index file details {file_params:?} do not match index details {params:?}"
+        )));
+    }
+    Ok(())
 }
 
 impl MinHashLshIndex {
@@ -899,30 +1004,23 @@ impl MinHashLshIndex {
             store.open_index_file(SIGNATURES_FILENAME)
         )?;
 
+        check_index_file(bands.as_ref(), BANDS_FILENAME, &BANDS_SCHEMA, &params)?;
+        check_index_file(
+            signatures.as_ref(),
+            SIGNATURES_FILENAME,
+            &signatures_schema(params.num_hashes as i32),
+            &params,
+        )?;
+
         let metadata = &bands.schema().metadata;
         let corrupt = |message: String| Error::corrupt_file_named(BANDS_FILENAME, message);
-        let index_version: u32 = metadata_value(metadata, INDEX_VERSION_META_KEY)?
-            .parse()
-            .map_err(|err| corrupt(format!("invalid {INDEX_VERSION_META_KEY}: {err}")))?;
-        if index_version > MINHASH_LSH_INDEX_VERSION {
-            return Err(Error::not_supported(format!(
-                "MinHash LSH index version {index_version} is newer than the supported version {MINHASH_LSH_INDEX_VERSION}"
-            )));
-        }
-        let file_params =
-            MinHashLshIndexParams::from_json(metadata_value(metadata, PARAMS_META_KEY)?)?;
-        if file_params != params {
-            return Err(corrupt(format!(
-                "index file params {file_params:?} do not match index details {params:?}"
-            )));
-        }
-        let page_rows: usize = metadata_value(metadata, PAGE_ROWS_META_KEY)?
+        let page_rows: usize = metadata_value(metadata, BANDS_FILENAME, PAGE_ROWS_META_KEY)?
             .parse()
             .map_err(|err| corrupt(format!("invalid {PAGE_ROWS_META_KEY}: {err}")))?;
         if page_rows == 0 {
             return Err(corrupt(format!("{PAGE_ROWS_META_KEY} must be positive")));
         }
-        let num_docs: usize = metadata_value(metadata, NUM_DOCS_META_KEY)?
+        let num_docs: usize = metadata_value(metadata, BANDS_FILENAME, NUM_DOCS_META_KEY)?
             .parse()
             .map_err(|err| corrupt(format!("invalid {NUM_DOCS_META_KEY}: {err}")))?;
         if num_docs != signatures.num_rows() {
@@ -931,9 +1029,10 @@ impl MinHashLshIndex {
                 signatures.num_rows()
             )));
         }
-        let page_table_buffer: u32 = metadata_value(metadata, PAGE_TABLE_BUFFER_META_KEY)?
-            .parse()
-            .map_err(|err| corrupt(format!("invalid {PAGE_TABLE_BUFFER_META_KEY}: {err}")))?;
+        let page_table_buffer: u32 =
+            metadata_value(metadata, BANDS_FILENAME, PAGE_TABLE_BUFFER_META_KEY)?
+                .parse()
+                .map_err(|err| corrupt(format!("invalid {PAGE_TABLE_BUFFER_META_KEY}: {err}")))?;
         let page_table = bands.read_global_buffer(page_table_buffer).await?;
         if page_table.len() % 8 != 0 {
             return Err(corrupt(format!(
@@ -1446,7 +1545,8 @@ fn signature_columns(
     let values = signatures
         .values()
         .as_primitive_opt::<UInt16Type>()
-        .ok_or_else(|| corrupt(format!("{SIGNATURE_COL} values are not UInt16")))?;
+        .filter(|values| values.null_count() == 0)
+        .ok_or_else(|| corrupt(format!("{SIGNATURE_COL} values are not non-null UInt16")))?;
     if values.len() != signatures.len() * num_hashes {
         return Err(corrupt(format!(
             "{SIGNATURE_COL} has {} values for {} rows of width {num_hashes}",
@@ -1939,7 +2039,7 @@ impl BandsWriter {
             .await?;
         self.writer
             .finish_with_metadata(HashMap::from([
-                (PARAMS_META_KEY.to_string(), serde_json::to_string(params)?),
+                (DETAILS_META_KEY.to_string(), params.details_hex()?),
                 (
                     INDEX_VERSION_META_KEY.to_string(),
                     MINHASH_LSH_INDEX_VERSION.to_string(),
@@ -2462,10 +2562,7 @@ impl MinHashLshIndexBuilder {
         }
         let signatures_file = signatures_writer
             .finish_with_metadata(HashMap::from([
-                (
-                    PARAMS_META_KEY.to_string(),
-                    serde_json::to_string(&self.params)?,
-                ),
+                (DETAILS_META_KEY.to_string(), self.params.details_hex()?),
                 (
                     INDEX_VERSION_META_KEY.to_string(),
                     MINHASH_LSH_INDEX_VERSION.to_string(),
@@ -3098,6 +3195,18 @@ mod tests {
         "custom_stop_words"
     )]
     #[case::lance_tokenizer(r#"{"tokenizer": {"lance_tokenizer": "json"}}"#, "lance_tokenizer")]
+    #[case::jieba(
+        r#"{"tokenizer": {"base_tokenizer": "jieba"}}"#,
+        "tokenizer_fingerprint"
+    )]
+    #[case::jieba_named(
+        r#"{"tokenizer": {"base_tokenizer": "jieba/default"}}"#,
+        "tokenizer_fingerprint"
+    )]
+    #[case::lindera(
+        r#"{"tokenizer": {"base_tokenizer": "lindera/ipadic"}}"#,
+        "tokenizer_fingerprint"
+    )]
     #[case::unknown_key(r#"{"num_hash": 128}"#, "unknown field")]
     #[case::bad_tokenizer(
         r#"{"tokenizer": {"base_tokenizer": "nope"}}"#,
@@ -3105,8 +3214,30 @@ mod tests {
     )]
     fn test_params_validation(#[case] json: &str, #[case] message: &str) {
         let err = MinHashLshIndexParams::from_json(json).unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(
+            matches!(err, Error::InvalidInput { .. } | Error::NotSupported { .. }),
+            "{err}"
+        );
         assert!(err.to_string().contains(message), "{err}");
+    }
+
+    #[test]
+    fn test_details_round_trip_and_fingerprint_rejection() {
+        let params = MinHashLshIndexParams::from_json(r#"{"num_hashes": 64}"#).unwrap();
+        let hex = params.details_hex().unwrap();
+        assert_eq!(
+            MinHashLshIndexParams::from_details_hex(&hex).unwrap(),
+            params
+        );
+        assert!(MinHashLshIndexParams::from_details_hex("zz").is_err());
+
+        let details = pb::MinHashLshIndexDetails {
+            tokenizer_fingerprint: Some(1),
+            ..params.to_details().unwrap()
+        };
+        let err = MinHashLshIndexParams::from_details(&details).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(err.to_string().contains("tokenizer_fingerprint"), "{err}");
     }
 
     /// The vectors of the format specification
@@ -3676,6 +3807,45 @@ mod tests {
         assert!(matches!(err, Error::CorruptFile { .. }), "{err}");
         assert!(
             err.to_string().contains("do not match index details"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_rejects_a_signature_file_with_another_schema() {
+        let (_tmpdir, store) = test_store();
+        let rows = rows_from(&["some text to index for this test"]);
+        let builder = default_builder();
+        let params = builder.params.clone();
+        builder
+            .train(text_stream(&rows, 1), store.as_ref())
+            .await
+            .unwrap();
+        // Replace the signature file with one whose signature is wider.
+        let other_schema = signatures_schema(params.num_hashes as i32 + 1);
+        let mut writer = store
+            .new_index_file(SIGNATURES_FILENAME, other_schema.clone())
+            .await
+            .unwrap();
+        writer
+            .write_record_batch(RecordBatch::new_empty(other_schema))
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+        let err = MinHashLshIndex::load(
+            store.clone(),
+            &params.details_any().unwrap(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err}");
+        assert!(
+            err.to_string().contains(SIGNATURES_FILENAME)
+                && err
+                    .to_string()
+                    .contains("does not match the expected schema"),
             "{err}"
         );
     }
