@@ -376,14 +376,18 @@ impl FileFragment {
             })?
             .infer_error()?;
 
-        let matched_offsets = with_offsets.then(|| {
+        let matched_offsets = if with_offsets {
             let mut buf = Vec::with_capacity(result.matched_offsets.serialized_size());
             result
                 .matched_offsets
                 .serialize_into(&mut buf)
-                .expect("RoaringBitmap serialization cannot fail");
-            buf
-        });
+                .map_err(|err| {
+                    PyIOError::new_err(format!("Failed to serialize matched row offsets: {err}"))
+                })?;
+            Some(buf)
+        } else {
+            None
+        };
         Ok((
             PyLance(result.fragment),
             result.fields_modified,
