@@ -70,6 +70,7 @@ statistics, so results from different segments merge exactly.
 | `shingle_size`      | 3                                                                | at least 1                                    | Tokens per shingle. Shorter shingles tolerate more edits but let unrelated texts that share common phrases look alike; 5 suits long documents, 2 very short texts.                                             |
 | `tokenizer`         | full text search default, without stemming and stop-word removal | the subset described under [Tokenizer](#tokenizer) | The tokenizer, recorded as the Full-Text Search index records it. Stemming and stop-word removal are off by default because merging different words inflates similarity.                                  |
 | `signature_version` | 0                                                                | 0                                             | Version of the signature procedure, including its hash seed and the band key hash. Managed by Lance, not a user parameter.                                                                                     |
+| `tokenizer_fingerprint` | absent                                                       | present exactly when the tokenizer loads resources from the language model home | XXH64 fingerprint of those resources, defined under [Tokenizer](#tokenizer). Managed by Lance, not a user parameter.                                                                       |
 
 Reference points: the probability that a row with true Jaccard similarity `J`
 becomes a candidate is `1 - (1 - J^r)^b` with `b = num_bands` and
@@ -93,7 +94,11 @@ file, and rejects the index when:
 - a parameter is outside its range above (this includes a `num_hashes` that is
   not a multiple of `num_bands`);
 - `tokenizer` is absent, or asks for a setting outside the supported subset;
-- `signature_version` is not a version the reader implements (only 0 exists).
+- `signature_version` is not a version the reader implements (only 0 exists);
+- `tokenizer_fingerprint` is present for a tokenizer that loads no resources,
+  or absent for one that does;
+- the tokenizer loads resources and the reader does not implement the
+  fingerprint.
 
 The ranges bound every derived size: a signature row is at most
 `8 + 2 * 4096` bytes, a band at most 4096 values and a query at most 256 band
@@ -114,10 +119,28 @@ query time. The supported subset is exactly what the message records:
 
 The default is the `simple` tokenizer with `language = English`,
 `max_token_length = 40`, `lower_case = true`, `ascii_folding = true`,
-`stem = false` and `remove_stop_words = false`. Dictionary-backed tokenizers
-(`icu`, `jieba/*`, `lindera/*`) are identified by name, as in the Full-Text
-Search index: the dictionary is part of the deployment, and an index must be
-rebuilt when it changes.
+`stem = false` and `remove_stop_words = false`.
+
+The details identify every input of tokenization, in one of two ways:
+
+- **Tokenizers whose data ships with Lance** (`simple`, `whitespace`, `raw`,
+  `ngram`, `code`, `icu`, `icu/split`; the ICU segmentation data is compiled
+  into Lance): their token stream for a given text and configuration is part
+  of `signature_version`, and `tokenizer_fingerprint` is absent.
+- **Tokenizers that load resources from the language model home**
+  (`jieba`, `jieba/*`, `lindera/*`, which read the directory
+  `LANCE_LANGUAGE_MODEL_HOME/<base_tokenizer>/`): the details carry
+  `tokenizer_fingerprint`, the XXH64 hash (seed 0) of the directory's
+  contents. The hash consumes, for every regular file below the directory in
+  ascending order of its relative path bytes, following symbolic links: the
+  relative path as UTF-8 bytes with `/` separators, one `0x00` byte, the file
+  length as 8 little-endian bytes, and the file contents. The writer computes
+  it when the index is built; a reader recomputes it from its own deployment
+  when it opens the index and rejects a mismatch, since the query would be
+  tokenized differently from the rows (the index must be rebuilt, or the
+  resources restored). An implementation that does not compute the
+  fingerprint rejects these tokenizers when an index is created and when one
+  is opened.
 
 ## Signature Generation
 
@@ -224,8 +247,8 @@ The texts `""` and `"  \n"` have no tokens and therefore no signature.
 ## Storage Layout
 
 Each segment consists of two Lance files. The details in the index metadata
-are the authoritative parameters; the files repeat them only so that a file
-that does not belong to the details is detected.
+are authoritative; both files repeat them as schema metadata so that a file
+that does not belong to the details is detected when the segment is opened.
 
 ### Signature File Schema
 
@@ -234,17 +257,35 @@ that does not belong to the details is detected.
 segment holds at most `2^32` documents, and larger tables use several
 segments.
 
-| Column      | Type                                | Nullable | Description                                                                                                                                                                  |
-|:------------|:------------------------------------|:---------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `_rowid`    | UInt64                              | false    | The row id of the indexed row as the dataset hands it to the index: the row address, or the stable row id when the dataset has stable row ids enabled, like every scalar index. |
-| `signature` | FixedSizeList<UInt16, `num_hashes`> | false    | The signature; the list items are not nullable.                                                                                                                              |
+```python
+pa.schema(
+    [
+        pa.field("_rowid", pa.uint64(), nullable=False),
+        pa.field(
+            "signature",
+            pa.list_(pa.field("item", pa.uint16(), nullable=False), num_hashes),
+            nullable=False,
+            metadata={
+                "lance-encoding:structural-encoding": "fullzip",
+                "lance-encoding:compression": "none",
+            },
+        ),
+    ],
+    metadata={
+        "minhash_lsh_details": "<hexadecimal serialized MinHashLshIndexDetails>",
+        "minhash_lsh_index_version": "0",
+    },
+)
+```
 
-The `signature` field carries the field metadata
-`lance-encoding:structural-encoding = fullzip` and
-`lance-encoding:compression = none`, so every row occupies the same
-`2 * num_hashes` bytes and a reader fetches the signature of document `i` by
-row number as one ranged read. Rows are written in document id order and
-never reordered.
+`_rowid` is the row id of the indexed row as the dataset hands it to the
+index: the row address, or the stable row id when the dataset has stable row
+ids enabled, like every scalar index. `signature` is the signature of
+[Signature Generation](#signature-generation). The field metadata of
+`signature` selects the full-zip structural encoding without compression, so
+every row occupies the same `2 * num_hashes` bytes and a reader fetches the
+signature of document `i` by row number as one ranged read. Rows are written
+in document id order and never reordered.
 
 ### Bands File Schema
 
@@ -252,13 +293,36 @@ never reordered.
 `band_key` and then `doc_id`, ascending. A bucket is the run of rows sharing
 a key.
 
-| Column     | Type   | Nullable | Description                                                  |
-|:-----------|:-------|:---------|:-------------------------------------------------------------|
-| `band_key` | UInt64 | false    | The band key of [Band Keys](#band-keys).                     |
-| `doc_id`   | UInt32 | false    | Segment-local document id: the row number in `signatures.lance`. |
+```python
+pa.schema(
+    [
+        pa.field(
+            "band_key",
+            pa.uint64(),
+            nullable=False,
+            metadata={"lance-encoding:compression": "none"},
+        ),
+        pa.field(
+            "doc_id",
+            pa.uint32(),
+            nullable=False,
+            metadata={"lance-encoding:compression": "none"},
+        ),
+    ],
+    metadata={
+        "minhash_lsh_details": "<hexadecimal serialized MinHashLshIndexDetails>",
+        "minhash_lsh_index_version": "0",
+        "minhash_lsh_num_docs": "<decimal document count>",
+        "minhash_lsh_page_rows": "4096",
+        "minhash_lsh_page_table_buffer": "<decimal global buffer index>",
+    },
+)
+```
 
-Both fields carry `lance-encoding:compression = none`, so any run of rows is
-one ranged read per column. The file is divided into logical pages of
+`band_key` is the key of [Band Keys](#band-keys); `doc_id` is the
+segment-local document id, the row number in `signatures.lance`. Both
+columns are stored without compression, so any run of rows is one ranged
+read per column. The file is divided into logical pages of
 `minhash_lsh_page_rows` rows: page `p` holds rows
 `[p * page_rows, (p + 1) * page_rows)`, and the last page may be shorter. A
 bucket may span any number of pages.
@@ -267,7 +331,7 @@ bucket may span any number of pages.
 
 | Key                             | File       | Value                                                                                                                                                                                                |
 |:--------------------------------|:-----------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `minhash_lsh_params`            | both       | JSON object with `num_hashes`, `num_bands`, `shingle_size` and `tokenizer` (the JSON form of the Full-Text Search index parameters). Must describe the same parameters as the index details.        |
+| `minhash_lsh_details`           | both       | Lower-case hexadecimal encoding of the serialized `MinHashLshIndexDetails` the segment was built from. A reader decodes it and requires it to describe, field by field, the same details as the index metadata. |
 | `minhash_lsh_index_version`     | both       | Decimal file layout version; `0` for the layout described here. Independent of `signature_version`.                                                                                                 |
 | `minhash_lsh_num_docs`          | `bands`    | Decimal number of documents of the segment; equals the row count of `signatures.lance`.                                                                                                             |
 | `minhash_lsh_page_rows`         | `bands`    | Decimal number of rows per logical page; positive. Writers use `4096`.                                                                                                                              |
@@ -290,13 +354,17 @@ reading the file.
 A reader opens a segment in this order and treats a failed check as
 corruption of the named file, except where noted:
 
-1. Parse and validate the index details ([Validation](#validation)).
-2. Open `bands.lance` and read its schema metadata. Every key above must be
-   present and parse. A `minhash_lsh_index_version` greater than the version
-   the reader implements is rejected as unsupported, not as corruption.
-   `minhash_lsh_params` must equal the details and `minhash_lsh_page_rows`
-   must be positive.
-3. Open `signatures.lance`; its row count must equal `minhash_lsh_num_docs`.
+1. Parse and validate the index details ([Validation](#validation)). When
+   they carry a `tokenizer_fingerprint`, recompute it from the deployment
+   and reject a mismatch as unsupported, not as corruption.
+2. Open both files. In each, the schema must match its definition above
+   exactly in field names, types, nullability (including the list item) and
+   list size, which must equal `num_hashes`; `minhash_lsh_details` must be
+   present, decode, validate and equal the index details field by field; and
+   `minhash_lsh_index_version` must be present. A version greater than the
+   one the reader implements is rejected as unsupported, not as corruption.
+3. In `bands.lance`, `minhash_lsh_page_rows` must be positive and
+   `minhash_lsh_num_docs` must equal the row count of `signatures.lance`.
 4. Read the page table buffer; its length must be a multiple of 8 and its
    entry count must be `ceil(num_rows / page_rows)` for the row count of
    `bands.lance`.

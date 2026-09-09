@@ -260,13 +260,15 @@ message FMIndexDetails {}
 /* Details for a MinHash LSH index used for near-duplicate detection
  * (approximate Jaccard similarity top-k over text).
  *
- * Every parameter that shapes a signature lives here and nowhere else. All
- * segments of one logical index must carry identical parameters so that
+ * Every input of signature generation is identified here and nowhere else:
+ * the parameters, the tokenizer configuration, the fingerprint of tokenizer
+ * resources that do not ship with Lance, and the version of the procedure.
+ * All segments of one logical index must carry identical details so that
  * signatures written by different segments (and computed on the query side)
- * are comparable; the index files repeat them as schema metadata only to
- * detect a details/file mismatch. A reader validates every field against the
- * ranges below before it allocates memory or reads an index file, and rejects
- * details outside them.
+ * are comparable; both index files repeat the serialized message as schema
+ * metadata so that a file that does not belong to the details is detected. A
+ * reader validates every field against the ranges below before it allocates
+ * memory or reads an index file, and rejects details outside them.
  */
 message MinHashLshIndexDetails {
   /* Number of MinHash values per signature (k). Must be in [1, 4096] and a
@@ -290,7 +292,8 @@ message MinHashLshIndexDetails {
    * postings (`with_position`, `block_size`, `posting_format_version`,
    * `document_granularity`) are carried unchanged and ignored. Settings the
    * message cannot record (custom stop words, document-level text extraction)
-   * are rejected when the index is created.
+   * are rejected when the index is created. The token stream of a tokenizer
+   * whose data ships with Lance is fixed by `signature_version`.
    */
   lance.table.InvertedIndexDetails tokenizer = 4;
 
@@ -301,4 +304,13 @@ message MinHashLshIndexDetails {
    * does not implement. Independent of the index file format version.
    */
   uint32 signature_version = 5;
+
+  /* XXH64 fingerprint of the resources the tokenizer loads from the language
+   * model home at build time (the jieba and lindera dictionaries), as
+   * defined by the format specification. Present exactly when the tokenizer
+   * loads such resources. A reader recomputes it from its own deployment
+   * before signing a query and rejects a mismatch; a writer or reader that
+   * does not implement the fingerprint rejects these tokenizers instead.
+   */
+  optional uint64 tokenizer_fingerprint = 6;
 }
