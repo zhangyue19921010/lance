@@ -69,8 +69,7 @@ statistics, so results from different segments merge exactly.
 | `num_bands`         | 16                                                               | 1 to 256                                      | Number of bands. With `num_hashes` it sets the similarity threshold `(1 / num_bands) ^ (num_bands / num_hashes)`. The bands table costs `12 * num_bands` bytes per row.                                        |
 | `shingle_size`      | 3                                                                | at least 1                                    | Tokens per shingle. Shorter shingles tolerate more edits but let unrelated texts that share common phrases look alike; 5 suits long documents, 2 very short texts.                                             |
 | `tokenizer`         | full text search default, without stemming and stop-word removal | the subset described under [Tokenizer](#tokenizer) | The tokenizer, recorded as the Full-Text Search index records it. Stemming and stop-word removal are off by default because merging different words inflates similarity.                                  |
-| `signature_version` | 0                                                                | 0                                             | Version of the signature procedure, including its hash seed and the band key hash. Managed by Lance, not a user parameter.                                                                                     |
-| `tokenizer_fingerprint` | absent                                                       | present exactly when the tokenizer loads resources from the language model home | XXH64 fingerprint of those resources, defined under [Tokenizer](#tokenizer). Managed by Lance, not a user parameter.                                                                       |
+| `signature_version` | 0                                                                | 0                                             | Version of the signature procedure, including the token streams of the built-in tokenizers, the hash seed and the band key hash. Managed by Lance, not a user parameter.                                     |
 
 Reference points: the probability that a row with true Jaccard similarity `J`
 becomes a candidate is `1 - (1 - J^r)^b` with `b = num_bands` and
@@ -94,13 +93,7 @@ file, and rejects the index when:
 - a parameter is outside its range above (this includes a `num_hashes` that is
   not a multiple of `num_bands`);
 - `tokenizer` is absent, or asks for a setting outside the supported subset;
-- `signature_version` is not a version the reader implements (only 0 exists);
-- `tokenizer_fingerprint` is present for a tokenizer that loads no resources,
-  or absent for one that does;
-- the tokenizer configuration names a resource outside its directory, or
-  depends on a fallback outside it;
-- the tokenizer loads resources and the reader does not implement the
-  fingerprint.
+- `signature_version` is not a version the reader implements (only 0 exists).
 
 The ranges bound every derived size: a signature row is at most
 `8 + 2 * 4096` bytes, a band at most 4096 values and a query at most 256 band
@@ -111,46 +104,28 @@ an unbounded allocation.
 
 The tokenizer is recorded as a `lance.table.InvertedIndexDetails`, the message
 the Full-Text Search index persists, and is rebuilt from that message alone at
-query time. The supported subset is exactly what the message records:
+query time. The details must identify the tokenizer completely, so the
+supported subset is what the message records about a tokenizer whose data
+ships with Lance:
 
 | Fields                                                                                                                                                                | Role                                                                                    |
 |:----------------------------------------------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------------------------------------------------------|
 | `base_tokenizer`, `language`, `max_token_length`, `lower_case`, `stem`, `remove_stop_words`, `ascii_folding`, `min_ngram_length`, `max_ngram_length`, `prefix_only`, `code_config` | Shape the token stream and are applied by the index.                                    |
 | `with_position`, `block_size`, `document_granularity`, `posting_format_version`                                                                                       | Describe full text search postings; carried unchanged and ignored.                      |
 | custom stop words, document-level text extraction (`lance_tokenizer`)                                                                                                 | Cannot be recorded in the message; a build that asks for them is rejected.              |
+| `jieba`, `jieba/*`, `lindera/*`                                                                                                                                       | Load dictionaries from the deployment (`LANCE_LANGUAGE_MODEL_HOME`), which the message cannot identify; rejected. |
 
 The default is the `simple` tokenizer with `language = English`,
 `max_token_length = 40`, `lower_case = true`, `ascii_folding = true`,
 `stem = false` and `remove_stop_words = false`.
 
-The details identify every input of tokenization, in one of two ways:
-
-- **Tokenizers whose data ships with Lance** (`simple`, `whitespace`, `raw`,
-  `ngram`, `code`, `icu`, `icu/split`; the ICU segmentation data is compiled
-  into Lance): their token stream for a given text and configuration is part
-  of `signature_version`, and `tokenizer_fingerprint` is absent.
-- **Tokenizers that load resources from the language model home**
-  (`jieba`, `jieba/*`, `lindera/*`, which read the directory
-  `LANCE_LANGUAGE_MODEL_HOME/<base_tokenizer>/`): the directory is the
-  complete set of resources. Its configuration file must exist (no
-  environment or built-in fallback, such as `LINDERA_CONFIG_PATH`, is
-  consulted), and every path the configuration names must be relative,
-  contain no `..` component and no URI scheme, and resolve to a regular file
-  below the directory; a configuration that reaches outside the directory is
-  rejected when an index is created or opened. Dictionaries compiled into
-  Lance (Lindera's built-in dictionary kinds) need no files and are part of
-  `signature_version`. The details carry `tokenizer_fingerprint`, the XXH64
-  hash (seed 0) of the directory's contents. The hash consumes, for every
-  regular file below the directory in
-  ascending order of its relative path bytes, following symbolic links: the
-  relative path as UTF-8 bytes with `/` separators, one `0x00` byte, the file
-  length as 8 little-endian bytes, and the file contents. The writer computes
-  it when the index is built; a reader recomputes it from its own deployment
-  when it opens the index and rejects a mismatch, since the query would be
-  tokenized differently from the rows (the index must be rebuilt, or the
-  resources restored). An implementation that does not compute the
-  fingerprint rejects these tokenizers when an index is created and when one
-  is opened.
+Version 0 therefore admits `simple`, `whitespace`, `raw`, `ngram`, `code`,
+`icu` and `icu/split` as `base_tokenizer` (the ICU segmentation data is
+compiled into Lance). The token stream these tokenizers produce for a given
+text and configuration is part of `signature_version`. For CJK text, `ngram`
+or `icu` gives deterministic shingles. A later version may admit
+dictionary-backed tokenizers by storing their resources in the index; a
+reader of this version rejects details that name them.
 
 ## Signature Generation
 
@@ -366,9 +341,7 @@ reading the file.
 A reader opens a segment in this order and treats a failed check as
 corruption of the named file, except where noted:
 
-1. Parse and validate the index details ([Validation](#validation)). When
-   they carry a `tokenizer_fingerprint`, recompute it from the deployment
-   and reject a mismatch as unsupported, not as corruption.
+1. Parse and validate the index details ([Validation](#validation)).
 2. Open both files. In each, the schema must match its definition above
    exactly in field names, types, nullability and list size, which must equal
    `num_hashes`; `minhash_lsh_details` must be
