@@ -254,7 +254,8 @@ public class MergeInsertParams {
    * each row's bytes the source columns occupy: nearly always for a KB-scale update of a MB-per-row
    * table, possibly never for a table of narrow columns.
    *
-   * <p>Default is {@link MergeWriteMode#Auto}, which rewrites whole rows.
+   * <p>Default is {@link MergeWriteMode#Auto}: the write mode is chosen by the engine, typically
+   * rewriting whole rows.
    *
    * @param writeMode How the merged rows are written.
    * @return This MergeInsertParams instance
@@ -385,8 +386,8 @@ public class MergeInsertParams {
    */
   public enum MergeWriteMode {
     /**
-     * Let the engine choose: whole rows, except that a partial-schema update whose join key carries
-     * a scalar index patches columns, on the indexed path that predates this enum.
+     * Let the engine choose, typically rewriting whole rows. A partial-schema update whose join key
+     * carries a scalar index may instead patch columns on the indexed path that predates this enum.
      */
     Auto,
 
