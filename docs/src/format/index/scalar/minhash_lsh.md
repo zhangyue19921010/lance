@@ -161,9 +161,10 @@ When a search is submitted (`nearest = MinHashQuery(text, column)`):
 1. The query text is signed with the parameters recorded in the index, and its
    band keys are computed.
 2. In every segment, each band key is looked up through the page table: a
-   binary search finds the pages holding the key's bucket, and those pages are
-   fetched in one scattered read. The document ids in the buckets form the
-   candidate set.
+   binary search finds the first and the last page of the key's bucket. The
+   boundary pages of all buckets are fetched in one scattered read; the pages
+   in between, when a bucket spans more than two pages, are streamed in
+   bounded windows. The document ids in the buckets form the candidate set.
 3. The candidates' signatures are read — from memory when resident, otherwise
    with scattered reads, or with a sequential scan when the candidates cover a
    large share of the segment — and each candidate's Jaccard distance to the
