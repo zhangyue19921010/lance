@@ -263,7 +263,7 @@ pa.schema(
         pa.field("_rowid", pa.uint64(), nullable=False),
         pa.field(
             "signature",
-            pa.list_(pa.field("item", pa.uint16(), nullable=False), num_hashes),
+            pa.list_(pa.uint16(), num_hashes),
             nullable=False,
             metadata={
                 "lance-encoding:structural-encoding": "fullzip",
@@ -281,7 +281,9 @@ pa.schema(
 `_rowid` is the row id of the indexed row as the dataset hands it to the
 index: the row address, or the stable row id when the dataset has stable row
 ids enabled, like every scalar index. `signature` is the signature of
-[Signature Generation](#signature-generation). The field metadata of
+[Signature Generation](#signature-generation); its values are never null
+(the Lance schema does not record the nullability of a fixed-size list item,
+so a reader treats a null value as corruption of the file). The field metadata of
 `signature` selects the full-zip structural encoding without compression, so
 every row occupies the same `2 * num_hashes` bytes and a reader fetches the
 signature of document `i` by row number as one ranged read. Rows are written
@@ -358,8 +360,8 @@ corruption of the named file, except where noted:
    they carry a `tokenizer_fingerprint`, recompute it from the deployment
    and reject a mismatch as unsupported, not as corruption.
 2. Open both files. In each, the schema must match its definition above
-   exactly in field names, types, nullability (including the list item) and
-   list size, which must equal `num_hashes`; `minhash_lsh_details` must be
+   exactly in field names, types, nullability and list size, which must equal
+   `num_hashes`; `minhash_lsh_details` must be
    present, decode, validate and equal the index details field by field; and
    `minhash_lsh_index_version` must be present. A version greater than the
    one the reader implements is rejected as unsupported, not as corruption.
@@ -371,7 +373,8 @@ corruption of the named file, except where noted:
 
 While answering queries, a page that does not decode to non-null `UInt64`
 and `UInt32` columns, and a `doc_id` that is not below
-`minhash_lsh_num_docs`, are corruption of `bands.lance`.
+`minhash_lsh_num_docs`, are corruption of `bands.lance`; a signature batch
+with a null value is corruption of `signatures.lance`.
 
 The fragments a segment covers are recorded in the index metadata of the
 dataset, never derived from the stored `_rowid` values (which do not identify
