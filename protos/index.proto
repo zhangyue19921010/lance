@@ -264,11 +264,13 @@ message FMIndexDetails {}
  * segments of one logical index must carry identical parameters so that
  * signatures written by different segments (and computed on the query side)
  * are comparable; the index files repeat them as schema metadata only to
- * detect a details/file mismatch.
+ * detect a details/file mismatch. A reader validates every field against the
+ * ranges below before it allocates memory or reads an index file, and rejects
+ * details outside them.
  */
 message MinHashLshIndexDetails {
-  /* Number of MinHash values per signature (k). Must be a positive multiple of
-   * `num_bands`.
+  /* Number of MinHash values per signature (k). Must be in [1, 4096] and a
+   * multiple of `num_bands`.
    */
   uint32 num_hashes = 1;
 
@@ -277,20 +279,26 @@ message MinHashLshIndexDetails {
    */
   uint32 num_bands = 2;
 
-  // Number of consecutive tokens joined into one shingle before hashing.
+  /* Number of consecutive tokens joined into one shingle before hashing. Must
+   * be at least 1; a text with fewer tokens forms one shingle of all of them.
+   */
   uint32 shingle_size = 3;
 
-  /* The tokenizer, recorded exactly like a full text search index records
-   * it. Only the tokenization fields matter here; fields that shape full text
-   * search postings (`with_position`, `block_size`, `posting_format_version`,
-   * `document_granularity`) are carried unchanged and ignored.
+  /* The tokenizer, recorded exactly like a full text search index records it
+   * and rebuilt from this message alone at query time. Required. Only the
+   * tokenization fields matter here; fields that shape full text search
+   * postings (`with_position`, `block_size`, `posting_format_version`,
+   * `document_granularity`) are carried unchanged and ignored. Settings the
+   * message cannot record (custom stop words, document-level text extraction)
+   * are rejected when the index is created.
    */
   lance.table.InvertedIndexDetails tokenizer = 4;
 
   /* Version of the signature generation behavior (tokenize, shingle, hash,
-   * permute, compress, including the fixed seed the coefficients derive from).
-   * Bumped whenever any step changes in a way that makes old and new
-   * signatures incomparable. Independent of the index file format version.
+   * permute, compress and derive band keys, including the fixed seed the
+   * coefficients derive from). Bumped whenever any step changes in a way that
+   * makes old and new signatures incomparable; a reader rejects a version it
+   * does not implement. Independent of the index file format version.
    */
   uint32 signature_version = 5;
 }

@@ -63,13 +63,13 @@ statistics, so results from different segments merge exactly.
 %%% proto.message.MinHashLshIndexDetails %%%
 ```
 
-| Parameter           | Default | Effect                                                                                                                                                                                                         |
-|:--------------------|:--------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `num_hashes`        | 128     | Signature length. More hashes make the similarity estimate more precise (error about `1 / sqrt(num_hashes)`) and the signature table larger (`8 + 2 * num_hashes` bytes per row).                              |
-| `num_bands`         | 16      | Number of bands; `num_hashes` must be a multiple of it. With `num_hashes` it sets the similarity threshold `(1 / num_bands) ^ (num_bands / num_hashes)`. The bands table costs `12 * num_bands` bytes per row. |
-| `shingle_size`      | 3       | Tokens per shingle. Shorter shingles tolerate more edits but let unrelated texts that share common phrases look alike; 5 suits long documents, 2 very short texts.                                             |
-| `tokenizer`         | full text search default, without stemming and stop-word removal | The tokenizer, recorded as the Full-Text Search index records it. Stemming and stop-word removal are off by default because merging different words inflates similarity.                         |
-| `signature_version` | 0       | Version of the signature procedure, including its hash seed. Managed by Lance, not a user parameter.                                                                                                           |
+| Parameter           | Default                                                          | Range                                         | Effect                                                                                                                                                                                                         |
+|:--------------------|:-----------------------------------------------------------------|:----------------------------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `num_hashes`        | 128                                                              | 1 to 4096, a multiple of `num_bands`          | Signature length. More hashes make the similarity estimate more precise (error about `1 / sqrt(num_hashes)`) and the signature table larger (`8 + 2 * num_hashes` bytes per row).                              |
+| `num_bands`         | 16                                                               | 1 to 256                                      | Number of bands. With `num_hashes` it sets the similarity threshold `(1 / num_bands) ^ (num_bands / num_hashes)`. The bands table costs `12 * num_bands` bytes per row.                                        |
+| `shingle_size`      | 3                                                                | at least 1                                    | Tokens per shingle. Shorter shingles tolerate more edits but let unrelated texts that share common phrases look alike; 5 suits long documents, 2 very short texts.                                             |
+| `tokenizer`         | full text search default, without stemming and stop-word removal | the subset described under [Tokenizer](#tokenizer) | The tokenizer, recorded as the Full-Text Search index records it. Stemming and stop-word removal are off by default because merging different words inflates similarity.                                  |
+| `signature_version` | 0                                                                | 0                                             | Version of the signature procedure, including its hash seed and the band key hash. Managed by Lance, not a user parameter.                                                                                     |
 
 Reference points: the probability that a row with true Jaccard similarity `J`
 becomes a candidate is `1 - (1 - J^r)^b` with `b = num_bands` and
@@ -85,55 +85,229 @@ Bands of fewer than six values admit a noticeable share of unrelated rows into
 the candidate set on tables of billions of rows and are better left to offline
 use.
 
+### Validation
+
+A reader validates the details before it allocates memory or reads an index
+file, and rejects the index when:
+
+- a parameter is outside its range above (this includes a `num_hashes` that is
+  not a multiple of `num_bands`);
+- `tokenizer` is absent, or asks for a setting outside the supported subset;
+- `signature_version` is not a version the reader implements (only 0 exists).
+
+The ranges bound every derived size: a signature row is at most
+`8 + 2 * 4096` bytes, a band at most 4096 values and a query at most 256 band
+keys, so no combination of parameters can overflow a size computation or drive
+an unbounded allocation.
+
+### Tokenizer
+
+The tokenizer is recorded as a `lance.table.InvertedIndexDetails`, the message
+the Full-Text Search index persists, and is rebuilt from that message alone at
+query time. The supported subset is exactly what the message records:
+
+| Fields                                                                                                                                                                | Role                                                                                    |
+|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------------------------------------------------------|
+| `base_tokenizer`, `language`, `max_token_length`, `lower_case`, `stem`, `remove_stop_words`, `ascii_folding`, `min_ngram_length`, `max_ngram_length`, `prefix_only`, `code_config` | Shape the token stream and are applied by the index.                                    |
+| `with_position`, `block_size`, `document_granularity`, `posting_format_version`                                                                                       | Describe full text search postings; carried unchanged and ignored.                      |
+| custom stop words, document-level text extraction (`lance_tokenizer`)                                                                                                 | Cannot be recorded in the message; a build that asks for them is rejected.              |
+
+The default is the `simple` tokenizer with `language = English`,
+`max_token_length = 40`, `lower_case = true`, `ascii_folding = true`,
+`stem = false` and `remove_stop_words = false`. Dictionary-backed tokenizers
+(`icu`, `jieba/*`, `lindera/*`) are identified by name, as in the Full-Text
+Search index: the dictionary is part of the deployment, and an index must be
+rebuilt when it changes.
+
 ## Signature Generation
 
 The build side and the query side run the same procedure, so a query is
-comparable with every stored row:
+comparable with every stored row. All arithmetic below is on unsigned 64-bit
+integers modulo `2^64`, and every multi-byte value is little-endian.
 
-1. Tokenize the text with the configured tokenizer.
-2. Form shingles of `shingle_size` consecutive tokens (joined with the byte
-   `0x1F`). A text with fewer tokens than `shingle_size` forms one shingle of
-   all its tokens; a text with no tokens (NULL, empty, whitespace only) has no
-   signature, is not indexed, and never appears in results.
-3. Hash every shingle to 64 bits with XXH64 (seed 42).
-4. Apply `num_hashes` permutations of the form `a_i * x + b_i mod 2^64`, with
-   coefficients drawn from a SplitMix64 generator (seed 42, odd `a_i`), and
-   keep the minimum of each permutation over all shingles of the text.
-5. Store each minimum as 16 bits: `(c_i * min mod 2^64) >> 48` with an odd
-   multiplier `c_i` from the same generator. A minimum shrinks as the text
-   grows, so its raw high bits would agree between any two long texts;
-   multiply-shift hashing keeps the chance that two different minima collide
-   below `2^-15`, negligible against the `1 / num_hashes` resolution of the
-   estimate.
+1. **Tokenize** the text with the configured tokenizer. A token is the UTF-8
+   bytes of the token text the tokenizer emits, in emission order.
+2. **Shingle**: a shingle is `shingle_size` consecutive tokens joined with the
+   single byte `0x1F`; a text of `n` tokens has `n - shingle_size + 1`
+   shingles, one starting at every token position. A text with fewer tokens
+   than `shingle_size` but at least one token forms one shingle of all its
+   tokens. A text with no tokens (NULL, empty, whitespace only, or every token
+   discarded by the tokenizer) has no signature, is not indexed, and never
+   appears in results.
+3. **Hash** every shingle to 64 bits: `x = XXH64(shingle bytes, seed = 42)`.
+4. **Coefficients** come from a SplitMix64 generator whose state `s` starts at
+   42. One draw is:
+
+    ```
+    s    = s + 0x9E3779B97F4A7C15
+    z    = s
+    z    = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+    z    = (z ^ (z >> 27)) * 0x94D049BB133111EB
+    draw = z ^ (z >> 31)
+    ```
+
+    The draws are consumed in this order: for `i = 0 .. num_hashes - 1`,
+    `a_i = draw() | 1` and then `b_i = draw()`; after all pairs, for
+    `i = 0 .. num_hashes - 1`, `c_i = draw() | 1`. The coefficients depend on
+    `num_hashes` only.
+5. **Permute and take the minima**: `m_i = min over all shingles x of
+   (a_i * x + b_i)`, comparing the full 64-bit values.
+6. **Compress** each minimum to 16 bits: `signature[i] = (c_i * m_i) >> 48`.
+   A minimum shrinks as the text grows, so its raw high bits would agree
+   between any two long texts; multiply-shift hashing keeps the chance that
+   two different minima collide below `2^-15`, negligible against the
+   `1 / num_hashes` resolution of the estimate.
 
 The estimated Jaccard similarity of two signatures is the fraction of
 positions whose values are equal; the reported `_distance` is
-`1 - estimated similarity`. Every constant of the procedure is fixed by
-`signature_version`, and every segment of an index must carry identical
-details, so signatures written by different segments or at query time are
-always comparable. Changing a parameter, or upgrading a tokenizer dictionary,
+`1 - estimated similarity`, and rows at equal distance are ordered by row id.
+Every constant of the procedure, and the band key below, is fixed by
+`signature_version`; every segment of an index must carry identical details,
+so signatures written by different segments or at query time are always
+comparable. Changing a parameter, or upgrading a tokenizer dictionary,
 requires rebuilding the index.
+
+### Band Keys
+
+The signature is split into `num_bands` bands of `r = num_hashes / num_bands`
+consecutive values; band `j` holds `signature[j * r .. (j + 1) * r)`. Its key
+is
+
+```
+band_key_j = (j << 56) | (XXH64(band bytes, seed = 42) & 0x00FFFFFFFFFFFFFF)
+```
+
+where the band bytes are the band's `r` values, each written as 2 little-endian
+bytes, in signature order. The band number in the high byte keeps the keys of
+one band contiguous in the sorted bands table.
+
+### Known-Answer Vectors
+
+An implementation of the procedure must reproduce these values, computed with
+`num_hashes = 4`, `num_bands = 2`, `shingle_size = 2`, the default tokenizer
+and `signature_version = 0`.
+
+Coefficients:
+
+| `i` | `a_i`              | `b_i`              | `c_i`              |
+|:----|:-------------------|:-------------------|:-------------------|
+| 0   | `0xbdd732262feb6e95` | `0x28efe333b266f103` | `0x5705b8770b3d7dd5` |
+| 1   | `0x47526757130f9f53` | `0x581ce1ff0e4ae394` | `0x9e54d738297f77af` |
+| 2   | `0x09bc585a244823f3` | `0xde4431fa3c80db06` | `0x3474724a775b19bf` |
+| 3   | `0x37e9671c45376d5d` | `0xccf635ee9e9e2fa4` | `0x7e348a0e451650bf` |
+
+Text `"The quick brown fox"` tokenizes to `the`, `quick`, `brown`, `fox`:
+
+| Shingle bytes           | `XXH64`            |
+|:------------------------|:-------------------|
+| `the` `0x1F` `quick`    | `0x4c0b0d36203ce55f` |
+| `quick` `0x1F` `brown`  | `0x09c7ae895d82b184` |
+| `brown` `0x1F` `fox`    | `0x68e7f4b1be7b4c1f` |
+
+| `i` | `m_i`              | `signature[i]` |
+|:----|:-------------------|:---------------|
+| 0   | `0x0959767d77eafad7` | `0xb00f`         |
+| 1   | `0x464e4457275cd2a1` | `0x59d6`         |
+| 2   | `0x50f41804abaa5973` | `0x511a`         |
+| 3   | `0x8944bd01067b09e7` | `0xcd2c`         |
+
+Band keys: `0x00f30f3501d458ea` (band 0), `0x01aec5df28d04915` (band 1).
+
+Text `"Fox"` has one token, fewer than `shingle_size`, so its only shingle is
+`fox` with `XXH64` `0x07c0130ab04388d5`; the minima are `0x2bb8ade505081afc`,
+`0x0a273c6ff9a78ba3`, `0x802f20573838dc35`, `0x1ef46a8d372c9605`, the signature is
+`0x2970 0xd6db 0x65f8 0xadfc`, and the band keys are `0x003cf6e803312eca` and
+`0x017c5504fbc83f36`.
+
+The texts `""` and `"  \n"` have no tokens and therefore no signature.
 
 ## Storage Layout
 
-Each segment consists of two Lance files:
+Each segment consists of two Lance files. The details in the index metadata
+are the authoritative parameters; the files repeat them only so that a file
+that does not belong to the details is detected.
 
-- `signatures.lance` — one row per indexed document: its `_rowid` and its
-  signature as a fixed-size list of `num_hashes` 16-bit values. The row number
-  is the segment-local document id, so a segment holds at most `2^32`
-  documents; larger tables use several segments. Rows are fixed width, so one
-  document's signature is a single ranged read at a known offset.
-- `bands.lance` — one row per (band key, document id) pair, sorted by band key
-  and then document id. A bucket is the run of rows sharing a key. The file is
-  divided into logical pages of 4096 rows, and a page table holding the
-  largest key of every page is stored in a global buffer of the file and kept
-  in memory when the index is open. The band key puts the band number in its
-  high 8 bits and a hash of the band's values in the low 56 bits, so the keys
-  of one band are contiguous.
+### Signature File Schema
 
-Both files also record the index parameters and the index version as schema
-metadata, so a mismatch with the index details is detected when the index is
-opened.
+`signatures.lance` holds one row per indexed document. Row `i` is document
+`i` of the segment: the row number is the segment-local document id, so a
+segment holds at most `2^32` documents, and larger tables use several
+segments.
+
+| Column      | Type                                | Nullable | Description                                                                                                                                                                  |
+|:------------|:------------------------------------|:---------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `_rowid`    | UInt64                              | false    | The row id of the indexed row as the dataset hands it to the index: the row address, or the stable row id when the dataset has stable row ids enabled, like every scalar index. |
+| `signature` | FixedSizeList<UInt16, `num_hashes`> | false    | The signature; the list items are not nullable.                                                                                                                              |
+
+The `signature` field carries the field metadata
+`lance-encoding:structural-encoding = fullzip` and
+`lance-encoding:compression = none`, so every row occupies the same
+`2 * num_hashes` bytes and a reader fetches the signature of document `i` by
+row number as one ranged read. Rows are written in document id order and
+never reordered.
+
+### Bands File Schema
+
+`bands.lance` holds one row per (band key, document id) pair, sorted by
+`band_key` and then `doc_id`, ascending. A bucket is the run of rows sharing
+a key.
+
+| Column     | Type   | Nullable | Description                                                  |
+|:-----------|:-------|:---------|:-------------------------------------------------------------|
+| `band_key` | UInt64 | false    | The band key of [Band Keys](#band-keys).                     |
+| `doc_id`   | UInt32 | false    | Segment-local document id: the row number in `signatures.lance`. |
+
+Both fields carry `lance-encoding:compression = none`, so any run of rows is
+one ranged read per column. The file is divided into logical pages of
+`minhash_lsh_page_rows` rows: page `p` holds rows
+`[p * page_rows, (p + 1) * page_rows)`, and the last page may be shorter. A
+bucket may span any number of pages.
+
+### Schema Metadata
+
+| Key                             | File       | Value                                                                                                                                                                                                |
+|:--------------------------------|:-----------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `minhash_lsh_params`            | both       | JSON object with `num_hashes`, `num_bands`, `shingle_size` and `tokenizer` (the JSON form of the Full-Text Search index parameters). Must describe the same parameters as the index details.        |
+| `minhash_lsh_index_version`     | both       | Decimal file layout version; `0` for the layout described here. Independent of `signature_version`.                                                                                                 |
+| `minhash_lsh_num_docs`          | `bands`    | Decimal number of documents of the segment; equals the row count of `signatures.lance`.                                                                                                             |
+| `minhash_lsh_page_rows`         | `bands`    | Decimal number of rows per logical page; positive. Writers use `4096`.                                                                                                                              |
+| `minhash_lsh_page_table_buffer` | `bands`    | Decimal index of the global buffer of `bands.lance` that holds the page table.                                                                                                                      |
+
+### Page Table
+
+The page table is a global buffer of `bands.lance` holding
+`ceil(num_rows / page_rows)` little-endian UInt64 values; entry `p` is the
+largest `band_key` of page `p`, that is the key of its last row. It is read
+when the segment is opened and kept in memory while the index is open. A
+bucket for key `K` starts in the first page whose entry is `>= K` and ends in
+the first page whose entry is `> K` (or the last page when there is none);
+the pages strictly between hold nothing but that bucket. Both positions are
+binary searches over the table, so a bucket's page range is known without
+reading the file.
+
+### Opening a Segment
+
+A reader opens a segment in this order and treats a failed check as
+corruption of the named file, except where noted:
+
+1. Parse and validate the index details ([Validation](#validation)).
+2. Open `bands.lance` and read its schema metadata. Every key above must be
+   present and parse. A `minhash_lsh_index_version` greater than the version
+   the reader implements is rejected as unsupported, not as corruption.
+   `minhash_lsh_params` must equal the details and `minhash_lsh_page_rows`
+   must be positive.
+3. Open `signatures.lance`; its row count must equal `minhash_lsh_num_docs`.
+4. Read the page table buffer; its length must be a multiple of 8 and its
+   entry count must be `ceil(num_rows / page_rows)` for the row count of
+   `bands.lance`.
+
+While answering queries, a page that does not decode to non-null `UInt64`
+and `UInt32` columns, and a `doc_id` that is not below
+`minhash_lsh_num_docs`, are corruption of `bands.lance`.
+
+The fragments a segment covers are recorded in the index metadata of the
+dataset, never derived from the stored `_rowid` values (which do not identify
+fragments once stable row ids are enabled).
 
 ## Segments, Appends and Merging
 
@@ -160,11 +334,12 @@ When a search is submitted (`nearest = MinHashQuery(text, column)`):
 
 1. The query text is signed with the parameters recorded in the index, and its
    band keys are computed.
-2. In every segment, each band key is looked up through the page table: a
-   binary search finds the first and the last page of the key's bucket. The
-   boundary pages of all buckets are fetched in one scattered read; the pages
-   in between, when a bucket spans more than two pages, are streamed in
-   bounded windows. The document ids in the buckets form the candidate set.
+2. In every segment, each band key is looked up through the
+   [page table](#page-table), which yields the first and the last page of the
+   key's bucket. The boundary pages of all buckets are fetched in one
+   scattered read; the pages in between, when a bucket spans more than two
+   pages, are streamed in bounded windows. The document ids in the buckets
+   form the candidate set.
 3. The candidates' signatures are read — from memory when resident, otherwise
    with scattered reads, or with a sequential scan when the candidates cover a
    large share of the segment — and each candidate's Jaccard distance to the
