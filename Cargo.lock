@@ -4833,6 +4833,7 @@ dependencies = [
  "geoarrow-array",
  "geoarrow-schema",
  "half",
+ "hex",
  "itertools 0.14.0",
  "jieba-rs",
  "jsonb",
@@ -4877,6 +4878,7 @@ dependencies = [
  "test-log",
  "tokio",
  "tracing",
+ "twox-hash",
  "uuid",
 ]
 
