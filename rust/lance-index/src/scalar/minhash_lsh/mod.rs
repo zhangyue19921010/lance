@@ -30,19 +30,21 @@
 //! ```
 //!
 //! A bucket is the run of rows sharing a band key; it may span pages. Lookups
-//! binary-search a resident page table (max band key per page), read the
-//! candidate pages with one scattered read, binary-search each page for the
-//! band key, collect the bucket's doc ids into a candidate bitmap, and read the
-//! candidate signatures with a second scattered read (or a sequential scan when
-//! the candidate set is dense).
+//! binary-search a resident page table (max band key per page), fetch the
+//! bucket's pages through the cache, binary-search each page for the band
+//! key, collect the bucket's doc ids into a candidate bitmap, and read the
+//! candidate signatures with a scattered read (or a sequential scan when the
+//! candidate set is dense).
 
 mod builder;
 mod index;
 #[cfg(test)]
 mod tests;
 
-pub use builder::{MinHashLshIndexBuilder, RowIdTransform, SignatureSource};
-pub use index::{BandPage, MinHashLshIndex, SignatureChunk, merge_minhash_indices};
+pub use builder::MinHashLshIndexBuilder;
+pub use index::{MinHashLshIndex, merge_minhash_indices};
+
+use builder::{RowIdTransform, SignatureSource};
 
 use std::any::Any;
 use std::collections::{BinaryHeap, HashMap};
@@ -138,11 +140,11 @@ const DEFAULT_PAGE_ROWS: usize = 4096;
 /// Byte inserted between the tokens of one shingle so that different token
 /// splits of the same characters hash differently.
 const SHINGLE_SEPARATOR: u8 = 0x1F;
-/// Bytes per read or write batch of an index file. Scattered candidate reads,
-/// the doc-id windows of a bucket that spans pages, sequential scans and the
-/// batches handed to the file writers all size themselves from it by their
-/// row width: large enough to amortize a request, small enough to bound the
-/// transient memory of a query or of a build stage.
+/// Bytes per read or write batch of an index file. Scattered reads,
+/// sequential scans and the batches handed to the file writers all size
+/// themselves from it by their row width: large enough to amortize a
+/// request, small enough to bound the transient memory of a query or of a
+/// build stage.
 const IO_BATCH_BYTES: usize = 8 * 1024 * 1024;
 /// Bytes per resident chunk of the signature table and per prewarm read of
 /// band pages. Chunks are separate cache entries, so a prewarm keeps as many
@@ -156,17 +158,17 @@ const READ_CONCURRENCY: usize = 4;
 const SPARSE_REFINE_READ_PERCENT: u64 = 10;
 
 /// Default memory budget of the sort: the run being filled, the runs being
-/// spilled and the merge groups together (see [`sort_budget`]).
-const DEFAULT_SORT_MEMORY_BYTES: usize = 2 * 1024 * 1024 * 1024;
-/// Memory budget of the sort (bytes), shared with the DataFusion-backed index
-/// builds: runs get three fifths of it, merge groups the rest.
+/// spilled and the merge groups together.
+const DEFAULT_SORT_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Memory budget of the sort (bytes), the variable the DataFusion-backed
+/// index builds honor as well.
 const SORT_MEMORY_ENV: &str = "LANCE_MEM_POOL_SIZE";
 /// Limit on the temporary disk space of one build (bytes), the variable the
 /// DataFusion-backed builds honor as well.
 const SPILL_LIMIT_ENV: &str = "LANCE_MAX_TEMP_DIRECTORY_SIZE";
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 100 * 1024 * 1024 * 1024;
-/// Bytes of one spilled record: the key and the doc id, little-endian.
-const SPILL_RECORD_BYTES: usize = std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
+/// Bytes of one (band key, doc id) row, in the bands file and in spill files.
+const BAND_ROW_BYTES: usize = std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
 /// Runs sorted and written concurrently with signing. Each holds a full run
 /// in memory, so this bounds the backlog when signing outpaces the disk.
 const MAX_INFLIGHT_SPILLS: usize = 4;
@@ -509,16 +511,6 @@ pub struct SignatureGenerator {
     token_ends: Vec<usize>,
     /// 64-bit permuted minima of the current document, mixed into the signature.
     mins: Vec<u64>,
-}
-
-impl std::fmt::Debug for SignatureGenerator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SignatureGenerator")
-            .field("num_hashes", &self.multipliers.len())
-            .field("num_bands", &self.num_bands)
-            .field("shingle_size", &self.shingle_size)
-            .finish()
-    }
 }
 
 impl SignatureGenerator {
@@ -906,26 +898,19 @@ impl ScalarIndexPlugin for MinHashLshIndexPlugin {
     ) -> Result<()> {
         // Compare parsed parameters rather than bytes: a newer Lance may
         // serialize additional tokenizer keys with their default values, which
-        // must not split a logical index. Byte-identical details are equal
-        // without parsing, which keeps the per-query check on the search path
-        // cheap.
-        let mut all = existing.iter().chain(incoming);
-        let Some(first) = all.next() else {
+        // must not split a logical index.
+        let mut all = existing
+            .iter()
+            .chain(incoming)
+            .map(|details| MinHashLshIndexParams::from_details_any(details));
+        let Some(first) = all.next().transpose()? else {
             return Ok(());
         };
-        let mut reference = None;
-        for details in all {
-            if details.type_url == first.type_url && details.value == first.value {
-                continue;
-            }
-            let reference = match &reference {
-                Some(reference) => reference,
-                None => reference.insert(MinHashLshIndexParams::from_details_any(first)?),
-            };
-            let params = MinHashLshIndexParams::from_details_any(details)?;
-            if params != *reference {
+        for params in all {
+            let params = params?;
+            if params != first {
                 return Err(Error::invalid_input(format!(
-                    "MinHash LSH index segments must share identical parameters (signatures are only comparable under the same hash functions and tokenizer); found {reference:?} and {params:?}"
+                    "MinHash LSH index segments must share identical parameters (signatures are only comparable under the same hash functions and tokenizer); found {first:?} and {params:?}"
                 )));
             }
         }

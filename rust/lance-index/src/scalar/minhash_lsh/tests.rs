@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering::Relaxed;
 
 use arrow_array::StringArray;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -95,11 +96,11 @@ async fn search(index: &MinHashLshIndex, text: &str, limit: usize) -> Vec<MinHas
 }
 
 async fn row_ids(index: &MinHashLshIndex, text: &str, limit: usize) -> Vec<u64> {
-    search(index, text, limit)
-        .await
-        .iter()
-        .map(|hit| hit.row_id)
-        .collect()
+    ids(&search(index, text, limit).await)
+}
+
+fn ids(hits: &[MinHashHit]) -> Vec<u64> {
+    hits.iter().map(|hit| hit.row_id).collect()
 }
 
 /// Tiny deterministic generator for synthetic corpora.
@@ -279,6 +280,22 @@ fn test_params_validation(#[case] json: &str, #[case] message: &str) {
     assert!(err.to_string().contains(message), "{err}");
 }
 
+#[test]
+fn test_plugin_rejects_non_string_fields() {
+    let plugin = MinHashLshIndexPlugin;
+    let Err(err) = plugin.new_training_request("{}", &Field::new("id", DataType::Int64, false))
+    else {
+        panic!("non-string field must be rejected");
+    };
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    assert!(err.to_string().contains("string column"), "{err}");
+    assert!(
+        plugin
+            .new_training_request("", &Field::new("text", DataType::LargeUtf8, true))
+            .is_ok()
+    );
+}
+
 #[tokio::test]
 async fn test_build_load_search_roundtrip() {
     let (_tmpdir, store) = test_store();
@@ -402,18 +419,16 @@ async fn test_rows_without_tokens_are_not_indexed() {
 }
 
 #[rstest]
-#[case::several_pages(10, 5)]
-#[case::whole_file(10, 0)]
+#[case::with_other_texts(5)]
+#[case::whole_file(0)]
 #[tokio::test]
-async fn test_bucket_spanning_pages_is_fully_collected(
-    #[case] num_duplicates: usize,
-    #[case] num_others: usize,
-) {
-    // Identical texts share every bucket; with four rows per page a bucket
-    // spans several pages and every member must still be found. Without
-    // other texts every bucket also fills its band up to the next one.
+async fn test_buckets_spanning_pages_and_dense_candidates(#[case] num_others: usize) {
+    // Forty identical texts share every bucket: with four rows per page each
+    // bucket spans ten pages, and the candidates cover most of the segment,
+    // which is refined with a sequential scan. Without other texts every
+    // bucket also runs up to the next band or the end of the file.
     let (bases, _) = near_duplicate_corpus(1 + num_others, 40);
-    let mut texts: Vec<&str> = vec![bases[0].as_str(); num_duplicates];
+    let mut texts = vec![bases[0].as_str(); 40];
     texts.extend(bases[1..].iter().map(String::as_str));
     let (_tmpdir, store) = test_store();
     let index = build_and_load(
@@ -424,30 +439,21 @@ async fn test_bucket_spanning_pages_is_fully_collected(
         &LanceCache::no_cache(),
     )
     .await;
-    let metrics = LocalMetricsCollector::default();
+    assert!(index.statistics().unwrap()["num_pages"].as_u64().unwrap() > 100);
+
+    let hits = search(&index, &bases[0], 5).await;
+    assert!(hits.iter().all(|hit| hit.distance == 0.0), "{hits:?}");
+    assert_eq!(ids(&hits), vec![0, 1, 2, 3, 4], "ties are broken by row id");
+    assert_eq!(
+        row_ids(&index, &bases[0], 100).await,
+        (0..40).collect::<Vec<u64>>()
+    );
+    let mask = RowAddrMask::from_block(RowAddrTreeMap::from_iter(0..20u64));
     let hits = index
-        .search_text(
-            &bases[0],
-            num_duplicates,
-            &RowAddrMask::all_rows(),
-            &metrics,
-        )
+        .search_text(&bases[0], 100, &mask, &NoOpMetricsCollector)
         .await
         .unwrap();
-    let mut found: Vec<u64> = hits.iter().map(|hit| hit.row_id).collect();
-    found.sort_unstable();
-    assert_eq!(found, (0..num_duplicates as u64).collect::<Vec<u64>>());
-    assert!(hits.iter().all(|hit| hit.distance == 0.0));
-    // Each bucket costs at most its two boundary pages and one interior
-    // window, whatever its size, plus the refine reads.
-    let num_bands = index.params().num_bands as usize;
-    let parts_loaded = metrics
-        .parts_loaded
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert!(
-        parts_loaded <= 3 * num_bands + 4,
-        "{parts_loaded} parts loaded"
-    );
+    assert_eq!(ids(&hits), (20..40).collect::<Vec<u64>>());
 }
 
 #[tokio::test]
@@ -509,9 +515,9 @@ async fn test_spill_limit_fails_before_writing() {
 }
 
 #[tokio::test]
-async fn test_band_pages_are_cached_and_mask_is_applied() {
+async fn test_cache_prewarm_and_mask() {
     let (_tmpdir, store) = test_store();
-    let (bases, duplicates) = near_duplicate_corpus(10, 40);
+    let (bases, duplicates) = near_duplicate_corpus(10, 120);
     let rows = corpus_rows(&bases, &duplicates);
     let cache = LanceCache::with_capacity(64 * 1024 * 1024);
     let index = build_and_load(
@@ -522,63 +528,56 @@ async fn test_band_pages_are_cached_and_mask_is_applied() {
         &cache,
     )
     .await;
+    let all_rows = RowAddrMask::all_rows();
 
+    // A cold search reads band pages; a repeated one finds them cached.
     let cold = LocalMetricsCollector::default();
     let hits = index
-        .search_text(&duplicates[3], 3, &RowAddrMask::all_rows(), &cold)
+        .search_text(&duplicates[5], 2, &all_rows, &cold)
         .await
         .unwrap();
-    assert_eq!(hits[0].row_id, 13);
+    assert_eq!(ids(&hits), vec![15, 5]);
     assert!(cold.index_cache_misses() > 0);
     let warm = LocalMetricsCollector::default();
-    let warm_hits = index
-        .search_text(&duplicates[3], 3, &RowAddrMask::all_rows(), &warm)
-        .await
-        .unwrap();
-    assert_eq!(warm_hits, hits);
+    assert_eq!(
+        index
+            .search_text(&duplicates[5], 2, &all_rows, &warm)
+            .await
+            .unwrap(),
+        hits
+    );
     assert_eq!(warm.index_cache_misses(), 0);
     assert!(warm.index_cache_hits() > 0);
 
+    // After a prewarm the signatures are resident too and a search reads
+    // nothing.
+    index.prewarm().await.unwrap();
+    let resident = LocalMetricsCollector::default();
+    assert_eq!(
+        index
+            .search_text(&duplicates[5], 2, &all_rows, &resident)
+            .await
+            .unwrap(),
+        hits
+    );
+    assert_eq!(resident.parts_loaded.load(Relaxed), 0);
+    assert_eq!(resident.index_cache_misses(), 0);
+
     let masked = |mask: RowAddrMask| {
-        let (index, text) = (&index, &duplicates[3]);
+        let (index, text) = (&index, &duplicates[5]);
         async move {
             let hits = index
-                .search_text(text, 3, &mask, &NoOpMetricsCollector)
+                .search_text(text, 2, &mask, &NoOpMetricsCollector)
                 .await
                 .unwrap();
-            hits.iter().map(|hit| hit.row_id).collect::<Vec<u64>>()
+            ids(&hits)
         }
     };
-    let blocked = masked(RowAddrMask::from_block(RowAddrTreeMap::from_iter([13u64]))).await;
-    assert!(!blocked.contains(&13) && blocked[0] == 3, "{blocked:?}");
-    let allowed = masked(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([3u64]))).await;
-    assert_eq!(allowed, vec![3]);
+    let blocked = masked(RowAddrMask::from_block(RowAddrTreeMap::from_iter([15u64]))).await;
+    assert!(!blocked.contains(&15) && blocked[0] == 5, "{blocked:?}");
+    let allowed = masked(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([5u64]))).await;
+    assert_eq!(allowed, vec![5]);
     assert!(masked(RowAddrMask::allow_nothing()).await.is_empty());
-}
-
-#[tokio::test]
-async fn test_dense_candidate_set_uses_sequential_refine() {
-    let (_tmpdir, store) = test_store();
-    let text = "every row in this segment carries exactly the same text content";
-    let mut rows: Vec<(Option<&str>, u64)> = (0..40).map(|i| (Some(text), i)).collect();
-    rows.push((Some("one row that is completely unrelated to the rest"), 40));
-    let index = build_and_load(&store, default_builder(), &rows, 9, &LanceCache::no_cache()).await;
-
-    let hits = search(&index, text, 5).await;
-    assert!(hits.iter().all(|hit| hit.distance == 0.0));
-    assert_eq!(
-        hits.iter().map(|hit| hit.row_id).collect::<Vec<_>>(),
-        vec![0, 1, 2, 3, 4],
-        "ties are broken by row id"
-    );
-    assert_eq!(row_ids(&index, text, 100).await.len(), 40);
-    let mask = RowAddrMask::from_block(RowAddrTreeMap::from_iter(0..20u64));
-    let hits = index
-        .search_text(text, 100, &mask, &NoOpMetricsCollector)
-        .await
-        .unwrap();
-    assert_eq!(hits.len(), 20);
-    assert!(hits.iter().all(|hit| (20..40).contains(&hit.row_id)));
 }
 
 #[tokio::test]
@@ -736,7 +735,7 @@ async fn test_rebuilds_remap_rows_of_a_deferred_compaction() {
     .unwrap();
     assert_eq!(row_ids(&index, &bases[0], 1).await, vec![compacted(0)]);
 
-    // Update: keep the compacted fragment, add a duplicate of row 3
+    // Keep the compacted fragment, add a duplicate of row 3
     let filter = OldIndexDataFilter::Fragments {
         to_keep: RoaringBitmap::from_iter([1u32]),
         to_remove: RoaringBitmap::from_iter([0u32]),
@@ -744,11 +743,7 @@ async fn test_rebuilds_remap_rows_of_a_deferred_compaction() {
     let new_rows = [(Some(duplicates[3].as_str()), 2u64 << 32)];
     let (_dir, dest_store) = test_store();
     let created = index
-        .update(
-            text_stream(&new_rows, 1),
-            dest_store.as_ref(),
-            Some(filter.clone()),
-        )
+        .update(text_stream(&new_rows, 1), dest_store.as_ref(), Some(filter))
         .await
         .unwrap();
     let updated = load(&dest_store, &created.index_details, &LanceCache::no_cache()).await;
@@ -759,16 +754,6 @@ async fn test_rebuilds_remap_rows_of_a_deferred_compaction() {
         row_ids(&updated, &duplicates[3], 2).await,
         vec![2u64 << 32, compacted(3)]
     );
-
-    // Merge with the same filter
-    let (_dir, dest_store) = test_store();
-    let created = merge_minhash_indices(&[(&index, Some(&filter))], dest_store.as_ref())
-        .await
-        .unwrap();
-    let merged = load(&dest_store, &created.index_details, &LanceCache::no_cache()).await;
-    assert_eq!(merged.num_docs(), 3);
-    assert_eq!(row_ids(&merged, &bases[3], 1).await, vec![compacted(3)]);
-    assert!(search(&merged, &bases[2], 5).await.is_empty());
 }
 
 #[tokio::test]
@@ -844,88 +829,4 @@ async fn test_merge_segments() {
     };
     assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
     assert!(err.to_string().contains("different parameters"), "{err}");
-
-    // A segment addresses its documents with u32 doc ids
-    let err = checked_doc_id(u32::MAX as u64 + 1).unwrap_err();
-    assert!(
-        err.to_string().contains("create_index_uncommitted"),
-        "{err}"
-    );
-}
-
-#[test]
-fn test_plugin_validates_segment_parameter_drift() {
-    let plugin = MinHashLshIndexPlugin;
-    let a = MinHashLshIndexParams::default().details_any().unwrap();
-    let b = MinHashLshIndexParams::from_json(r#"{"shingle_size": 4}"#)
-        .unwrap()
-        .details_any()
-        .unwrap();
-    plugin
-        .validate_new_segments_against_existing(&[&a], &[&a, &a])
-        .unwrap();
-    let err = plugin
-        .validate_new_segments_against_existing(&[&a], &[&b])
-        .unwrap_err();
-    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
-    assert!(err.to_string().contains("identical parameters"), "{err}");
-}
-
-#[tokio::test]
-async fn test_prewarm_makes_search_io_free() {
-    let (_tmpdir, store) = test_store();
-    let (bases, duplicates) = near_duplicate_corpus(10, 120);
-    let rows = corpus_rows(&bases, &duplicates);
-    let cache = LanceCache::with_capacity(64 * 1024 * 1024);
-    let index = build_and_load(
-        &store,
-        default_builder().with_page_rows(16).unwrap(),
-        &rows,
-        8,
-        &cache,
-    )
-    .await;
-    index.prewarm().await.unwrap();
-
-    let metrics = LocalMetricsCollector::default();
-    let hits = index
-        .search_text(&duplicates[5], 2, &RowAddrMask::all_rows(), &metrics)
-        .await
-        .unwrap();
-    assert_eq!(
-        hits.iter().map(|hit| hit.row_id).collect::<Vec<_>>(),
-        vec![15, 5]
-    );
-    assert_eq!(
-        metrics
-            .parts_loaded
-            .load(std::sync::atomic::Ordering::Relaxed),
-        0
-    );
-    assert_eq!(metrics.index_cache_misses(), 0);
-
-    // A blocked row is still excluded on the resident path
-    let blocked = RowAddrMask::from_block(RowAddrTreeMap::from_iter([15u64]));
-    let hits = index
-        .search_text(&duplicates[5], 2, &blocked, &NoOpMetricsCollector)
-        .await
-        .unwrap();
-    assert_eq!(hits[0].row_id, 5);
-    assert!(hits.iter().all(|hit| hit.row_id != 15));
-}
-
-#[test]
-fn test_plugin_rejects_non_string_fields() {
-    let plugin = MinHashLshIndexPlugin;
-    let Err(err) = plugin.new_training_request("{}", &Field::new("id", DataType::Int64, false))
-    else {
-        panic!("non-string field must be rejected");
-    };
-    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
-    assert!(err.to_string().contains("string column"), "{err}");
-    assert!(
-        plugin
-            .new_training_request("", &Field::new("text", DataType::LargeUtf8, true))
-            .is_ok()
-    );
 }

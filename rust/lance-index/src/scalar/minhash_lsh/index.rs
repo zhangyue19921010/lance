@@ -9,14 +9,24 @@ use super::*;
 
 /// One logical page of `bands.lance`, cached per page.
 #[derive(Debug, DeepSizeOf)]
-pub struct BandPage {
+pub(super) struct BandPage {
     keys: Vec<u64>,
     doc_ids: Vec<u32>,
 }
 
 impl BandPage {
     fn try_from_batch(batch: &RecordBatch) -> Result<Self> {
-        let (keys, doc_ids) = band_columns(batch, BANDS_FILENAME)?;
+        let corrupt = |message: String| Error::corrupt_file_named(BANDS_FILENAME, message);
+        let keys = batch
+            .column_by_name(BAND_KEY_COL)
+            .and_then(|column| column.as_primitive_opt::<UInt64Type>())
+            .filter(|keys| keys.null_count() == 0)
+            .ok_or_else(|| corrupt(format!("{BAND_KEY_COL} is not a non-null UInt64 column")))?;
+        let doc_ids = batch
+            .column_by_name(DOC_ID_COL)
+            .and_then(|column| column.as_primitive_opt::<UInt32Type>())
+            .filter(|doc_ids| doc_ids.null_count() == 0)
+            .ok_or_else(|| corrupt(format!("{DOC_ID_COL} is not a non-null UInt32 column")))?;
         // Copy out of the batch so a cached page neither pins nor is charged
         // for the buffers of every other page read in the same request.
         Ok(Self {
@@ -36,46 +46,35 @@ impl BandPage {
     }
 }
 
-/// The two non-null columns of a bands or spill batch.
-fn band_columns<'a>(
-    batch: &'a RecordBatch,
-    file: &str,
-) -> Result<(&'a UInt64Array, &'a UInt32Array)> {
-    let column = |name: &str| {
-        batch
-            .column_by_name(name)
-            .ok_or_else(|| Error::corrupt_file_named(file, format!("missing column {name}")))
-    };
-    let keys = column(BAND_KEY_COL)?
-        .as_primitive_opt::<UInt64Type>()
-        .filter(|keys| keys.null_count() == 0)
-        .ok_or_else(|| {
-            Error::corrupt_file_named(
-                file,
-                format!("{BAND_KEY_COL} is not a non-null UInt64 column"),
-            )
-        })?;
-    let doc_ids = column(DOC_ID_COL)?
-        .as_primitive_opt::<UInt32Type>()
-        .filter(|doc_ids| doc_ids.null_count() == 0)
-        .ok_or_else(|| {
-            Error::corrupt_file_named(
-                file,
-                format!("{DOC_ID_COL} is not a non-null UInt32 column"),
-            )
-        })?;
-    Ok((keys, doc_ids))
-}
-
 #[derive(Debug, Clone)]
 struct BandPageKey {
     page: u32,
 }
 
-/// `SIGNATURE_CHUNK_DOCS` consecutive documents of the signature table,
+impl CacheKey for BandPageKey {
+    type ValueType = BandPage;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("band-page-{}", self.page).into()
+    }
+
+    fn type_name() -> &'static str {
+        "MinHashLshBandPage"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.minhashlsh.band-page-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.page);
+    }
+}
+
+/// `signature_chunk_docs` consecutive documents of the signature table,
 /// resident after a prewarm.
 #[derive(Debug, DeepSizeOf)]
-pub struct SignatureChunk {
+pub(super) struct SignatureChunk {
     row_ids: Vec<u64>,
     /// `row_ids.len() * num_hashes` values.
     signatures: Vec<SignatureValue>,
@@ -106,26 +105,6 @@ impl CacheKey for SignatureChunkKey {
     }
 }
 
-impl CacheKey for BandPageKey {
-    type ValueType = BandPage;
-
-    fn key(&self) -> std::borrow::Cow<'_, str> {
-        format!("band-page-{}", self.page).into()
-    }
-
-    fn type_name() -> &'static str {
-        "MinHashLshBandPage"
-    }
-
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.scalar.minhashlsh.band-page-key", 1)
-    }
-
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_u32(self.page);
-    }
-}
-
 /// A single segment of a MinHash LSH index.
 pub struct MinHashLshIndex {
     params: MinHashLshIndexParams,
@@ -147,7 +126,6 @@ impl std::fmt::Debug for MinHashLshIndex {
         f.debug_struct("MinHashLshIndex")
             .field("params", &self.params)
             .field("num_docs", &self.num_docs)
-            .field("num_buckets", &self.bands.num_rows())
             .field("num_pages", &self.page_max_keys.len())
             .finish()
     }
@@ -362,66 +340,47 @@ impl MinHashLshIndex {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        self.refine(&candidates, &query.signature, limit, mask, metrics)
+        self.refine(candidates, &query.signature, limit, mask, metrics)
             .await
     }
 
     /// Union of the buckets of `band_keys`.
     ///
     /// A bucket is a run of equal keys in the sorted bands file, and the page
-    /// table locates it without probing: it starts in the first page whose max
-    /// key reaches the key and ends in the first page whose max key exceeds it,
-    /// and the pages in between hold nothing else. The boundary pages of all
-    /// buckets are fetched through the cache in one read; interior pages are
-    /// read as doc ids only, one bounded window at a time.
+    /// table locates it without probing: its pages run from the first page
+    /// whose max key reaches the key through the first page whose max key
+    /// exceeds it. The pages of all buckets are fetched through the cache.
     async fn collect_candidates(
         &self,
         band_keys: &[u64],
         metrics: &dyn MetricsCollector,
     ) -> Result<RoaringBitmap> {
         let num_pages = self.page_max_keys.len();
-        let mut buckets: Vec<(u32, u32, u64)> = band_keys
+        let buckets: Vec<(u64, Range<u32>)> = band_keys
             .iter()
-            .filter_map(|&key| {
+            .map(|&key| {
                 let first = self.page_max_keys.partition_point(|&max_key| max_key < key);
-                // `first == num_pages` means the key is larger than every stored key.
-                (first < num_pages).then(|| {
-                    let end = self
-                        .page_max_keys
-                        .partition_point(|&max_key| max_key <= key);
-                    (first as u32, end as u32, key)
-                })
+                let end = self
+                    .page_max_keys
+                    .partition_point(|&max_key| max_key <= key);
+                (key, first as u32..(end + 1).min(num_pages) as u32)
             })
             .collect();
         metrics.record_comparisons(band_keys.len());
-        let mut candidates = RoaringBitmap::new();
-        if buckets.is_empty() {
-            return Ok(candidates);
-        }
-        buckets.sort_unstable();
-        let mut boundary_pages: Vec<u32> = buckets
+        let mut pages: Vec<u32> = buckets
             .iter()
-            .flat_map(|&(first, end, _)| [first, end])
-            .filter(|&page| (page as usize) < num_pages)
+            .flat_map(|(_, pages)| pages.clone())
             .collect();
-        boundary_pages.sort_unstable();
-        boundary_pages.dedup();
-        let pages = self.load_pages(&boundary_pages, metrics).await?;
-        let page = |page_id: u32| {
-            pages.get(&page_id).ok_or_else(|| {
-                Error::internal(format!("band page {page_id} was requested but not loaded"))
-            })
-        };
-        for (first, end, key) in buckets {
-            candidates.extend(page(first)?.members(key).iter().copied());
-            if end == first {
-                continue;
-            }
-            self.collect_bucket_interior(first + 1..end, &mut candidates, metrics)
-                .await?;
-            // `end == num_pages` when the bucket reaches the end of the file
-            if (end as usize) < num_pages {
-                candidates.extend(page(end)?.members(key).iter().copied());
+        pages.sort_unstable();
+        pages.dedup();
+        let pages = self.load_pages(&pages, metrics).await?;
+        let mut candidates = RoaringBitmap::new();
+        for (key, bucket_pages) in &buckets {
+            for page in bucket_pages.clone() {
+                let page = pages.get(&page).ok_or_else(|| {
+                    Error::internal(format!("band page {page} was requested but not loaded"))
+                })?;
+                candidates.extend(page.members(*key).iter().copied());
             }
         }
         if let Some(max_doc_id) = candidates.max()
@@ -438,46 +397,9 @@ impl MinHashLshIndex {
         Ok(candidates)
     }
 
-    /// Add the doc ids of `pages`, which lie strictly inside one bucket, to
-    /// `candidates`. The windows are not cached: they are only useful to a
-    /// query with the same key, and a large bucket would evict the pages
-    /// every other query needs.
-    async fn collect_bucket_interior(
-        &self,
-        pages: Range<u32>,
-        candidates: &mut RoaringBitmap,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<()> {
-        let mut from = pages.start as usize * self.page_rows;
-        let end = (pages.end as usize * self.page_rows).min(self.bands.num_rows());
-        while from < end {
-            let to = (from + rows_per_batch(std::mem::size_of::<u32>())).min(end);
-            metrics.record_parts_loaded(1);
-            tracing::info!(
-                target: TRACE_IO_EVENTS,
-                r#type = IO_TYPE_LOAD_SCALAR_PART,
-                index_type = "minhashlsh",
-                num_parts = 1,
-            );
-            let batch = self.bands.read_range(from..to, Some(&[DOC_ID_COL])).await?;
-            let doc_ids = batch
-                .column_by_name(DOC_ID_COL)
-                .and_then(|column| column.as_primitive_opt::<UInt32Type>())
-                .filter(|doc_ids| doc_ids.null_count() == 0)
-                .ok_or_else(|| {
-                    Error::corrupt_file_named(
-                        BANDS_FILENAME,
-                        format!("{DOC_ID_COL} is not a non-null UInt32 column"),
-                    )
-                })?;
-            candidates.extend(doc_ids.values().iter().copied());
-            from = to;
-        }
-        Ok(())
-    }
-
-    /// Fetch pages through the cache; every page missing from the cache is
-    /// read with one scattered read.
+    /// Fetch pages through the cache; the pages missing from the cache are
+    /// read with scattered reads of at most [`IO_BATCH_BYTES`] each, so a
+    /// bucket spanning many pages never materializes at once.
     async fn load_pages(
         &self,
         pages: &[u32],
@@ -494,28 +416,29 @@ impl MinHashLshIndex {
                 None => missing.push(page),
             }
         }
-        if missing.is_empty() {
-            return Ok(loaded);
-        }
         metrics.record_index_cache_misses(missing.len());
-        metrics.record_parts_loaded(missing.len());
-        tracing::info!(
-            target: TRACE_IO_EVENTS,
-            r#type = IO_TYPE_LOAD_SCALAR_PART,
-            index_type = "minhashlsh",
-            num_parts = missing.len(),
-        );
-        let ranges: Vec<Range<usize>> = missing.iter().map(|&page| self.page_range(page)).collect();
-        let batch = self.bands.read_ranges(&ranges, None).await?;
-        let mut offset = 0;
-        for (page, range) in missing.into_iter().zip(&ranges) {
-            let page_batch = batch.slice(offset, range.len());
-            offset += range.len();
-            let band_page = Arc::new(BandPage::try_from_batch(&page_batch)?);
-            self.cache
-                .insert_with_key(&BandPageKey { page }, band_page.clone())
-                .await;
-            loaded.insert(page, band_page);
+        let pages_per_read = (rows_per_batch(BAND_ROW_BYTES) / self.page_rows).max(1);
+        for missing in missing.chunks(pages_per_read) {
+            metrics.record_parts_loaded(missing.len());
+            tracing::info!(
+                target: TRACE_IO_EVENTS,
+                r#type = IO_TYPE_LOAD_SCALAR_PART,
+                index_type = "minhashlsh",
+                num_parts = missing.len(),
+            );
+            let ranges: Vec<Range<usize>> =
+                missing.iter().map(|&page| self.page_range(page)).collect();
+            let batch = self.bands.read_ranges(&ranges, None).await?;
+            let mut offset = 0;
+            for (&page, range) in missing.iter().zip(&ranges) {
+                let band_page =
+                    Arc::new(BandPage::try_from_batch(&batch.slice(offset, range.len()))?);
+                offset += range.len();
+                self.cache
+                    .insert_with_key(&BandPageKey { page }, band_page.clone())
+                    .await;
+                loaded.insert(page, band_page);
+            }
         }
         Ok(loaded)
     }
@@ -524,10 +447,7 @@ impl MinHashLshIndex {
         let num_hashes = self.params.num_hashes as usize;
         let start = chunk * self.signature_chunk_docs;
         let end = (start + self.signature_chunk_docs).min(self.num_docs);
-        let batch = self
-            .signatures
-            .read_range(start..end, Some(&[ROW_ID, SIGNATURE_COL]))
-            .await?;
+        let batch = self.signatures.read_range(start..end, None).await?;
         let (row_ids, signatures) = signature_columns(&batch, num_hashes)?;
         if row_ids.len() != end - start {
             return Err(Error::corrupt_file_named(
@@ -545,10 +465,12 @@ impl MinHashLshIndex {
     }
 
     /// Score every candidate against the query signature and keep the best
-    /// `limit` rows selected by `mask`.
+    /// `limit` rows selected by `mask`. Candidates in resident signature
+    /// chunks are scored from memory; the rest are read with scattered reads,
+    /// or with a sequential scan when they cover much of the segment.
     async fn refine(
         &self,
-        candidates: &RoaringBitmap,
+        mut candidates: RoaringBitmap,
         query: &[SignatureValue],
         limit: usize,
         mask: &RowAddrMask,
@@ -573,60 +495,49 @@ impl MinHashLshIndex {
             });
         };
         metrics.record_comparisons(candidates.len() as usize);
-        // Look up each signature chunk holding candidates once; candidates in
-        // resident chunks are scored from memory, the rest are read.
+
         let chunk_docs = self.signature_chunk_docs;
-        let mut resident: Vec<(usize, Arc<SignatureChunk>)> = Vec::new();
-        let mut doc_ids = candidates.iter();
-        let mut next = doc_ids.next();
-        while let Some(doc_id) = next {
-            let chunk = doc_id as usize / chunk_docs;
+        let (Some(first), Some(last)) = (candidates.min(), candidates.max()) else {
+            return Ok(Vec::new());
+        };
+        for chunk in (first as usize / chunk_docs)..=(last as usize / chunk_docs) {
+            let first_doc = chunk * chunk_docs;
+            let chunk_range =
+                first_doc as u32..=((first_doc + chunk_docs - 1).min(u32::MAX as usize)) as u32;
+            if candidates.range_cardinality(chunk_range.clone()) == 0 {
+                continue;
+            }
             // A chunk that is not resident is read, not loaded, so only a
             // hit is a cache event.
-            if let Some(data) = self
+            let Some(resident) = self
                 .cache
                 .get_with_key(&SignatureChunkKey {
                     chunk: chunk as u32,
                 })
                 .await
-            {
-                metrics.record_index_cache_hit();
-                resident.push((chunk, data));
+            else {
+                continue;
+            };
+            metrics.record_index_cache_hit();
+            for doc_id in candidates.range(chunk_range.clone()) {
+                let offset = doc_id as usize - first_doc;
+                let Some(row_id) = resident.row_ids.get(offset) else {
+                    return Err(Error::corrupt_file_named(
+                        SIGNATURES_FILENAME,
+                        format!("resident signature chunk {chunk} has no doc {doc_id}"),
+                    ));
+                };
+                score(
+                    *row_id,
+                    &resident.signatures[offset * num_hashes..(offset + 1) * num_hashes],
+                );
             }
-            let chunk_end = ((chunk + 1) * chunk_docs) as u64;
-            next = doc_ids.find(|&doc_id| doc_id as u64 >= chunk_end);
+            candidates.remove_range(chunk_range);
         }
-        // Score the candidates of resident chunks and drop them from the set
-        // that still needs reading; both are per-chunk range operations.
-        let mut unresolved;
-        let candidates = if resident.is_empty() {
-            candidates
-        } else {
-            unresolved = candidates.clone();
-            for (chunk, data) in &resident {
-                let first_doc = chunk * chunk_docs;
-                let last_doc = (first_doc + chunk_docs - 1).min(u32::MAX as usize);
-                let chunk_range = first_doc as u32..=last_doc as u32;
-                for doc_id in candidates.range(chunk_range.clone()) {
-                    let offset = doc_id as usize - first_doc;
-                    let Some(row_id) = data.row_ids.get(offset) else {
-                        return Err(Error::corrupt_file_named(
-                            SIGNATURES_FILENAME,
-                            format!("resident signature chunk {chunk} has no doc {doc_id}"),
-                        ));
-                    };
-                    score(
-                        *row_id,
-                        &data.signatures[offset * num_hashes..(offset + 1) * num_hashes],
-                    );
-                }
-                unresolved.remove_range(chunk_range);
-            }
-            &unresolved
-        };
         if candidates.is_empty() {
             return Ok(hits.into_sorted());
         }
+
         let mut score_batch = |batch: &RecordBatch, keep: &mut dyn FnMut(usize) -> bool| {
             let (row_ids, signatures) = signature_columns(batch, num_hashes)?;
             for (index, (row_id, signature)) in row_ids
@@ -648,25 +559,18 @@ impl MinHashLshIndex {
             index_type = "minhashlsh",
             part_id = "signatures",
         );
-        let projection = [ROW_ID, SIGNATURE_COL];
+        let rows_per_read = rows_per_batch(signature_row_bytes(num_hashes));
         if candidates.len().saturating_mul(100)
             <= (self.num_docs as u64).saturating_mul(SPARSE_REFINE_READ_PERCENT)
         {
             let mut doc_ids = candidates.iter();
             loop {
-                let ranges = doc_id_ranges(
-                    doc_ids
-                        .by_ref()
-                        .take(rows_per_batch(signature_row_bytes(num_hashes))),
-                );
+                let ranges = doc_id_ranges(doc_ids.by_ref().take(rows_per_read));
                 if ranges.is_empty() {
                     break;
                 }
                 let expected_rows: usize = ranges.iter().map(|range| range.len()).sum();
-                let batch = self
-                    .signatures
-                    .read_ranges(&ranges, Some(&projection))
-                    .await?;
+                let batch = self.signatures.read_ranges(&ranges, None).await?;
                 if batch.num_rows() != expected_rows {
                     return Err(Error::corrupt_file_named(
                         SIGNATURES_FILENAME,
@@ -682,23 +586,12 @@ impl MinHashLshIndex {
             let mut stream = std::pin::pin!(scan_rows(
                 self.signatures.clone(),
                 self.num_docs,
-                Some(projection.iter().map(|column| column.to_string()).collect()),
-                rows_per_batch(signature_row_bytes(num_hashes)),
+                rows_per_read
             ));
-            // The scan and the candidate set are both ascending, so walk them
-            // in lockstep instead of probing the bitmap for every row.
-            let mut pending = candidates.iter().peekable();
             let mut first_doc = 0usize;
             while let Some(batch) = stream.try_next().await? {
                 score_batch(&batch, &mut |index| {
-                    let Ok(doc_id) = u32::try_from(first_doc + index) else {
-                        return false;
-                    };
-                    while pending
-                        .next_if(|&pending_doc| pending_doc < doc_id)
-                        .is_some()
-                    {}
-                    pending.next_if_eq(&doc_id).is_some()
+                    u32::try_from(first_doc + index).is_ok_and(|doc_id| candidates.contains(doc_id))
                 })?;
                 first_doc += batch.num_rows();
             }
@@ -746,13 +639,6 @@ pub(super) fn signature_columns(
         .as_primitive_opt::<UInt16Type>()
         .filter(|values| values.null_count() == 0)
         .ok_or_else(|| corrupt(format!("{SIGNATURE_COL} values are not non-null UInt16")))?;
-    if values.len() != signatures.len() * num_hashes {
-        return Err(corrupt(format!(
-            "{SIGNATURE_COL} has {} values for {} rows of width {num_hashes}",
-            values.len(),
-            signatures.len()
-        )));
-    }
     Ok((row_ids, values.values()))
 }
 
@@ -761,7 +647,6 @@ pub(super) fn signature_columns(
 pub(super) fn scan_rows(
     reader: Arc<dyn IndexReader>,
     num_rows: usize,
-    projection: Option<Vec<String>>,
     rows_per_read: usize,
 ) -> impl Stream<Item = Result<RecordBatch>> + Send {
     let ranges: Vec<Range<usize>> = (0..num_rows)
@@ -771,13 +656,7 @@ pub(super) fn scan_rows(
     futures::stream::iter(ranges)
         .map(move |range| {
             let reader = reader.clone();
-            let projection = projection.clone();
-            async move {
-                let columns: Option<Vec<&str>> = projection
-                    .as_ref()
-                    .map(|columns| columns.iter().map(String::as_str).collect());
-                reader.read_range(range, columns.as_deref()).await
-            }
+            async move { reader.read_range(range, None).await }
         })
         .buffered(READ_CONCURRENCY)
 }
@@ -794,55 +673,38 @@ impl Index for MinHashLshIndex {
 
     async fn prewarm(&self) -> Result<()> {
         // Load what the cache can hold, signature chunks first: a scattered
-        // signature read costs a query far more than a page read, and a chunk
-        // is one allocation of about `RESIDENT_CHUNK_BYTES`. A cache without
-        // capacity has nothing to warm.
+        // signature read costs a query far more than a page read.
         let capacity = self.cache.capacity_bytes();
         if capacity == Some(0) {
             return Ok(());
         }
-        let mut budget = capacity;
-        let mut fits = |bytes: usize, count: usize| -> usize {
-            match budget {
-                None => count,
-                Some(remaining) => {
-                    let affordable = (remaining / bytes.max(1)).min(count);
-                    budget = Some(remaining - affordable * bytes);
-                    affordable
-                }
-            }
-        };
-
-        let doc_bytes = std::mem::size_of::<u64>()
-            + self.params.num_hashes as usize * std::mem::size_of::<SignatureValue>();
+        let mut budget = capacity.unwrap_or(usize::MAX);
         let num_chunks = self.num_docs.div_ceil(self.signature_chunk_docs);
-        let mut chunks_to_load = 0;
-        while chunks_to_load < num_chunks {
-            let start = chunks_to_load * self.signature_chunk_docs;
+        let mut chunks_loaded = 0;
+        while chunks_loaded < num_chunks {
+            let start = chunks_loaded * self.signature_chunk_docs;
             let docs = self.signature_chunk_docs.min(self.num_docs - start);
-            if fits(docs * doc_bytes, 1) == 0 {
+            let bytes = docs * signature_row_bytes(self.params.num_hashes as usize);
+            if bytes > budget {
                 break;
             }
+            budget -= bytes;
             self.cache
                 .get_or_insert_with_key(
                     SignatureChunkKey {
-                        chunk: chunks_to_load as u32,
+                        chunk: chunks_loaded as u32,
                     },
-                    || self.load_signature_chunk(chunks_to_load),
+                    || self.load_signature_chunk(chunks_loaded),
                 )
                 .await?;
-            chunks_to_load += 1;
+            chunks_loaded += 1;
         }
 
         let num_rows = self.bands.num_rows();
         let num_pages = self.page_max_keys.len();
-        let bytes_per_row = self
-            .bands
-            .file_size_bytes()
-            .map(|bytes| (bytes as usize / num_rows.max(1)).max(1))
-            .unwrap_or(64);
-        let pages_to_load = fits(bytes_per_row * self.page_rows, num_pages);
-        let pages_per_read = (RESIDENT_CHUNK_BYTES / (bytes_per_row * self.page_rows)).max(1);
+        let page_bytes = self.page_rows * BAND_ROW_BYTES;
+        let pages_to_load = (budget / page_bytes).min(num_pages);
+        let pages_per_read = (RESIDENT_CHUNK_BYTES / page_bytes).max(1);
         for first_page in (0..pages_to_load).step_by(pages_per_read) {
             let last_page = (first_page + pages_per_read).min(pages_to_load);
             let rows = first_page * self.page_rows..(last_page * self.page_rows).min(num_rows);
@@ -858,9 +720,9 @@ impl Index for MinHashLshIndex {
             }
         }
 
-        if chunks_to_load < num_chunks || pages_to_load < num_pages {
+        if chunks_loaded < num_chunks || pages_to_load < num_pages {
             log::warn!(
-                "MinHash LSH prewarm kept {chunks_to_load} of {num_chunks} signature chunks and {pages_to_load} of {num_pages} band pages: the index cache capacity is {} bytes",
+                "MinHash LSH prewarm kept {chunks_loaded} of {num_chunks} signature chunks and {pages_to_load} of {num_pages} band pages: the index cache capacity is {} bytes",
                 capacity.unwrap_or(0)
             );
         }
