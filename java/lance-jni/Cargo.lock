@@ -4048,6 +4048,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "serde",
  "tokio",
  "tracing",
 ]
