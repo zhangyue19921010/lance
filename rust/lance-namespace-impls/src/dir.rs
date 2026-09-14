@@ -345,7 +345,7 @@ impl DirectoryNamespaceBuilder {
             session: None,
             manifest_enabled: true,
             dir_listing_enabled: true, // Default to enabled for backwards compatibility
-            inline_optimization_enabled: true,
+            inline_optimization_enabled: false,
             table_version_tracking_enabled: false, // Default to disabled
             dir_listing_to_manifest_migration_enabled: false, // Default to disabled
             credential_vendor_properties: HashMap::new(),
@@ -388,8 +388,8 @@ impl DirectoryNamespaceBuilder {
 
     /// Enable or disable replacement index maintenance for the __manifest table.
     ///
-    /// When enabled (default), copy-on-write manifest rewrites build replacement indices
-    /// for fast reads. When disabled, rewrites only replace data files.
+    /// When enabled, copy-on-write manifest rewrites build replacement indices for fast
+    /// reads. This is disabled by default so rewrites only replace data files.
     pub fn inline_optimization_enabled(mut self, enabled: bool) -> Self {
         self.inline_optimization_enabled = enabled;
         self
@@ -414,7 +414,7 @@ impl DirectoryNamespaceBuilder {
     /// - `root`: The root directory path (required)
     /// - `manifest_enabled`: Enable manifest-based table tracking (optional, default: true)
     /// - `dir_listing_enabled`: Enable directory listing for table discovery (optional, default: true)
-    /// - `inline_optimization_enabled`: Enable replacement indices on __manifest rewrites (optional, default: true)
+    /// - `inline_optimization_enabled`: Enable replacement indices on __manifest rewrites (optional, default: false)
     /// - `storage.*`: Storage options (optional, prefix will be stripped)
     ///
     /// Credential vendor properties (prefixed with `credential_vendor.`, prefix is stripped):
@@ -512,11 +512,11 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
-        // Extract inline_optimization_enabled (default: true)
+        // Extract inline_optimization_enabled (default: false)
         let inline_optimization_enabled = properties
             .get("inline_optimization_enabled")
             .and_then(|v| str_to_bool(v))
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         // Extract table_version_tracking_enabled (default: false)
         let table_version_tracking_enabled = properties
@@ -9781,9 +9781,15 @@ mod tests {
         properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
 
         let builder = DirectoryNamespaceBuilder::from_properties(properties, None).unwrap();
-        // Both should default to true
         assert!(builder.manifest_enabled);
         assert!(builder.dir_listing_enabled);
+        assert!(!builder.inline_optimization_enabled);
+    }
+
+    #[test]
+    fn test_builder_disables_inline_optimization_by_default() {
+        let builder = DirectoryNamespaceBuilder::new("memory://");
+        assert!(!builder.inline_optimization_enabled);
     }
 
     #[tokio::test]
