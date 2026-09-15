@@ -519,7 +519,13 @@ async fn prepare_vector_segment_build(
     mode: &str,
     require_precomputed_ivf: bool,
     fragment_ids: Option<&[u32]>,
-) -> Result<(DataType, IndexType, IvfBuildParams, Box<dyn Shuffler>)> {
+) -> Result<(
+    DataType,
+    IndexType,
+    IvfBuildParams,
+    Box<dyn Shuffler>,
+    TempStdDir,
+)> {
     let stages = &params.stages;
 
     if stages.is_empty() {
@@ -596,7 +602,7 @@ async fn prepare_vector_segment_build(
         Some(progress),
     );
 
-    Ok((element_type, index_type, ivf_params, shuffler))
+    Ok((element_type, index_type, ivf_params, shuffler, temp_dir))
 }
 
 /// Build a Distributed Vector Index for specific fragments
@@ -612,16 +618,17 @@ pub(crate) async fn build_distributed_vector_index(
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<(Uuid, Vec<IndexFile>)> {
-    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
-        dataset,
-        column,
-        params,
-        progress.clone(),
-        "Build Distributed Vector Index",
-        true,
-        Some(fragment_ids),
-    )
-    .await?;
+    let (element_type, index_type, ivf_params, shuffler, _shuffle_dir) =
+        prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build Distributed Vector Index",
+            true,
+            Some(fragment_ids),
+        )
+        .await?;
     let stages = &params.stages;
 
     let ivf_centroids = ivf_params
@@ -1013,16 +1020,17 @@ async fn build_vector_index_impl(
     progress: Arc<dyn IndexBuildProgress>,
     fragment_ids: Option<&[u32]>,
 ) -> Result<Vec<IndexFile>> {
-    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
-        dataset,
-        column,
-        params,
-        progress.clone(),
-        "Build Vector Index",
-        false,
-        fragment_ids,
-    )
-    .await?;
+    let (element_type, index_type, ivf_params, shuffler, _shuffle_dir) =
+        prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build Vector Index",
+            false,
+            fragment_ids,
+        )
+        .await?;
     let stages = &params.stages;
 
     match index_type {
