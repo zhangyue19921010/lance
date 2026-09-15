@@ -127,6 +127,7 @@ pub unsafe fn sum_4bit_dist_table_uninit(
     debug_assert!(n.is_multiple_of(BATCH_SIZE));
     debug_assert!(dists.len() >= n);
     debug_assert!(codes.len() >= n * code_len);
+    debug_assert!(dist_table.len() >= BATCH_SIZE * code_len);
 
     let (has_avx512bw, has_avx2) = x86_dist_table_features();
     match dist_table_backend(
