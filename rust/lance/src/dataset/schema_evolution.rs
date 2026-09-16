@@ -699,8 +699,8 @@ async fn add_columns_from_stream(
                 // Reject nulls the dataset's file format cannot store (e.g. integer
                 // nulls on Legacy), matching the hash-join based merge path, instead
                 // of silently writing them as default values.
-                for column in new_batch.columns() {
-                    HashJoiner::check_lance_support_null(column, updater.dataset())?;
+                for (field, column) in new_batch.schema().fields().iter().zip(new_batch.columns()) {
+                    HashJoiner::check_lance_support_null(field.name(), column, updater.dataset())?;
                 }
 
                 updater.update(new_batch).await?;
@@ -4542,8 +4542,11 @@ mod test {
         Ok(())
     }
 
+    #[rstest]
+    #[case::reader(false)]
+    #[case::stream(true)]
     #[tokio::test]
-    async fn test_add_columns_via_reader_rejects_unsupported_nulls() {
+    async fn test_add_columns_via_stream_rejects_unsupported_nulls(#[case] use_stream: bool) {
         // Legacy files cannot store integer nulls: a new column of [1, NULL, 3] must
         // fail, matching the hash-join based merge path, instead of being silently
         // written and read back as [1, 0, 3].
@@ -4571,31 +4574,28 @@ mod test {
         .await
         .unwrap();
 
-        let value_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            DataType::Int32,
-            true,
-        )]));
-        let values = RecordBatch::try_new(
-            value_schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]))],
-        )
-        .unwrap();
+        let values =
+            arrow_array::record_batch!(("value", Int32, [Some(1), None, Some(3)])).unwrap();
+        let values_schema = values.schema();
+        // `Reader` and `Stream` share `add_columns_from_stream` today, but a future
+        // refactor could split them, so both variants are exercised directly.
+        let values_reader: Box<dyn RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(values)], values_schema));
+        let transform = if use_stream {
+            NewColumnTransform::Stream(values_reader.into_stream())
+        } else {
+            NewColumnTransform::Reader(values_reader)
+        };
+
         let err = dataset
-            .add_columns(
-                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
-                    vec![Ok(values)],
-                    value_schema,
-                ))),
-                None,
-                None,
-            )
+            .add_columns(transform, None, None)
             .await
             .unwrap_err();
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("not supported"),
+            message.contains("Column 'value'") && message.contains("not supported"),
             "unexpected error: {}",
-            err
+            message
         );
     }
 }
