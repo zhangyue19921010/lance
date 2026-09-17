@@ -109,7 +109,9 @@ pub async fn read_manifest(
     }
 
     let proto = pb::Manifest::decode(buf)?;
-    Manifest::try_from(proto)
+    let mut manifest = Manifest::try_from(proto)?;
+    manifest.detach_sparse_inline_row_ids(recorded_length);
+    Ok(manifest)
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]
