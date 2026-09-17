@@ -3,7 +3,6 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    future::Future,
     ops::{DerefMut, Range},
     panic::AssertUnwindSafe,
     sync::{
@@ -1729,26 +1728,6 @@ impl BlobFile {
         matches!(&*self.state.lock().await, BlobFileState::Closed)
     }
 
-    async fn do_with_cursor<T, Fut: Future<Output = Result<(u64, T)>>, Func: FnOnce(u64) -> Fut>(
-        &self,
-        func: Func,
-    ) -> Result<T> {
-        let mut state = self.state.lock().await;
-        match state.deref_mut() {
-            BlobFileState::Open {
-                cursor, prefetch, ..
-            } => {
-                let (new_cursor, data) = func(*cursor).await?;
-                *cursor = new_cursor;
-                *prefetch = None;
-                Ok(data)
-            }
-            BlobFileState::Closed => Err(Error::invalid_input(
-                "Blob file is already closed".to_string(),
-            )),
-        }
-    }
-
     async fn ensure_open(&self) -> Result<()> {
         let state = self.state.lock().await;
         match &*state {
@@ -1819,23 +1798,52 @@ impl BlobFile {
     /// After this call the cursor will be pointing to the end of
     /// the file.
     pub async fn read(&self) -> Result<bytes::Bytes> {
-        let size = self.size;
-        let source = self.source.clone();
-        let position = self.position;
-        self.do_with_cursor(move |cursor| {
-            let source = source.clone();
-            async move {
-                if cursor >= size {
-                    return Ok((size, Bytes::new()));
+        let mut state = self.state.lock().await;
+        match state.deref_mut() {
+            BlobFileState::Closed => Err(Error::invalid_input(
+                "Blob file is already closed".to_string(),
+            )),
+            BlobFileState::Open {
+                cursor, prefetch, ..
+            } => {
+                if *cursor >= self.size {
+                    *cursor = self.size;
+                    *prefetch = None;
+                    return Ok(Bytes::new());
                 }
-                let physical = (position + cursor)..(position + size);
-                Ok((
-                    size,
-                    source.read_ranges(vec![physical]).await?.pop().unwrap(),
-                ))
+                let remaining = (self.size - *cursor) as usize;
+                let held = prefetch
+                    .as_ref()
+                    .and_then(|w| w.slice_from(*cursor, remaining));
+                let bytes = match held {
+                    Some(held) if held.len() == remaining => held,
+                    // Joining copies the unread span while the tail is still
+                    // live, so only do it when the tail is no larger than the
+                    // bytes it saves re-fetching.
+                    Some(held) if remaining <= 2 * held.len() => {
+                        self.fetch_after(*cursor, held).await?
+                    }
+                    _ => self.fetch_after(*cursor, Bytes::new()).await?,
+                };
+                *cursor = self.size;
+                *prefetch = None;
+                Ok(bytes)
             }
-        })
-        .await
+        }
+    }
+
+    async fn fetch_after(&self, cursor: u64, held: Bytes) -> Result<Bytes> {
+        let physical = self.read_phys_range(cursor + held.len() as u64..self.size)?;
+        let rest = self
+            .source
+            .read_ranges(vec![physical])
+            .await?
+            .pop()
+            .unwrap();
+        if held.is_empty() {
+            return Ok(rest);
+        }
+        Ok([held, rest].concat().into())
     }
 
     /// Read up to `len` bytes from the current cursor position
@@ -9681,6 +9689,34 @@ mod tests {
         let got = read_up_to_chunks(blob, 8192).await;
         assert_eq!(got.as_ref(), payload.as_slice());
         assert_eq!(blob.range_submission_count(), 2);
+    }
+
+    #[rstest]
+    #[case::window_covers_the_rest(4 * 1024 * 1024, 0, 1)]
+    #[case::small_tail_is_appended(64 * 1024, 32 * 1024, 2)]
+    #[case::large_tail_is_read_from_cursor(16 * 1024, 95 * 1024, 2)]
+    #[tokio::test]
+    async fn read_after_read_up_to_reuses_prefetch(
+        #[case] buffer_size: usize,
+        #[case] fetched: u64,
+        #[case] submissions: usize,
+    ) {
+        let payload: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+        let (_dir, dataset) = write_blob_v2_dataset(&[payload.as_slice()]).await;
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let blob = blobs[0].as_ref().unwrap();
+        blob.set_buffer_size(buffer_size).await.unwrap();
+
+        blob.read_up_to(1024).await.unwrap();
+        let _ = dataset.object_store.io_stats_incremental();
+        let rest = blob.read().await.unwrap();
+        assert_eq!(rest.as_ref(), &payload[1024..]);
+        assert_eq!(
+            dataset.object_store.io_stats_incremental().read_bytes,
+            fetched
+        );
+        assert_eq!(blob.range_submission_count(), submissions);
+        assert_eq!(blob.tell().await.unwrap(), payload.len() as u64);
     }
 
     #[tokio::test]
