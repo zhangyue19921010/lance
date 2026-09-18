@@ -396,6 +396,18 @@ impl ObjectStoreParams {
             .and_then(|a| a.initial_storage_options())
     }
 
+    /// The block size to use: the explicit `block_size` parameter, else the
+    /// `block_size` storage option, else `None` for the store's default.
+    pub fn resolved_block_size(&self) -> Result<Option<usize>> {
+        if self.block_size.is_some() {
+            return Ok(self.block_size);
+        }
+        match self.storage_options() {
+            Some(options) => StorageOptions(options.clone()).block_size(),
+            None => Ok(None),
+        }
+    }
+
     /// Resolve these params for a single base path scope.
     ///
     /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
@@ -673,7 +685,7 @@ impl ObjectStore {
                 inner: tracked_store,
                 local_dir_operations: None,
                 scheme: path.scheme().to_string(),
-                block_size: params.block_size.unwrap_or(64 * 1024),
+                block_size: params.resolved_block_size()?.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
                 use_constant_size_upload_parts: params.use_constant_size_upload_parts,
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
@@ -1687,6 +1699,24 @@ impl StorageOptions {
         })
     }
 
+    /// Byte gap below which the I/O scheduler merges two reads of one file
+    /// into a single request, overriding the store's default.
+    pub fn block_size(&self) -> Result<Option<usize>> {
+        let Some((_, value)) = self
+            .0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("block_size"))
+        else {
+            return Ok(None);
+        };
+        let block_size = value.trim().parse::<usize>().map_err(|err| {
+            Error::invalid_input(format!(
+                "storage option block_size must be a number of bytes, got `{value}`: {err}"
+            ))
+        })?;
+        Ok(Some(block_size))
+    }
+
     /// Number of times to retry a download that fails
     pub fn download_retry_count(&self) -> usize {
         self.0
@@ -2073,6 +2103,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.block_size, 1024);
+
+        // The storage option applies when no parameter is given...
+        let mut options_with_block_size = storage_options.unwrap_or_default();
+        options_with_block_size.insert(String::from("block_size"), String::from("2048"));
+        let accessor = Arc::new(StorageOptionsAccessor::with_static_options(
+            options_with_block_size,
+        ));
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(accessor.clone()),
+            ..ObjectStoreParams::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.block_size, 2048);
+
+        // ...and the explicit parameter wins over it.
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            block_size: Some(1024),
+            storage_options_accessor: Some(accessor),
+            ..ObjectStoreParams::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.block_size, 1024);
+    }
+
+    #[tokio::test]
+    async fn test_block_size_option_rejects_invalid_values() {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let accessor = Arc::new(StorageOptionsAccessor::with_static_options(HashMap::from(
+            [(String::from("block_size"), String::from("64KiB"))],
+        )));
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(accessor),
+            ..ObjectStoreParams::default()
+        };
+        let error =
+            ObjectStore::from_uri_and_params(registry, "memory:///bucket/foo.lance", &params)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("block_size"), "{error}");
     }
 
     #[rstest]

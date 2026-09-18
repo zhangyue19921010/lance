@@ -213,6 +213,11 @@ impl ObjectStoreRegistry {
         metrics_base: &str,
     ) -> Result<Arc<ObjectStore>> {
         let mut store = provider.new_store(base_path, params).await?;
+        // Providers only know the explicit parameter; the storage option is
+        // applied here so every store honours it the same way.
+        if let Some(block_size) = params.resolved_block_size()? {
+            store.block_size = block_size;
+        }
 
         store.inner = store.inner.traced();
 
