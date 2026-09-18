@@ -656,7 +656,11 @@ impl ObjectStore {
                 registry.calculate_object_store_prefix(uri, params.storage_options())?;
 
             let mut io_tracker = IOTracker::default();
-            meter_store(&mut inner, &mut io_tracker, &store_prefix);
+            meter_store(
+                &mut inner,
+                &mut io_tracker,
+                &metrics_base(&store_prefix, path),
+            );
 
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 inner = wrapper.wrap(&store_prefix, inner);
@@ -1790,7 +1794,11 @@ impl ObjectStore {
             }
         };
         let mut io_tracker = IOTracker::default();
-        meter_store(&mut store, &mut io_tracker, &store_prefix);
+        meter_store(
+            &mut store,
+            &mut io_tracker,
+            &metrics_base(&store_prefix, &location),
+        );
 
         let store = match wrapper {
             Some(wrapper) => wrapper.wrap(&store_prefix, store),
@@ -1827,18 +1835,26 @@ impl ObjectStore {
 /// constructor that hands an [`ObjectStore`] to a caller must route its `inner`
 /// through here, or through nothing at all.
 #[cfg(feature = "metrics")]
-fn meter_store(inner: &mut Arc<dyn OSObjectStore>, io_tracker: &mut IOTracker, store_prefix: &str) {
+fn meter_store(inner: &mut Arc<dyn OSObjectStore>, io_tracker: &mut IOTracker, base: &str) {
     use crate::object_store::metrics::ObjectStoreMetricsExt;
-    io_tracker.set_metrics_base(store_prefix);
-    *inner = inner.clone().metered(store_prefix.to_owned());
+    io_tracker.set_metrics_base(base);
+    *inner = inner.clone().metered(base.to_owned());
 }
 
 #[cfg(not(feature = "metrics"))]
-fn meter_store(
-    _inner: &mut Arc<dyn OSObjectStore>,
-    _io_tracker: &mut IOTracker,
-    _store_prefix: &str,
-) {
+fn meter_store(_inner: &mut Arc<dyn OSObjectStore>, _io_tracker: &mut IOTracker, _base: &str) {}
+
+/// The `base` metrics label for a store opened at `location`; see
+/// [`metrics::metrics_base`]. Without the `metrics` feature the label is unused
+/// and the prefix keeps the registry cache keyed per bucket as before.
+#[cfg(feature = "metrics")]
+pub(crate) fn metrics_base(store_prefix: &str, location: &Url) -> String {
+    metrics::metrics_base(metrics::base_label_mode(), store_prefix, location)
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn metrics_base(store_prefix: &str, _location: &Url) -> String {
+    store_prefix.to_owned()
 }
 
 fn infer_block_size(scheme: &str) -> usize {
