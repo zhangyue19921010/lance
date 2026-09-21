@@ -303,7 +303,8 @@ impl MinHashLshIndex {
     }
 
     /// Return the `limit` rows with the smallest Jaccard distance to `text`
-    /// among rows selected by `mask`, ordered by ascending distance.
+    /// among rows selected by `mask`, ordered by ascending distance and then
+    /// row id. Which rows are returned among equal distances is not specified.
     pub async fn search_text(
         &self,
         text: &str,
@@ -344,7 +345,9 @@ impl MinHashLshIndex {
             .await
     }
 
-    /// Union of the buckets of `band_keys`.
+    /// Every document in a bucket of `band_keys` with the number of bands it
+    /// shares with the query, by decreasing shared bands and then ascending
+    /// doc id: the order in which candidates are refined.
     ///
     /// A bucket is a run of equal keys in the sorted bands file, and the page
     /// table locates it without probing: its pages run from the first page
@@ -354,7 +357,7 @@ impl MinHashLshIndex {
         &self,
         band_keys: &[u64],
         metrics: &dyn MetricsCollector,
-    ) -> Result<RoaringBitmap> {
+    ) -> Result<Vec<(u32, u32)>> {
         let num_pages = self.page_max_keys.len();
         let buckets: Vec<(u64, Range<u32>)> = band_keys
             .iter()
@@ -374,16 +377,16 @@ impl MinHashLshIndex {
         pages.sort_unstable();
         pages.dedup();
         let pages = self.load_pages(&pages, metrics).await?;
-        let mut candidates = RoaringBitmap::new();
+        let mut members: Vec<u32> = Vec::new();
         for (key, bucket_pages) in &buckets {
             for page in bucket_pages.clone() {
                 let page = pages.get(&page).ok_or_else(|| {
                     Error::internal(format!("band page {page} was requested but not loaded"))
                 })?;
-                candidates.extend(page.members(*key).iter().copied());
+                members.extend_from_slice(page.members(*key));
             }
         }
-        if let Some(max_doc_id) = candidates.max()
+        if let Some(&max_doc_id) = members.iter().max()
             && max_doc_id as usize >= self.num_docs
         {
             return Err(Error::corrupt_file_named(
@@ -394,6 +397,15 @@ impl MinHashLshIndex {
                 ),
             ));
         }
+        members.sort_unstable();
+        let mut candidates: Vec<(u32, u32)> = Vec::new();
+        for doc_id in members {
+            match candidates.last_mut() {
+                Some((last, shared)) if *last == doc_id => *shared += 1,
+                _ => candidates.push((doc_id, 1)),
+            }
+        }
+        candidates.sort_by_key(|&(_, shared)| std::cmp::Reverse(shared));
         Ok(candidates)
     }
 
@@ -464,21 +476,25 @@ impl MinHashLshIndex {
         })
     }
 
-    /// Score every candidate against the query signature and keep the best
+    /// Score candidates against the query signature and keep the best
     /// `limit` rows selected by `mask`. Candidates in resident signature
-    /// chunks are scored from memory; the rest are read with scattered reads,
-    /// or with a sequential scan when they cover much of the segment.
+    /// chunks are scored from memory; the rest are read with scattered reads
+    /// in the order of [`Self::collect_candidates`], stopping once no
+    /// remaining candidate can beat the results held, or with a sequential
+    /// scan when they cover much of the segment. Which rows are returned
+    /// among equal distances is not specified.
     async fn refine(
         &self,
-        mut candidates: RoaringBitmap,
+        mut candidates: Vec<(u32, u32)>,
         query: &[SignatureValue],
         limit: usize,
         mask: &RowAddrMask,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<MinHashHit>> {
         let num_hashes = query.len();
+        let num_bands = self.params.num_bands as usize;
         let mut hits = TopHits::new(limit);
-        let mut score = |row_id: u64, signature: &[SignatureValue]| {
+        let score = |hits: &mut TopHits, row_id: u64, signature: &[SignatureValue]| {
             let row_id = match &self.frag_reuse_index {
                 Some(remapper) => match remapper.remap_row_id(row_id) {
                     Some(row_id) => row_id,
@@ -494,17 +510,18 @@ impl MinHashLshIndex {
                 distance: 1.0 - estimate_jaccard(query, signature),
             });
         };
-        metrics.record_comparisons(candidates.len() as usize);
+        metrics.record_comparisons(candidates.len());
 
         let chunk_docs = self.signature_chunk_docs;
-        let (Some(first), Some(last)) = (candidates.min(), candidates.max()) else {
+        let mut unresolved: RoaringBitmap = candidates.iter().map(|&(doc_id, _)| doc_id).collect();
+        let (Some(first), Some(last)) = (unresolved.min(), unresolved.max()) else {
             return Ok(Vec::new());
         };
         for chunk in (first as usize / chunk_docs)..=(last as usize / chunk_docs) {
             let first_doc = chunk * chunk_docs;
             let chunk_range =
                 first_doc as u32..=((first_doc + chunk_docs - 1).min(u32::MAX as usize)) as u32;
-            if candidates.range_cardinality(chunk_range.clone()) == 0 {
+            if unresolved.range_cardinality(chunk_range.clone()) == 0 {
                 continue;
             }
             // A chunk that is not resident is read, not loaded, so only a
@@ -519,7 +536,7 @@ impl MinHashLshIndex {
                 continue;
             };
             metrics.record_index_cache_hit();
-            for doc_id in candidates.range(chunk_range.clone()) {
+            for doc_id in unresolved.range(chunk_range.clone()) {
                 let offset = doc_id as usize - first_doc;
                 let Some(row_id) = resident.row_ids.get(offset) else {
                     return Err(Error::corrupt_file_named(
@@ -528,30 +545,32 @@ impl MinHashLshIndex {
                     ));
                 };
                 score(
+                    &mut hits,
                     *row_id,
                     &resident.signatures[offset * num_hashes..(offset + 1) * num_hashes],
                 );
             }
-            candidates.remove_range(chunk_range);
+            unresolved.remove_range(chunk_range);
         }
-        if candidates.is_empty() {
+        if unresolved.is_empty() {
             return Ok(hits.into_sorted());
         }
 
-        let mut score_batch = |batch: &RecordBatch, keep: &mut dyn FnMut(usize) -> bool| {
-            let (row_ids, signatures) = signature_columns(batch, num_hashes)?;
-            for (index, (row_id, signature)) in row_ids
-                .values()
-                .iter()
-                .zip(signatures.chunks_exact(num_hashes))
-                .enumerate()
-            {
-                if keep(index) {
-                    score(*row_id, signature);
+        let score_batch =
+            |hits: &mut TopHits, batch: &RecordBatch, keep: &mut dyn FnMut(usize) -> bool| {
+                let (row_ids, signatures) = signature_columns(batch, num_hashes)?;
+                for (index, (row_id, signature)) in row_ids
+                    .values()
+                    .iter()
+                    .zip(signatures.chunks_exact(num_hashes))
+                    .enumerate()
+                {
+                    if keep(index) {
+                        score(hits, *row_id, signature);
+                    }
                 }
-            }
-            Ok::<_, Error>(())
-        };
+                Ok::<_, Error>(())
+            };
         metrics.record_part_load();
         tracing::info!(
             target: TRACE_IO_EVENTS,
@@ -560,15 +579,58 @@ impl MinHashLshIndex {
             part_id = "signatures",
         );
         let rows_per_read = rows_per_batch(signature_row_bytes(num_hashes));
-        if candidates.len().saturating_mul(100)
+        if unresolved.len().saturating_mul(100)
             <= (self.num_docs as u64).saturating_mul(SPARSE_REFINE_READ_PERCENT)
         {
-            let mut doc_ids = candidates.iter();
-            loop {
-                let ranges = doc_id_ranges(doc_ids.by_ref().take(rows_per_read));
-                if ranges.is_empty() {
-                    break;
-                }
+            // A candidate sharing `shared` bands differs from the query in at
+            // least one value of every other band, so its distance is at
+            // least `(num_bands - shared) / num_hashes`; candidates come in
+            // decreasing `shared`, so once the results held are at least
+            // that close, no remaining candidate can beat them.
+            //
+            // That cannot happen before the results are full, and unless the
+            // candidates filling them share every band (their distance is
+            // then zero), not before the end of the group of the last of
+            // them. What must be read anyway is read in doc id order, which
+            // takes the fewest requests; the rest follows by priority in
+            // batches that grow, so that a search that stops early reads
+            // little more than it needs.
+            candidates.retain(|&(doc_id, _)| unresolved.contains(doc_id));
+            let mut must_read = hits.missing().min(candidates.len());
+            if let Some(&(_, shared)) = must_read
+                .checked_sub(1)
+                .and_then(|last| candidates.get(last))
+                && (shared as usize) < num_bands
+            {
+                must_read = candidates.partition_point(|&(_, other)| other >= shared);
+            }
+            candidates[..must_read].sort_unstable();
+            let mut next = 0;
+            let mut batch_rows = must_read.max(MIN_REFINE_READ_ROWS).min(rows_per_read);
+            while let Some(&(_, shared)) = candidates.get(next) {
+                let batch_end = if next < must_read {
+                    must_read.min(next + rows_per_read)
+                } else {
+                    let differing = num_bands.saturating_sub(shared as usize);
+                    let closest_remaining =
+                        1.0 - (num_hashes - differing) as f32 / num_hashes as f32;
+                    if hits
+                        .cutoff()
+                        .is_some_and(|cutoff| cutoff <= closest_remaining)
+                    {
+                        break;
+                    }
+                    let batch_end = candidates.len().min(next + batch_rows);
+                    batch_rows = (batch_rows * 2).min(rows_per_read);
+                    batch_end
+                };
+                let mut doc_ids: Vec<u32> = candidates[next..batch_end]
+                    .iter()
+                    .map(|&(doc_id, _)| doc_id)
+                    .collect();
+                doc_ids.sort_unstable();
+                let ranges = doc_id_ranges(doc_ids.into_iter());
+                next = batch_end;
                 let expected_rows: usize = ranges.iter().map(|range| range.len()).sum();
                 let batch = self.signatures.read_ranges(&ranges, None).await?;
                 if batch.num_rows() != expected_rows {
@@ -580,7 +642,7 @@ impl MinHashLshIndex {
                         ),
                     ));
                 }
-                score_batch(&batch, &mut |_| true)?;
+                score_batch(&mut hits, &batch, &mut |_| true)?;
             }
         } else {
             let mut stream = std::pin::pin!(scan_rows(
@@ -590,8 +652,8 @@ impl MinHashLshIndex {
             ));
             let mut first_doc = 0usize;
             while let Some(batch) = stream.try_next().await? {
-                score_batch(&batch, &mut |index| {
-                    u32::try_from(first_doc + index).is_ok_and(|doc_id| candidates.contains(doc_id))
+                score_batch(&mut hits, &batch, &mut |index| {
+                    u32::try_from(first_doc + index).is_ok_and(|doc_id| unresolved.contains(doc_id))
                 })?;
                 first_doc += batch.num_rows();
             }

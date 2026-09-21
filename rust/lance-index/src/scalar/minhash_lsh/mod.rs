@@ -32,9 +32,10 @@
 //! A bucket is the run of rows sharing a band key; it may span pages. Lookups
 //! binary-search a resident page table (max band key per page), fetch the
 //! bucket's pages through the cache, binary-search each page for the band
-//! key, collect the bucket's doc ids into a candidate bitmap, and read the
-//! candidate signatures with a scattered read (or a sequential scan when the
-//! candidate set is dense).
+//! key, count the bands every doc id of the buckets shares with the query,
+//! and refine the candidates by decreasing shared bands, reading their
+//! signatures with scattered reads until no remaining candidate can beat the
+//! results held (or with a sequential scan when the candidate set is dense).
 
 mod builder;
 mod index;
@@ -156,6 +157,10 @@ const READ_CONCURRENCY: usize = 4;
 /// A candidate set covering more than this percentage of a segment is refined
 /// with a sequential scan of the signature file instead of a scattered read.
 const SPARSE_REFINE_READ_PERCENT: u64 = 10;
+/// Fewest rows of one scattered signature read of a refine beyond what it
+/// must read. A read this small costs one round trip whatever its size, so
+/// smaller batches would only add round trips.
+const MIN_REFINE_READ_ROWS: usize = 64;
 
 /// Default memory budget of the sort: the run being filled, the runs being
 /// spilled and the merge groups together.
@@ -761,6 +766,19 @@ impl TopHits {
             self.heap.pop();
             self.heap.push(hit);
         }
+    }
+
+    /// Hits still missing to hold `limit` of them.
+    pub fn missing(&self) -> usize {
+        self.limit - self.heap.len()
+    }
+
+    /// The distance a new hit must beat, once `limit` hits are held.
+    pub fn cutoff(&self) -> Option<f32> {
+        if self.heap.len() < self.limit {
+            return None;
+        }
+        self.heap.peek().map(|worst| worst.distance)
     }
 
     /// Hits ordered by ascending distance, ties broken by row id.
