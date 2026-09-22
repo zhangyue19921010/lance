@@ -5,7 +5,10 @@
 //! `signatures.lance`, and sorting the (band key, doc id) records into
 //! `bands.lance` with an external sort that spills to local temporary files.
 
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
+
+use tokio::sync::mpsc;
 
 use super::index::{scan_rows, signature_columns};
 use super::*;
@@ -131,6 +134,7 @@ impl SignatureSource<'_> {
         let num_hashes = generator.num_hashes();
         let batches = scan_rows(
             self.reader.clone(),
+            0,
             self.num_docs,
             rows_per_batch(signature_row_bytes(num_hashes)),
         );
@@ -503,22 +507,25 @@ enum SortedRuns {
     Spilled(Arc<[SpilledRun]>),
 }
 
-/// Split the partitions into contiguous groups of about `group_records`
-/// records each (at least one partition per group).
-fn merge_groups(runs: &[SpilledRun], group_records: usize) -> Vec<Range<usize>> {
+/// Records of `partitions` over every run.
+fn group_records(runs: &[SpilledRun], partitions: &Range<usize>) -> usize {
+    runs.iter().map(|run| run.rows(partitions).len()).sum()
+}
+
+/// Split the partitions into contiguous groups of at most `budget_records`
+/// records each; a partition larger than that forms a group of its own.
+fn merge_groups(runs: &[SpilledRun], budget_records: usize) -> Vec<Range<usize>> {
     let mut groups = Vec::new();
     let mut start = 0;
     let mut records = 0usize;
     for partition in 0..SPILL_PARTITIONS {
-        records += runs
-            .iter()
-            .map(|run| run.rows(&(partition..partition + 1)).len())
-            .sum::<usize>();
-        if records >= group_records {
-            groups.push(start..partition + 1);
-            start = partition + 1;
+        let partition_records = group_records(runs, &(partition..partition + 1));
+        if records + partition_records > budget_records && start < partition {
+            groups.push(start..partition);
+            start = partition;
             records = 0;
         }
+        records += partition_records;
     }
     if start < SPILL_PARTITIONS {
         groups.push(start..SPILL_PARTITIONS);
@@ -560,6 +567,126 @@ async fn merge_group(
         Ok::<_, Error>(records.into_iter().unzip())
     })
     .await
+}
+
+/// A run's rows of one merge group, read one chunk at a time.
+struct SpillCursor {
+    path: PathBuf,
+    /// Rows not read yet.
+    rows: Range<usize>,
+    chunk: Vec<(u64, u32)>,
+    pos: usize,
+}
+
+impl SpillCursor {
+    async fn refill(&mut self, chunk_records: usize) -> Result<()> {
+        let to = (self.rows.start + chunk_records).min(self.rows.end);
+        let rows = self.rows.start..to;
+        self.rows.start = to;
+        let path = self.path.clone();
+        // Spill reads are blocking file IO, kept off the runtime workers.
+        self.chunk = tokio::task::spawn_blocking(move || read_spill_records(&path, rows))
+            .await
+            .map_err(|err| Error::internal(format!("spill read task failed: {err}")))?
+            .map_err(|err| Error::io(format!("cannot read MinHash LSH spill file: {err}")))?;
+        self.pos = 0;
+        Ok(())
+    }
+}
+
+/// Merge the records of `partitions` from every run in key order while
+/// holding one chunk per run, for a group larger than the memory budget: a
+/// duplicate cluster puts every one of its documents into the same partition
+/// of each band, and a partition cannot be split. Each chunk holds
+/// `budget_records / (2 * runs)` records. Runs of equal keys are copied as
+/// whole blocks, so a large bucket costs one heap step per chunk rather than
+/// per record. Batches are sent in order to `output`.
+async fn stream_merge_group(
+    runs: &[SpilledRun],
+    partitions: Range<usize>,
+    budget_records: usize,
+    output: mpsc::Sender<Result<(Vec<u64>, Vec<u32>)>>,
+) -> Result<()> {
+    let mut cursors: Vec<SpillCursor> = runs
+        .iter()
+        .filter_map(|run| {
+            let rows = run.rows(&partitions);
+            (!rows.is_empty()).then(|| SpillCursor {
+                path: run.dir.run_path(run.run),
+                rows,
+                chunk: Vec::new(),
+                pos: 0,
+            })
+        })
+        .collect();
+    let chunk_records = (budget_records / (2 * cursors.len().max(1))).max(MIN_SPILL_CHUNK_RECORDS);
+    for cursor in &mut cursors {
+        cursor.refill(chunk_records).await?;
+    }
+    let mut heap: BinaryHeap<Reverse<(u64, u32, usize)>> = cursors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, cursor)| {
+            cursor
+                .chunk
+                .first()
+                .map(|&(key, doc_id)| Reverse((key, doc_id, index)))
+        })
+        .collect();
+    let batch_records = rows_per_batch(BAND_ROW_BYTES);
+    let mut keys: Vec<u64> = Vec::with_capacity(batch_records);
+    let mut doc_ids: Vec<u32> = Vec::with_capacity(batch_records);
+    while let Some(Reverse((key, _, index))) = heap.pop() {
+        // The records of `key` are a prefix of the sorted chunk from `pos`;
+        // the block ends where another run's records of the same key would
+        // come first (never, since every run holds a contiguous range of doc
+        // ids, but the merge does not rely on it).
+        let next_doc_id = match heap.peek() {
+            Some(Reverse((next_key, next_doc_id, _))) if *next_key == key => Some(*next_doc_id),
+            _ => None,
+        };
+        let cursor = &mut cursors[index];
+        let block = cursor.chunk[cursor.pos..]
+            .partition_point(|record| {
+                record.0 == key && next_doc_id.is_none_or(|next| record.1 < next)
+            })
+            .min(batch_records - keys.len());
+        for &(key, doc_id) in &cursor.chunk[cursor.pos..cursor.pos + block] {
+            keys.push(key);
+            doc_ids.push(doc_id);
+        }
+        cursor.pos += block;
+        if keys.len() == batch_records {
+            send_batch(
+                &output,
+                std::mem::replace(&mut keys, Vec::with_capacity(batch_records)),
+                std::mem::replace(&mut doc_ids, Vec::with_capacity(batch_records)),
+            )
+            .await?;
+        }
+        if cursor.pos == cursor.chunk.len() && !cursor.rows.is_empty() {
+            cursor.refill(chunk_records).await?;
+        }
+        if let Some(&(key, doc_id)) = cursor.chunk.get(cursor.pos) {
+            heap.push(Reverse((key, doc_id, index)));
+        }
+    }
+    if !keys.is_empty() {
+        send_batch(&output, keys, doc_ids).await?;
+    }
+    Ok(())
+}
+
+/// Hand one batch of ascending records to the bands writer.
+async fn send_batch(
+    output: &mpsc::Sender<Result<(Vec<u64>, Vec<u32>)>>,
+    keys: Vec<u64>,
+    doc_ids: Vec<u32>,
+) -> Result<()> {
+    output
+        .send(Ok((keys, doc_ids)))
+        .await
+        .map_err(|_| Error::internal("bands writer stopped before the merge finished"))
 }
 
 /// Builds the two index files from a stream of `value` (text) and `_rowid`
@@ -625,6 +752,18 @@ impl MinHashLshIndexBuilder {
             ));
         }
         self.sort_run_records = sort_run_records;
+        Ok(self)
+    }
+
+    /// Records per merge group; exposed so tests can force streaming merges
+    /// with small inputs.
+    pub fn with_merge_group_records(mut self, merge_group_records: usize) -> Result<Self> {
+        if merge_group_records == 0 {
+            return Err(Error::invalid_input(
+                "MinHash LSH merge_group_records must be positive".to_string(),
+            ));
+        }
+        self.merge_group_records = merge_group_records;
         Ok(self)
     }
 
@@ -800,22 +939,41 @@ impl MinHashLshIndexBuilder {
             }
             SortedRuns::Spilled(runs) => {
                 // Each group is its own task so gathering and sorting proceed
-                // while this loop waits on the writer.
+                // while this loop waits on the writer. A group within the
+                // budget arrives as one batch; a larger one is streamed in
+                // batches through a channel that holds one at a time.
+                let budget = self.merge_group_records;
                 let mut merged =
                     futures::stream::iter(merge_groups(runs, self.merge_group_records))
                         .map(|group| {
                             let runs = runs.clone();
-                            tokio::spawn(async move { merge_group(&runs, group).await })
+                            let (output, batches) = mpsc::channel(1);
+                            let task = tokio::spawn(async move {
+                                if group_records(&runs, &group) <= budget {
+                                    let batch = merge_group(&runs, group).await;
+                                    output.send(batch).await.map_err(|_| {
+                                        Error::internal(
+                                            "bands writer stopped before the merge finished",
+                                        )
+                                    })
+                                } else {
+                                    stream_merge_group(&runs, group, budget, output).await
+                                }
+                            });
+                            futures::future::ready((batches, task))
                         })
                         .buffered(
                             (get_num_compute_intensive_cpus() / 4).clamp(1, MERGE_GROUPS_IN_FLIGHT),
                         );
-                while let Some(joined) = merged.next().await {
-                    let (keys, doc_ids) = joined
-                        .map_err(|err| Error::internal(format!("merge task failed: {err}")))??;
-                    if !keys.is_empty() {
-                        bands.write_batch(keys, doc_ids).await?;
+                while let Some((mut batches, task)) = merged.next().await {
+                    while let Some(batch) = batches.recv().await {
+                        let (keys, doc_ids) = batch?;
+                        if !keys.is_empty() {
+                            bands.write_batch(keys, doc_ids).await?;
+                        }
                     }
+                    task.await
+                        .map_err(|err| Error::internal(format!("merge task failed: {err}")))??;
                 }
             }
         }

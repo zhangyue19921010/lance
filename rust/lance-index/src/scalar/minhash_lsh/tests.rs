@@ -830,3 +830,156 @@ async fn test_merge_segments() {
     assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
     assert!(err.to_string().contains("different parameters"), "{err}");
 }
+
+/// Load the index in `store` holding `candidate_batch` candidates per level
+/// and walking buckets `window_pages` pages at a time, so that a small
+/// corpus exercises the paused, continued and dense walks of the buckets.
+async fn load_bounded(
+    store: &Arc<LanceIndexStore>,
+    details: &prost_types::Any,
+    cache: &LanceCache,
+    candidate_batch: usize,
+    window_pages: usize,
+) -> Arc<MinHashLshIndex> {
+    let mut index = load(store, details, cache).await;
+    let bounds = Arc::get_mut(&mut index).unwrap();
+    bounds.candidate_batch = candidate_batch;
+    bounds.window_pages = window_pages;
+    index
+}
+
+#[tokio::test]
+async fn test_large_cluster_is_walked_in_bounded_windows() {
+    // 300 identical texts, four rows per page: every bucket spans 75 pages.
+    // Holding 32 candidates per level and walking eight pages per window,
+    // a search stops after the first windows instead of walking every page,
+    // a second search finds those pages cached, and any limit or mask gives
+    // the same result as holding every candidate at once.
+    let (bases, _) = near_duplicate_corpus(6, 40);
+    let mut texts = vec![bases[0].as_str(); 300];
+    texts.extend(bases[1..].iter().map(String::as_str));
+    let (_tmpdir, store) = test_store();
+    let builder = default_builder().with_page_rows(4).unwrap();
+    let details = builder.params().details_any().unwrap();
+    builder
+        .train(text_stream(&rows_from(&texts), 64), store.as_ref())
+        .await
+        .unwrap();
+    let cache = LanceCache::with_capacity(64 << 20);
+    let bounded = load_bounded(&store, &details, &cache, 32, 8).await;
+    let unbounded = load(&store, &details, &LanceCache::no_cache()).await;
+
+    let parts = |metrics: &LocalMetricsCollector| metrics.parts_loaded.load(Relaxed);
+    let cold = LocalMetricsCollector::default();
+    let hits = bounded
+        .search_text(&bases[0], 10, &RowAddrMask::all_rows(), &cold)
+        .await
+        .unwrap();
+    assert_eq!(ids(&hits), (0..10).collect::<Vec<u64>>());
+    // 32 boundary pages, two windows of eight pages per bucket and one
+    // signature read at most; the whole walk would be 75 pages per bucket
+    assert!(parts(&cold) <= 32 + 16 * 16 + 1, "{} parts", parts(&cold));
+    let warm = LocalMetricsCollector::default();
+    search_with(&bounded, &bases[0], 10, &RowAddrMask::all_rows(), &warm).await;
+    assert_eq!(parts(&warm), 1, "only the signatures are read again");
+
+    for limit in [10, 32, 33, 300, 400] {
+        assert_eq!(
+            search(&bounded, &bases[0], limit).await,
+            search(&unbounded, &bases[0], limit).await,
+            "limit {limit}"
+        );
+    }
+    // Only the tail of the cluster is allowed: the walk continues batch by
+    // batch until the results fill
+    let tail = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(290..300u64));
+    let hits = search_with(&bounded, &bases[0], 10, &tail, &NoOpMetricsCollector).await;
+    assert_eq!(ids(&hits), (290..300).collect::<Vec<u64>>());
+}
+
+async fn search_with(
+    index: &MinHashLshIndex,
+    text: &str,
+    limit: usize,
+    mask: &RowAddrMask,
+    metrics: &dyn MetricsCollector,
+) -> Vec<MinHashHit> {
+    index.search_text(text, limit, mask, metrics).await.unwrap()
+}
+
+#[rstest]
+#[case::dense(0)]
+#[case::sparse(3000)]
+#[tokio::test]
+async fn test_overflowing_lower_level_is_continued(#[case] num_fillers: usize) {
+    // 200 copies of a text (rows 0..200) and 200 copies of a near duplicate
+    // (rows 200..400) sharing some but not all bands with it. Searching the
+    // near duplicate for 250 rows takes its copies, then the 50 lowest rows
+    // of the text, whose level holds only 32 candidates and is walked again
+    // from where it overflowed: against a sequential scan of the signatures
+    // when the level is most of the segment, by scattered reads when filler
+    // texts dilute it below a tenth.
+    let (bases, _) = near_duplicate_corpus(1 + num_fillers, 60);
+    let mut words: Vec<&str> = bases[0].split(' ').collect();
+    words[59] = "zzz";
+    let near = words.join(" ");
+    let mut texts = vec![bases[0].as_str(); 200];
+    texts.extend(std::iter::repeat_n(near.as_str(), 200));
+    texts.extend(bases[1..].iter().map(String::as_str));
+    let (_tmpdir, store) = test_store();
+    let builder = default_builder().with_page_rows(8).unwrap();
+    let details = builder.params().details_any().unwrap();
+    builder
+        .train(text_stream(&rows_from(&texts), 64), store.as_ref())
+        .await
+        .unwrap();
+    let bounded = load_bounded(&store, &details, &LanceCache::no_cache(), 32, 8).await;
+    let unbounded = load(&store, &details, &LanceCache::no_cache()).await;
+
+    let hits = ids(&search(&bounded, &near, 250).await);
+    assert_eq!(hits[..200], (200..400).collect::<Vec<u64>>()[..]);
+    assert_eq!(hits[200..], (0..50).collect::<Vec<u64>>()[..]);
+    for limit in [10, 201, 250, 500] {
+        assert_eq!(
+            search(&bounded, &near, limit).await,
+            search(&unbounded, &near, limit).await,
+            "limit {limit}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_oversized_merge_groups_stream_and_match_gather() {
+    // 3000 identical texts put 3000 records into one partition of every
+    // band; with 200 records per merge group those partitions exceed the
+    // budget and are merged by streaming, which must write the same bands
+    // file as an in-memory sort.
+    let (bases, _) = near_duplicate_corpus(30, 40);
+    let mut texts = vec![bases[0].as_str(); 3000];
+    texts.extend(bases[1..].iter().map(String::as_str));
+    let rows = rows_from(&texts);
+    async fn bands(
+        builder: MinHashLshIndexBuilder,
+        rows: &[(Option<&str>, u64)],
+    ) -> Vec<(u64, u32)> {
+        let (_tmpdir, store) = test_store();
+        builder
+            .train(text_stream(rows, 64), store.as_ref())
+            .await
+            .unwrap();
+        let files = store.list_files_with_sizes().await.unwrap();
+        assert_eq!(files.len(), 2, "spill files must be deleted: {files:?}");
+        let reader = store.open_index_file(BANDS_FILENAME).await.unwrap();
+        let batch = reader.read_range(0..reader.num_rows(), None).await.unwrap();
+        let keys = batch[BAND_KEY_COL].as_primitive::<UInt64Type>().values();
+        let doc_ids = batch[DOC_ID_COL].as_primitive::<UInt32Type>().values();
+        keys.iter().copied().zip(doc_ids.iter().copied()).collect()
+    }
+    let sorted_in_memory = bands(default_builder(), &rows).await;
+    let streamed = default_builder()
+        .with_sort_run_records(1000)
+        .unwrap()
+        .with_merge_group_records(200)
+        .unwrap();
+    assert_eq!(bands(streamed, &rows).await, sorted_in_memory);
+}

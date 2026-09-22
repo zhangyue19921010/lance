@@ -7,6 +7,8 @@
 
 use super::*;
 
+use futures::future::try_join_all;
+
 /// One logical page of `bands.lance`, cached per page.
 #[derive(Debug, DeepSizeOf)]
 pub(super) struct BandPage {
@@ -33,16 +35,6 @@ impl BandPage {
             keys: keys.values().to_vec(),
             doc_ids: doc_ids.values().to_vec(),
         })
-    }
-
-    /// Doc ids of the bucket `band_key` within this page.
-    fn members(&self, band_key: u64) -> &[u32] {
-        let start = self.keys.partition_point(|&key| key < band_key);
-        let len = self.keys[start..]
-            .iter()
-            .take_while(|&&key| key == band_key)
-            .count();
-        &self.doc_ids[start..start + len]
     }
 }
 
@@ -117,6 +109,11 @@ pub struct MinHashLshIndex {
     num_docs: usize,
     /// Documents per resident signature chunk; see [`RESIDENT_CHUNK_BYTES`].
     signature_chunk_docs: usize,
+    /// Candidates held per level of a search and rows per signature read:
+    /// one IO batch of signature rows.
+    pub(super) candidate_batch: usize,
+    /// Pages of a bucket walked per read: one IO batch of band rows.
+    pub(super) window_pages: usize,
     cache: WeakLanceCache,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 }
@@ -249,8 +246,9 @@ impl MinHashLshIndex {
         }
 
         let generator = SignatureGenerator::try_new(&params)?;
-        let signature_chunk_docs =
-            (RESIDENT_CHUNK_BYTES / signature_row_bytes(params.num_hashes as usize)).max(1);
+        let row_bytes = signature_row_bytes(params.num_hashes as usize);
+        let signature_chunk_docs = (RESIDENT_CHUNK_BYTES / row_bytes).max(1);
+        let candidate_batch = rows_per_batch(row_bytes);
         Ok(Arc::new(Self {
             params,
             generator,
@@ -260,6 +258,8 @@ impl MinHashLshIndex {
             page_max_keys,
             num_docs,
             signature_chunk_docs,
+            candidate_batch,
+            window_pages: (rows_per_batch(BAND_ROW_BYTES) / page_rows).max(1),
             cache: WeakLanceCache::from(cache),
             frag_reuse_index,
         }))
@@ -337,81 +337,86 @@ impl MinHashLshIndex {
         if limit == 0 || self.num_docs == 0 {
             return Ok(Vec::new());
         }
-        let candidates = self.collect_candidates(&query.band_keys, metrics).await?;
-        if candidates.is_empty() {
+        let mut buckets = self.open_buckets(&query.band_keys, metrics).await?;
+        if buckets.cursors.is_empty() {
             return Ok(Vec::new());
         }
-        self.refine(candidates, &query.signature, limit, mask, metrics)
+        self.refine(&mut buckets, &query.signature, limit, mask, metrics)
             .await
     }
 
-    /// Every document in a bucket of `band_keys` with the number of bands it
-    /// shares with the query, by decreasing shared bands and then ascending
-    /// doc id: the order in which candidates are refined.
+    /// Locate the bucket of every band key and position a cursor at its
+    /// first row.
     ///
     /// A bucket is a run of equal keys in the sorted bands file, and the page
     /// table locates it without probing: its pages run from the first page
     /// whose max key reaches the key through the first page whose max key
-    /// exceeds it. The pages of all buckets are fetched through the cache.
-    async fn collect_candidates(
+    /// exceeds it, and the pages strictly between hold nothing else. The two
+    /// boundary pages of each bucket are fetched through the cache and give
+    /// the exact row range by binary search; the cursor then walks the rows
+    /// one window of pages at a time, through the cache as well.
+    async fn open_buckets(
         &self,
         band_keys: &[u64],
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<(u32, u32)>> {
+    ) -> Result<BucketScan> {
         let num_pages = self.page_max_keys.len();
-        let buckets: Vec<(u64, Range<u32>)> = band_keys
+        let located: Vec<(u64, usize, usize)> = band_keys
             .iter()
-            .map(|&key| {
+            .filter_map(|&key| {
                 let first = self.page_max_keys.partition_point(|&max_key| max_key < key);
-                let end = self
-                    .page_max_keys
-                    .partition_point(|&max_key| max_key <= key);
-                (key, first as u32..(end + 1).min(num_pages) as u32)
+                // `first == num_pages` means the key is larger than every stored key.
+                (first < num_pages).then(|| {
+                    let end = self
+                        .page_max_keys
+                        .partition_point(|&max_key| max_key <= key);
+                    (key, first, end)
+                })
             })
             .collect();
         metrics.record_comparisons(band_keys.len());
-        let mut pages: Vec<u32> = buckets
+        let mut boundary_pages: Vec<u32> = located
             .iter()
-            .flat_map(|(_, pages)| pages.clone())
+            .flat_map(|&(_, first, end)| [first as u32, end as u32])
+            .filter(|&page| (page as usize) < num_pages)
             .collect();
-        pages.sort_unstable();
-        pages.dedup();
-        let pages = self.load_pages(&pages, metrics).await?;
-        let mut members: Vec<u32> = Vec::new();
-        for (key, bucket_pages) in &buckets {
-            for page in bucket_pages.clone() {
-                let page = pages.get(&page).ok_or_else(|| {
-                    Error::internal(format!("band page {page} was requested but not loaded"))
-                })?;
-                members.extend_from_slice(page.members(*key));
+        boundary_pages.sort_unstable();
+        boundary_pages.dedup();
+        let pages = self.load_pages(&boundary_pages, metrics).await?;
+        let page = |page: usize| {
+            pages.get(&(page as u32)).cloned().ok_or_else(|| {
+                Error::internal(format!("band page {page} was requested but not loaded"))
+            })
+        };
+        let mut cursors = Vec::with_capacity(located.len());
+        for (key, first_page, end_page) in located {
+            let first = page(first_page)?;
+            let page_start = first_page * self.page_rows;
+            let row = page_start + first.keys.partition_point(|&k| k < key);
+            let end = if end_page < num_pages {
+                end_page * self.page_rows + page(end_page)?.keys.partition_point(|&k| k <= key)
+            } else {
+                // The bucket reaches the end of the file
+                self.bands.num_rows()
+            };
+            if row < end {
+                // The first window is the bucket's rows of the page in hand,
+                // all of them for the usual bucket within one page
+                let window = first.doc_ids
+                    [row - page_start..end.min(page_start + first.doc_ids.len()) - page_start]
+                    .to_vec();
+                cursors.push(BucketCursor {
+                    next: row,
+                    end,
+                    window: window.into_iter(),
+                });
             }
         }
-        if let Some(&max_doc_id) = members.iter().max()
-            && max_doc_id as usize >= self.num_docs
-        {
-            return Err(Error::corrupt_file_named(
-                BANDS_FILENAME,
-                format!(
-                    "posting references doc id {max_doc_id} but the segment has {} documents",
-                    self.num_docs
-                ),
-            ));
-        }
-        members.sort_unstable();
-        let mut candidates: Vec<(u32, u32)> = Vec::new();
-        for doc_id in members {
-            match candidates.last_mut() {
-                Some((last, shared)) if *last == doc_id => *shared += 1,
-                _ => candidates.push((doc_id, 1)),
-            }
-        }
-        candidates.sort_by_key(|&(_, shared)| std::cmp::Reverse(shared));
-        Ok(candidates)
+        Ok(BucketScan { cursors })
     }
 
     /// Fetch pages through the cache; the pages missing from the cache are
-    /// read with scattered reads of at most [`IO_BATCH_BYTES`] each, so a
-    /// bucket spanning many pages never materializes at once.
+    /// read with scattered reads of at most [`IO_BATCH_BYTES`] each.
     async fn load_pages(
         &self,
         pages: &[u32],
@@ -476,16 +481,174 @@ impl MinHashLshIndex {
         })
     }
 
-    /// Score candidates against the query signature and keep the best
-    /// `limit` rows selected by `mask`. Candidates in resident signature
-    /// chunks are scored from memory; the rest are read with scattered reads
-    /// in the order of [`Self::collect_candidates`], stopping once no
-    /// remaining candidate can beat the results held, or with a sequential
-    /// scan when they cover much of the segment. Which rows are returned
-    /// among equal distances is not specified.
+    /// The next window of doc ids of `cursor`: the rows of its next
+    /// `window_pages` pages, fetched through the page cache (the pages
+    /// missing from it are read together).
+    async fn load_window(
+        &self,
+        cursor: &BucketCursor,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<u32>> {
+        let row = cursor.next;
+        let first_page = row / self.page_rows;
+        let last_page = ((cursor.end - 1) / self.page_rows).min(first_page + self.window_pages - 1);
+        let pages: Vec<u32> = (first_page..=last_page).map(|page| page as u32).collect();
+        let loaded = self.load_pages(&pages, metrics).await?;
+        let to = cursor.end.min((last_page + 1) * self.page_rows);
+        let mut window = Vec::with_capacity(to - row);
+        for page in pages {
+            let band_page = loaded.get(&page).ok_or_else(|| {
+                Error::internal(format!("band page {page} was requested but not loaded"))
+            })?;
+            let page_start = page as usize * self.page_rows;
+            let from = row.max(page_start) - page_start;
+            let until = to.min(page_start + band_page.doc_ids.len()) - page_start;
+            window.extend_from_slice(&band_page.doc_ids[from..until]);
+        }
+        Ok(window)
+    }
+
+    /// The next doc id in any bucket of `scan`, in ascending order, with the
+    /// number of buckets (bands) it appears in; `None` once every bucket is
+    /// exhausted. The buckets are sorted by doc id, so this is a merge of
+    /// their cursors, each refilled with a bounded window as it runs out.
+    async fn next_candidate(
+        &self,
+        scan: &mut BucketScan,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<(u32, u32)>> {
+        let needs_window =
+            |cursor: &BucketCursor| cursor.window.as_slice().is_empty() && cursor.next < cursor.end;
+        if scan.cursors.iter().any(needs_window) {
+            let refills: Vec<usize> = scan
+                .cursors
+                .iter()
+                .enumerate()
+                .filter(|(_, cursor)| needs_window(cursor))
+                .map(|(index, _)| index)
+                .collect();
+            let windows = try_join_all(
+                refills
+                    .iter()
+                    .map(|&index| self.load_window(&scan.cursors[index], metrics)),
+            )
+            .await?;
+            for (&index, window) in refills.iter().zip(windows) {
+                scan.cursors[index].window = window.into_iter();
+            }
+        }
+        let mut min_doc = u32::MAX;
+        let mut shared = 0u32;
+        for cursor in &scan.cursors {
+            if let Some(&doc_id) = cursor.window.as_slice().first() {
+                if doc_id < min_doc {
+                    min_doc = doc_id;
+                    shared = 1;
+                } else if doc_id == min_doc {
+                    shared += 1;
+                }
+            }
+        }
+        if shared == 0 {
+            return Ok(None);
+        }
+        if min_doc as usize >= self.num_docs {
+            return Err(Error::corrupt_file_named(
+                BANDS_FILENAME,
+                format!(
+                    "posting references doc id {min_doc} but the segment has {} documents",
+                    self.num_docs
+                ),
+            ));
+        }
+        for cursor in &mut scan.cursors {
+            if cursor.window.as_slice().first() == Some(&min_doc) {
+                cursor.window.next();
+                cursor.next += 1;
+            }
+        }
+        Ok(Some((min_doc, shared)))
+    }
+
+    /// Walk the buckets from the cursors' positions, sorting every doc id met
+    /// into the level of its shared band count. Each level keeps its first
+    /// `cap` doc ids and remembers where the scan stood when it filled up, so
+    /// the level can be continued from there. Returns when level
+    /// `pause_level` fills up or when the buckets are exhausted.
+    async fn scan_levels(
+        &self,
+        scan: &mut BucketScan,
+        levels: &mut CandidateLevels,
+        pause_level: usize,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        while let Some((doc_id, shared)) = self.next_candidate(scan, metrics).await? {
+            let shared = shared as usize;
+            levels.counts[shared] += 1;
+            let list = &mut levels.lists[shared];
+            if list.len() < levels.cap {
+                list.push(doc_id);
+                if list.len() == levels.cap {
+                    levels.resume[shared] = Some(scan.positions());
+                    if shared == pause_level {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        levels.complete = true;
+        Ok(())
+    }
+
+    /// The next doc id of level `shared` from the cursors' positions.
+    async fn next_in_level(
+        &self,
+        scan: &mut BucketScan,
+        shared: usize,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<u32>> {
+        while let Some((doc_id, count)) = self.next_candidate(scan, metrics).await? {
+            if count as usize == shared {
+                return Ok(Some(doc_id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Up to `cap` further doc ids of level `shared`, and whether the buckets
+    /// are exhausted.
+    async fn next_level_chunk(
+        &self,
+        scan: &mut BucketScan,
+        shared: usize,
+        cap: usize,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<(Vec<u32>, bool)> {
+        let mut doc_ids = Vec::new();
+        while doc_ids.len() < cap {
+            match self.next_in_level(scan, shared, metrics).await? {
+                Some(doc_id) => doc_ids.push(doc_id),
+                None => return Ok((doc_ids, true)),
+            }
+        }
+        Ok((doc_ids, false))
+    }
+
+    /// Score the candidates of the buckets against the query signature and
+    /// keep the best `limit` rows selected by `mask`.
+    ///
+    /// A candidate sharing `m` of the `b` bands differs from the query in at
+    /// least one value of every other band, so its distance is at least
+    /// `(b - m) / k`. Candidates are therefore scored by decreasing shared
+    /// bands, and the search stops as soon as the results held are at least
+    /// that close. Nothing is materialized beyond one batch per level: the
+    /// top level is scored one batch at a time as the buckets are walked,
+    /// and a lower level that overflowed its batch is walked again from
+    /// where it overflowed. Which rows are returned among equal distances
+    /// is not specified.
     async fn refine(
         &self,
-        mut candidates: Vec<(u32, u32)>,
+        scan: &mut BucketScan,
         query: &[SignatureValue],
         limit: usize,
         mask: &RowAddrMask,
@@ -493,37 +656,132 @@ impl MinHashLshIndex {
     ) -> Result<Vec<MinHashHit>> {
         let num_hashes = query.len();
         let num_bands = self.params.num_bands as usize;
-        let mut hits = TopHits::new(limit);
-        let score = |hits: &mut TopHits, row_id: u64, signature: &[SignatureValue]| {
-            let row_id = match &self.frag_reuse_index {
-                Some(remapper) => match remapper.remap_row_id(row_id) {
-                    Some(row_id) => row_id,
-                    None => return,
-                },
-                None => row_id,
-            };
-            if !mask.selected(row_id) {
-                return;
-            }
-            hits.push(MinHashHit {
-                row_id,
-                distance: 1.0 - estimate_jaccard(query, signature),
-            });
+        let cap = self.candidate_batch;
+        let mut scorer = Scorer {
+            hits: TopHits::new(limit),
+            query,
+            mask,
+            remapper: self.frag_reuse_index.as_deref(),
         };
-        metrics.record_comparisons(candidates.len());
+        let mut levels = CandidateLevels::new(num_bands, cap);
 
-        let chunk_docs = self.signature_chunk_docs;
-        let mut unresolved: RoaringBitmap = candidates.iter().map(|&(doc_id, _)| doc_id).collect();
-        let (Some(first), Some(last)) = (unresolved.min(), unresolved.max()) else {
-            return Ok(Vec::new());
-        };
-        for chunk in (first as usize / chunk_docs)..=(last as usize / chunk_docs) {
-            let first_doc = chunk * chunk_docs;
-            let chunk_range =
-                first_doc as u32..=((first_doc + chunk_docs - 1).min(u32::MAX as usize)) as u32;
-            if unresolved.range_cardinality(chunk_range.clone()) == 0 {
+        // Top level: candidates sharing every band, at distance zero unless a
+        // band hash collided. The walk pauses whenever a batch of them is
+        // held; the first read takes just enough to fill the results, since
+        // that alone can end the search.
+        self.scan_levels(scan, &mut levels, num_bands, metrics)
+            .await?;
+        let mut first_batch = Some(scorer.hits.missing().max(MIN_REFINE_READ_ROWS));
+        loop {
+            let doc_ids = std::mem::take(&mut levels.lists[num_bands]);
+            if !doc_ids.is_empty() {
+                self.score_docs(&doc_ids, first_batch.take(), 0.0, &mut scorer, metrics)
+                    .await?;
+            }
+            if scorer.done(0.0) {
+                return Ok(scorer.hits.into_sorted());
+            }
+            if levels.complete {
+                break;
+            }
+            self.scan_levels(scan, &mut levels, num_bands, metrics)
+                .await?;
+        }
+
+        // Lower levels, complete counts known: the first batch of each is
+        // held; the rest is walked again from where the level overflowed,
+        // sequentially against the signature table when it covers much of
+        // the segment.
+        for shared in (1..num_bands).rev() {
+            let floor = (num_bands - shared) as f32 / num_hashes as f32;
+            if scorer.done(floor) {
+                break;
+            }
+            let doc_ids = std::mem::take(&mut levels.lists[shared]);
+            if doc_ids.is_empty() {
                 continue;
             }
+            self.score_docs(&doc_ids, None, floor, &mut scorer, metrics)
+                .await?;
+            let Some(positions) = levels.resume[shared].take() else {
+                continue;
+            };
+            if scorer.done(floor) {
+                break;
+            }
+            scan.seek(&positions);
+            let remaining = levels.counts[shared] - cap as u64;
+            if remaining.saturating_mul(100)
+                > (self.num_docs as u64).saturating_mul(SPARSE_REFINE_READ_PERCENT)
+            {
+                self.score_level_dense(scan, shared, floor, &mut scorer, metrics)
+                    .await?;
+                continue;
+            }
+            loop {
+                let (doc_ids, exhausted) =
+                    self.next_level_chunk(scan, shared, cap, metrics).await?;
+                if doc_ids.is_empty() {
+                    break;
+                }
+                self.score_docs(&doc_ids, None, floor, &mut scorer, metrics)
+                    .await?;
+                if exhausted || scorer.done(floor) {
+                    break;
+                }
+            }
+        }
+        Ok(scorer.hits.into_sorted())
+    }
+
+    /// Score `doc_ids` (ascending) in batches: `first_batch` rows first (all
+    /// of them when `None`), then doubling up to one IO batch, so that a
+    /// search that stops early reads little more than it needs. Stops
+    /// between batches once no candidate at distance `floor` or more can
+    /// improve the results.
+    async fn score_docs(
+        &self,
+        doc_ids: &[u32],
+        first_batch: Option<usize>,
+        floor: f32,
+        scorer: &mut Scorer<'_>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        let rows_per_read = rows_per_batch(signature_row_bytes(self.params.num_hashes as usize));
+        let mut batch_rows = first_batch.unwrap_or(doc_ids.len()).clamp(1, rows_per_read);
+        let mut next = 0;
+        while next < doc_ids.len() {
+            if next > 0 && scorer.done(floor) {
+                return Ok(());
+            }
+            let end = doc_ids.len().min(next + batch_rows);
+            self.score_batch(&doc_ids[next..end], scorer, metrics)
+                .await?;
+            next = end;
+            batch_rows = (batch_rows * 2).min(rows_per_read);
+        }
+        Ok(())
+    }
+
+    /// Score one batch of ascending `doc_ids`: those in resident signature
+    /// chunks from memory, the rest with one scattered read.
+    async fn score_batch(
+        &self,
+        doc_ids: &[u32],
+        scorer: &mut Scorer<'_>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        let num_hashes = self.params.num_hashes as usize;
+        let chunk_docs = self.signature_chunk_docs;
+        metrics.record_comparisons(doc_ids.len());
+        let mut pending: Vec<u32> = Vec::new();
+        let mut start = 0;
+        while start < doc_ids.len() {
+            let chunk = doc_ids[start] as usize / chunk_docs;
+            let end = start
+                + doc_ids[start..].partition_point(|&doc_id| doc_id as usize / chunk_docs == chunk);
+            let group = &doc_ids[start..end];
+            start = end;
             // A chunk that is not resident is read, not loaded, so only a
             // hit is a cache event.
             let Some(resident) = self
@@ -533,10 +791,12 @@ impl MinHashLshIndex {
                 })
                 .await
             else {
+                pending.extend_from_slice(group);
                 continue;
             };
             metrics.record_index_cache_hit();
-            for doc_id in unresolved.range(chunk_range.clone()) {
+            let first_doc = chunk * chunk_docs;
+            for &doc_id in group {
                 let offset = doc_id as usize - first_doc;
                 let Some(row_id) = resident.row_ids.get(offset) else {
                     return Err(Error::corrupt_file_named(
@@ -544,33 +804,15 @@ impl MinHashLshIndex {
                         format!("resident signature chunk {chunk} has no doc {doc_id}"),
                     ));
                 };
-                score(
-                    &mut hits,
+                scorer.score(
                     *row_id,
                     &resident.signatures[offset * num_hashes..(offset + 1) * num_hashes],
                 );
             }
-            unresolved.remove_range(chunk_range);
         }
-        if unresolved.is_empty() {
-            return Ok(hits.into_sorted());
+        if pending.is_empty() {
+            return Ok(());
         }
-
-        let score_batch =
-            |hits: &mut TopHits, batch: &RecordBatch, keep: &mut dyn FnMut(usize) -> bool| {
-                let (row_ids, signatures) = signature_columns(batch, num_hashes)?;
-                for (index, (row_id, signature)) in row_ids
-                    .values()
-                    .iter()
-                    .zip(signatures.chunks_exact(num_hashes))
-                    .enumerate()
-                {
-                    if keep(index) {
-                        score(hits, *row_id, signature);
-                    }
-                }
-                Ok::<_, Error>(())
-            };
         metrics.record_part_load();
         tracing::info!(
             target: TRACE_IO_EVENTS,
@@ -578,87 +820,177 @@ impl MinHashLshIndex {
             index_type = "minhashlsh",
             part_id = "signatures",
         );
-        let rows_per_read = rows_per_batch(signature_row_bytes(num_hashes));
-        if unresolved.len().saturating_mul(100)
-            <= (self.num_docs as u64).saturating_mul(SPARSE_REFINE_READ_PERCENT)
-        {
-            // A candidate sharing `shared` bands differs from the query in at
-            // least one value of every other band, so its distance is at
-            // least `(num_bands - shared) / num_hashes`; candidates come in
-            // decreasing `shared`, so once the results held are at least
-            // that close, no remaining candidate can beat them.
-            //
-            // That cannot happen before the results are full, and unless the
-            // candidates filling them share every band (their distance is
-            // then zero), not before the end of the group of the last of
-            // them. What must be read anyway is read in doc id order, which
-            // takes the fewest requests; the rest follows by priority in
-            // batches that grow, so that a search that stops early reads
-            // little more than it needs.
-            candidates.retain(|&(doc_id, _)| unresolved.contains(doc_id));
-            let mut must_read = hits.missing().min(candidates.len());
-            if let Some(&(_, shared)) = must_read
-                .checked_sub(1)
-                .and_then(|last| candidates.get(last))
-                && (shared as usize) < num_bands
-            {
-                must_read = candidates.partition_point(|&(_, other)| other >= shared);
-            }
-            candidates[..must_read].sort_unstable();
-            let mut next = 0;
-            let mut batch_rows = must_read.max(MIN_REFINE_READ_ROWS).min(rows_per_read);
-            while let Some(&(_, shared)) = candidates.get(next) {
-                let batch_end = if next < must_read {
-                    must_read.min(next + rows_per_read)
-                } else {
-                    let differing = num_bands.saturating_sub(shared as usize);
-                    let closest_remaining =
-                        1.0 - (num_hashes - differing) as f32 / num_hashes as f32;
-                    if hits
-                        .cutoff()
-                        .is_some_and(|cutoff| cutoff <= closest_remaining)
-                    {
-                        break;
-                    }
-                    let batch_end = candidates.len().min(next + batch_rows);
-                    batch_rows = (batch_rows * 2).min(rows_per_read);
-                    batch_end
-                };
-                let mut doc_ids: Vec<u32> = candidates[next..batch_end]
-                    .iter()
-                    .map(|&(doc_id, _)| doc_id)
-                    .collect();
-                doc_ids.sort_unstable();
-                let ranges = doc_id_ranges(doc_ids.into_iter());
-                next = batch_end;
-                let expected_rows: usize = ranges.iter().map(|range| range.len()).sum();
-                let batch = self.signatures.read_ranges(&ranges, None).await?;
-                if batch.num_rows() != expected_rows {
-                    return Err(Error::corrupt_file_named(
-                        SIGNATURES_FILENAME,
-                        format!(
-                            "scattered read returned {} rows for {expected_rows} candidates",
-                            batch.num_rows()
-                        ),
-                    ));
-                }
-                score_batch(&mut hits, &batch, &mut |_| true)?;
-            }
-        } else {
-            let mut stream = std::pin::pin!(scan_rows(
-                self.signatures.clone(),
-                self.num_docs,
-                rows_per_read
+        let ranges = doc_id_ranges(pending.iter().copied());
+        let batch = self.signatures.read_ranges(&ranges, None).await?;
+        if batch.num_rows() != pending.len() {
+            return Err(Error::corrupt_file_named(
+                SIGNATURES_FILENAME,
+                format!(
+                    "scattered read returned {} rows for {} candidates",
+                    batch.num_rows(),
+                    pending.len()
+                ),
             ));
-            let mut first_doc = 0usize;
-            while let Some(batch) = stream.try_next().await? {
-                score_batch(&mut hits, &batch, &mut |index| {
-                    u32::try_from(first_doc + index).is_ok_and(|doc_id| unresolved.contains(doc_id))
-                })?;
-                first_doc += batch.num_rows();
-            }
         }
-        Ok(hits.into_sorted())
+        let (row_ids, signatures) = signature_columns(&batch, num_hashes)?;
+        for (row_id, signature) in row_ids
+            .values()
+            .iter()
+            .zip(signatures.chunks_exact(num_hashes))
+        {
+            scorer.score(*row_id, signature);
+        }
+        Ok(())
+    }
+
+    /// Score the rest of level `shared` by walking the buckets and the
+    /// signature table together in doc id order, both sequentially: cheaper
+    /// than scattered reads once the level covers much of the segment.
+    async fn score_level_dense(
+        &self,
+        scan: &mut BucketScan,
+        shared: usize,
+        floor: f32,
+        scorer: &mut Scorer<'_>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        let num_hashes = self.params.num_hashes as usize;
+        let Some(mut pending) = self.next_in_level(scan, shared, metrics).await? else {
+            return Ok(());
+        };
+        metrics.record_part_load();
+        tracing::info!(
+            target: TRACE_IO_EVENTS,
+            r#type = IO_TYPE_LOAD_SCALAR_PART,
+            index_type = "minhashlsh",
+            part_id = "signatures",
+        );
+        let mut first_row = pending as usize;
+        let mut stream = std::pin::pin!(scan_rows(
+            self.signatures.clone(),
+            first_row,
+            self.num_docs,
+            rows_per_batch(signature_row_bytes(num_hashes)),
+        ));
+        while let Some(batch) = stream.try_next().await? {
+            let end_row = first_row + batch.num_rows();
+            let (row_ids, signatures) = signature_columns(&batch, num_hashes)?;
+            let mut scored = 0;
+            while (pending as usize) < end_row {
+                let offset = pending as usize - first_row;
+                scorer.score(
+                    row_ids.value(offset),
+                    &signatures[offset * num_hashes..(offset + 1) * num_hashes],
+                );
+                scored += 1;
+                match self.next_in_level(scan, shared, metrics).await? {
+                    Some(doc_id) => pending = doc_id,
+                    None => {
+                        metrics.record_comparisons(scored);
+                        return Ok(());
+                    }
+                }
+            }
+            metrics.record_comparisons(scored);
+            if scorer.done(floor) {
+                return Ok(());
+            }
+            first_row = end_row;
+        }
+        Ok(())
+    }
+}
+
+/// One bucket of a search: the rows of one band key, walked in doc id order
+/// through a bounded window.
+struct BucketCursor {
+    /// Absolute row of the head: the next doc id to yield.
+    next: usize,
+    /// Row after the bucket's last row.
+    end: usize,
+    /// Doc ids of the rows from `next`, one window of pages; refilled once
+    /// drained.
+    window: std::vec::IntoIter<u32>,
+}
+
+/// The cursors of a search's buckets, merged in doc id order by
+/// [`MinHashLshIndex::next_candidate`].
+struct BucketScan {
+    cursors: Vec<BucketCursor>,
+}
+
+impl BucketScan {
+    /// The absolute row each cursor stands at.
+    fn positions(&self) -> Vec<usize> {
+        self.cursors.iter().map(|cursor| cursor.next).collect()
+    }
+
+    /// Move every cursor to `positions`, dropping the windows held.
+    fn seek(&mut self, positions: &[usize]) {
+        for (cursor, &row) in self.cursors.iter_mut().zip(positions) {
+            cursor.next = row;
+            cursor.window = Vec::new().into_iter();
+        }
+    }
+}
+
+/// Candidates sorted by the number of bands they share with the query, each
+/// level holding at most `cap` doc ids in ascending order.
+struct CandidateLevels {
+    cap: usize,
+    /// Indexed by shared band count; index 0 is unused.
+    lists: Vec<Vec<u32>>,
+    /// Candidates met per level, including those beyond `cap`.
+    counts: Vec<u64>,
+    /// Cursor positions right after a level reached `cap`, where a walk
+    /// continuing that level starts.
+    resume: Vec<Option<Vec<usize>>>,
+    /// Whether the buckets were walked to the end, making `counts` exact.
+    complete: bool,
+}
+
+impl CandidateLevels {
+    fn new(num_bands: usize, cap: usize) -> Self {
+        Self {
+            cap,
+            lists: vec![Vec::new(); num_bands + 1],
+            counts: vec![0; num_bands + 1],
+            resume: vec![None; num_bands + 1],
+            complete: false,
+        }
+    }
+}
+
+/// Scores candidate rows against the query signature into a bounded result.
+struct Scorer<'a> {
+    hits: TopHits,
+    query: &'a [SignatureValue],
+    mask: &'a RowAddrMask,
+    remapper: Option<&'a dyn RowIdRemapper>,
+}
+
+impl Scorer<'_> {
+    fn score(&mut self, row_id: u64, signature: &[SignatureValue]) {
+        let row_id = match self.remapper {
+            Some(remapper) => match remapper.remap_row_id(row_id) {
+                Some(row_id) => row_id,
+                None => return,
+            },
+            None => row_id,
+        };
+        if !self.mask.selected(row_id) {
+            return;
+        }
+        self.hits.push(MinHashHit {
+            row_id,
+            distance: 1.0 - estimate_jaccard(self.query, signature),
+        });
+    }
+
+    /// Whether no candidate at distance `floor` or more can improve the
+    /// results held.
+    fn done(&self, floor: f32) -> bool {
+        self.hits.cutoff().is_some_and(|cutoff| cutoff <= floor)
     }
 }
 
@@ -704,14 +1036,15 @@ pub(super) fn signature_columns(
     Ok((row_ids, values.values()))
 }
 
-/// Stream rows `0..num_rows` of `reader` as `rows_per_read` batches with a
-/// few reads in flight.
+/// Stream rows `first_row..num_rows` of `reader` as `rows_per_read` batches
+/// with a few reads in flight.
 pub(super) fn scan_rows(
     reader: Arc<dyn IndexReader>,
+    first_row: usize,
     num_rows: usize,
     rows_per_read: usize,
 ) -> impl Stream<Item = Result<RecordBatch>> + Send {
-    let ranges: Vec<Range<usize>> = (0..num_rows)
+    let ranges: Vec<Range<usize>> = (first_row..num_rows)
         .step_by(rows_per_read.max(1))
         .map(|start| start..(start + rows_per_read).min(num_rows))
         .collect();

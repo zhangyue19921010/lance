@@ -30,12 +30,16 @@
 //! ```
 //!
 //! A bucket is the run of rows sharing a band key; it may span pages. Lookups
-//! binary-search a resident page table (max band key per page), fetch the
-//! bucket's pages through the cache, binary-search each page for the band
-//! key, count the bands every doc id of the buckets shares with the query,
-//! and refine the candidates by decreasing shared bands, reading their
-//! signatures with scattered reads until no remaining candidate can beat the
-//! results held (or with a sequential scan when the candidate set is dense).
+//! binary-search a resident page table (max band key per page) for the pages
+//! of each bucket, fetch its two boundary pages through the cache and
+//! binary-search them for the bucket's exact rows, then walk the buckets
+//! together in doc id order, one window of pages per bucket at a time, to
+//! count the bands each doc id shares with the query. Candidates are refined
+//! by decreasing shared bands, one batch at a time, reading their signatures
+//! with scattered reads (or sequentially when a batch's level covers much of
+//! the segment) until no remaining candidate can beat the results held. A
+//! search never holds more than one window per bucket and one batch of
+//! candidates per level, whatever the size of the buckets.
 
 mod builder;
 mod index;
@@ -161,6 +165,9 @@ const SPARSE_REFINE_READ_PERCENT: u64 = 10;
 /// must read. A read this small costs one round trip whatever its size, so
 /// smaller batches would only add round trips.
 const MIN_REFINE_READ_ROWS: usize = 64;
+/// Fewest records of one read of a spill file by a streaming merge; smaller
+/// reads would only add round trips.
+const MIN_SPILL_CHUNK_RECORDS: usize = 4096;
 
 /// Default memory budget of the sort: the run being filled, the runs being
 /// spilled and the merge groups together.
