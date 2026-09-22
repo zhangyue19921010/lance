@@ -597,10 +597,12 @@ impl SpillCursor {
 /// Merge the records of `partitions` from every run in key order while
 /// holding one chunk per run, for a group larger than the memory budget: a
 /// duplicate cluster puts every one of its documents into the same partition
-/// of each band, and a partition cannot be split. Each chunk holds
-/// `budget_records / (2 * runs)` records. Runs of equal keys are copied as
-/// whole blocks, so a large bucket costs one heap step per chunk rather than
-/// per record. Batches are sent in order to `output`.
+/// of each band, and a partition cannot be split. The chunks together hold
+/// half the budget however many runs there are (a small budget over many
+/// runs just reads in small pieces); output batches take the other half.
+/// Runs of equal keys are copied as whole blocks, so a large bucket costs
+/// one heap step per chunk rather than per record. Batches are sent in
+/// order to `output`.
 async fn stream_merge_group(
     runs: &[SpilledRun],
     partitions: Range<usize>,
@@ -619,7 +621,7 @@ async fn stream_merge_group(
             })
         })
         .collect();
-    let chunk_records = (budget_records / (2 * cursors.len().max(1))).max(MIN_SPILL_CHUNK_RECORDS);
+    let chunk_records = (budget_records / (2 * cursors.len().max(1))).max(1);
     for cursor in &mut cursors {
         cursor.refill(chunk_records).await?;
     }
@@ -633,7 +635,9 @@ async fn stream_merge_group(
                 .map(|&(key, doc_id)| Reverse((key, doc_id, index)))
         })
         .collect();
-    let batch_records = rows_per_batch(BAND_ROW_BYTES);
+    let batch_records = rows_per_batch(BAND_ROW_BYTES)
+        .min(budget_records / 2)
+        .max(1);
     let mut keys: Vec<u64> = Vec::with_capacity(batch_records);
     let mut doc_ids: Vec<u32> = Vec::with_capacity(batch_records);
     while let Some(Reverse((key, _, index))) = heap.pop() {

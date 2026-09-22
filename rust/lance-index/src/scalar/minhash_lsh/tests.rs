@@ -832,8 +832,8 @@ async fn test_merge_segments() {
 }
 
 /// Load the index in `store` holding `candidate_batch` candidates per level
-/// and walking buckets `window_pages` pages at a time, so that a small
-/// corpus exercises the paused, continued and dense walks of the buckets.
+/// and `window_pages` pages of the walked buckets, so that a small corpus
+/// exercises the paused, continued and dense walks of the buckets.
 async fn load_bounded(
     store: &Arc<LanceIndexStore>,
     details: &prost_types::Any,
@@ -851,8 +851,9 @@ async fn load_bounded(
 #[tokio::test]
 async fn test_large_cluster_is_walked_in_bounded_windows() {
     // 300 identical texts, four rows per page: every bucket spans 75 pages.
-    // Holding 32 candidates per level and walking eight pages per window,
-    // a search stops after the first windows instead of walking every page,
+    // Holding 32 candidates per level and 128 pages over the 16 buckets
+    // (eight per window), a search stops after the first windows instead
+    // of walking every page,
     // a second search finds those pages cached, and any limit or mask gives
     // the same result as holding every candidate at once.
     let (bases, _) = near_duplicate_corpus(6, 40);
@@ -866,7 +867,7 @@ async fn test_large_cluster_is_walked_in_bounded_windows() {
         .await
         .unwrap();
     let cache = LanceCache::with_capacity(64 << 20);
-    let bounded = load_bounded(&store, &details, &cache, 32, 8).await;
+    let bounded = load_bounded(&store, &details, &cache, 32, 128).await;
     let unbounded = load(&store, &details, &LanceCache::no_cache()).await;
 
     let parts = |metrics: &LocalMetricsCollector| metrics.parts_loaded.load(Relaxed);
@@ -933,7 +934,7 @@ async fn test_overflowing_lower_level_is_continued(#[case] num_fillers: usize) {
         .train(text_stream(&rows_from(&texts), 64), store.as_ref())
         .await
         .unwrap();
-    let bounded = load_bounded(&store, &details, &LanceCache::no_cache(), 32, 8).await;
+    let bounded = load_bounded(&store, &details, &LanceCache::no_cache(), 32, 128).await;
     let unbounded = load(&store, &details, &LanceCache::no_cache()).await;
 
     let hits = ids(&search(&bounded, &near, 250).await);
@@ -951,9 +952,9 @@ async fn test_overflowing_lower_level_is_continued(#[case] num_fillers: usize) {
 #[tokio::test]
 async fn test_oversized_merge_groups_stream_and_match_gather() {
     // 3000 identical texts put 3000 records into one partition of every
-    // band; with 200 records per merge group those partitions exceed the
-    // budget and are merged by streaming, which must write the same bands
-    // file as an in-memory sort.
+    // band; with 2000 records per merge group those partitions exceed the
+    // budget and are merged by streaming in chunks of a few records, which
+    // must write the same bands file as an in-memory sort.
     let (bases, _) = near_duplicate_corpus(30, 40);
     let mut texts = vec![bases[0].as_str(); 3000];
     texts.extend(bases[1..].iter().map(String::as_str));
@@ -979,7 +980,7 @@ async fn test_oversized_merge_groups_stream_and_match_gather() {
     let streamed = default_builder()
         .with_sort_run_records(1000)
         .unwrap()
-        .with_merge_group_records(200)
+        .with_merge_group_records(2000)
         .unwrap();
     assert_eq!(bands(streamed, &rows).await, sorted_in_memory);
 }

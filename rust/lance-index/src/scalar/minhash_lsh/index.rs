@@ -112,7 +112,8 @@ pub struct MinHashLshIndex {
     /// Candidates held per level of a search and rows per signature read:
     /// one IO batch of signature rows.
     pub(super) candidate_batch: usize,
-    /// Pages of a bucket walked per read: one IO batch of band rows.
+    /// Pages a walk holds at once: one IO batch of band rows, shared by the
+    /// buckets not yet walked to their end.
     pub(super) window_pages: usize,
     cache: WeakLanceCache,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
@@ -481,17 +482,18 @@ impl MinHashLshIndex {
         })
     }
 
-    /// The next window of doc ids of `cursor`: the rows of its next
-    /// `window_pages` pages, fetched through the page cache (the pages
-    /// missing from it are read together).
+    /// The next window of doc ids of `cursor`: the rows of its next `pages`
+    /// pages, fetched through the page cache (the pages missing from it are
+    /// read together).
     async fn load_window(
         &self,
         cursor: &BucketCursor,
+        pages: usize,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<u32>> {
         let row = cursor.next;
         let first_page = row / self.page_rows;
-        let last_page = ((cursor.end - 1) / self.page_rows).min(first_page + self.window_pages - 1);
+        let last_page = ((cursor.end - 1) / self.page_rows).min(first_page + pages - 1);
         let pages: Vec<u32> = (first_page..=last_page).map(|page| page as u32).collect();
         let loaded = self.load_pages(&pages, metrics).await?;
         let to = cursor.end.min((last_page + 1) * self.page_rows);
@@ -527,10 +529,18 @@ impl MinHashLshIndex {
                 .filter(|(_, cursor)| needs_window(cursor))
                 .map(|(index, _)| index)
                 .collect();
+            // The page budget is shared by the buckets still being walked, so
+            // a walk that outlives the others reads in full batches
+            let live = scan
+                .cursors
+                .iter()
+                .filter(|cursor| cursor.next < cursor.end)
+                .count();
+            let pages = (self.window_pages / live.max(1)).max(1);
             let windows = try_join_all(
                 refills
                     .iter()
-                    .map(|&index| self.load_window(&scan.cursors[index], metrics)),
+                    .map(|&index| self.load_window(&scan.cursors[index], pages, metrics)),
             )
             .await?;
             for (&index, window) in refills.iter().zip(windows) {
