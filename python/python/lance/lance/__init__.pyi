@@ -149,6 +149,7 @@ class CleanupStats:
     transaction_files_removed: int
     index_files_removed: int
     deletion_files_removed: int
+    failed_deletes: int
 
 class CleanupCandidateFile:
     path: str

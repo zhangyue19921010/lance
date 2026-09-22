@@ -3758,7 +3758,7 @@ fn cleanup_stats_to_java<'local>(
 ) -> Result<JObject<'local>> {
     Ok(env.new_object(
         "org/lance/cleanup/RemovalStats",
-        "(JJJJJJ)V",
+        "(JJJJJJJ)V",
         &[
             JValue::Long(stats.bytes_removed as i64),
             JValue::Long(stats.old_versions as i64),
@@ -3766,6 +3766,7 @@ fn cleanup_stats_to_java<'local>(
             JValue::Long(stats.transaction_files_removed as i64),
             JValue::Long(stats.index_files_removed as i64),
             JValue::Long(stats.deletion_files_removed as i64),
+            JValue::Long(stats.failed_deletes as i64),
         ],
     )?)
 }
