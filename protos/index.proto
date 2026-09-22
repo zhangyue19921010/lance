@@ -259,6 +259,12 @@ message FMIndexDetails {}
 
 /* Details of a MinHash LSH index (near-duplicate search over text).
  *
+ * EXPERIMENTAL: this index is an experimental format feature. This message
+ * and the index files may change incompatibly without a separate vote, in
+ * which case the index must be rebuilt (the data is never rewritten), and
+ * the feature is removed if its stabilization vote does not pass. Datasets
+ * that do not use the index are not affected either way.
+ *
  * The message identifies every input of signature generation: the
  * parameters, the tokenizer and the version of the procedure. All segments
  * of one logical index carry identical details, so their signatures and the
