@@ -953,8 +953,9 @@ async fn test_overflowing_lower_level_is_continued(#[case] num_fillers: usize) {
 async fn test_oversized_merge_groups_stream_and_match_gather() {
     // 3000 identical texts put 3000 records into one partition of every
     // band; with 2000 records per merge group those partitions exceed the
-    // budget and are merged by streaming in chunks of a few records, which
-    // must write the same bands file as an in-memory sort.
+    // budget and are merged by streaming in chunks of a few records, and the
+    // maps of the 49 runs share 256 KB, so they are coarsened to 512
+    // partitions. Either way the bands file must be the in-memory sort's.
     let (bases, _) = near_duplicate_corpus(30, 40);
     let mut texts = vec![bases[0].as_str(); 3000];
     texts.extend(bases[1..].iter().map(String::as_str));

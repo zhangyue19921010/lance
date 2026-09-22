@@ -7,6 +7,8 @@
 
 use super::*;
 
+use std::collections::VecDeque;
+
 use futures::future::try_join_all;
 
 /// One logical page of `bands.lance`, cached per page.
@@ -112,7 +114,7 @@ pub struct MinHashLshIndex {
     /// Candidates held per level of a search and rows per signature read:
     /// one IO batch of signature rows.
     pub(super) candidate_batch: usize,
-    /// Pages a walk holds at once: one IO batch of band rows, shared by the
+    /// Pages a walk reads per round: one IO batch of band rows, shared by the
     /// buckets not yet walked to their end.
     pub(super) window_pages: usize,
     cache: WeakLanceCache,
@@ -482,16 +484,16 @@ impl MinHashLshIndex {
         })
     }
 
-    /// The next window of doc ids of `cursor`: the rows of its next `pages`
-    /// pages, fetched through the page cache (the pages missing from it are
-    /// read together).
+    /// The doc ids of the `pages` pages of `cursor`'s bucket that follow the
+    /// rows it holds, fetched through the page cache (the pages missing from
+    /// it are read together).
     async fn load_window(
         &self,
         cursor: &BucketCursor,
         pages: usize,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<u32>> {
-        let row = cursor.next;
+        let row = cursor.next + cursor.window.as_slice().len();
         let first_page = row / self.page_rows;
         let last_page = ((cursor.end - 1) / self.page_rows).min(first_page + pages - 1);
         let pages: Vec<u32> = (first_page..=last_page).map(|page| page as u32).collect();
@@ -519,24 +521,29 @@ impl MinHashLshIndex {
         scan: &mut BucketScan,
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<(u32, u32)>> {
-        let needs_window =
-            |cursor: &BucketCursor| cursor.window.as_slice().is_empty() && cursor.next < cursor.end;
-        if scan.cursors.iter().any(needs_window) {
+        let live = |cursor: &BucketCursor| cursor.next < cursor.end;
+        let drained = |cursor: &BucketCursor| live(cursor) && cursor.window.as_slice().is_empty();
+        if scan.cursors.iter().any(drained) {
+            // The page budget is shared by the buckets still being walked, so
+            // a walk that outlives the others reads in full batches.
+            let live_cursors = scan.cursors.iter().filter(|cursor| live(cursor)).count();
+            let pages = (self.window_pages / live_cursors.max(1)).max(1);
+            let window_rows = pages * self.page_rows;
+            // One round tops up every bucket that is running low, not only the
+            // drained one, so buckets advancing together cost one concurrent
+            // read per round rather than one read each. A bucket the merge has
+            // not reached yet keeps its window and stops reading, so no bucket
+            // holds more than two windows.
             let refills: Vec<usize> = scan
                 .cursors
                 .iter()
                 .enumerate()
-                .filter(|(_, cursor)| needs_window(cursor))
+                .filter(|(_, cursor)| {
+                    let held = cursor.window.as_slice().len();
+                    held < window_rows && cursor.next + held < cursor.end
+                })
                 .map(|(index, _)| index)
                 .collect();
-            // The page budget is shared by the buckets still being walked, so
-            // a walk that outlives the others reads in full batches
-            let live = scan
-                .cursors
-                .iter()
-                .filter(|cursor| cursor.next < cursor.end)
-                .count();
-            let pages = (self.window_pages / live.max(1)).max(1);
             let windows = try_join_all(
                 refills
                     .iter()
@@ -544,7 +551,14 @@ impl MinHashLshIndex {
             )
             .await?;
             for (&index, window) in refills.iter().zip(windows) {
-                scan.cursors[index].window = window.into_iter();
+                let cursor = &mut scan.cursors[index];
+                if cursor.window.as_slice().is_empty() {
+                    cursor.window = window.into_iter();
+                } else {
+                    let mut held = cursor.window.as_slice().to_vec();
+                    held.extend(window);
+                    cursor.window = held.into_iter();
+                }
             }
         }
         let mut min_doc = u32::MAX;
@@ -649,13 +663,12 @@ impl MinHashLshIndex {
     ///
     /// A candidate sharing `m` of the `b` bands differs from the query in at
     /// least one value of every other band, so its distance is at least
-    /// `(b - m) / k`. Candidates are therefore scored by decreasing shared
-    /// bands, and the search stops as soon as the results held are at least
-    /// that close. Nothing is materialized beyond one batch per level: the
-    /// top level is scored one batch at a time as the buckets are walked,
-    /// and a lower level that overflowed its batch is walked again from
-    /// where it overflowed. Which rows are returned among equal distances
-    /// is not specified.
+    /// `(b - m) / k`. Candidates are therefore read by decreasing shared
+    /// bands through a [`ReadQueue`]: the top level as the walk finds it, then
+    /// every lower level, its first batch held by the walk and the rest walked
+    /// again from where it overflowed. Nothing is materialized beyond what the
+    /// results miss plus one batch per level. Which rows are returned among
+    /// equal distances is not specified.
     async fn refine(
         &self,
         scan: &mut BucketScan,
@@ -674,103 +687,125 @@ impl MinHashLshIndex {
             remapper: self.frag_reuse_index.as_deref(),
         };
         let mut levels = CandidateLevels::new(num_bands, cap);
+        let mut queue = ReadQueue::new(scorer.hits.missing(), cap);
 
         // Top level: candidates sharing every band, at distance zero unless a
         // band hash collided. The walk pauses whenever a batch of them is
-        // held; the first read takes just enough to fill the results, since
-        // that alone can end the search.
-        self.scan_levels(scan, &mut levels, num_bands, metrics)
-            .await?;
-        let mut first_batch = Some(scorer.hits.missing().max(MIN_REFINE_READ_ROWS));
+        // held, so a large cluster can end the search without being walked.
         loop {
-            let doc_ids = std::mem::take(&mut levels.lists[num_bands]);
-            if !doc_ids.is_empty() {
-                self.score_docs(&doc_ids, first_batch.take(), 0.0, &mut scorer, metrics)
-                    .await?;
-            }
-            if scorer.done(0.0) {
+            self.scan_levels(scan, &mut levels, num_bands, metrics)
+                .await?;
+            queue.push(0.0, std::mem::take(&mut levels.lists[num_bands]));
+            if !self
+                .read_queued(&mut queue, false, false, &mut scorer, metrics)
+                .await?
+            {
                 return Ok(scorer.hits.into_sorted());
             }
             if levels.complete {
                 break;
             }
-            self.scan_levels(scan, &mut levels, num_bands, metrics)
-                .await?;
         }
 
-        // Lower levels, complete counts known: the first batch of each is
-        // held; the rest is walked again from where the level overflowed,
-        // sequentially against the signature table when it covers much of
-        // the segment.
+        // Lower levels, complete counts known.
         for shared in (1..num_bands).rev() {
             let floor = (num_bands - shared) as f32 / num_hashes as f32;
-            if scorer.done(floor) {
-                break;
+            if scorer.done(queue.floor().unwrap_or(floor)) {
+                return Ok(scorer.hits.into_sorted());
             }
-            let doc_ids = std::mem::take(&mut levels.lists[shared]);
-            if doc_ids.is_empty() {
-                continue;
+            queue.push(floor, std::mem::take(&mut levels.lists[shared]));
+            if let Some(positions) = levels.resume[shared].take() {
+                scan.seek(&positions);
+                let remaining = levels.counts[shared] - cap as u64;
+                if remaining.saturating_mul(100)
+                    > (self.num_docs as u64).saturating_mul(SPARSE_REFINE_READ_PERCENT)
+                {
+                    if !self
+                        .read_queued(&mut queue, true, true, &mut scorer, metrics)
+                        .await?
+                    {
+                        return Ok(scorer.hits.into_sorted());
+                    }
+                    self.score_level_dense(scan, shared, floor, &mut scorer, metrics)
+                        .await?;
+                    // The scan read far more than the results missed
+                    queue.must = 0;
+                    continue;
+                }
+                loop {
+                    if !self
+                        .read_queued(&mut queue, false, false, &mut scorer, metrics)
+                        .await?
+                        || scorer.done(queue.floor().unwrap_or(floor))
+                    {
+                        return Ok(scorer.hits.into_sorted());
+                    }
+                    let (doc_ids, exhausted) =
+                        self.next_level_chunk(scan, shared, cap, metrics).await?;
+                    queue.push(floor, doc_ids);
+                    if exhausted {
+                        break;
+                    }
+                }
             }
-            self.score_docs(&doc_ids, None, floor, &mut scorer, metrics)
-                .await?;
-            let Some(positions) = levels.resume[shared].take() else {
-                continue;
-            };
-            if scorer.done(floor) {
-                break;
-            }
-            scan.seek(&positions);
-            let remaining = levels.counts[shared] - cap as u64;
-            if remaining.saturating_mul(100)
-                > (self.num_docs as u64).saturating_mul(SPARSE_REFINE_READ_PERCENT)
+            if !self
+                .read_queued(&mut queue, true, false, &mut scorer, metrics)
+                .await?
             {
-                self.score_level_dense(scan, shared, floor, &mut scorer, metrics)
-                    .await?;
-                continue;
-            }
-            loop {
-                let (doc_ids, exhausted) =
-                    self.next_level_chunk(scan, shared, cap, metrics).await?;
-                if doc_ids.is_empty() {
-                    break;
-                }
-                self.score_docs(&doc_ids, None, floor, &mut scorer, metrics)
-                    .await?;
-                if exhausted || scorer.done(floor) {
-                    break;
-                }
+                return Ok(scorer.hits.into_sorted());
             }
         }
+        self.read_queued(&mut queue, true, true, &mut scorer, metrics)
+            .await?;
         Ok(scorer.hits.into_sorted())
     }
 
-    /// Score `doc_ids` (ascending) in batches: `first_batch` rows first (all
-    /// of them when `None`), then doubling up to one IO batch, so that a
-    /// search that stops early reads little more than it needs. Stops
-    /// between batches once no candidate at distance `floor` or more can
-    /// improve the results.
-    async fn score_docs(
+    /// Read what `queue` holds as far as its plan allows: first the
+    /// candidates the results were missing when the search started, without
+    /// a stop check in between, and every queued one when the queue ends at
+    /// a level boundary (`level_end`), the only place a search usually stops;
+    /// then batches of doubling size, each only while its first candidate can
+    /// still improve the results. With `flush`, whatever is queued is read.
+    /// Returns false once the search can stop.
+    async fn read_queued(
         &self,
-        doc_ids: &[u32],
-        first_batch: Option<usize>,
-        floor: f32,
+        queue: &mut ReadQueue,
+        level_end: bool,
+        flush: bool,
         scorer: &mut Scorer<'_>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<()> {
-        let rows_per_read = rows_per_batch(signature_row_bytes(self.params.num_hashes as usize));
-        let mut batch_rows = first_batch.unwrap_or(doc_ids.len()).clamp(1, rows_per_read);
-        let mut next = 0;
-        while next < doc_ids.len() {
-            if next > 0 && scorer.done(floor) {
-                return Ok(());
+    ) -> Result<bool> {
+        while let Some(floor) = queue.floor() {
+            let rows = if queue.must > 0 {
+                if queue.len < queue.must && !flush {
+                    return Ok(true);
+                }
+                if level_end || flush {
+                    queue.len
+                } else {
+                    queue.must
+                }
+            } else {
+                if scorer.done(floor) {
+                    return Ok(false);
+                }
+                if queue.len < queue.batch_rows && !flush {
+                    return Ok(true);
+                }
+                queue.batch_rows.min(queue.len)
+            };
+            // Sorted as a whole before it is split into IO batches, so that
+            // neighbouring rows share a batch and their requests coalesce
+            for doc_ids in queue.pop(rows).chunks(self.candidate_batch) {
+                self.score_batch(doc_ids, scorer, metrics).await?;
             }
-            let end = doc_ids.len().min(next + batch_rows);
-            self.score_batch(&doc_ids[next..end], scorer, metrics)
-                .await?;
-            next = end;
-            batch_rows = (batch_rows * 2).min(rows_per_read);
+            if queue.must > 0 {
+                queue.must = queue.must.saturating_sub(rows);
+            } else {
+                queue.batch_rows = (queue.batch_rows * 2).min(self.candidate_batch);
+            }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Score one batch of ascending `doc_ids`: those in resident signature
@@ -918,8 +953,8 @@ struct BucketCursor {
     next: usize,
     /// Row after the bucket's last row.
     end: usize,
-    /// Doc ids of the rows from `next`, one window of pages; refilled once
-    /// drained.
+    /// Doc ids of the rows from `next`: up to two windows of pages, topped
+    /// up whenever any bucket runs dry.
     window: std::vec::IntoIter<u32>,
 }
 
@@ -968,6 +1003,59 @@ impl CandidateLevels {
             resume: vec![None; num_bands + 1],
             complete: false,
         }
+    }
+}
+
+/// Candidates waiting for their signatures, in refine order: by decreasing
+/// shared bands, each level in doc id order, with the plan of how much to
+/// read at once (see [`MinHashLshIndex::read_queued`]).
+struct ReadQueue {
+    /// The floor of each queued level (the smallest distance its candidates
+    /// can have) and its queued doc ids.
+    levels: VecDeque<(f32, std::vec::IntoIter<u32>)>,
+    len: usize,
+    /// Candidates still to read before the first stop check.
+    must: usize,
+    /// Candidates of the next read once `must` is read.
+    batch_rows: usize,
+}
+
+impl ReadQueue {
+    fn new(missing: usize, max_batch_rows: usize) -> Self {
+        Self {
+            levels: VecDeque::new(),
+            len: 0,
+            must: missing,
+            batch_rows: missing.max(MIN_REFINE_READ_ROWS).min(max_batch_rows),
+        }
+    }
+
+    fn push(&mut self, floor: f32, doc_ids: Vec<u32>) {
+        if !doc_ids.is_empty() {
+            self.len += doc_ids.len();
+            self.levels.push_back((floor, doc_ids.into_iter()));
+        }
+    }
+
+    /// The floor of the next candidate to read.
+    fn floor(&self) -> Option<f32> {
+        self.levels.front().map(|(floor, _)| *floor)
+    }
+
+    /// The next `rows` candidates, in doc id order.
+    fn pop(&mut self, rows: usize) -> Vec<u32> {
+        let mut doc_ids = Vec::with_capacity(rows.min(self.len));
+        while doc_ids.len() < rows
+            && let Some((_, level)) = self.levels.front_mut()
+        {
+            doc_ids.extend(level.by_ref().take(rows - doc_ids.len()));
+            if level.as_slice().is_empty() {
+                self.levels.pop_front();
+            }
+        }
+        self.len -= doc_ids.len();
+        doc_ids.sort_unstable();
+        doc_ids
     }
 }
 

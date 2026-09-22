@@ -325,8 +325,8 @@ impl SpillDir {
 }
 
 /// A sorted run of (band key, doc id) records in a spill file, with the row
-/// at which each key-range partition starts (`SPILL_PARTITIONS + 1` entries,
-/// the last one being the row count).
+/// at which each key-range partition starts (one entry per partition plus
+/// the row count; see [`RunSorter::collect`] for the number of partitions).
 struct SpilledRun {
     dir: Arc<SpillDir>,
     run: usize,
@@ -337,6 +337,19 @@ impl SpilledRun {
     /// Rows of this run that hold `partitions`.
     fn rows(&self, partitions: &Range<usize>) -> Range<usize> {
         self.partition_starts[partitions.start]..self.partition_starts[partitions.end]
+    }
+
+    /// Merge every `2^steps` adjacent partitions into one. The starts are
+    /// cumulative, so the coarser map is every `2^steps`-th entry.
+    fn coarsen(&mut self, steps: u32) {
+        if steps > 0 {
+            self.partition_starts = self
+                .partition_starts
+                .iter()
+                .step_by(1 << steps)
+                .copied()
+                .collect();
+        }
     }
 }
 
@@ -429,6 +442,10 @@ struct RunSorter {
     run_records: usize,
     spill_limit_bytes: u64,
     partitions_per_band: usize,
+    /// Bytes the partition maps of the spilled runs may hold together.
+    partition_map_bytes: usize,
+    /// The maps are held at `SPILL_PARTITIONS >> shift` partitions.
+    shift: u32,
     /// Created by the first spill and shared with every run and spill task.
     spill_dir: Option<Arc<SpillDir>>,
     /// Runs being sorted and written, oldest first; at most
@@ -448,8 +465,36 @@ impl RunSorter {
         if self.spills.len() >= MAX_INFLIGHT_SPILLS
             && let Some(spilled) = self.spills.next().await
         {
-            self.spilled.push(joined_spill(spilled)?);
+            self.collect(spilled)?;
         }
+        Ok(())
+    }
+
+    /// Take a finished spill. Every run keeps its partition map until the
+    /// merge, so the maps of all runs share one budget: when they outgrow
+    /// it, every map merges adjacent partitions. The merge groups only get
+    /// coarser, and a group larger than its budget is streamed; at the
+    /// default budgets the spill limit is reached before any map coarsens.
+    fn collect(
+        &mut self,
+        spilled: std::result::Result<Result<SpilledRun>, tokio::task::JoinError>,
+    ) -> Result<()> {
+        let mut run = joined_spill(spilled)?;
+        run.coarsen(self.shift);
+        self.spilled.push(run);
+        let map_bytes = |shift: u32| {
+            self.spilled.len() * ((SPILL_PARTITIONS >> shift) + 1) * size_of::<usize>()
+        };
+        let mut shift = self.shift;
+        while shift < SPILL_PARTITIONS.trailing_zeros()
+            && map_bytes(shift) > self.partition_map_bytes
+        {
+            shift += 1;
+        }
+        for run in &mut self.spilled {
+            run.coarsen(shift - self.shift);
+        }
+        self.shift = shift;
         Ok(())
     }
 
@@ -486,7 +531,7 @@ impl RunSorter {
             self.spill(run)?;
         }
         while let Some(spilled) = self.spills.next().await {
-            self.spilled.push(joined_spill(spilled)?);
+            self.collect(spilled)?;
         }
         Ok(SortedRuns::Spilled(self.spilled.into()))
     }
@@ -512,13 +557,15 @@ fn group_records(runs: &[SpilledRun], partitions: &Range<usize>) -> usize {
     runs.iter().map(|run| run.rows(partitions).len()).sum()
 }
 
-/// Split the partitions into contiguous groups of at most `budget_records`
-/// records each; a partition larger than that forms a group of its own.
+/// Split the partitions of the runs' maps into contiguous groups of at most
+/// `budget_records` records each; a partition larger than that forms a group
+/// of its own.
 fn merge_groups(runs: &[SpilledRun], budget_records: usize) -> Vec<Range<usize>> {
+    let partitions = runs.first().map_or(0, |run| run.partition_starts.len() - 1);
     let mut groups = Vec::new();
     let mut start = 0;
     let mut records = 0usize;
-    for partition in 0..SPILL_PARTITIONS {
+    for partition in 0..partitions {
         let partition_records = group_records(runs, &(partition..partition + 1));
         if records + partition_records > budget_records && start < partition {
             groups.push(start..partition);
@@ -527,8 +574,8 @@ fn merge_groups(runs: &[SpilledRun], budget_records: usize) -> Vec<Range<usize>>
         }
         records += partition_records;
     }
-    if start < SPILL_PARTITIONS {
-        groups.push(start..SPILL_PARTITIONS);
+    if start < partitions {
+        groups.push(start..partitions);
     }
     groups
 }
@@ -852,6 +899,14 @@ impl MinHashLshIndexBuilder {
                 run_records: self.sort_run_records,
                 spill_limit_bytes: self.spill_limit_bytes,
                 partitions_per_band: SPILL_PARTITIONS / num_bands,
+                // The maps live beside the runs while spilling and beside the
+                // merge groups while merging: half the merge groups' share, a
+                // fifth of the memory budget.
+                partition_map_bytes: self.merge_group_records
+                    * MERGE_GROUPS_IN_FLIGHT
+                    * size_of::<(u64, u32)>()
+                    / 2,
+                shift: 0,
                 spill_dir: None,
                 spills: FuturesOrdered::new(),
                 spilled: Vec::new(),

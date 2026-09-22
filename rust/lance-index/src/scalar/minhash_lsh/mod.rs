@@ -33,14 +33,15 @@
 //! binary-search a resident page table (max band key per page) for the pages
 //! of each bucket, fetch its two boundary pages through the cache and
 //! binary-search them for the bucket's exact rows, then walk the buckets
-//! together in doc id order, one IO batch of pages at a time shared by the
-//! buckets still being walked, to count the bands each doc id shares with
-//! the query. Candidates are refined
-//! by decreasing shared bands, one batch at a time, reading their signatures
-//! with scattered reads (or sequentially when a batch's level covers much of
-//! the segment) until no remaining candidate can beat the results held. A
-//! search never holds more than one IO batch of pages and one batch of
-//! candidates per level, whatever the size or number of the buckets.
+//! together in doc id order, topping up every bucket with a share of one IO
+//! batch of pages whenever one runs dry, to count the bands each doc id
+//! shares with the query. Candidates are refined
+//! by decreasing shared bands: their signatures are read with scattered reads
+//! that gather consecutive levels and end where a level ends (or
+//! sequentially when a level covers much of the segment) until no remaining
+//! candidate can beat the results held. A search never holds more than two IO
+//! batches of pages, one batch of candidates per level and the candidates the
+//! results miss, whatever the size or number of the buckets.
 
 mod builder;
 mod index;
@@ -190,7 +191,9 @@ const SIGNED_BATCH_QUEUE: usize = 16;
 /// memory and write it, partitions processed independently and in key order.
 /// A band gets `SPILL_PARTITIONS / num_bands` partitions split on the hash
 /// bits below the band id, so a partition holds `num_bands / SPILL_PARTITIONS`
-/// of all records: 1.5 MB per 10^9 rows at eight bands, 47 MB at 256.
+/// of all records: 1.5 MB per 10^9 rows at eight bands, 47 MB at 256. A
+/// build with so many runs that their maps outgrow their memory share
+/// merges adjacent partitions.
 const SPILL_PARTITIONS: usize = 1 << 16;
 /// Upper bound on merge groups gathered and sorted concurrently; the actual
 /// count is a quarter of the CPU pool.
