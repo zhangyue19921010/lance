@@ -141,6 +141,106 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
     Ok(())
 }
 
+/// Move a caller-defined segment group's coverage into the current fragment space.
+///
+/// A deferred compaction can combine several independently built segments into one
+/// new fragment. Remapping each segment bitmap separately would treat every segment
+/// as only partially covering the rewrite group and drop the new fragment. The
+/// merge owns the whole caller-defined group, so remap its union and use that
+/// representable group coverage while materializing every source.
+///
+/// Returns whether coverage was remapped. Coverage only ever moves together with
+/// the row addresses the dataset's own mapping supplies, so where no mapping
+/// applies the coverage shrinks instead — reported, because those rows leave the
+/// merged index and fall back to a flat scan.
+async fn remap_merged_segment_coverage(
+    dataset: &Dataset,
+    index_name: &str,
+    segments: &mut [IndexMetadata],
+) -> Result<bool> {
+    let staged_coverage = segments
+        .iter()
+        .map(|segment| {
+            segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "CreateIndex: segment {} is missing fragment coverage",
+                    segment.uuid
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .fold(RoaringBitmap::new(), |coverage, segment| coverage | segment);
+
+    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    let has_fragment_reuse_index = frag_reuse_index.is_some();
+    // Partly retired counts as stale: the retired half is about to be
+    // intersected away, which drops its rows from the merged index.
+    let coverage_is_stale = !staged_coverage.is_subset(&dataset.fragment_bitmap);
+    let Some(frag_reuse_index) = frag_reuse_index
+        .filter(|index| append::fragment_reuse_affects_segments(index, segments.iter()))
+    else {
+        // Nothing to remap through, so the retired fragments are intersected away
+        // and the merged index will not cover their rows. It cannot claim them
+        // either: moving coverage without the row addresses, which
+        // `open_scalar_index` derives from the dataset's own mapping, would leave
+        // an index asserting coverage it cannot serve and suppress the scan
+        // fallback those rows need. So report and let the coverage shrink.
+        if coverage_is_stale {
+            tracing::warn!(
+                index_name,
+                staged_fragments = staged_coverage.len(),
+                has_fragment_reuse_index,
+                "Merging index segments over retired fragments with no applicable reuse \
+                 mapping: the merged index will not cover their rows, which fall back to \
+                 a flat scan. Rebuild the index to cover them."
+            );
+        }
+        return Ok(false);
+    };
+
+    let mut merged_coverage = staged_coverage.clone();
+    frag_reuse_index.remap_fragment_bitmap(&mut merged_coverage)?;
+
+    // An applicable mapping can still be short of what these segments need.
+    // Fragments compacted more than once need every link in the chain, and a trim
+    // that dropped an earlier link leaves the remap on an intermediate fragment
+    // the dataset no longer has. The intersect below would remove it silently.
+    let unmapped = &merged_coverage - dataset.fragment_bitmap.as_ref();
+    if !unmapped.is_empty() {
+        tracing::warn!(
+            index_name,
+            unmapped_fragments = unmapped.len(),
+            "Merged index will not cover rows whose fragments the reuse history only \
+             partly maps: a link in their rewrite chain is missing. Rebuild the index \
+             to cover those rows."
+        );
+    }
+
+    merged_coverage &= dataset.fragment_bitmap.as_ref();
+
+    if merged_coverage.is_empty() {
+        // The union straddles: these segments together still cover only part of a
+        // rewrite group, so the group's new fragments hold rows no segment indexed
+        // and claiming them would be a lie. Covering nothing is the conservative
+        // answer. `remap_fragment_bitmap` already reports the group it healed, but
+        // it cannot say what that costs the caller, and here it costs the whole
+        // merged index.
+        tracing::warn!(
+            index_name,
+            staged_fragments = staged_coverage.len(),
+            "Merged index covers no rows: its segments together cover only part of a \
+             rewrite group, so the fragments that group produced hold rows no segment \
+             indexed. The remapper reports the group; this is the effect on the merge."
+        );
+    }
+
+    for segment in segments {
+        segment.fragment_bitmap = Some(merged_coverage.clone());
+    }
+    Ok(true)
+}
+
 fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
     field_ids.insert(field.id);
     for child in &field.children {
@@ -2069,6 +2169,36 @@ impl DatasetIndexExt for Dataset {
 
         validate_segment_params_compatible(&[], &source_segments)?;
 
+        // Coverage may only move with the row addresses. A scalar merge loads its
+        // sources through the reuse index as a row-address remapper, so those
+        // addresses land in the current fragment space and the coverage has to
+        // follow them.
+        //
+        // Vector is exempt because its merge cannot remap: it hands the segments
+        // to the distributed file merger with an object store and a directory,
+        // reaching no dataset and so no reuse index.
+        //
+        // RTree is exempt for a narrower reason: it does load through the
+        // remapper, but the `all_rtree` branch below writes the same coverage
+        // field from its own staleness pruning, so a value set here would not
+        // survive. Placing it under the remap means settling how the two compose.
+        let has_remapped_source_coverage = if !all_vector && !all_rtree {
+            let index_name = source_segments[0].name.clone();
+            remap_merged_segment_coverage(self, &index_name, &mut source_segments).await?
+        } else {
+            false
+        };
+
+        // Refused before the pruning below, which checks out historical dataset
+        // versions: a build without `geo` cannot merge these segments at all, so
+        // that work would be discarded.
+        #[cfg(not(feature = "geo"))]
+        if all_rtree {
+            return Err(Error::not_supported(
+                "RTree segment merge requires the `geo` feature".to_string(),
+            ));
+        }
+
         let merged_dataset_version = if all_rtree {
             let mut source_coverage = source_segments
                 .iter()
@@ -2080,6 +2210,8 @@ impl DatasetIndexExt for Dataset {
                 source.fragment_bitmap = Some(coverage.fragment_bitmap().clone());
             }
             self.manifest.version
+        } else if has_remapped_source_coverage {
+            self.manifest.version
         } else {
             source_dataset_version
         };
@@ -2089,7 +2221,12 @@ impl DatasetIndexExt for Dataset {
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
         } else if all_fmindex {
-            crate::index::scalar::fmindex::merge_segments(self, source_segments).await?
+            crate::index::scalar::fmindex::merge_segments(
+                self,
+                source_segments,
+                has_remapped_source_coverage,
+            )
+            .await?
         } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
         } else if all_bloomfilter {
@@ -2107,10 +2244,9 @@ impl DatasetIndexExt for Dataset {
             {
                 crate::index::scalar::rtree::merge_segments(self, source_segments).await?
             }
+            // Refused above, before the coverage work.
             #[cfg(not(feature = "geo"))]
-            return Err(Error::not_supported(
-                "RTree segment merge requires the `geo` feature".to_string(),
-            ));
+            unreachable!("an RTree merge without `geo` returns before this point")
         } else {
             crate::index::scalar::btree::merge_segments(self, source_segments).await?
         };
