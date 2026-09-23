@@ -663,10 +663,10 @@ impl MinHashLshIndex {
     ///
     /// A candidate sharing `m` of the `b` bands differs from the query in at
     /// least one value of every other band, so its distance is at least
-    /// `(b - m) / k`. Candidates are therefore read by decreasing shared
-    /// bands through a [`ReadQueue`]: the top level as the walk finds it, then
-    /// every lower level, its first batch held by the walk and the rest walked
-    /// again from where it overflowed. Nothing is materialized beyond what the
+    /// `(b - m) / k`. Candidates are therefore queued by decreasing shared
+    /// bands in [`Pending`]: the top level as the walk finds it, then every
+    /// lower level, its first batch held by the walk and the rest walked again
+    /// from where it overflowed. Nothing is materialized beyond what the
     /// results miss plus one batch per level. Which rows are returned among
     /// equal distances is not specified.
     async fn refine(
@@ -687,7 +687,12 @@ impl MinHashLshIndex {
             remapper: self.frag_reuse_index.as_deref(),
         };
         let mut levels = CandidateLevels::new(num_bands, cap);
-        let mut queue = ReadQueue::new(scorer.hits.missing(), cap);
+        let missing = scorer.hits.missing();
+        let mut pending = Pending {
+            candidates: VecDeque::new(),
+            must: missing,
+            batch_rows: missing.max(MIN_REFINE_READ_ROWS).min(cap),
+        };
 
         // Top level: candidates sharing every band, at distance zero unless a
         // band hash collided. The walk pauses whenever a batch of them is
@@ -695,9 +700,9 @@ impl MinHashLshIndex {
         loop {
             self.scan_levels(scan, &mut levels, num_bands, metrics)
                 .await?;
-            queue.push(0.0, std::mem::take(&mut levels.lists[num_bands]));
+            pending.queue(0.0, std::mem::take(&mut levels.lists[num_bands]));
             if !self
-                .read_queued(&mut queue, false, false, &mut scorer, metrics)
+                .read_queued(&mut pending, false, false, &mut scorer, metrics)
                 .await?
             {
                 return Ok(scorer.hits.into_sorted());
@@ -710,10 +715,10 @@ impl MinHashLshIndex {
         // Lower levels, complete counts known.
         for shared in (1..num_bands).rev() {
             let floor = (num_bands - shared) as f32 / num_hashes as f32;
-            if scorer.done(queue.floor().unwrap_or(floor)) {
+            if scorer.done(pending.floor().unwrap_or(floor)) {
                 return Ok(scorer.hits.into_sorted());
             }
-            queue.push(floor, std::mem::take(&mut levels.lists[shared]));
+            pending.queue(floor, std::mem::take(&mut levels.lists[shared]));
             if let Some(positions) = levels.resume[shared].take() {
                 scan.seek(&positions);
                 let remaining = levels.counts[shared] - cap as u64;
@@ -721,7 +726,7 @@ impl MinHashLshIndex {
                     > (self.num_docs as u64).saturating_mul(SPARSE_REFINE_READ_PERCENT)
                 {
                     if !self
-                        .read_queued(&mut queue, true, true, &mut scorer, metrics)
+                        .read_queued(&mut pending, true, true, &mut scorer, metrics)
                         .await?
                     {
                         return Ok(scorer.hits.into_sorted());
@@ -729,38 +734,38 @@ impl MinHashLshIndex {
                     self.score_level_dense(scan, shared, floor, &mut scorer, metrics)
                         .await?;
                     // The scan read far more than the results missed
-                    queue.must = 0;
+                    pending.must = 0;
                     continue;
                 }
                 loop {
                     if !self
-                        .read_queued(&mut queue, false, false, &mut scorer, metrics)
+                        .read_queued(&mut pending, false, false, &mut scorer, metrics)
                         .await?
-                        || scorer.done(queue.floor().unwrap_or(floor))
+                        || scorer.done(pending.floor().unwrap_or(floor))
                     {
                         return Ok(scorer.hits.into_sorted());
                     }
                     let (doc_ids, exhausted) =
                         self.next_level_chunk(scan, shared, cap, metrics).await?;
-                    queue.push(floor, doc_ids);
+                    pending.queue(floor, doc_ids);
                     if exhausted {
                         break;
                     }
                 }
             }
             if !self
-                .read_queued(&mut queue, true, false, &mut scorer, metrics)
+                .read_queued(&mut pending, true, false, &mut scorer, metrics)
                 .await?
             {
                 return Ok(scorer.hits.into_sorted());
             }
         }
-        self.read_queued(&mut queue, true, true, &mut scorer, metrics)
+        self.read_queued(&mut pending, true, true, &mut scorer, metrics)
             .await?;
         Ok(scorer.hits.into_sorted())
     }
 
-    /// Read what `queue` holds as far as its plan allows: first the
+    /// Read what `pending` holds as far as its plan allows: first the
     /// candidates the results were missing when the search started, without
     /// a stop check in between, and every queued one when the queue ends at
     /// a level boundary (`level_end`), the only place a search usually stops;
@@ -769,40 +774,47 @@ impl MinHashLshIndex {
     /// Returns false once the search can stop.
     async fn read_queued(
         &self,
-        queue: &mut ReadQueue,
+        pending: &mut Pending,
         level_end: bool,
         flush: bool,
         scorer: &mut Scorer<'_>,
         metrics: &dyn MetricsCollector,
     ) -> Result<bool> {
-        while let Some(floor) = queue.floor() {
-            let rows = if queue.must > 0 {
-                if queue.len < queue.must && !flush {
+        while let Some(floor) = pending.floor() {
+            let queued = pending.candidates.len();
+            let rows = if pending.must > 0 {
+                if queued < pending.must && !flush {
                     return Ok(true);
                 }
                 if level_end || flush {
-                    queue.len
+                    queued
                 } else {
-                    queue.must
+                    pending.must
                 }
             } else {
                 if scorer.done(floor) {
                     return Ok(false);
                 }
-                if queue.len < queue.batch_rows && !flush {
+                if queued < pending.batch_rows && !flush {
                     return Ok(true);
                 }
-                queue.batch_rows.min(queue.len)
+                pending.batch_rows.min(queued)
             };
             // Sorted as a whole before it is split into IO batches, so that
             // neighbouring rows share a batch and their requests coalesce
-            for doc_ids in queue.pop(rows).chunks(self.candidate_batch) {
-                self.score_batch(doc_ids, scorer, metrics).await?;
+            let mut doc_ids: Vec<u32> = pending
+                .candidates
+                .drain(..rows)
+                .map(|(doc_id, _)| doc_id)
+                .collect();
+            doc_ids.sort_unstable();
+            for batch in doc_ids.chunks(self.candidate_batch) {
+                self.score_batch(batch, scorer, metrics).await?;
             }
-            if queue.must > 0 {
-                queue.must = queue.must.saturating_sub(rows);
+            if pending.must > 0 {
+                pending.must = pending.must.saturating_sub(rows);
             } else {
-                queue.batch_rows = (queue.batch_rows * 2).min(self.candidate_batch);
+                pending.batch_rows = (pending.batch_rows * 2).min(self.candidate_batch);
             }
         }
         Ok(true)
@@ -1006,56 +1018,28 @@ impl CandidateLevels {
     }
 }
 
-/// Candidates waiting for their signatures, in refine order: by decreasing
-/// shared bands, each level in doc id order, with the plan of how much to
-/// read at once (see [`MinHashLshIndex::read_queued`]).
-struct ReadQueue {
-    /// The floor of each queued level (the smallest distance its candidates
-    /// can have) and its queued doc ids.
-    levels: VecDeque<(f32, std::vec::IntoIter<u32>)>,
-    len: usize,
+/// Candidates waiting for their signatures, in refine order (by decreasing
+/// shared bands, each level in doc id order) with the smallest distance each
+/// can have, and how much to read at once (see [`MinHashLshIndex::read_queued`]).
+struct Pending {
+    candidates: VecDeque<(u32, f32)>,
     /// Candidates still to read before the first stop check.
     must: usize,
     /// Candidates of the next read once `must` is read.
     batch_rows: usize,
 }
 
-impl ReadQueue {
-    fn new(missing: usize, max_batch_rows: usize) -> Self {
-        Self {
-            levels: VecDeque::new(),
-            len: 0,
-            must: missing,
-            batch_rows: missing.max(MIN_REFINE_READ_ROWS).min(max_batch_rows),
-        }
+impl Pending {
+    /// Queue the doc ids of one level, whose candidates are at least `floor`
+    /// away from the query.
+    fn queue(&mut self, floor: f32, doc_ids: Vec<u32>) {
+        self.candidates
+            .extend(doc_ids.into_iter().map(|doc_id| (doc_id, floor)));
     }
 
-    fn push(&mut self, floor: f32, doc_ids: Vec<u32>) {
-        if !doc_ids.is_empty() {
-            self.len += doc_ids.len();
-            self.levels.push_back((floor, doc_ids.into_iter()));
-        }
-    }
-
-    /// The floor of the next candidate to read.
+    /// The smallest distance the next candidate to read can have.
     fn floor(&self) -> Option<f32> {
-        self.levels.front().map(|(floor, _)| *floor)
-    }
-
-    /// The next `rows` candidates, in doc id order.
-    fn pop(&mut self, rows: usize) -> Vec<u32> {
-        let mut doc_ids = Vec::with_capacity(rows.min(self.len));
-        while doc_ids.len() < rows
-            && let Some((_, level)) = self.levels.front_mut()
-        {
-            doc_ids.extend(level.by_ref().take(rows - doc_ids.len()));
-            if level.as_slice().is_empty() {
-                self.levels.pop_front();
-            }
-        }
-        self.len -= doc_ids.len();
-        doc_ids.sort_unstable();
-        doc_ids
+        self.candidates.front().map(|&(_, floor)| floor)
     }
 }
 
@@ -1081,7 +1065,7 @@ impl Scorer<'_> {
         }
         self.hits.push(MinHashHit {
             row_id,
-            distance: 1.0 - estimate_jaccard(self.query, signature),
+            distance: OrderedFloat(1.0 - estimate_jaccard(self.query, signature)),
         });
     }
 

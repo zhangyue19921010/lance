@@ -8,6 +8,8 @@
 use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 
+use lance_arrow::iter_str_array;
+use lance_datafusion::exec::LanceExecutionOptions;
 use tokio::sync::mpsc;
 
 use super::index::{scan_rows, signature_columns};
@@ -43,7 +45,7 @@ fn sign_batch(mut generator: SignatureGenerator, batch: RecordBatch) -> Result<S
         band_keys: Vec::with_capacity(num_rows * generator.num_bands()),
     };
     let mut signature = vec![SignatureValue::MAX; generator.num_hashes()];
-    for (row, text) in text_values(values.as_ref())?.enumerate() {
+    for (row, text) in iter_str_array(values.as_ref()).enumerate() {
         if let Some(text) = text
             && generator.signature(text, &mut signature)
         {
@@ -310,7 +312,7 @@ impl SpillDir {
         let written = self.written_bytes.fetch_add(bytes, Ordering::SeqCst);
         if written + bytes > self.limit_bytes {
             return Err(Error::io(format!(
-                "MinHash LSH build needs {} bytes of temporary disk in {} ({written} already written) but {SPILL_LIMIT_ENV} limits it to {}",
+                "MinHash LSH build needs {} bytes of temporary disk in {} ({written} already written) but LANCE_MAX_TEMP_DIRECTORY_SIZE limits it to {}",
                 written + bytes,
                 self.dir.path().display(),
                 self.limit_bytes
@@ -754,20 +756,21 @@ pub struct MinHashLshIndexBuilder {
 }
 
 impl MinHashLshIndexBuilder {
-    /// A builder with the memory budget of `LANCE_MEM_POOL_SIZE` (2 GiB by
-    /// default) and the spill limit of `LANCE_MAX_TEMP_DIRECTORY_SIZE`
-    /// (100 GiB by default).
+    /// A builder with the memory budget and the temporary disk limit of the
+    /// DataFusion-backed index builds (`LANCE_MEM_POOL_SIZE`,
+    /// `LANCE_MAX_TEMP_DIRECTORY_SIZE`).
     pub fn try_new(params: MinHashLshIndexParams) -> Result<Self> {
         params.validate()?;
+        let options = LanceExecutionOptions::default();
         // The runs (the one being filled plus the in-flight spills) get three
         // fifths of the memory budget, the merge groups the rest.
-        let memory_bytes = env_bytes(SORT_MEMORY_ENV).unwrap_or(DEFAULT_SORT_MEMORY_BYTES) as usize;
+        let memory_bytes = options.mem_pool_size() as usize;
         let record_bytes = std::mem::size_of::<(u64, u32)>();
         let sort_run_records = memory_bytes * 3 / 5 / (MAX_INFLIGHT_SPILLS + 1) / record_bytes;
         let merge_group_records = memory_bytes * 2 / 5 / MERGE_GROUPS_IN_FLIGHT / record_bytes;
         if sort_run_records == 0 || merge_group_records == 0 {
             return Err(Error::invalid_input(format!(
-                "MinHash LSH sort memory budget of {memory_bytes} bytes ({SORT_MEMORY_ENV}) is too small"
+                "MinHash LSH sort memory budget of {memory_bytes} bytes (LANCE_MEM_POOL_SIZE) is too small"
             )));
         }
         Ok(Self {
@@ -775,7 +778,7 @@ impl MinHashLshIndexBuilder {
             page_rows: DEFAULT_PAGE_ROWS,
             sort_run_records,
             merge_group_records,
-            spill_limit_bytes: env_bytes(SPILL_LIMIT_ENV).unwrap_or(DEFAULT_SPILL_LIMIT_BYTES),
+            spill_limit_bytes: options.max_temp_directory_size(),
         })
     }
 
@@ -1037,17 +1040,5 @@ impl MinHashLshIndexBuilder {
             }
         }
         bands.finish(&self.params, num_docs).await
-    }
-}
-
-/// A byte count from the environment, if set and valid.
-fn env_bytes(name: &str) -> Option<u64> {
-    let value = std::env::var(name).ok()?;
-    match value.parse::<u64>() {
-        Ok(bytes) => Some(bytes),
-        Err(err) => {
-            log::warn!("ignoring {name}={value}: {err}");
-            None
-        }
     }
 }

@@ -101,6 +101,7 @@ use crate::scalar::{
     MetricsCollector, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
     SearchResult, UpdateCriteria,
 };
+use crate::vector::graph::OrderedFloat;
 use crate::{Index, IndexType};
 use crate::{pb, pbold};
 
@@ -168,16 +169,6 @@ const SPARSE_REFINE_READ_PERCENT: u64 = 10;
 /// smaller batches would only add round trips.
 const MIN_REFINE_READ_ROWS: usize = 64;
 
-/// Default memory budget of the sort: the run being filled, the runs being
-/// spilled and the merge groups together.
-const DEFAULT_SORT_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// Memory budget of the sort (bytes), the variable the DataFusion-backed
-/// index builds honor as well.
-const SORT_MEMORY_ENV: &str = "LANCE_MEM_POOL_SIZE";
-/// Limit on the temporary disk space of one build (bytes), the variable the
-/// DataFusion-backed builds honor as well.
-const SPILL_LIMIT_ENV: &str = "LANCE_MAX_TEMP_DIRECTORY_SIZE";
-const DEFAULT_SPILL_LIMIT_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 /// Bytes of one (band key, doc id) row, in the bands file and in spill files.
 const BAND_ROW_BYTES: usize = std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
 /// Runs sorted and written concurrently with signing. Each holds a full run
@@ -645,18 +636,6 @@ impl SignatureGenerator {
     }
 }
 
-/// The texts of a string array of any width; the types a MinHash index accepts.
-pub fn text_values(array: &dyn Array) -> Result<Box<dyn Iterator<Item = Option<&str>> + '_>> {
-    match array.data_type() {
-        DataType::Utf8 => Ok(Box::new(array.as_string::<i32>().iter())),
-        DataType::LargeUtf8 => Ok(Box::new(array.as_string::<i64>().iter())),
-        DataType::Utf8View => Ok(Box::new(array.as_string_view().iter())),
-        other => Err(Error::invalid_input(format!(
-            "MinHash LSH index supports Utf8, LargeUtf8 and Utf8View columns, got {other}"
-        ))),
-    }
-}
-
 /// Estimated Jaccard similarity of two signatures: the fraction of positions
 /// whose MinHash values agree.
 pub fn estimate_jaccard(a: &[SignatureValue], b: &[SignatureValue]) -> f32 {
@@ -727,27 +706,12 @@ impl QuerySignature {
     }
 }
 
-/// One search hit: a row id and its Jaccard distance (`1 - estimated Jaccard`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// One search hit: its Jaccard distance (`1 - estimated Jaccard`) and row id,
+/// ordered by distance and then row id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MinHashHit {
+    pub distance: OrderedFloat,
     pub row_id: u64,
-    pub distance: f32,
-}
-
-impl Eq for MinHashHit {}
-
-impl PartialOrd for MinHashHit {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MinHashHit {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.distance
-            .total_cmp(&other.distance)
-            .then(self.row_id.cmp(&other.row_id))
-    }
 }
 
 /// Bounded collection of the `limit` best (smallest distance) hits.
@@ -786,7 +750,7 @@ impl TopHits {
         if self.heap.len() < self.limit {
             return None;
         }
-        self.heap.peek().map(|worst| worst.distance)
+        self.heap.peek().map(|worst| worst.distance.0)
     }
 
     /// Hits ordered by ascending distance, ties broken by row id.

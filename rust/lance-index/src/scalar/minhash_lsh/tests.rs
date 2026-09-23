@@ -319,18 +319,21 @@ async fn test_build_load_search_roundtrip() {
         hits[0],
         MinHashHit {
             row_id: rows[0].1,
-            distance: 0.0
+            distance: OrderedFloat(0.0)
         }
     );
     assert_eq!(
         hits[1],
         MinHashHit {
             row_id: rows[4].1,
-            distance: 0.0
+            distance: OrderedFloat(0.0)
         }
     );
     assert_eq!(hits[2].row_id, rows[2].1);
-    assert!(hits[2].distance > 0.0 && hits[2].distance < 0.4, "{hits:?}");
+    assert!(
+        hits[2].distance.0 > 0.0 && hits[2].distance.0 < 0.4,
+        "{hits:?}"
+    );
     assert!(
         hits.iter()
             .all(|hit| hit.row_id != rows[1].1 && hit.row_id != rows[3].1),
@@ -442,7 +445,7 @@ async fn test_buckets_spanning_pages_and_dense_candidates(#[case] num_others: us
     assert!(index.statistics().unwrap()["num_pages"].as_u64().unwrap() > 100);
 
     let hits = search(&index, &bases[0], 5).await;
-    assert!(hits.iter().all(|hit| hit.distance == 0.0), "{hits:?}");
+    assert!(hits.iter().all(|hit| hit.distance.0 == 0.0), "{hits:?}");
     assert_eq!(ids(&hits), vec![0, 1, 2, 3, 4], "ties are broken by row id");
     assert_eq!(
         row_ids(&index, &bases[0], 100).await,
@@ -511,7 +514,10 @@ async fn test_spill_limit_fails_before_writing() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::IO { .. }), "{err}");
-    assert!(err.to_string().contains(SPILL_LIMIT_ENV), "{err}");
+    assert!(
+        err.to_string().contains("LANCE_MAX_TEMP_DIRECTORY_SIZE"),
+        "{err}"
+    );
 }
 
 #[tokio::test]

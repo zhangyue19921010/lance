@@ -22,6 +22,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
+use lance_arrow::iter_str_array;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{Error, ROW_ID, Result};
@@ -29,8 +30,9 @@ use lance_index::prefilter::PreFilter;
 use lance_index::scalar::ScalarIndex;
 use lance_index::scalar::minhash_lsh::{
     MinHashHit, MinHashLshIndex, MinHashLshIndexParams, MinHashQuery, QuerySignature,
-    SignatureGenerator, SignatureValue, TopHits, estimate_jaccard, text_values,
+    SignatureGenerator, SignatureValue, TopHits, estimate_jaccard,
 };
+use lance_index::vector::graph::OrderedFloat;
 use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 use tracing::instrument;
@@ -292,7 +294,7 @@ impl ExecutionPlan for MinHashSearchExec {
 }
 
 fn hits_batch(hits: &[MinHashHit]) -> DataFusionResult<RecordBatch> {
-    let distances = Float32Array::from_iter_values(hits.iter().map(|hit| hit.distance));
+    let distances = Float32Array::from_iter_values(hits.iter().map(|hit| hit.distance.0));
     let row_ids = UInt64Array::from_iter_values(hits.iter().map(|hit| hit.row_id));
     Ok(RecordBatch::try_new(
         KNN_INDEX_SCHEMA.clone(),
@@ -327,14 +329,14 @@ fn score_flat_batch(
     let mut hits = TopHits::new(limit);
     let mut signature = vec![SignatureValue::MAX; generator.num_hashes()];
     let mut band_keys = Vec::with_capacity(generator.num_bands());
-    for (row, text) in text_values(values.as_ref())?.enumerate() {
+    for (row, text) in iter_str_array(values.as_ref()).enumerate() {
         if let Some(text) = text
             && generator.signature(text, &mut signature)
             && query.shares_band(&generator, &signature, &mut band_keys)
         {
             hits.push(MinHashHit {
                 row_id: row_ids.value(row),
-                distance: 1.0 - estimate_jaccard(query.signature(), &signature),
+                distance: OrderedFloat(1.0 - estimate_jaccard(query.signature(), &signature)),
             });
         }
     }
