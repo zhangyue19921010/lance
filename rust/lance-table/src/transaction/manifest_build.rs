@@ -11,12 +11,13 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_STABLE_ROW_IDS,
+    apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
+    inherit_sticky_feature_flags,
 };
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
-    DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
+    DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
     overlay::DataOverlayFile,
 };
 use crate::io::{
@@ -24,7 +25,9 @@ use crate::io::{
     manifest::{read_manifest, read_manifest_indexes},
 };
 use crate::rowids::version::build_version_meta;
+use crate::rowids::{read_row_ids, write_row_ids};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use crate::system_index::frag_reuse::metadata::{is_tagged, validate_flags};
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -51,6 +54,72 @@ use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Table config key that opts a table into writing clustered deletions as
+/// `Range` segments (`U64Segment::Ranges`). Set it to `true` with
+/// `update_config`.
+///
+/// Manifests written afterwards re-encode bitmap row id segments as runs of
+/// `Range` segments where that is smaller. That is the
+/// existing wire format, so any version reads the result, but a reader without
+/// the compact in-memory form handles thousands of segments per fragment
+/// slowly. That is why it is opt-in rather than the default.
+///
+/// Setting the key back to `false` only stops further conversions. Fragments
+/// already written as `Range` segments keep that encoding until something else
+/// rewrites their row ids (compaction, for example), so coordinate reader
+/// upgrades before enabling it.
+pub const RANGE_SEGMENTS_CONFIG_KEY: &str = "lance.row_ids.range_segments";
+
+fn range_segments_enabled(manifest: &Manifest) -> bool {
+    manifest
+        .config
+        .get(RANGE_SEGMENTS_CONFIG_KEY)
+        .is_some_and(|value| str_is_truthy(value))
+}
+
+/// Re-encode inline row id sequences as runs of `Range` segments when the
+/// table has opted in.
+///
+/// Fragments that the previous manifest already re-encoded are left alone
+/// (their inline bytes are the very same allocation), so a commit pays only
+/// for the fragments it changed; enabling the key re-encodes every fragment
+/// once.
+fn apply_range_segments(
+    manifest: &mut Manifest,
+    current_manifest: Option<&Manifest>,
+) -> Result<()> {
+    if !range_segments_enabled(manifest) {
+        return Ok(());
+    }
+    let unchanged: HashMap<u64, *const u8> = current_manifest
+        .filter(|current| range_segments_enabled(current))
+        .map(|current| {
+            current
+                .fragments
+                .iter()
+                .filter_map(|fragment| match &fragment.row_id_meta {
+                    Some(RowIdMeta::Inline(data)) => Some((fragment.id, data.as_ptr())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let fragments = Arc::make_mut(&mut manifest.fragments);
+    for fragment in fragments.iter_mut() {
+        let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
+            continue;
+        };
+        if unchanged.get(&fragment.id) == Some(&data.as_ptr()) {
+            continue;
+        }
+        let mut sequence = read_row_ids(&data[..])?;
+        if sequence.use_range_segments() {
+            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
+        }
+    }
+    Ok(())
+}
 
 impl Transaction {
     pub(super) fn fragments_with_ids<'a, T>(
@@ -115,6 +184,7 @@ impl Transaction {
         manifest.set_timestamp(config.timestamp_nanos);
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
+        validate_flags(&manifest, &indices)?;
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
@@ -413,6 +483,17 @@ impl Transaction {
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        if current_indices.iter().any(is_tagged)
+            && !matches!(
+                self.operation,
+                Operation::Append { .. } | Operation::ReserveFragments { .. }
+            )
+        {
+            return Err(Error::not_supported(
+                "Tagged FRI history maintenance is not implemented for this operation; upgrade to a writer supporting tagged histories",
+            ));
+        }
+
         if config.use_stable_row_ids
             && config.migration_next_row_id.is_none()
             && current_manifest
@@ -477,7 +558,7 @@ impl Transaction {
         }
 
         // Get the schema and the final fragment list
-        let schema = match self.operation {
+        let mut schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
             Operation::Merge { ref schema, .. } => schema.clone(),
             Operation::Project { ref schema, .. } => schema.clone(),
@@ -1326,6 +1407,46 @@ impl Transaction {
             )?;
         }
 
+        // Blob is one logical column across file versions. Publishing its first
+        // 2.2+ file also publishes the logical v2 view, without replacing older files.
+        // Blob children are not independent physical columns; retain the root ID
+        // and allocate logical child IDs against the current manifest on commit.
+        let legacy_blob_ids = schema
+            .fields_pre_order()
+            .filter(|field| field.is_blob() && !field.is_blob_v2())
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+        if !legacy_blob_ids.is_empty() {
+            let mut blob_v2_fields = std::collections::BTreeSet::new();
+            for file in final_fragments
+                .iter()
+                .flat_map(|fragment| fragment.referenced_lance_files())
+            {
+                if matches!(
+                    file.file_version()?,
+                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                ) {
+                    blob_v2_fields.extend(
+                        file.fields
+                            .iter()
+                            .copied()
+                            .filter(|id| legacy_blob_ids.contains(id)),
+                    );
+                }
+            }
+            let mut next_field_id = current_manifest
+                .map(|manifest| manifest.max_field_id())
+                .unwrap_or(-1)
+                .max(schema.max_field_id().unwrap_or(-1))
+                + 1;
+            for id in blob_v2_fields {
+                if let Some(field) = schema.mut_field_by_id(id) {
+                    field.promote_blob_v2()?;
+                    field.set_id(field.parent_id, &mut next_field_id);
+                }
+            }
+        }
+
         let mut manifest = if let Some(current_manifest) = current_manifest {
             // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
             // So we always use new_from_previous which preserves base_paths
@@ -1539,6 +1660,8 @@ impl Transaction {
             _ => {}
         }
 
+        apply_range_segments(&mut manifest, current_manifest)?;
+
         // Handle UpdateBases operation to update manifest base_paths
         if let Operation::UpdateBases { new_bases } = &self.operation {
             // Validate and add new base paths to the manifest
@@ -1581,6 +1704,10 @@ impl Transaction {
             manifest.next_row_id = next_row_id;
         }
 
+        if final_indices.iter().any(is_tagged) {
+            manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+            manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        }
         Ok((manifest, final_indices))
     }
 
@@ -1627,6 +1754,51 @@ mod tests {
     use lance_io::utils::CachedFileSize;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[rstest::rstest]
+    #[case::delete("delete")]
+    #[case::update("update")]
+    #[case::create_index("create_index")]
+    #[case::config("config")]
+    #[case::memwal("memwal")]
+    fn tagged_history_rejects_unsupported_transactions(#[case] kind: &str) {
+        let mut manifest = sample_manifest();
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        let mut fri = sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        fri.fields.clear();
+        let operation = match kind {
+            "delete" => Operation::Delete {
+                updated_fragments: vec![],
+                deleted_fragment_ids: vec![0],
+                predicate: "true".into(),
+            },
+            "update" => crate::transaction::test_support::update_txn(vec![]).operation,
+            "create_index" => Operation::CreateIndex {
+                new_indices: vec![sample_index_metadata("id_idx")],
+                removed_indices: vec![],
+            },
+            "config" => Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            "memwal" => Operation::UpdateMemWalState {
+                compacted_sstables: vec![],
+            },
+            _ => unreachable!(),
+        };
+        let transaction = Transaction::new(manifest.version, operation, None);
+        let error = transaction
+            .build_manifest(Some(&manifest), vec![fri], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(
+            error.to_string().contains("Tagged FRI history maintenance"),
+            "{error}"
+        );
+    }
 
     fn sample_manifest_with_fragments(ids: std::ops::Range<u64>) -> Manifest {
         let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);

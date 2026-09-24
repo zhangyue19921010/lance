@@ -11,7 +11,7 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::{
-    format::{Fragment, RowIdMeta},
+    format::{Fragment, ROW_ID_FIELD_ID, RowIdMeta},
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
 };
 use std::sync::Arc;
@@ -29,30 +29,24 @@ pub async fn load_row_id_sequence(
     let key = RowIdSequenceKey {
         fragment_id: fragment.id,
         row_id_meta,
+        lineage_file: fragment.row_lineage_file(ROW_ID_FIELD_ID)?,
     };
     dataset
         .metadata_cache
-        .get_or_insert_with_key(key, || read_row_id_sequence(dataset, fragment))
+        .get_or_insert_with_key(key, || read_row_id_sequence(fragment))
         .await
 }
 
 /// Decode the row id sequence of `fragment`, bypassing every cache.
-async fn read_row_id_sequence(dataset: &Dataset, fragment: &Fragment) -> Result<RowIdSequence> {
+async fn read_row_id_sequence(fragment: &Fragment) -> Result<RowIdSequence> {
     match &fragment.row_id_meta {
         None => Err(Error::internal("Missing row id meta")),
         Some(RowIdMeta::Inline(data)) => read_row_ids(data),
-        Some(RowIdMeta::External(file_slice)) => {
-            let path = dataset.base.clone().join(file_slice.path.as_str());
-            let range =
-                file_slice.offset as usize..(file_slice.offset as usize + file_slice.size as usize);
-            let data = dataset
-                .object_store
-                .open(&path)
-                .await?
-                .get_range(range)
-                .await?;
-            read_row_ids(&data)
-        }
+        Some(RowIdMeta::Column) => Err(Error::not_supported(format!(
+            "row ids of fragment {} are spilled to a data file column, which this build \
+             cannot read",
+            fragment.id
+        ))),
     }
 }
 
@@ -258,7 +252,7 @@ async fn read_fragment_row_id_index(
     dataset: &Dataset,
     fragment: &Fragment,
 ) -> Result<FragmentRowIdIndex> {
-    let row_id_sequence = Arc::new(read_row_id_sequence(dataset, fragment).await?);
+    let row_id_sequence = Arc::new(read_row_id_sequence(fragment).await?);
     let deletion_vector = match &fragment.deletion_file {
         None => Arc::new(DeletionVector::default()),
         Some(deletion_file) => {
@@ -277,7 +271,8 @@ mod test {
     use std::ops::Range;
 
     use crate::dataset::{
-        ReadParams, UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder,
+        ProjectionRequest, ReadParams, UpdateBuilder, WriteMode, WriteParams,
+        builder::DatasetBuilder,
     };
 
     use super::*;
@@ -296,6 +291,7 @@ mod test {
     use lance_datagen::Dimension;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
+    use lance_table::rowids::segment::U64Segment;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -992,6 +988,117 @@ mod test {
 
     pub(super) async fn delete(dataset: &mut Dataset, expr: &str) {
         dataset.delete(expr).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_range_segments_are_opt_in() {
+        use lance_table::format::pb;
+        use lance_table::transaction::RANGE_SEGMENTS_CONFIG_KEY;
+        use prost::Message;
+
+        /// Wire-level segment kinds of every fragment, and whether the decoded
+        /// form folded any of them into a compact `Ranges` segment.
+        fn segment_shapes(dataset: &Dataset) -> (Vec<&'static str>, bool) {
+            let mut kinds = Vec::new();
+            let mut folded = false;
+            for fragment in dataset.manifest.fragments.iter() {
+                let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
+                    panic!("expected inline row ids, got {:?}", fragment.row_id_meta);
+                };
+                let wire = pb::RowIdSequence::decode(&data[..]).unwrap();
+                kinds.extend(wire.segments.iter().map(|segment| match segment.segment {
+                    Some(pb::u64_segment::Segment::Range(_)) => "range",
+                    Some(pb::u64_segment::Segment::RangeWithBitmap(_)) => "bitmap",
+                    _ => "other",
+                }));
+                folded |= read_row_ids(&data[..])
+                    .unwrap()
+                    .segments()
+                    .iter()
+                    .any(|segment| matches!(segment, U64Segment::Ranges { .. }));
+            }
+            (kinds, folded)
+        }
+
+        // Deleting a contiguous block inside every fragment leaves each row id
+        // sequence as a range with one long run of holes, which `delete`
+        // encodes as a bitmap segment; compaction carries those segments over.
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(4),
+                FragmentRowCount::from(500),
+                Some(WriteParams {
+                    max_rows_per_file: 500,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        delete(&mut dataset, "i % 500 >= 100 and i % 500 < 400").await;
+        compact(&mut dataset, 5000).await;
+        let map_before = scan_rowid_map(&dataset).await;
+        assert_eq!(map_before.len(), 800);
+
+        // Without the opt-in the bitmaps stay.
+        let (kinds, folded) = segment_shapes(&dataset);
+        assert!(kinds.contains(&"bitmap") && !folded, "{kinds:?}");
+
+        // Opting in re-encodes every eligible fragment in the same commit: on
+        // the wire only plain `Range` segments, folded back when decoded.
+        dataset
+            .update_config([(RANGE_SEGMENTS_CONFIG_KEY, "true")])
+            .await
+            .unwrap();
+        let (kinds, folded) = segment_shapes(&dataset);
+        assert!(kinds.iter().all(|kind| *kind == "range"), "{kinds:?}");
+        assert!(
+            folded,
+            "fragments with 300 contiguous holes each should fold into Ranges"
+        );
+        assert_eq!(
+            dataset.manifest().reader_feature_flags,
+            lance_table::feature_flags::FLAG_STABLE_ROW_IDS,
+            "the wire format did not change, so no new reader flag"
+        );
+
+        // Reads see the same row ids; a take by row id resolves through the
+        // compact segments.
+        let map_after = scan_rowid_map(&dataset).await;
+        assert_eq!(map_before, map_after);
+        let mut sample: Vec<u64> = map_before.keys().copied().collect();
+        sample.sort_unstable();
+        let sample: Vec<u64> = sample.into_iter().step_by(97).collect();
+        let taken = dataset
+            .take_rows(
+                &sample,
+                ProjectionRequest::from_columns(["i"], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(taken.num_rows(), sample.len());
+        let index = get_row_id_index(&Arc::new(dataset.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        for row_id in &sample {
+            assert!(index.get(*row_id).unwrap().is_some(), "row id {row_id}");
+        }
+
+        // Later commits keep re-encoding only what changed, and the manifest
+        // re-read from storage folds the same way.
+        delete(&mut dataset, "i = 10").await;
+        let reopened = dataset
+            .checkout_version(dataset.manifest().version)
+            .await
+            .unwrap();
+        let (kinds, folded) = segment_shapes(&reopened);
+        assert!(
+            kinds.iter().all(|kind| *kind == "range") && folded,
+            "{kinds:?}"
+        );
+        assert_eq!(scan_rowid_map(&reopened).await.len(), 799);
     }
 
     #[tokio::test]

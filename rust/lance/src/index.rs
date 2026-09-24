@@ -81,6 +81,7 @@ mod api;
 pub(crate) mod append;
 mod create;
 pub mod frag_reuse;
+pub mod frag_reuse_reader;
 pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
@@ -99,7 +100,9 @@ use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
-use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, write_index_identity};
+use crate::session::index_caches::{
+    DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, write_index_identity,
+};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
@@ -136,6 +139,106 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
     }
 
     Ok(())
+}
+
+/// Move a caller-defined segment group's coverage into the current fragment space.
+///
+/// A deferred compaction can combine several independently built segments into one
+/// new fragment. Remapping each segment bitmap separately would treat every segment
+/// as only partially covering the rewrite group and drop the new fragment. The
+/// merge owns the whole caller-defined group, so remap its union and use that
+/// representable group coverage while materializing every source.
+///
+/// Returns whether coverage was remapped. Coverage only ever moves together with
+/// the row addresses the dataset's own mapping supplies, so where no mapping
+/// applies the coverage shrinks instead — reported, because those rows leave the
+/// merged index and fall back to a flat scan.
+async fn remap_merged_segment_coverage(
+    dataset: &Dataset,
+    index_name: &str,
+    segments: &mut [IndexMetadata],
+) -> Result<bool> {
+    let staged_coverage = segments
+        .iter()
+        .map(|segment| {
+            segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "CreateIndex: segment {} is missing fragment coverage",
+                    segment.uuid
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .fold(RoaringBitmap::new(), |coverage, segment| coverage | segment);
+
+    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    let has_fragment_reuse_index = frag_reuse_index.is_some();
+    // Partly retired counts as stale: the retired half is about to be
+    // intersected away, which drops its rows from the merged index.
+    let coverage_is_stale = !staged_coverage.is_subset(&dataset.fragment_bitmap);
+    let Some(frag_reuse_index) = frag_reuse_index
+        .filter(|index| append::fragment_reuse_affects_segments(index, segments.iter()))
+    else {
+        // Nothing to remap through, so the retired fragments are intersected away
+        // and the merged index will not cover their rows. It cannot claim them
+        // either: moving coverage without the row addresses, which
+        // `open_scalar_index` derives from the dataset's own mapping, would leave
+        // an index asserting coverage it cannot serve and suppress the scan
+        // fallback those rows need. So report and let the coverage shrink.
+        if coverage_is_stale {
+            tracing::warn!(
+                index_name,
+                staged_fragments = staged_coverage.len(),
+                has_fragment_reuse_index,
+                "Merging index segments over retired fragments with no applicable reuse \
+                 mapping: the merged index will not cover their rows, which fall back to \
+                 a flat scan. Rebuild the index to cover them."
+            );
+        }
+        return Ok(false);
+    };
+
+    let mut merged_coverage = staged_coverage.clone();
+    frag_reuse_index.remap_fragment_bitmap(&mut merged_coverage)?;
+
+    // An applicable mapping can still be short of what these segments need.
+    // Fragments compacted more than once need every link in the chain, and a trim
+    // that dropped an earlier link leaves the remap on an intermediate fragment
+    // the dataset no longer has. The intersect below would remove it silently.
+    let unmapped = &merged_coverage - dataset.fragment_bitmap.as_ref();
+    if !unmapped.is_empty() {
+        tracing::warn!(
+            index_name,
+            unmapped_fragments = unmapped.len(),
+            "Merged index will not cover rows whose fragments the reuse history only \
+             partly maps: a link in their rewrite chain is missing. Rebuild the index \
+             to cover those rows."
+        );
+    }
+
+    merged_coverage &= dataset.fragment_bitmap.as_ref();
+
+    if merged_coverage.is_empty() {
+        // The union straddles: these segments together still cover only part of a
+        // rewrite group, so the group's new fragments hold rows no segment indexed
+        // and claiming them would be a lie. Covering nothing is the conservative
+        // answer. `remap_fragment_bitmap` already reports the group it healed, but
+        // it cannot say what that costs the caller, and here it costs the whole
+        // merged index.
+        tracing::warn!(
+            index_name,
+            staged_fragments = staged_coverage.len(),
+            "Merged index covers no rows: its segments together cover only part of a \
+             rewrite group, so the fragments that group produced hold rows no segment \
+             indexed. The remapper reports the group; this is the effect on the merge."
+        );
+    }
+
+    for segment in segments {
+        segment.fragment_bitmap = Some(merged_coverage.clone());
+    }
+    Ok(true)
 }
 
 fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
@@ -810,6 +913,41 @@ fn filter_index_segments_by_ids(
     Ok(filtered)
 }
 
+/// Ask the scalar index plugin whether the parameters of `incoming` segments
+/// let them join `existing` ones (for example, MinHash signatures are only
+/// comparable across segments built with the same hashing parameters).
+/// Complements [`validate_segment_index_details`], which only checks that
+/// segments share a details type. Vector indices and details without a plugin
+/// are not checked.
+pub(crate) fn validate_segment_params_compatible(
+    existing: &[IndexMetadata],
+    incoming: &[IndexMetadata],
+) -> Result<()> {
+    let Some(reference) = incoming
+        .iter()
+        .chain(existing.iter())
+        .find_map(|segment| segment.index_details.as_ref())
+    else {
+        return Ok(());
+    };
+    let details = IndexDetails(reference.clone());
+    let Ok(plugin) = details.get_plugin() else {
+        return Ok(());
+    };
+    let existing_details: Vec<&prost_types::Any> = existing
+        .iter()
+        .filter_map(|segment| segment.index_details.as_deref())
+        .collect();
+    let incoming_details: Vec<&prost_types::Any> = incoming
+        .iter()
+        .filter_map(|segment| segment.index_details.as_deref())
+        .collect();
+    plugin.validate_new_segments_against_existing(&existing_details, &incoming_details)
+}
+
+/// Every segment of one commit must carry index details of the same type;
+/// whether their parameters are compatible is the plugin's call, see
+/// [`validate_segment_params_compatible`].
 fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
     let mut type_url = None::<&str>;
     for segment in segments {
@@ -926,6 +1064,13 @@ fn segment_has_rtree_details(segment: &IndexMetadata) -> bool {
         .index_details
         .as_ref()
         .is_some_and(|details| details.type_url.ends_with("RTreeIndexDetails"))
+}
+
+fn segment_has_minhashlsh_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("MinHashLshIndexDetails"))
 }
 
 fn segment_has_ngram_details(segment: &IndexMetadata) -> bool {
@@ -1139,6 +1284,7 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "RTree" => IndexType::RTree.to_string(),
         "Inverted" => IndexType::Inverted.to_string(),
         "FMIndex" | "FM" => IndexType::Fm.to_string(),
+        "MinHashLsh" => IndexType::MinHashLsh.to_string(),
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),
@@ -1900,6 +2046,39 @@ impl DatasetIndexExt for Dataset {
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indices = load_all_indices(self).await?;
+        if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
+            match fri.index_version {
+                // Legacy FRI index version 0 already had its fragment coverage
+                // remapped in load_all_indices().
+                0 => {}
+                1 => {
+                    // Cache the coverage-rewritten listing per snapshot identity:
+                    // load_indices sits on the query-planning and merge_insert
+                    // per-batch paths, and the derivation (segment_coverage plus
+                    // the per-index bitmap rewrites) is otherwise redone on every
+                    // call. The raw ledger and mapping readers are already cached
+                    // by frag_reuse_reader; this caches its derived output.
+                    let derived_key = DerivedIndexListingKey {
+                        version: self.version().version,
+                        store_identity: &self.object_store.store_prefix,
+                        e_tag: self.manifest_location.e_tag.as_deref(),
+                    };
+                    return self
+                        .index_cache
+                        .get_or_insert_with_key(derived_key, || async {
+                            let derived =
+                                frag_reuse_reader::load_indices(self, fri, &indices).await?;
+                            Ok(derived.as_ref().clone())
+                        })
+                        .await;
+                }
+                version => {
+                    return Err(Error::not_supported(format!(
+                        "FRI index_version {version} is unsupported. Please upgrade to a newer version",
+                    )));
+                }
+            }
+        }
         if indices.iter().all(index_is_usable) {
             return Ok(indices);
         }
@@ -1969,6 +2148,7 @@ impl DatasetIndexExt for Dataset {
         let all_label_list = source_segments.iter().all(segment_has_label_list_details);
         let all_rtree = source_segments.iter().all(segment_has_rtree_details);
         let all_ngram = source_segments.iter().all(segment_has_ngram_details);
+        let all_minhashlsh = source_segments.iter().all(segment_has_minhashlsh_details);
         if !all_vector
             && !all_inverted
             && !all_bitmap
@@ -1979,10 +2159,43 @@ impl DatasetIndexExt for Dataset {
             && !all_label_list
             && !all_rtree
             && !all_ngram
+            && !all_minhashlsh
         {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
                     .to_string(),
+            ));
+        }
+
+        validate_segment_params_compatible(&[], &source_segments)?;
+
+        // Coverage may only move with the row addresses. A scalar merge loads its
+        // sources through the reuse index as a row-address remapper, so those
+        // addresses land in the current fragment space and the coverage has to
+        // follow them.
+        //
+        // Vector is exempt because its merge cannot remap: it hands the segments
+        // to the distributed file merger with an object store and a directory,
+        // reaching no dataset and so no reuse index.
+        //
+        // RTree is exempt for a narrower reason: it does load through the
+        // remapper, but the `all_rtree` branch below writes the same coverage
+        // field from its own staleness pruning, so a value set here would not
+        // survive. Placing it under the remap means settling how the two compose.
+        let has_remapped_source_coverage = if !all_vector && !all_rtree {
+            let index_name = source_segments[0].name.clone();
+            remap_merged_segment_coverage(self, &index_name, &mut source_segments).await?
+        } else {
+            false
+        };
+
+        // Refused before the pruning below, which checks out historical dataset
+        // versions: a build without `geo` cannot merge these segments at all, so
+        // that work would be discarded.
+        #[cfg(not(feature = "geo"))]
+        if all_rtree {
+            return Err(Error::not_supported(
+                "RTree segment merge requires the `geo` feature".to_string(),
             ));
         }
 
@@ -1997,6 +2210,8 @@ impl DatasetIndexExt for Dataset {
                 source.fragment_bitmap = Some(coverage.fragment_bitmap().clone());
             }
             self.manifest.version
+        } else if has_remapped_source_coverage {
+            self.manifest.version
         } else {
             source_dataset_version
         };
@@ -2006,7 +2221,12 @@ impl DatasetIndexExt for Dataset {
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
         } else if all_fmindex {
-            crate::index::scalar::fmindex::merge_segments(self, source_segments).await?
+            crate::index::scalar::fmindex::merge_segments(
+                self,
+                source_segments,
+                has_remapped_source_coverage,
+            )
+            .await?
         } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
         } else if all_bloomfilter {
@@ -2017,15 +2237,16 @@ impl DatasetIndexExt for Dataset {
             crate::index::scalar::zonemap::merge_segments(self, source_segments).await?
         } else if all_ngram {
             crate::index::scalar::ngram::merge_segments(self, source_segments).await?
+        } else if all_minhashlsh {
+            crate::index::scalar::minhash_lsh::merge_segments(self, source_segments).await?
         } else if all_rtree {
             #[cfg(feature = "geo")]
             {
                 crate::index::scalar::rtree::merge_segments(self, source_segments).await?
             }
+            // Refused above, before the coverage work.
             #[cfg(not(feature = "geo"))]
-            return Err(Error::not_supported(
-                "RTree segment merge requires the `geo` feature".to_string(),
-            ));
+            unreachable!("an RTree merge without `geo` returns before this point")
         } else {
             crate::index::scalar::btree::merge_segments(self, source_segments).await?
         };
@@ -2142,6 +2363,7 @@ impl DatasetIndexExt for Dataset {
         }
 
         let is_index_type_change = existing_different_type_url.is_some();
+        let existing_snapshot = existing_named_indices.clone();
         // What a retained sibling has to agree with. Every incoming segment
         // already carries the same pair: `build_index_metadata_from_segments`
         // compares them against each other before this point.
@@ -2216,6 +2438,18 @@ impl DatasetIndexExt for Dataset {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        // Segments that stay together must be compatible under the plugin's
+        // rules (for example identical hash parameters). Segments this commit
+        // removes are not consulted, so a full rebuild may change parameters.
+        let retained_indices: Vec<IndexMetadata> = existing_snapshot
+            .into_iter()
+            .filter(|idx| {
+                !removed_indices
+                    .iter()
+                    .any(|removed| removed.uuid == idx.uuid)
+            })
+            .collect();
+        validate_segment_params_compatible(&retained_indices, &new_indices)?;
 
         let transaction = Transaction::new(
             self.manifest.version,
@@ -2571,7 +2805,28 @@ async fn migrate_and_recompute_index_statistics(ds: &Dataset, index_name: &str) 
     ds.index_statistics(index_name).await
 }
 
+/// Find the FRI entry from the raw manifest listing (bookkeeping path).
+///
+/// This is a metadata-only lookup: it must not drive the query reader's coverage
+/// rewrite, parse the mapping, or fail on a corrupt ledger. Callers that then use
+/// the mapping (for example the v0 reader inside `open_frag_reuse_index`) still
+/// validate it and surface corruption; only the by-name lookup skips that work.
+async fn find_frag_reuse_index_meta(ds: &Dataset) -> Result<Option<IndexMetadata>> {
+    Ok(load_all_indices(ds)
+        .await?
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        .cloned())
+}
+
 async fn index_statistics_frag_reuse(ds: &Dataset) -> Result<String> {
+    if let Some(fri) = find_frag_reuse_index_meta(ds).await?
+        && fri.index_version != 0
+    {
+        return Err(Error::not_supported(
+            "FRI index_version 1 statistics are not implemented. Please upgrade to a supporting version",
+        ));
+    }
     let index = ds
         .open_frag_reuse_index(&NoOpMetricsCollector)
         .await?
@@ -2835,6 +3090,28 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
         }
     }
 
+    // Legacy FRI index version 0 is handled below by directly remapping fragment coverage.
+    // For version 1 and above, load_indices handles version checks and filters index
+    // segments for query use; keep their metadata unchanged here.
+    if indices
+        .iter()
+        .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
+    {
+        if indices
+            .iter()
+            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .count()
+            != 1
+        {
+            return Err(Error::corrupt_file_named(
+                "FRI metadata",
+                "tagged history requires a single FRI entry",
+            ));
+        }
+        // Commit bookkeeping carries the original Any unchanged. Only query
+        // loading or an operation consuming FRI needs to interpret its encoding.
+        return Ok(indices);
+    }
     if let Some(frag_reuse_index_meta) =
         indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
     {
@@ -3376,7 +3653,21 @@ impl DatasetIndexInternalExt for Dataset {
         &self,
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<Arc<CompactFragReuseIndex>>> {
-        if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
+        if let Some(frag_reuse_index_meta) = find_frag_reuse_index_meta(self).await? {
+            if frag_reuse_index_meta.index_version != 0 {
+                // Version-1 consumers are installed separately. The planner excludes
+                // affected segments; independent segments need no legacy remapper.
+                // Maintenance is rejected before entering the legacy write path.
+                return match frag_reuse_index_meta.index_version {
+                    // None means this legacy API cannot provide a reader for FRI index
+                    // version 1; it does not mean the dataset has no FRI.
+                    // Callers must not use this result to authorize index maintenance.
+                    1 => Ok(None),
+                    version => Err(Error::not_supported(format!(
+                        "FRI index_version {version} is unsupported. Please upgrade to a newer version",
+                    ))),
+                };
+            }
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
             let frag_reuse_key = FragReuseIndexKey {
                 uuid: &frag_reuse_uuid,
@@ -3437,7 +3728,11 @@ impl DatasetIndexInternalExt for Dataset {
     }
 
     async fn frag_reuse_index_uuid(&self) -> Option<Uuid> {
-        if let Ok(indices) = self.load_indices().await {
+        // Bookkeeping-only lookup: the uuid comes off the raw manifest listing,
+        // so it must not drive the query reader's coverage rewrite (nor parse the
+        // mapping, nor fail on a corrupt ledger). Use load_all_indices; the FRI
+        // entry itself is identical in the raw and derived listings.
+        if let Ok(indices) = load_all_indices(self).await {
             indices
                 .iter()
                 .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
