@@ -652,12 +652,14 @@ public class FragmentTest {
         Fragment fragment = dataset.getFragments().get(0);
 
         // The stream carries only the new column, one value per fragment row in row order;
-        // several small batches exercise the positional zip across batch boundaries.
+        // several small batches exercise the positional zip across batch boundaries. A read
+        // batch size of 5 against stream batches of 8 forces stream batches to be sliced at
+        // non-zero offsets, which the nulls in the stream must survive.
         FragmentMergeResult result;
         try (ArrowStreamReader reader = newColumnStream(allocator, rowCount, 8);
             ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
           Data.exportArrayStream(allocator, reader, stream);
-          result = fragment.addColumns(stream, Optional.empty());
+          result = fragment.addColumns(stream, Optional.of(5L));
         }
 
         try (Transaction transaction =
@@ -677,7 +679,11 @@ public class FragmentTest {
                 VectorSchemaRoot root = batches.getVectorSchemaRoot();
                 BigIntVector val = (BigIntVector) root.getVector("val");
                 for (int i = 0; i < root.getRowCount(); i++, row++) {
-                  assertEquals(row * 2L, val.get(i));
+                  if (row % 3 == 0) {
+                    assertTrue(val.isNull(i), "row " + row + " should be null");
+                  } else {
+                    assertEquals(row * 2L, val.get(i));
+                  }
                 }
               }
               assertEquals(rowCount, row);
@@ -685,16 +691,23 @@ public class FragmentTest {
           }
         }
 
-        // The stream must cover every live row exactly once: one row short must fail
-        // instead of silently misaligning values.
-        try (ArrowStreamReader reader = newColumnStream(allocator, rowCount - 1, 8);
-            ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
-          Data.exportArrayStream(allocator, reader, stream);
-          Exception e =
-              assertThrows(Exception.class, () -> fragment.addColumns(stream, Optional.empty()));
-          assertTrue(e.getMessage().contains("Stream ended before"), "unexpected error: " + e);
-        }
+        // The stream must cover every live row exactly once: one row short or one row long
+        // must fail instead of silently misaligning values.
+        assertAddColumnsRejected(allocator, fragment, rowCount - 1, Optional.empty());
+        assertAddColumnsRejected(allocator, fragment, rowCount + 1, Optional.empty());
+        // The batch size must fit a u32.
+        assertAddColumnsRejected(allocator, fragment, rowCount, Optional.of(-1L));
       }
+    }
+  }
+
+  private static void assertAddColumnsRejected(
+      RootAllocator allocator, Fragment fragment, int rows, Optional<Long> batchSize)
+      throws IOException {
+    try (ArrowStreamReader reader = newColumnStream(allocator, rows, 8);
+        ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+      Data.exportArrayStream(allocator, reader, stream);
+      assertThrows(IllegalArgumentException.class, () -> fragment.addColumns(stream, batchSize));
     }
   }
 
@@ -712,7 +725,12 @@ public class FragmentTest {
         root.allocateNew();
         BigIntVector val = (BigIntVector) root.getVector("val");
         for (int i = 0; i < batchRows; i++) {
-          val.setSafe(i, (start + i) * 2L);
+          // Every third row is null to check nulls line up with their rows.
+          if ((start + i) % 3 == 0) {
+            val.setNull(i);
+          } else {
+            val.setSafe(i, (start + i) * 2L);
+          }
         }
         root.setRowCount(batchRows);
         writer.writeBatch();
