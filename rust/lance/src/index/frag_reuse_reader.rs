@@ -62,13 +62,47 @@ pub(super) async fn load_indices(
                 .push((position, index));
         }
     }
+    // Third state, decided once: a dropped unknown transition loses the record
+    // of which fragments it touched, so no user-index segment's stored
+    // addresses can be proven translatable (supporting the remap plugin is
+    // necessary but not sufficient when the mapping itself is gone). Exclude
+    // every such segment up front (no coverage, scan fallback) rather than grant
+    // coverage a translator cannot honor, which would drop rows silently. System
+    // indices were already passed through above, and `may_need_translation`
+    // reports true in this state as well, so this is the same decision made
+    // explicitly here without consulting the plugin registry per segment.
+    let unsupported_history = mapping.ledger.has_unsupported_transitions();
     for members in groups.into_values() {
         let mut supported = Vec::with_capacity(members.len());
         for (position, index) in members {
-            if mapping.may_need_translation(index.fragment_bitmap.as_ref()) {
-                // Async consumers are installed in the next PR. Until then,
-                // these segments cannot contribute to destination coverage.
+            if unsupported_history {
                 continue;
+            }
+            if mapping.may_need_translation(index.fragment_bitmap.as_ref()) {
+                let can_remap = if super::segment_has_vector_details(index) {
+                    super::frag_reuse_remapping::vector_supports_batch_remapping(dataset, index)
+                        .await?
+                } else if index
+                    .index_details
+                    .as_ref()
+                    .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"))
+                {
+                    super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index)
+                        .await?
+                } else {
+                    index
+                        .index_details
+                        .as_ref()
+                        .and_then(|details| {
+                            super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                                .get_plugin_by_details(details)
+                                .ok()
+                        })
+                        .is_some_and(|plugin| plugin.supports_batch_row_id_remapping())
+                };
+                if index.fragment_bitmap.is_none() || !can_remap {
+                    continue;
+                }
             }
             supported.push((position, index));
         }
@@ -101,13 +135,17 @@ pub(super) async fn load_indices(
 }
 
 /// One segment's derived query-time inputs from the coverage backtrack.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SegmentPlanParts {
     /// Live fragments this segment answers for in the current snapshot.
     pub coverage: RoaringBitmap,
     /// Fragments directly covered by other selected group members; translated
     /// paths entering them belong to those siblings.
     pub excluded: RoaringBitmap,
+    /// Positions (in ledger order) of the transitions this segment's rows
+    /// pass through on their way to `coverage`: every transition whose
+    /// resolved contributors include this segment.
+    pub path: Vec<usize>,
 }
 
 /// A validated FRI graph whose mapping payloads are opened only when needed.
@@ -264,14 +302,74 @@ impl FragmentReuseIndex {
             }
         }
         let group_direct: RoaringBitmap = direct.keys().copied().collect();
+        // Invert the resolutions: a transition whose contributors include a
+        // segment is on that segment's translation path.
+        let mut paths = vec![Vec::new(); provenance.len()];
+        for (&index, resolution) in &transitions {
+            for &segment in resolution.iter().flatten() {
+                paths[segment].push(index);
+            }
+        }
         provenance
             .iter()
             .zip(coverage)
-            .map(|(own, coverage)| SegmentPlanParts {
-                coverage,
-                excluded: &group_direct - own,
+            .zip(paths)
+            .map(|((own, coverage), mut path)| {
+                path.sort_unstable();
+                SegmentPlanParts {
+                    coverage,
+                    excluded: &group_direct - own,
+                    path,
+                }
             })
             .collect()
+    }
+
+    /// The translation identity of one segment: a hash of everything that
+    /// decides its translated output, so cached objects that embed translated
+    /// addresses can be keyed by it and go cold only when that state changes.
+    ///
+    /// `remap_row_ids_excluding` is a function of the mappings on the
+    /// segment's path, the liveness of the fragments along it, `excluded`
+    /// and `coverage`. The hash therefore covers `coverage` (live fragments
+    /// only, so a fragment dropped from the manifest changes it), `excluded`
+    /// restricted to the destinations of the path (sibling churn elsewhere in
+    /// the group cannot change this segment's output), the fingerprints of
+    /// the path transitions in ledger order (a trimmed or replaced transition
+    /// on the path changes it; one elsewhere does not) and whether the ledger
+    /// dropped unsupported transitions. The FRI entry's UUID is deliberately
+    /// not part of it: every rewrite and trim mints a new one, even for
+    /// transitions this segment never touches.
+    pub fn translation_fingerprint(
+        &self,
+        coverage: &RoaringBitmap,
+        excluded: &RoaringBitmap,
+        path: &[usize],
+    ) -> [u8; 32] {
+        let transitions = self.ledger.transitions();
+        let path_destinations: RoaringBitmap = path
+            .iter()
+            .flat_map(|&index| transitions[index].destinations())
+            .map(|destination| destination.id as u32)
+            .collect();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"fri-translation/1");
+        hasher.update(&[u8::from(self.ledger.has_unsupported_transitions())]);
+        hasher.update(b"coverage");
+        // The serialized form is canonical for a given set; the hasher
+        // implements `io::Write`, so nothing is buffered.
+        coverage
+            .serialize_into(&mut hasher)
+            .expect("hashing a bitmap cannot fail");
+        hasher.update(b"excluded");
+        (excluded & path_destinations)
+            .serialize_into(&mut hasher)
+            .expect("hashing a bitmap cannot fail");
+        hasher.update(b"path");
+        for &index in path {
+            hasher.update(transitions[index].fingerprint());
+        }
+        *hasher.finalize().as_bytes()
     }
 
     /// Remap physical row IDs through supported lineage, stopping at live fragments.
@@ -378,7 +476,7 @@ async fn load_ledger(dataset: &Dataset, index: &IndexMetadata) -> Result<FragReu
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
@@ -405,11 +503,11 @@ mod tests {
     use prost::encoding::WireType;
     use tokio::io::AsyncWriteExt;
     use uuid::Uuid;
-    async fn fixture() -> Dataset {
+    pub async fn fixture() -> Dataset {
         fixture_with_index(IndexType::BTree).await
     }
 
-    async fn fixture_with_index(index_type: IndexType) -> Dataset {
+    pub async fn fixture_with_index(index_type: IndexType) -> Dataset {
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
             .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
@@ -467,8 +565,35 @@ mod tests {
         dataset
     }
 
-    async fn prepare(dataset: &Dataset) -> (Transition, Vec<Fragment>) {
-        let batch = dataset.scan().try_into_batch().await.unwrap();
+    pub async fn prepare(dataset: &Dataset) -> (Transition, Vec<Fragment>) {
+        let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+        prepare_partition(dataset, &source_ids, 10).await
+    }
+
+    /// [`prepare`] over a subset of fragments: scans `source_ids` in order,
+    /// alternates their rows across two uncommitted destinations numbered
+    /// from `dest_base_id`, and writes the row map for that partition.
+    pub async fn prepare_partition(
+        dataset: &Dataset,
+        source_ids: &[u64],
+        dest_base_id: u64,
+    ) -> (Transition, Vec<Fragment>) {
+        let source_fragments: Vec<Fragment> = source_ids
+            .iter()
+            .map(|id| {
+                dataset
+                    .fragments()
+                    .iter()
+                    .find(|f| f.id == *id)
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        let batch = {
+            let mut scan = dataset.scan();
+            scan.with_fragments(source_fragments.clone());
+            scan.try_into_batch().await.unwrap()
+        };
         let values = batch["i"].as_primitive::<Int32Type>();
         let labels: Vec<_> = values.iter().map(|v| (v.unwrap() % 2) as u16).collect();
         let mut destinations = Vec::new();
@@ -503,11 +628,11 @@ mod tests {
             destinations.extend(fragments);
         }
         for (i, fragment) in destinations.iter_mut().enumerate() {
-            fragment.id = 10 + i as u64;
+            fragment.id = dest_base_id + i as u64;
         }
         let mut source_rows = Vec::new();
         let mut sources = Vec::new();
-        for fragment in dataset.fragments().iter() {
+        for fragment in source_fragments.iter() {
             let deleted: Option<RoaringBitmap> = dataset
                 .get_fragment(fragment.id as usize)
                 .unwrap()
@@ -559,7 +684,7 @@ mod tests {
         (transition, destinations)
     }
 
-    fn field(tag: u32, bytes: &[u8]) -> Vec<u8> {
+    pub fn field(tag: u32, bytes: &[u8]) -> Vec<u8> {
         let mut output = Vec::new();
         prost::encoding::encode_key(tag, WireType::LengthDelimited, &mut output);
         prost::encoding::encode_varint(bytes.len() as u64, &mut output);
@@ -569,7 +694,7 @@ mod tests {
 
     // Assemble a reader snapshot directly. Publishing rewrites and their FRI
     // deltas atomically belongs to the writer PR, not this test helper.
-    async fn install(
+    pub async fn install(
         dataset: &mut Dataset,
         content: Vec<u8>,
         destinations: Vec<Fragment>,
@@ -640,7 +765,7 @@ mod tests {
 
     // Maintenance and clone reopen the manifest instead of using the query cache.
     // Persist the assembled fixture without requiring the future rewrite writer.
-    async fn persist_fixture(dataset: &mut Dataset, indices: Vec<IndexMetadata>) {
+    pub async fn persist_fixture(dataset: &mut Dataset, indices: Vec<IndexMetadata>) {
         let mut manifest = dataset.manifest.as_ref().clone();
         manifest.version += 1;
         manifest.update_max_fragment_id();
@@ -691,9 +816,11 @@ mod tests {
         assert!(error.to_string().contains("Please upgrade"));
     }
 
+    // Deferred compaction is no longer in this list: on a tagged table it
+    // appends an ordered-compaction transition to the tagged entry (see the
+    // chained end-to-end test in `crate::index::frag_reuse`).
     #[rstest::rstest]
     #[case::eager_compaction("eager")]
-    #[case::deferred_compaction("deferred")]
     #[case::statistics("statistics")]
     #[case::cleanup("cleanup")]
     #[case::shallow_clone("shallow")]
@@ -716,11 +843,10 @@ mod tests {
         persist_fixture(&mut dataset, indices).await;
         let version = dataset.manifest.version;
         let error = match operation {
-            "eager" | "deferred" => crate::dataset::optimize::compact_files(
+            "eager" => crate::dataset::optimize::compact_files(
                 &mut dataset,
                 crate::dataset::optimize::CompactionOptions {
                     target_rows_per_fragment: 100,
-                    defer_index_remap: operation == "deferred",
                     ..Default::default()
                 },
                 None,
@@ -965,7 +1091,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .all(|i| i.name == FRAG_REUSE_INDEX_NAME)
+                .any(|i| i.name == "i_idx")
         );
         assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
     }
@@ -1624,6 +1750,59 @@ mod tests {
         assert_eq!(plans[0].excluded, RoaringBitmap::from_iter([1, 4]));
         assert_eq!(plans[1].excluded, RoaringBitmap::from_iter([0, 4]));
         assert_eq!(plans[2].excluded, RoaringBitmap::from_iter([0, 1]));
+        // X and Y reach F5 through both transitions; Z covers F4 directly and
+        // passes through none.
+        assert_eq!(plans[0].path, vec![0, 1]);
+        assert_eq!(plans[1].path, vec![0, 1]);
+        assert!(plans[2].path.is_empty());
+
+        // The translation identity follows exactly the inputs of the
+        // translated output: coverage, the exclusions on the path's
+        // destinations, and the path itself.
+        let fingerprint = |plan: &SegmentPlanParts| {
+            reader.translation_fingerprint(&plan.coverage, &plan.excluded, &plan.path)
+        };
+        let base = fingerprint(&plans[0]);
+        assert_eq!(base, fingerprint(&plans[0]), "deterministic");
+        // X and Y share coverage, path and on-path exclusions ({4}), so they
+        // share an identity; their own content is told apart by the index
+        // UUID namespace layered on top.
+        assert_eq!(base, fingerprint(&plans[1]));
+        assert_ne!(base, fingerprint(&plans[2]), "a direct segment differs");
+        assert_ne!(
+            base,
+            reader.translation_fingerprint(
+                &RoaringBitmap::new(),
+                &plans[0].excluded,
+                &plans[0].path
+            ),
+            "coverage is part of the identity"
+        );
+        assert_ne!(
+            base,
+            reader.translation_fingerprint(
+                &plans[0].coverage,
+                &plans[0].excluded,
+                &plans[0].path[..1]
+            ),
+            "a transition dropped from the path changes the identity"
+        );
+        // Exclusions outside the path's destinations {2, 3, 4, 5} are inert:
+        // sibling churn elsewhere in the group cannot change X's output.
+        let mut off_path = plans[0].excluded.clone();
+        off_path.insert(99);
+        assert_eq!(
+            base,
+            reader.translation_fingerprint(&plans[0].coverage, &off_path, &plans[0].path),
+            "an exclusion off the path leaves the identity unchanged"
+        );
+        let mut on_path = plans[0].excluded.clone();
+        on_path.insert(5);
+        assert_ne!(
+            base,
+            reader.translation_fingerprint(&plans[0].coverage, &on_path, &plans[0].path),
+            "an exclusion on a path destination changes the identity"
+        );
     }
 
     #[rstest::rstest]
@@ -1921,3 +2100,7 @@ mod tests {
         assert!(!is_tagged(&carried));
     }
 }
+
+#[cfg(test)]
+#[path = "frag_reuse_reader_tests.rs"]
+mod consumer_tests;
