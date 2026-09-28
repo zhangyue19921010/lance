@@ -177,6 +177,11 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert name_by_id[2] == "gen1_2", "SSTable gen must overwrite base for id=2"
     assert name_by_id[3] == "base_3"
 
+    reader = LsmScanner.from_snapshots(base_ds, [snap]).to_reader()
+    assert isinstance(reader, pa.RecordBatchReader)
+    assert reader.schema == table.schema
+    assert reader.read_all().sort_by("id") == table.sort_by("id")
+
     offset_table = (
         LsmScanner.from_snapshots(base_ds, [snap]).limit(None, offset=1).to_table()
     )
