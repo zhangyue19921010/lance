@@ -912,6 +912,7 @@ impl Transaction {
                             &offsets,
                             new_version,
                             prev_version,
+                            &config.spilled_row_lineage,
                         )?;
                     }
                 }
@@ -934,6 +935,7 @@ impl Transaction {
                         existing_fragments,
                         new_fragments.as_mut_slice(),
                         new_version,
+                        &config.spilled_row_lineage,
                     )?;
                 }
 
@@ -1498,6 +1500,7 @@ impl Transaction {
                                     &covered_offsets,
                                     new_version,
                                     1,
+                                    &config.spilled_row_lineage,
                                 )?;
                             }
                         }
