@@ -2096,6 +2096,25 @@ class LanceDataset(pa.dataset.Dataset):
             for f in self._ds.get_fragments()
         ]
 
+    def fragment_ids(self) -> Bitmap:
+        """Get the ids of all fragments in the currently checked out version.
+
+        Unlike :meth:`get_fragments`, this does not create an object for every
+        fragment.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": range(4)})
+        >>> dataset = lance.write_dataset(
+        ...     data, "memory://fragment_ids", max_rows_per_file=2
+        ... )
+        >>> list(dataset.fragment_ids())
+        [0, 1]
+        """
+        return self._ds.fragment_ids()
+
     def get_fragment(self, fragment_id: int) -> Optional[LanceFragment]:
         """Get the fragment with fragment id."""
         raw_fragment = self._ds.get_fragment(fragment_id)
@@ -3154,14 +3173,33 @@ class LanceDataset(pa.dataset.Dataset):
         """
         versions = self._ds.versions()
         for v in versions:
-            # TODO: python datetime supports only microsecond precision. When a
-            # separate Version object is implemented, expose the precise timestamp
-            # (ns) to python.
-            ts_nanos = v["timestamp"]
-            v["timestamp"] = datetime.fromtimestamp(ts_nanos // 1e9) + timedelta(
-                microseconds=(ts_nanos % 1e9) // 1e3
-            )
+            _convert_version_timestamp(v)
         return versions
+
+    def get_version(self) -> Version:
+        """
+        Return the currently checked out version, with its timestamp and the
+        summary of its manifest.
+
+        The summary is in ``metadata``. It counts the fragments, data files,
+        deletion files, rows and bytes of the version, and is computed from the
+        manifest that is already loaded, so nothing is read from storage.
+
+        Use :attr:`version` instead when only the version number is needed.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": [1, 2, 3]})
+        >>> dataset = lance.write_dataset(data, "memory://get_version")
+        >>> version = dataset.get_version()
+        >>> version["version"]
+        1
+        >>> version["metadata"]["total_rows"]
+        '3'
+        """
+        return _convert_version_timestamp(self._ds.current_version())
 
     def version_refs(self) -> List[VersionRef]:
         """
@@ -6083,6 +6121,17 @@ class Version(TypedDict):
     version: int
     timestamp: int | datetime
     metadata: Dict[str, str]
+
+
+def _convert_version_timestamp(version: Version) -> Version:
+    # TODO: python datetime supports only microsecond precision. When a
+    # separate Version object is implemented, expose the precise timestamp
+    # (ns) to python.
+    ts_nanos = version["timestamp"]
+    version["timestamp"] = datetime.fromtimestamp(ts_nanos // 1e9) + timedelta(
+        microseconds=(ts_nanos % 1e9) // 1e3
+    )
+    return version
 
 
 class VersionRef(TypedDict):
