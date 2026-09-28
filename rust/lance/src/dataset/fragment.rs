@@ -6948,16 +6948,45 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut frag = dataset.get_fragments().pop().unwrap();
-        let stream = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let fragments = dataset.get_fragments();
+        let mut merged_fragments = Vec::with_capacity(fragments.len());
+        let mut merged_schema = dataset.schema().clone();
+        for mut frag in fragments {
+            let stream = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+            let (new_frag, new_schema) = frag.merge_columns(stream, "i", "i").await.unwrap();
+            let new_field_id = new_schema.field("double_i").unwrap().id;
+            assert_eq!(new_field_id, dataset.manifest.max_field_id() + 1);
+            assert_eq!(
+                new_frag.files.last().unwrap().fields.as_ref(),
+                &[new_field_id]
+            );
+            merged_fragments.push(new_frag);
+            merged_schema = new_schema;
+        }
 
-        let (new_frag, new_schema) = frag.merge_columns(stream, "i", "i").await.unwrap();
-        let new_field_id = new_schema.field("double_i").unwrap().id;
-        assert_eq!(new_field_id, dataset.manifest.max_field_id() + 1);
-        assert_eq!(
-            new_frag.files.last().unwrap().fields.as_ref(),
-            &[new_field_id]
-        );
+        let dataset = Dataset::commit(
+            &test_dir,
+            Operation::Merge {
+                fragments: merged_fragments,
+                schema: merged_schema,
+                preserves_nullability: true,
+            },
+            Some(dataset.manifest.version),
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let actual = dataset
+            .scan()
+            .project(&["i", "double_i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(actual, batch);
     }
 
     #[tokio::test]
