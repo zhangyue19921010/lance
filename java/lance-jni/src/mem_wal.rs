@@ -281,7 +281,7 @@ fn inner_memtable_stats<'local>(
             guard.writer.memory(),
         )
     };
-    memtable_stats_to_java(env, &stats, &memory)
+    memtable_stats_to_java(env, &stats, Some(&memory))
 }
 
 #[unsafe(no_mangle)]
@@ -342,7 +342,29 @@ pub extern "system" fn Java_org_lance_memwal_ShardWriter_releaseNativeShardWrite
 
 fn inner_release_shard_writer(env: &mut JNIEnv, this: JObject) -> Result<()> {
     let blocking: BlockingShardWriter = unsafe { env.take_rust_field(&this, NATIVE_SHARD_WRITER) }?;
+    // Snapshot stats before close so the captured state reflects what was
+    // written, not any internal bookkeeping done by close().
+    let stats = blocking.writer.stats();
+    let memtable_stats = block_on(blocking.writer.memtable_stats());
     block_on(blocking.writer.close())?;
+
+    // The native writer is gone; leave its final statistics on the Java object
+    // so `stats()` and `memtableStats()` keep answering after close.
+    let stats = write_stats_to_java(env, &stats)?;
+    let memtable_stats =
+        memtable_stats_to_java(env, &closed_memtable_stats(memtable_stats?), None)?;
+    env.set_field(
+        &this,
+        "closedStats",
+        "Lorg/lance/memwal/WriteStats;",
+        JValueGen::Object(&stats),
+    )?;
+    env.set_field(
+        &this,
+        "closedMemtableStats",
+        "Lorg/lance/memwal/MemTableStats;",
+        JValueGen::Object(&memtable_stats),
+    )?;
     Ok(())
 }
 
@@ -1367,10 +1389,12 @@ fn write_stats_to_java<'a>(
     )?)
 }
 
+/// `memory` is `None` for a closed writer: it holds nothing, so the byte totals
+/// are zero by construction rather than stale.
 fn memtable_stats_to_java<'a>(
     env: &mut JNIEnv<'a>,
     stats: &MemTableStats,
-    memory: &ShardMemory,
+    memory: Option<&ShardMemory>,
 ) -> Result<JObject<'a>> {
     let max_buffered = box_u64_opt(env, stats.max_buffered_batch_position)?;
     let pending_start = box_u64_opt(env, stats.pending_wal_start_batch_position)?;
@@ -1381,7 +1405,7 @@ fn memtable_stats_to_java<'a>(
         &[
             JValueGen::Long(stats.row_count as i64),
             JValueGen::Long(stats.batch_count as i64),
-            JValueGen::Long(memory.row_bytes() as i64),
+            JValueGen::Long(memory.map_or(0, ShardMemory::row_bytes) as i64),
             JValueGen::Long(stats.generation as i64),
             JValueGen::Object(&max_buffered),
             JValueGen::Long(stats.durable_batch_count as i64),
@@ -1391,11 +1415,44 @@ fn memtable_stats_to_java<'a>(
             JValueGen::Long(stats.pending_wal_batch_count as i64),
             JValueGen::Long(stats.pending_wal_row_count as i64),
             JValueGen::Long(stats.pending_wal_estimated_bytes as i64),
-            JValueGen::Long(memory.index_bytes() as i64),
-            JValueGen::Long(memory.grace_bytes() as i64),
-            JValueGen::Long(memory.retained_bytes() as i64),
+            JValueGen::Long(memory.map_or(0, ShardMemory::index_bytes) as i64),
+            JValueGen::Long(memory.map_or(0, ShardMemory::grace_bytes) as i64),
+            JValueGen::Long(memory.map_or(0, ShardMemory::retained_bytes) as i64),
         ],
     )?)
+}
+
+/// The MemTable statistics a closed writer reports. Mirrors the Python binding.
+fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
+    // Close awaits every frozen memtable's flush, so nothing is owed afterwards
+    // regardless of whether the active memtable had buffered batches.
+    let stats_before_close = MemTableStats {
+        frozen_count: 0,
+        ..stats_before_close
+    };
+
+    if stats_before_close.batch_count == 0 {
+        return stats_before_close;
+    }
+
+    // After a successful close every buffered batch is flushed and WAL-durable,
+    // so the synthesized empty memtable starts at the writer's global end and the
+    // durable cursor has caught up to it.
+    let global_end = stats_before_close.global_offset + stats_before_close.batch_count;
+    MemTableStats {
+        row_count: 0,
+        batch_count: 0,
+        generation: stats_before_close.generation.saturating_add(1),
+        max_buffered_batch_position: None,
+        durable_batch_count: global_end,
+        global_offset: global_end,
+        pending_wal_start_batch_position: None,
+        pending_wal_end_batch_position: None,
+        pending_wal_batch_count: 0,
+        pending_wal_row_count: 0,
+        pending_wal_estimated_bytes: 0,
+        frozen_count: 0,
+    }
 }
 
 fn box_u64_opt<'a>(env: &mut JNIEnv<'a>, value: Option<usize>) -> Result<JObject<'a>> {

@@ -444,6 +444,55 @@ public class MemWalTest {
   }
 
   @Test
+  void testShardWriterStatsAfterClose(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("base").toString();
+    String shardId = UUID.randomUUID().toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeLookupDataset(allocator, path, new long[] {0}, "base")) {
+      dataset.initializeMemWal(new InitializeMemWalParams());
+
+      ShardWriterConfig config =
+          new ShardWriterConfig()
+              .withDurableWrite(true)
+              .withMaxWalBufferSize(1)
+              .withMaxWalFlushIntervalMs(10);
+
+      ShardWriter writer = dataset.memWalWriter(shardId, config);
+      MemTableStats openStats;
+      try {
+        try (VectorSchemaRoot root = lookupRoot(allocator, new long[] {1, 2}, "writer");
+            ArrowReader reader = toReader(allocator, root)) {
+          writer.put(reader);
+        }
+        openStats = writer.memtableStats();
+        assertEquals(1, openStats.batchCount());
+      } finally {
+        writer.close();
+      }
+
+      WriteStats stats = writer.stats();
+      assertEquals(1, stats.putCount());
+      assertTrue(stats.walFlushCount() >= 1, "a durable put flushes the WAL before returning");
+
+      // close() flushed the MemTable that held the put, leaving an empty one behind.
+      MemTableStats closedStats = writer.memtableStats();
+      assertEquals(0, closedStats.rowCount());
+      assertEquals(0, closedStats.batchCount());
+      assertEquals(openStats.generation() + 1, closedStats.generation());
+      assertEquals(1, closedStats.globalOffset());
+      assertEquals(1, closedStats.durableBatchCount());
+      assertEquals(0, closedStats.pendingWalBatchCount());
+      assertEquals(0, closedStats.retainedBytes());
+
+      // A second close is a no-op and keeps the final statistics.
+      writer.close();
+      assertEquals(1, writer.stats().putCount());
+
+      assertThrows(IllegalArgumentException.class, writer::shardId);
+    }
+  }
+
+  @Test
   void testLsmScannerFromSnapshots(@TempDir Path tempDir) throws Exception {
     String basePath = tempDir.resolve("base").toString();
     String shardId = UUID.randomUUID().toString();

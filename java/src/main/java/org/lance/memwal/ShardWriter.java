@@ -40,8 +40,9 @@ import java.util.List;
  * }
  * }</pre>
  *
- * <p>{@link #close()} flushes pending data and releases native resources. Statistics must be read
- * before the writer is closed.
+ * <p>{@link #close()} flushes pending data and releases native resources. {@link #stats()} and
+ * {@link #memtableStats()} keep answering afterwards with the writer's final statistics; every
+ * other method fails on a closed writer.
  */
 public class ShardWriter implements Closeable {
   static {
@@ -49,6 +50,9 @@ public class ShardWriter implements Closeable {
   }
 
   private long nativeShardWriterHandle;
+  // Final statistics, set by the native side when close() succeeds.
+  private WriteStats closedStats;
+  private MemTableStats closedMemtableStats;
   private BufferAllocator allocator;
   private final LockManager lockManager = new LockManager();
 
@@ -130,20 +134,36 @@ public class ShardWriter implements Closeable {
 
   private native void nativeDelete(long streamAddress);
 
-  /** Return a snapshot of cumulative write statistics. */
+  /**
+   * Return a snapshot of cumulative write statistics.
+   *
+   * <p>On a closed writer this is the snapshot taken as {@link #close()} began, so it counts what
+   * was written and not the flushes close itself performed.
+   */
   public WriteStats stats() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
-      Preconditions.checkArgument(nativeShardWriterHandle != 0, "ShardWriter is closed");
+      if (nativeShardWriterHandle == 0) {
+        Preconditions.checkArgument(closedStats != null, "ShardWriter is closed");
+        return closedStats;
+      }
       return nativeStats();
     }
   }
 
   private native WriteStats nativeStats();
 
-  /** Return current statistics of the active MemTable. */
+  /**
+   * Return current statistics of the active MemTable.
+   *
+   * <p>On a closed writer this describes the empty MemTable left behind by {@link #close()}: no
+   * rows, no batches, no resident bytes, and every batch written before it durable.
+   */
   public MemTableStats memtableStats() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
-      Preconditions.checkArgument(nativeShardWriterHandle != 0, "ShardWriter is closed");
+      if (nativeShardWriterHandle == 0) {
+        Preconditions.checkArgument(closedMemtableStats != null, "ShardWriter is closed");
+        return closedMemtableStats;
+      }
       return nativeMemtableStats();
     }
   }
