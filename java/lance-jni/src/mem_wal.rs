@@ -1377,7 +1377,7 @@ fn memtable_stats_to_java<'a>(
     let pending_end = box_u64_opt(env, stats.pending_wal_end_batch_position)?;
     Ok(env.new_object(
         "org/lance/memwal/MemTableStats",
-        "(JJJJLjava/lang/Long;JJLjava/lang/Long;Ljava/lang/Long;JJJJJJ)V",
+        "(JJJJLjava/lang/Long;JJLjava/lang/Long;Ljava/lang/Long;JJJJJJJJ)V",
         &[
             JValueGen::Long(stats.row_count as i64),
             JValueGen::Long(stats.batch_count as i64),
@@ -1392,6 +1392,8 @@ fn memtable_stats_to_java<'a>(
             JValueGen::Long(stats.pending_wal_row_count as i64),
             JValueGen::Long(stats.pending_wal_estimated_bytes as i64),
             JValueGen::Long(memory.index_bytes() as i64),
+            JValueGen::Long(stats.frozen_count as i64),
+            JValueGen::Long(memory.frozen_bytes() as i64),
             JValueGen::Long(memory.grace_bytes() as i64),
             JValueGen::Long(memory.retained_bytes() as i64),
         ],

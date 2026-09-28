@@ -32,6 +32,8 @@ public class MemTableStats {
   private final long pendingWalRowCount;
   private final long pendingWalEstimatedBytes;
   private final long indexBytes;
+  private final long frozenCount;
+  private final long frozenBytes;
   private final long graceBytes;
   private final long retainedBytes;
 
@@ -49,6 +51,8 @@ public class MemTableStats {
       long pendingWalRowCount,
       long pendingWalEstimatedBytes,
       long indexBytes,
+      long frozenCount,
+      long frozenBytes,
       long graceBytes,
       long retainedBytes) {
     this.rowCount = rowCount;
@@ -64,6 +68,8 @@ public class MemTableStats {
     this.pendingWalRowCount = pendingWalRowCount;
     this.pendingWalEstimatedBytes = pendingWalEstimatedBytes;
     this.indexBytes = indexBytes;
+    this.frozenCount = frozenCount;
+    this.frozenBytes = frozenBytes;
     this.graceBytes = graceBytes;
     this.retainedBytes = retainedBytes;
   }
@@ -144,6 +150,22 @@ public class MemTableStats {
   }
 
   /**
+   * Number of frozen MemTables in the read view: sealed and awaiting flush, plus flushed ones still
+   * inside the configured frozen-MemTable grace.
+   */
+  public long frozenCount() {
+    return frozenCount;
+  }
+
+  /**
+   * Bytes held by sealed MemTables whose flush has not committed. Together with the active
+   * MemTable, this is what backpressure meters against {@code maxUnflushedMemtableBytes}.
+   */
+  public long frozenBytes() {
+    return frozenBytes;
+  }
+
+  /**
    * Bytes held by generations that have flushed but are lingering out the configured
    * frozen-MemTable grace. Resident, but no flush reclaims them — the sweeper does, on a timer.
    */
@@ -175,6 +197,8 @@ public class MemTableStats {
         .add("pendingWalRowCount", pendingWalRowCount)
         .add("pendingWalEstimatedBytes", pendingWalEstimatedBytes)
         .add("indexBytes", indexBytes)
+        .add("frozenCount", frozenCount)
+        .add("frozenBytes", frozenBytes)
         .add("graceBytes", graceBytes)
         .add("retainedBytes", retainedBytes)
         .toString();

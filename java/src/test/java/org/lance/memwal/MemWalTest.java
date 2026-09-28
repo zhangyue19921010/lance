@@ -399,6 +399,49 @@ public class MemWalTest {
   }
 
   @Test
+  void testMemtableStatsReportFrozenMemtables(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("base").toString();
+    String shardId = UUID.randomUUID().toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeLookupDataset(allocator, path, new long[] {0}, "base")) {
+      dataset.initializeMemWal(new InitializeMemWalParams());
+
+      // One batch per MemTable, so every put seals the MemTable it wrote to.
+      ShardWriterConfig config =
+          new ShardWriterConfig()
+              .withDurableWrite(true)
+              .withMaxWalBufferSize(1)
+              .withMaxWalFlushIntervalMs(10)
+              .withMaxMemtableBatches(1);
+
+      try (ShardWriter writer = dataset.memWalWriter(shardId, config)) {
+        // A sealed MemTable is reported only until its flush commits, which may happen before the
+        // stats are read. Retry with a fresh put rather than depend on that timing.
+        boolean sawFrozen = false;
+        for (long id = 1; id <= 20 && !sawFrozen; id++) {
+          try (VectorSchemaRoot root = lookupRoot(allocator, new long[] {id}, "writer");
+              ArrowReader reader = toReader(allocator, root)) {
+            writer.put(reader);
+          }
+          MemTableStats stats = writer.memtableStats();
+          sawFrozen = stats.frozenCount() > 0 && stats.frozenBytes() > 0;
+        }
+        assertTrue(sawFrozen, "a sealed MemTable awaiting flush must be reported");
+
+        MemTableStats drained = writer.memtableStats();
+        long deadline = System.currentTimeMillis() + 10_000;
+        while ((drained.frozenCount() > 0 || drained.frozenBytes() > 0)
+            && System.currentTimeMillis() < deadline) {
+          Thread.sleep(50);
+          drained = writer.memtableStats();
+        }
+        assertEquals(0, drained.frozenCount(), "every sealed MemTable must eventually flush");
+        assertEquals(0, drained.frozenBytes());
+      }
+    }
+  }
+
+  @Test
   void testShardWriterDeleteMasksBaseRow(@TempDir Path tempDir) throws Exception {
     String path = tempDir.resolve("base").toString();
     String shardId = UUID.randomUUID().toString();
