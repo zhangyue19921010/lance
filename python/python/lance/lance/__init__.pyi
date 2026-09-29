@@ -1029,6 +1029,11 @@ class ScanStatistics:
     all_counts: Dict[
         str, int
     ]  # Additional metrics for debugging purposes. Subject to change.
+    all_times: Dict[str, int]
+    """Additional debugging timings in nanoseconds. Keys are subject to change.
+
+    Nested and concurrent stages overlap; summing these values does not
+    reconstruct query wall time."""
 
 class DatasetBasePath:
     def __init__(

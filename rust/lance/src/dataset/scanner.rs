@@ -18961,6 +18961,23 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .copied()
             .unwrap_or(0);
         assert_eq!(loads, if filtered || !segmented { 1 } else { 0 });
+        for name in [
+            "ANNSubIndexExec_elapsed_compute",
+            "index_open_time",
+            "index_partition_load_time",
+            "index_partition_prepare_time",
+            "index_cpu_queue_wait_time",
+            "index_search_time",
+            "index_query_prepare_time",
+            "index_distance_topk_time",
+            "index_result_materialize_time",
+        ] {
+            assert!(
+                summary.all_times.get(name).is_some_and(|time| *time > 0),
+                "missing ANN stage timing: {name}: {:?}",
+                summary.all_times
+            );
+        }
     }
 
     #[rstest]

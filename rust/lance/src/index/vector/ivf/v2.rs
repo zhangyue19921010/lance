@@ -44,7 +44,7 @@ use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
 use lance_index::cache_pb::IvfStateHeader;
-use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
+use lance_index::metrics::{IndexTimer, IndexTiming, LocalMetricsCollector, MetricsCollector};
 use lance_index::prefilter::NoFilter;
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
@@ -85,6 +85,7 @@ use lance_select::RowAddrTreeMap;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, instrument};
@@ -1222,10 +1223,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         metrics: &dyn MetricsCollector,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
     ) -> Result<PreparedPartitionSearch<S, Q>> {
-        let (part_entry, ()) = tokio::try_join!(
-            self.load_partition(partition_id, true, metrics),
-            pre_filter.wait_for_ready(),
-        )?;
+        let _stage_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
+        let (part_entry, ()) =
+            tokio::try_join!(self.load_partition(partition_id, true, metrics), async {
+                let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
+                pre_filter.wait_for_ready().await
+            },)?;
         let pre_filter =
             Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
                 .await?;
@@ -1250,6 +1253,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         metrics: &dyn MetricsCollector,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
     ) -> Result<PreparedPartitionSearch<S, Q>> {
+        let _stage_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
         let pre_filter =
             Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
@@ -1274,6 +1278,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         metrics: &dyn MetricsCollector,
         scratch: &mut QueryScratch,
     ) -> Result<RecordBatch> {
+        let _stage_timer = IndexTimer::new(metrics, IndexTiming::Search);
         let PreparedPartitionSearch {
             query,
             pre_filter,
@@ -1357,6 +1362,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         scratch: &mut QueryScratch,
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
+        let _stage_timer = IndexTimer::new(metrics, IndexTiming::Search);
         let PreparedPartitionSearch {
             query,
             pre_filter,
@@ -1426,7 +1432,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         }
     }
 
-    fn global_heap_to_batch(heap: BinaryHeap<OrderedNode<u64>>) -> Result<RecordBatch> {
+    fn global_heap_to_batch(
+        heap: BinaryHeap<OrderedNode<u64>>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        let _result_timer = IndexTimer::new(metrics, IndexTiming::ResultMaterialize);
         let (row_ids, dists): (Vec<_>, Vec<_>) = heap.into_iter().map(|r| (r.id, r.dist.0)).unzip();
         Ok(RecordBatch::try_new(
             VECTOR_RESULT_SCHEMA.clone(),
@@ -1709,6 +1719,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         write_cache: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<PartitionEntry<S, Q>>> {
+        let _stage_timer = IndexTimer::new(metrics, IndexTiming::PartitionLoad);
         if partition_id >= self.ivf.num_partitions() {
             return Err(Error::index(format!(
                 "partition id {} is out of range of {} partitions",
@@ -2187,11 +2198,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        let part_entry = self.load_partition(partition_id, true, metrics).await?;
-        pre_filter.wait_for_ready().await?;
-        let pre_filter =
-            Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
-                .await?;
+        let (part_entry, pre_filter) = {
+            // Match split preparation without counting CPU queueing or search.
+            let _prepare_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
+            let part_entry = self.load_partition(partition_id, true, metrics).await?;
+            {
+                let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
+                pre_filter.wait_for_ready().await?;
+            }
+            let pre_filter = Self::prefilter_for_partition(
+                &self.index_cache,
+                partition_id,
+                &part_entry,
+                pre_filter,
+            )
+            .await?;
+            (part_entry, pre_filter)
+        };
 
         let partition_centroid = self.ivf.centroid(partition_id);
         let rq_search_cache = self.rq_search_cache.clone();
@@ -2206,11 +2229,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let scratch_pool = self.scratch_pool.clone();
         let use_query_residual = self.use_query_residual;
         let use_residual_scratch = self.use_residual_scratch;
+        let queued = Instant::now();
         let (batch, local_metrics) = spawn_cpu(move || {
+            let local_metrics = LocalMetricsCollector::default();
+            local_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
+            let search_timer = IndexTimer::new(&local_metrics, IndexTiming::Search);
             let param = (&query).into();
             let refine_factor = query.refine_factor.unwrap_or(1) as usize;
             let k = query.k * refine_factor;
-            let local_metrics = LocalMetricsCollector::default();
             let rotated_partition_centroid =
                 rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
             let residual = Self::query_context_for_scratch(
@@ -2233,6 +2259,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     scratch,
                 )
             })?;
+            drop(search_timer);
             Result::Ok((batch, local_metrics))
         })
         .await?;
@@ -2318,7 +2345,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         if control.is_none() && S::supports_global_topk_heap() {
             let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
-            pre_filter.wait_for_ready().await?;
+            {
+                let _wait_timer = IndexTimer::new(metrics.as_ref(), IndexTiming::PrefilterWait);
+                pre_filter.wait_for_ready().await?;
+            }
             let prepare_index = self.clone();
             let prepare_metrics = metrics.clone();
             let prepare_raw_query_context = raw_query_context.clone();
@@ -2371,7 +2401,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 let chunk = chunk?;
                 let search_metrics = metrics.clone();
                 let scratch_pool = self.scratch_pool.clone();
+                let queued = Instant::now();
                 let score = spawn_cpu(move || -> Result<BinaryHeap<OrderedNode<u64>>> {
+                    search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
                     scratch_pool.with_scratch(|scratch| -> Result<()> {
                         for prepared in chunk {
                             Self::accumulate_prepared_partition_search(
@@ -2398,9 +2430,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             // `spawn_cpu` dispatch pays for itself, so do it inline and keep the
             // common small-k query at one dispatch (as before the chunked scoring).
             let batch = if heap.len() <= GLOBAL_TOPK_INLINE_HEAP_LEN {
-                Self::global_heap_to_batch(heap)?
+                Self::global_heap_to_batch(heap, metrics.as_ref())?
             } else {
-                spawn_cpu(move || Self::global_heap_to_batch(heap)).await?
+                let result_metrics = metrics.clone();
+                let queued = Instant::now();
+                spawn_cpu(move || {
+                    result_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
+                    Self::global_heap_to_batch(heap, result_metrics.as_ref())
+                })
+                .await?
             };
 
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -2518,7 +2556,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     // on `closed()` would not help here: `spawn_cpu` closures are not
                     // cancellable, so abandoning the await leaves the work running.)
                     let cancel_probe = batch_tx.clone();
+                    let queued = Instant::now();
                     let search_output = spawn_cpu(move || {
+                        search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
                         let mut outputs: Vec<DataFusionResult<RecordBatch>> =
                             Vec::with_capacity(prepared_batch.len());
                         // `stopped` means the whole search should end (an error, an
@@ -2671,7 +2711,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             }
         }
 
-        pre_filter.wait_for_ready().await?;
+        {
+            let _wait_timer = IndexTimer::new(metrics.as_ref(), IndexTiming::PrefilterWait);
+            pre_filter.wait_for_ready().await?;
+        }
 
         // Score partitions in a deterministic order. `assignments` is a HashMap,
         // so its iteration order (and hence the order partitions accumulate into
@@ -2734,7 +2777,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let raw_query_contexts = raw_query_contexts.clone();
             let scratch_pool = self.scratch_pool.clone();
             let search_metrics = metrics.clone();
+            let queued = Instant::now();
             let score = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
+                search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
                 scratch_pool.with_scratch(|scratch| -> Result<()> {
                     for (part_id, part_entry, probing_queries) in &chunk {
                         let partition_centroid = index.ivf.centroid(*part_id);
@@ -2774,7 +2819,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         heaps
             .into_iter()
-            .map(Self::global_heap_to_batch)
+            .map(|heap| Self::global_heap_to_batch(heap, metrics.as_ref()))
             .collect::<Result<Vec<_>>>()
     }
 

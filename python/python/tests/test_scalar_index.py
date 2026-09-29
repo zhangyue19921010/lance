@@ -5730,6 +5730,12 @@ def test_scan_statistics_callback(tmp_path):
     assert isinstance(scan_stats.parts_loaded, int)
     assert isinstance(scan_stats.index_comparisons, int)
     assert isinstance(scan_stats.all_counts, dict)
+    assert isinstance(scan_stats.all_times, dict)
+    for key, value in scan_stats.all_times.items():
+        assert isinstance(key, str)
+        assert isinstance(value, int)
+        assert value >= 0
+    assert "all_times=" in repr(scan_stats)
 
     # Verify we got some I/O activity
     assert scan_stats.iops > 0, "Expected some I/O operations"
