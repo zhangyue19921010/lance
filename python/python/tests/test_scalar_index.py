@@ -6432,7 +6432,9 @@ def test_vector_filter_fts_search(tmp_path):
         prefilter=False, nearest=vector_query, filter=MatchQuery("text", "text")
     )
     result = scanner.to_table()
-    assert [300, 299] == result["id"].to_pylist()
+    # The approximate IVF_PQ index can return the two nearest "text" matches
+    # (299 and 300) in either order, so assert the set of ids, not the order.
+    assert sorted(result["id"].to_pylist()) == [299, 300]
 
     # Case 2: search with prefilter=true, search_filter=match("text"),
     #         filter="category='geography'"
@@ -6454,7 +6456,9 @@ def test_vector_filter_fts_search(tmp_path):
         filter=MatchQuery("text", "text"),
     )
     result = scanner.to_table()
-    assert [300, 299] == result["id"].to_pylist()
+    # The approximate IVF_PQ index can return the two nearest "text" matches
+    # (299 and 300) in either order, so assert the set of ids, not the order.
+    assert sorted(result["id"].to_pylist()) == [299, 300]
 
     # Case 4: search with prefilter=false, search_filter=match("text"),
     #       filter="category='geography'"
