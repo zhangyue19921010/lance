@@ -1123,12 +1123,14 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         branch: str
-            Name of the branch to create.
+            Name of the branch to create. ``"main"`` is reserved for the
+            default branch and cannot be used as a new branch name.
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         storage_options: Optional[Dict[str, str]]
             Storage options for the underlying object store. If not provided,
             the storage options from the current dataset will be used.
@@ -3267,7 +3269,8 @@ class LanceDataset(pa.dataset.Dataset):
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
 
         Returns
         -------
@@ -5233,7 +5236,8 @@ class LanceDataset(pa.dataset.Dataset):
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
             endpoints). If not specified, the storage options of the source dataset
@@ -7890,7 +7894,8 @@ class Tags:
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         """
         self._ds.create_tag(tag, reference)
 
@@ -7922,7 +7927,8 @@ class Tags:
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch. (None, None) means the latest
-            version_number on the main branch.
+            version_number on the default branch. ``("main", version)`` is an
+            explicit alias for the default branch in this reference context.
         """
         self._ds.update_tag(tag, reference)
 
