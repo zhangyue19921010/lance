@@ -113,6 +113,11 @@ use crate::session::index_caches::{
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
+pub use optimize::{
+    DEFAULT_MAX_ROWS_PER_SEGMENT, DeltaMergePlanner, FragmentRows, IndexOptimizePlan,
+    IndexOptimizePlanOptions, IndexOptimizePlanner, IndexOptimizeResult, IndexOptimizeStrategy,
+    IndexOptimizeTask, SizeTieredPlanner, commit_index_optimization, plan_index_optimization,
+};
 
 fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
     if segments.is_empty() {
