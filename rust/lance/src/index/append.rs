@@ -64,8 +64,6 @@ pub enum NewIndexData<'a> {
     /// as `old_indices`, for example by parallel workers over disjoint
     /// fragments. Their rows are read back from the segments instead of being
     /// scanned, and they are never reported as removed.
-    // Constructed by the optimize task's reduce step; see `index::optimize`.
-    #[allow(dead_code)]
     Segments(&'a [IndexMetadata]),
 }
 
@@ -731,7 +729,7 @@ async fn merge_scalar_indices<'a>(
     )))
 }
 
-async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> Result<bool> {
+pub async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> Result<bool> {
     // Declared type first: an index awaiting training declares itself a vector
     // index and has no file to find it by.
     if index.index_details.is_some() {
@@ -819,7 +817,7 @@ async fn rebuild_vector_segment(
 ///
 /// Happens when an index is created against an empty table, or one without
 /// enough rows to justify training it.
-fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
+pub fn is_definition_only_segment(metadata: &IndexMetadata) -> bool {
     let no_files_recorded = metadata.files.as_ref().is_none_or(|files| files.is_empty());
     let covers_nothing = metadata
         .fragment_bitmap
@@ -971,7 +969,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 /// [`NewIndexData`]). The segment selection -- which of `old_indices` are
 /// replaced -- is the same for both; the removed segments never include new
 /// data segments.
-pub(crate) async fn merge_indices_impl<'a>(
+pub async fn merge_indices_impl<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
     new_data: NewIndexData<'_>,

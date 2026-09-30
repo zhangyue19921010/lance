@@ -2781,9 +2781,7 @@ pub(crate) async fn eligible_index_groups(
         // cannot read one of them: the merged segment would overlap the
         // segment left behind, and `Dataset::validate` calls that
         // corruption. Leave the whole name to a build that can read it.
-        if let Some(max_supported_version) =
-            deltas.iter().find_map(|idx| unsupported_index_version(idx))
-        {
+        if let Some(max_supported_version) = deltas.iter().find_map(unsupported_index_version) {
             log::warn!(
                 "Index {} has a segment newer than version {}, which this build cannot read; \
                  skipping its optimization",
