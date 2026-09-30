@@ -143,11 +143,19 @@ impl InvertedIndex {
         &self.deleted_fragments
     }
 
+    /// Merge `segments` and `new_data` into one segment written to `dest_store`.
+    ///
+    /// `old_data_filters` pairs each segment, by position, with the filter that
+    /// keeps the rows it may still contribute (`None` keeps every row). A
+    /// segment built from live rows only, such as one a worker built from
+    /// unindexed fragments, takes `None`; widening one segment's filter to
+    /// cover another's rows would keep stale postings whose row id is live
+    /// again elsewhere.
     pub async fn merge_segments(
         segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        old_data_filter: Option<OldIndexDataFilter>,
+        old_data_filters: &[Option<&OldIndexDataFilter>],
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let Some(first) = segments.first() else {
@@ -155,6 +163,13 @@ impl InvertedIndex {
                 "cannot merge inverted index without at least one source segment".to_string(),
             ));
         };
+        if old_data_filters.len() != segments.len() {
+            return Err(Error::invalid_input(format!(
+                "cannot merge inverted index: {} segments but {} old data filters",
+                segments.len(),
+                old_data_filters.len()
+            )));
+        }
 
         for segment in segments.iter().skip(1) {
             if segment.params != first.params {
@@ -187,7 +202,7 @@ impl InvertedIndex {
             .with_token_set_format(first.token_set_format)
             .with_format_version(first.format_version());
         let files = builder
-            .update_from_segments(new_data, dest_store, segments, old_data_filter)
+            .update_from_segments(new_data, dest_store, segments, old_data_filters)
             .await?;
 
         let details = pbold::InvertedIndexDetails::try_from(&first.params)?;

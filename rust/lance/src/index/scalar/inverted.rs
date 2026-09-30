@@ -1001,7 +1001,7 @@ pub(crate) async fn merge_segments(
         &source_indices,
         empty_inverted_update_stream(dataset, &resolved)?,
         &new_store,
-        None,
+        &vec![None; source_indices.len()],
         lance_index::progress::noop_progress(),
     )
     .await?;

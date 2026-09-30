@@ -1429,7 +1429,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                                 &selected_indices,
                                 new_data_stream,
                                 &new_store,
-                                old_data_filter,
+                                &vec![old_data_filter.as_ref(); selected_indices.len()],
                                 options.progress.clone(),
                             )
                             .await?,
