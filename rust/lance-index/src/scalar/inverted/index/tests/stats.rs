@@ -495,8 +495,17 @@ async fn test_loaded_bm25_stats_are_all_or_nothing_and_preserve_oov() {
         .unwrap()
         .unwrap();
     let asynchronous = index.bm25_stats_for_terms(&terms, None).await.unwrap();
-    assert_eq!(loaded, (10, 10, vec![1, 0, 1]));
-    assert_eq!(loaded, asynchronous);
+    assert_eq!(loaded.stats, (10, 10, vec![1, 0, 1]));
+    assert_eq!(loaded.stats, asynchronous);
+    let dictionary = &index.partitions[0].tokens;
+    assert_eq!(
+        loaded.token_ids.as_ref(),
+        terms
+            .iter()
+            .map(|term| dictionary.get(term))
+            .collect::<Vec<_>>(),
+        "recorded ids must be the partition dictionary's ids, with None for OOV terms"
+    );
 }
 
 #[tokio::test]
@@ -1069,6 +1078,15 @@ async fn test_packed_group_deep_size_is_smaller_than_materialized_graph() {
         packed_size * 4 < materialized_size * 3,
         "packed group deep_size_of {packed_size}B should be at least 25% smaller than the \
              {materialized_size}B materialized graph for {posting_count} postings"
+    );
+    // Prewarm caches a group per 128 dictionary rows of every partition, and
+    // each is resident and charged at its inline size on top of its buffers,
+    // so a group keeps only the buffers every posting view reads, not an
+    // Arrow array (100+ bytes) per column.
+    let inline_size = std::mem::size_of_val(group.as_ref());
+    assert!(
+        inline_size <= 320,
+        "packed group holds {inline_size}B inline"
     );
 }
 
