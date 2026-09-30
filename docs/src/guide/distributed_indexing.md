@@ -192,6 +192,103 @@ The grouping decision is separate from worker build. Workers only build
 segments; Lance applies the segment build policy when it plans
 physical segments.
 
+## Distributed Index Optimization
+
+Optimizing an index means indexing the fragments no segment covers yet and
+merging that new data with some of the existing segments, so that a query
+opens fewer segments. Like compaction, Lance splits this into three steps that
+a caller can run on different machines: plan, execute, commit.
+
+```text
+plan     one dataset version -> independent tasks
+execute  each task on a worker -> one new segment and the segments it replaces
+commit   every result of the plan, together, as one manifest version
+```
+
+In Rust the entry points are `plan_index_optimization`,
+`IndexOptimizeTask::execute` / `shard` / `merge` and
+`commit_index_optimization` in `lance::index`. Tasks and results serialize to
+JSON, so a scheduler can send them to workers and collect the results.
+
+### Strategies
+
+The plan is made by one of two strategies, selected through
+`IndexOptimizePlanOptions`; they are mutually exclusive:
+
+- **`DeltaMerge { num_indices_to_merge, retrain }`** reproduces what
+  `optimize_indices` does in a single process: one task per index, which
+  merges the most recent `num_indices_to_merge` segments with the new data.
+  `retrain` and the automatic partition rebalancing of vector indices are only
+  available here, and only as a single task.
+- **`SizeTiered { max_rows_per_segment }`** (the default) packs the segments
+  holding fewer rows than the budget, together with the new fragments, into
+  bins of at most `max_rows_per_segment` rows. Every bin is one task, so one
+  index's merge work runs as several tasks in parallel, and a segment at or
+  above the budget is never rewritten. Vector segments are packed per shared
+  model, since only segments that share IVF centroids and quantizer state can
+  be merged into one; the new data joins the model of the newest segment.
+
+Sizes come from the manifest and the deletion files alone: a segment counts
+the physical rows of the live fragments it covers, a fragment its live rows.
+
+### One task type
+
+A task names, for one logical index, the candidate segments it may replace,
+the unindexed fragments it indexes (each with its live row count) and the
+merge options. Executing it runs the same merge code a single-process
+optimize runs and produces one new segment plus the list of replaced
+segments. Which candidates are replaced is decided while executing, by the
+same rules `optimize_indices` applies.
+
+A task marked `shardable` can have its new data built in parallel:
+
+```text
+shards = [task.shard(ids) for ids in <partition of task.fragments>]
+parts  = [shard.execute(dataset) for shard in shards]      # in parallel
+result = task.merge(dataset, parts)                         # one worker
+```
+
+`shard(fragment_ids)` derives a task over a subset of the fragments that
+indexes them with the model of the task's last segment and replaces nothing;
+`merge` re-runs the task with the shard outputs as its new data instead of
+scanning the fragments. The result equals executing the task directly:
+same coverage, same replaced segments, same rows per IVF partition. For HNSW
+sub-indices the graph is rebuilt during the merge, so the search results may
+differ in the way two builds over the same vectors do.
+
+How the fragments are partitioned is up to the caller; the row counts on the
+task are there to balance the shards (for example, the same size-based
+batching an engine uses for distributed index creation). A shard's result is
+itself a valid result: it can be committed without a merge, as a delta
+segment, which is what a caller may do when the merge step fails. In that
+case prefer shards of consecutive fragment ids, because compaction only
+rewrites neighbouring fragments that the same segments cover.
+
+Shards are available for IVF vector indices in the current (v3) format, BTree,
+NGram and inverted indices. They are not available for a vector index that
+has to be retrained or rebuilt (a dormant or definition-only segment, the
+legacy IVF format), for legacy inverted segments, for the other scalar index
+families, or on a table whose fragment reuse history uses the tagged format;
+such tasks run as one unit.
+
+### Commit
+
+`commit_index_optimization` takes every result of one plan and commits one
+`CreateIndex` transaction anchored at the plan's version. Results are checked
+against the manifest at that version (every replaced segment exists under
+the result's index name, no segment is replaced twice, the remaining coverage
+does not overlap) before anything is written. What changed on the table since
+the plan is handled by the commit's conflict resolution: an append or a
+delete is fine, while a compaction that rewrote covered fragments, or another
+optimize that replaced the same segments, is reported as a retryable
+conflict, after which the caller plans again. Segments written by a plan that
+is never committed are unreferenced index directories and are cleaned up
+by `cleanup_old_versions(...)`.
+
+The single-process `optimize_indices` is the same three steps in one process:
+it plans with `DeltaMerge`, executes the tasks (`num_threads` at a time, one
+by default) and commits their results together.
+
 ## Responsibility Boundaries
 
 The caller is expected to know:
