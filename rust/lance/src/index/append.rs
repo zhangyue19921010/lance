@@ -749,37 +749,6 @@ pub async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) 
     object_store.exists(&index_file).await
 }
 
-/// Merge in-inflight unindexed data, with a specific number of previous indices
-/// into a new index, to improve the query performance.
-///
-/// The merge behavior is controlled by [`OptimizeOptions::num_indices_to_merge].
-///
-/// Returns
-/// -------
-/// - the UUID of the new index
-/// - merged indices,
-/// - Bitmap of the fragments that covered in the newly created index.
-pub async fn merge_indices<'a>(
-    dataset: Arc<Dataset>,
-    old_indices: &[&'a IndexMetadata],
-    options: &OptimizeOptions,
-) -> Result<Option<IndexMergeResults<'a>>> {
-    if old_indices.is_empty() {
-        return Err(Error::index(
-            "Append index: no previous index found".to_string(),
-        ));
-    };
-
-    let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
-    Box::pin(merge_indices_with_unindexed_frags(
-        dataset,
-        old_indices,
-        &unindexed,
-        options,
-    ))
-    .await
-}
-
 /// Whether a rebuild of `params` should expect the definition alone, because
 /// the column does not hold the vectors its quantizer needs.
 async fn expects_definition_only(
@@ -947,8 +916,9 @@ fn fresh_vector_segment_result<'a>(
     })
 }
 
-/// Merge a list of provided unindexed data, with a specific number of previous indices
-/// into a new index, to improve the query performance.
+/// [`merge_indices_impl`] over unindexed fragments; the shorthand the tests
+/// use. Production code goes through `IndexOptimizeTask`.
+#[cfg(test)]
 pub async fn merge_indices_with_unindexed_frags<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
@@ -964,11 +934,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     .await
 }
 
-/// [`merge_indices_with_unindexed_frags`] with the new rows coming from either
-/// unindexed fragments or segments already built over them (see
-/// [`NewIndexData`]). The segment selection -- which of `old_indices` are
-/// replaced -- is the same for both; the removed segments never include new
-/// data segments.
+/// Merge some of `old_indices` (chosen by `options.num_indices_to_merge`)
+/// with the new rows, which come either from unindexed fragments or from
+/// segments already built over them (see [`NewIndexData`]). The segment
+/// selection -- which of `old_indices` are replaced -- is the same for both
+/// sources; the removed segments never include new data segments.
 pub async fn merge_indices_impl<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],

@@ -91,7 +91,6 @@ pub mod scalar;
 pub(crate) mod scalar_logical;
 pub mod vector;
 
-use self::append::merge_indices;
 use self::frag_reuse_with_stable_row_ids::{
     has_frag_reuse_with_stable_row_ids, is_hidden_by_frag_reuse,
     warn_about_indices_hidden_by_frag_reuse,
@@ -100,7 +99,7 @@ use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
-use crate::dataset::transaction::{Operation, ReadVersionState, Transaction, TransactionBuilder};
+use crate::dataset::transaction::{Operation, ReadVersionState, Transaction};
 pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
@@ -2580,75 +2579,30 @@ impl DatasetIndexExt for Dataset {
 
     #[instrument(skip_all)]
 
+    /// Plan one task per index with [`DeltaMergePlanner`], execute the tasks
+    /// (`options.num_threads` at a time, one by default) and commit their
+    /// results together: the same steps a distributed optimize runs, in one
+    /// process. Any task failing aborts the pass before the commit.
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
-        let dataset = Arc::new(self.clone());
-        let indices = load_all_indices(self).await?;
-        let groups = eligible_index_groups(self, options.index_names.as_deref()).await?;
-
-        let mut new_indices = vec![];
-        let mut removed_indices = vec![];
-        for (_, group) in groups.iter() {
-            let deltas: Vec<&IndexMetadata> = group.iter().collect();
-            // Scalar indices have no rebalance concept, so skip them entirely
-            // when every fragment is already covered and the caller hasn't
-            // asked for retrain or an explicit delta merge. Vector indices
-            // fall through and use a rebalance-aware no-op check inside
-            // merge_indices_with_unindexed_frags.
-            if !options.retrain
-                && options.num_indices_to_merge.is_none_or(|n| n == 0)
-                && index_group_is_scalar(self, &deltas)
-                && index_group_has_no_unindexed(self, &deltas)
-            {
-                continue;
-            }
-
-            let Some(res) = merge_indices(dataset.clone(), &deltas, options).await? else {
-                continue;
-            };
-
-            let last_idx = deltas.last().expect("Delta indices should not be empty");
-            let new_idx = IndexMetadata {
-                uuid: res.new_uuid,
-                name: last_idx.name.clone(), // Keep the same name
-                fields: last_idx.fields.clone(),
-                covering_fields: last_idx.covering_fields.clone(),
-                dataset_version: res.new_dataset_version,
-                fragment_bitmap: Some(res.new_fragment_bitmap),
-                index_details: Some(Arc::new(res.new_index_details)),
-                index_version: res.new_index_version,
-                created_at: Some(chrono::Utc::now()),
-                base_id: None, // New merged index file locates in the cloned dataset.
-                files: Some(res.files),
-            };
-            removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
-            new_indices.push(new_idx);
-        }
-
-        // A no-work optimize still has to commit on a table that requires
-        // catch-up. Coverage is derived at commit time, so an index that
-        // already spans the table records its position only if there is a
-        // commit to record it on -- and that is the ordinary case after a
-        // remap or a compaction that advanced a generation without changing
-        // fragments. Returning early there leaves the position missing forever
-        // and the repair rescheduling itself.
-        if new_indices.is_empty() && !self.mem_wal_catch_up_would_advance(&indices)? {
-            return Ok(());
-        }
-
-        let transaction = TransactionBuilder::new(
-            self.manifest.version,
-            Operation::CreateIndex {
-                new_indices,
-                removed_indices,
-            },
+        let plan = DeltaMergePlanner::new(
+            options.index_names.clone(),
+            options.num_indices_to_merge,
+            options.retrain,
         )
-        .transaction_properties(options.transaction_properties.clone())
-        .build();
-
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-
-        Ok(())
+        .plan(self)
+        .await?;
+        let results: Vec<IndexOptimizeResult> = {
+            let dataset: &Dataset = self;
+            futures::stream::iter(plan.tasks)
+                .map(|task| {
+                    let progress = options.progress.clone();
+                    async move { task.execute_with_progress(dataset, progress).await }
+                })
+                .buffer_unordered(options.num_threads.unwrap_or(1).max(1))
+                .try_collect()
+                .await?
+        };
+        commit_index_optimization(self, results, options.transaction_properties.clone()).await
     }
 
     async fn index_statistics(&self, index_name: &str) -> Result<String> {
@@ -2798,32 +2752,6 @@ pub(crate) async fn eligible_index_groups(
         eligible.push((name, deltas));
     }
     Ok(eligible)
-}
-
-fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
-    let Some(field_id) = deltas.first().and_then(|d| d.fields.first()) else {
-        return false;
-    };
-    match dataset.schema().field_by_id(*field_id) {
-        Some(field) => !is_vector_field(field.data_type()),
-        None => false,
-    }
-}
-
-fn index_group_has_no_unindexed(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
-    let mut indexed = RoaringBitmap::new();
-    for idx in deltas {
-        if let Some(bitmap) = idx.fragment_bitmap.as_ref() {
-            indexed |= bitmap;
-        } else {
-            // Pre-0.8 indices have no fragment bitmap; treat as needing optimize.
-            return false;
-        }
-    }
-    dataset
-        .fragments()
-        .iter()
-        .all(|frag| indexed.contains(frag.id as u32))
 }
 
 fn sum_indexed_rows_per_delta(indexed_fragments_per_delta: &[Vec<Fragment>]) -> Result<Vec<usize>> {
@@ -4178,17 +4106,6 @@ fn resolve_index_column(
         "Column '{}' does not exist in the schema",
         column_arg
     )))
-}
-
-fn is_vector_field(data_type: DataType) -> bool {
-    match data_type {
-        DataType::FixedSizeList(_, _) => true,
-        DataType::List(inner) => {
-            // If the inner type is a fixed size list, then it is a multivector field
-            matches!(inner.data_type(), DataType::FixedSizeList(_, _))
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]

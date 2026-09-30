@@ -48,6 +48,11 @@ pub struct OptimizeOptions {
 
     /// Progress callback for index building during optimization.
     pub progress: Arc<dyn IndexBuildProgress>,
+
+    /// How many indices are optimized concurrently. Default: 1, so indices
+    /// are processed one after another. Merging one index can rewrite a large
+    /// segment, so raise this only with the memory to match; `None` means 1.
+    pub num_threads: Option<usize>,
 }
 
 impl Default for OptimizeOptions {
@@ -58,6 +63,7 @@ impl Default for OptimizeOptions {
             retrain: false,
             transaction_properties: None,
             progress: noop_progress(),
+            num_threads: None,
         }
     }
 }
@@ -111,6 +117,12 @@ impl OptimizeOptions {
     /// Set progress callback for index building during optimization.
     pub fn progress(mut self, progress: Arc<dyn IndexBuildProgress>) -> Self {
         self.progress = progress;
+        self
+    }
+
+    /// Set how many indices are optimized concurrently.
+    pub fn num_threads(mut self, num_threads: usize) -> Self {
+        self.num_threads = Some(num_threads);
         self
     }
 }
