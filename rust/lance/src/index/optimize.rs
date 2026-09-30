@@ -1102,12 +1102,1333 @@ impl IndexOptimizePlanner for SizeTieredPlanner {
 mod tests {
     use std::sync::Arc;
 
+    use arrow::datatypes::{Float32Type, UInt32Type};
+    use arrow_array::FixedSizeListArray;
+    use arrow_array::cast::AsArray;
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_index::IndexType;
+    use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
+    use lance_linalg::distance::{DistanceType, MetricType};
+    use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
     use lance_table::format::{IndexFile, IndexMetadata};
     use roaring::RoaringBitmap;
+    use rstest::rstest;
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
 
     use super::*;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::transaction::Transaction;
+    use crate::index::append::test_fixtures::*;
+    use crate::index::vector::{IndexFileVersion, VectorIndexParams};
+    use crate::index::{CreateIndexBuilder, DatasetIndexExt};
+
+    // ---- fixtures ----------------------------------------------------------
+
+    /// Four indexed fragments of 256 rows (`vector_idx`, `id_idx`, `text_idx`,
+    /// `ngram_idx`) followed by `new` unindexed fragments of 256 rows.
+    async fn indexed_dataset(
+        uri: &str,
+        stable_row_ids: bool,
+        params: &VectorIndexParams,
+        new: usize,
+    ) -> Dataset {
+        let mut next_id = 0;
+        let mut dataset =
+            write_new_data_dataset(uri, stable_row_ids, &[256; 4], &mut next_id).await;
+        create_new_data_indices(&mut dataset, params).await;
+        if new > 0 {
+            append_new_data(&mut dataset, &vec![256; new], &mut next_id).await;
+        }
+        dataset
+    }
+
+    fn delta_merge(num_indices_to_merge: Option<usize>) -> IndexOptimizePlanOptions {
+        IndexOptimizePlanOptions {
+            index_names: None,
+            strategy: IndexOptimizeStrategy::DeltaMerge {
+                num_indices_to_merge,
+                retrain: false,
+            },
+        }
+    }
+
+    fn size_tiered(max_rows_per_segment: u64) -> IndexOptimizePlanOptions {
+        IndexOptimizePlanOptions {
+            index_names: None,
+            strategy: IndexOptimizeStrategy::SizeTiered {
+                max_rows_per_segment,
+            },
+        }
+    }
+
+    fn task_for<'a>(plan: &'a IndexOptimizePlan, name: &str) -> &'a IndexOptimizeTask {
+        plan.tasks
+            .iter()
+            .find(|task| task.index_name == name)
+            .unwrap_or_else(|| panic!("no task for {name} in {plan:?}"))
+    }
+
+    fn fragment_ids(task: &IndexOptimizeTask) -> Vec<u32> {
+        task.fragments.iter().map(|f| f.id).collect()
+    }
+
+    async fn segment_uuids(dataset: &Dataset, name: &str) -> Vec<Uuid> {
+        dataset
+            .load_indices_by_name(name)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.uuid)
+            .collect()
+    }
+
+    /// The coverage of every segment of `name`, sorted, so two datasets can be
+    /// compared regardless of manifest order.
+    async fn coverage(dataset: &Dataset, name: &str) -> Vec<Vec<u32>> {
+        let mut out: Vec<Vec<u32>> = dataset
+            .load_indices_by_name(name)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.fragment_bitmap.as_ref().unwrap().iter().collect())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// `name` (a BTree over `id`) committed as one segment per group of
+    /// fragment ids.
+    async fn commit_btree_segments(dataset: &mut Dataset, name: &str, groups: &[Vec<u32>]) {
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut staged = Vec::new();
+        for group in groups {
+            staged.push(
+                CreateIndexBuilder::new(dataset, &["id"], IndexType::BTree, &params)
+                    .name(name.to_string())
+                    .fragments(group.clone())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments(name, "id", staged)
+            .await
+            .unwrap();
+    }
+
+    async fn ids_matching(dataset: &Dataset, predicate: &str, use_index: bool) -> Vec<u32> {
+        let mut scan = dataset.scan();
+        scan.project(&["id"]).unwrap().filter(predicate).unwrap();
+        scan.use_scalar_index(use_index);
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut ids = batch["id"].as_primitive::<UInt32Type>().values().to_vec();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Mark the table's fragment reuse history as the tagged format, the way
+    /// the compaction tests do; the next deferred compaction then records a
+    /// v1 entry.
+    async fn tag_table(dataset: &mut Dataset) {
+        let indices: Vec<IndexMetadata> = load_all_indices(dataset).await.unwrap().as_ref().clone();
+        {
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+            manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        }
+        crate::index::frag_reuse_reader::tests::persist_fixture(dataset, indices).await;
+    }
+
+    async fn deferred_compaction(dataset: &mut Dataset, target_rows_per_fragment: usize) {
+        compact_files(
+            dataset,
+            CompactionOptions {
+                target_rows_per_fragment,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// IVF centroids trained over the table, so that segments built with them
+    /// share a model.
+    async fn shared_ivf(dataset: &Dataset) -> IvfBuildParams {
+        let batch = dataset
+            .scan()
+            .project(&["vector"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let vectors = batch["vector"].as_fixed_size_list();
+        let dim = vectors.value_length() as usize;
+        let kmeans = train_kmeans::<Float32Type>(
+            vectors.values().as_primitive::<Float32Type>(),
+            KMeansParams::new(None, 10, 1, DistanceType::L2),
+            dim,
+            2,
+            3,
+        )
+        .unwrap();
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                kmeans.centroids.as_primitive::<Float32Type>().clone(),
+                dim as i32,
+            )
+            .unwrap(),
+        );
+        IvfBuildParams::try_with_centroids(2, centroids).unwrap()
+    }
+
+    // ---- DeltaMergePlanner -------------------------------------------------
+
+    #[tokio::test]
+    async fn delta_merge_plans_one_task_per_index_like_optimize_indices() {
+        let dir = TempStrDir::default();
+        let dataset = indexed_dataset(dir.as_str(), false, &ivf_pq_params(), 2).await;
+
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        assert_eq!(plan.read_version, dataset.manifest.version);
+        assert_eq!(plan.tasks.len(), 4);
+        for name in ["vector_idx", "id_idx", "text_idx", "ngram_idx"] {
+            let task = task_for(&plan, name);
+            assert_eq!(task.read_version, plan.read_version);
+            assert_eq!(task.segments, segment_uuids(&dataset, name).await);
+            assert_eq!(
+                task.fragments,
+                vec![
+                    FragmentRows {
+                        id: 4,
+                        num_rows: 256
+                    },
+                    FragmentRows {
+                        id: 5,
+                        num_rows: 256
+                    }
+                ]
+            );
+            assert_eq!(task.num_indices_to_merge, Some(1));
+            assert!(!task.retrain);
+            assert!(task.shardable, "{name}");
+        }
+        // Only the named indices.
+        let plan = plan_index_optimization(
+            &dataset,
+            &IndexOptimizePlanOptions {
+                index_names: Some(vec!["id_idx".to_string()]),
+                ..delta_merge(None)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].index_name, "id_idx");
+        assert_eq!(plan.tasks[0].num_indices_to_merge, None);
+
+        // Nothing unindexed: scalar groups are skipped under `None` / `Some(0)`
+        // like `optimize_indices` does; the vector group may still rebalance.
+        // An explicit `Some(1)` still asks for the trailing merge everywhere.
+        let dir = TempStrDir::default();
+        let dataset = indexed_dataset(dir.as_str(), false, &ivf_pq_params(), 0).await;
+        for num in [None, Some(0)] {
+            let plan = plan_index_optimization(&dataset, &delta_merge(num))
+                .await
+                .unwrap();
+            let names: Vec<&str> = plan.tasks.iter().map(|t| t.index_name.as_str()).collect();
+            assert_eq!(names, ["vector_idx"], "{num:?}");
+            assert!(!plan.tasks[0].shardable, "nothing to shard");
+        }
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 4);
+        assert!(
+            plan.tasks
+                .iter()
+                .all(|t| t.fragments.is_empty() && !t.shardable)
+        );
+    }
+
+    /// A name with a segment this build cannot read is left alone, exactly
+    /// as `optimize_indices` leaves it (the rules are shared).
+    #[tokio::test]
+    async fn delta_merge_skips_a_group_with_an_unreadable_segment() {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), false, &ivf_pq_params(), 1).await;
+        let current = dataset.load_indices_by_name("id_idx").await.unwrap();
+        let mut newer = current.clone();
+        newer[0].index_version += 1;
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: newer,
+                removed_indices: current,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let plan = plan_index_optimization(&dataset, &delta_merge(None))
+            .await
+            .unwrap();
+        let mut names: Vec<&str> = plan.tasks.iter().map(|t| t.index_name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["ngram_idx", "text_idx", "vector_idx"]);
+        let plan = plan_index_optimization(
+            &dataset,
+            &IndexOptimizePlanOptions {
+                index_names: Some(vec!["id_idx".to_string()]),
+                ..delta_merge(None)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(plan.tasks.is_empty());
+    }
+
+    /// A delta-merge task produces the segment `optimize_indices` produces:
+    /// the same coverage and, for a vector index, the same partitions; the
+    /// scalar segments answer the same queries.
+    #[tokio::test]
+    async fn delta_merge_execute_matches_optimize_indices() {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), false, &ivf_pq_params(), 2).await;
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        let mut results = HashMap::new();
+        for task in &plan.tasks {
+            results.insert(
+                task.index_name.clone(),
+                task.execute(&dataset).await.unwrap(),
+            );
+        }
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+        for name in ["vector_idx", "id_idx", "text_idx", "ngram_idx"] {
+            let committed = dataset.load_indices_by_name(name).await.unwrap();
+            assert_eq!(committed.len(), 1, "{name}");
+            let from_task = results[name].new_segment.clone().unwrap();
+            assert_eq!(
+                from_task.fragment_bitmap, committed[0].fragment_bitmap,
+                "{name}"
+            );
+            assert_eq!(
+                from_task.index_details, committed[0].index_details,
+                "{name}"
+            );
+            if name == "vector_idx" {
+                let task_index = dataset
+                    .open_vector_index_from_metadata("vector", &from_task, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                let committed_index = dataset
+                    .open_vector_index_from_metadata("vector", &committed[0], &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    partition_contents(&task_index).await,
+                    partition_contents(&committed_index).await
+                );
+            } else {
+                let expected = scalar_query_ids(&dataset, name, true).await;
+                assert_eq!(expected, scalar_query_ids(&dataset, name, false).await);
+                let with_task_segment = commit_segments(&dataset, vec![from_task], committed).await;
+                assert_eq!(
+                    scalar_query_ids(&with_task_segment, name, true).await,
+                    expected,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    // ---- SizeTieredPlanner -------------------------------------------------
+
+    /// The worked example: `s1` covers four fragments and stays above the
+    /// budget, `s2` and `s3` cover one each, and two fragments are new. With
+    /// a budget of three fragments the sequence `[s2, s3, f6, f7]` packs into
+    /// `[s2, s3, f6]` and `[f7]`.
+    #[tokio::test]
+    async fn size_tiered_packs_small_segments_and_new_fragments_in_order() {
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset = write_new_data_dataset(dir.as_str(), false, &[64; 6], &mut next_id).await;
+        commit_btree_segments(
+            &mut dataset,
+            "id_seg",
+            &[vec![0, 1, 2, 3], vec![4], vec![5]],
+        )
+        .await;
+        append_new_data(&mut dataset, &[64, 64], &mut next_id).await;
+        let segments = segment_uuids(&dataset, "id_seg").await;
+        let (s1, s2, s3) = (segments[0], segments[1], segments[2]);
+
+        let plan = plan_index_optimization(&dataset, &size_tiered(192))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 2, "{plan:?}");
+        let first = &plan.tasks[0];
+        assert_eq!(first.segments, vec![s2, s3]);
+        assert_eq!(fragment_ids(first), vec![6]);
+        assert_eq!(first.num_indices_to_merge, Some(2));
+        assert!(first.shardable);
+        let second = &plan.tasks[1];
+        assert_eq!(
+            second.segments,
+            vec![s3],
+            "the reference segment lends its model"
+        );
+        assert_eq!(fragment_ids(second), vec![7]);
+        assert_eq!(second.num_indices_to_merge, Some(0));
+        assert!(second.shardable);
+        for task in &plan.tasks {
+            assert!(!task.retrain);
+            assert_eq!(task.read_version, dataset.manifest.version);
+        }
+
+        // Everything fits one bin when the budget allows it.
+        let plan = plan_index_optimization(&dataset, &size_tiered(1_000))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].segments, vec![s1, s2, s3]);
+        assert_eq!(fragment_ids(&plan.tasks[0]), vec![6, 7]);
+        assert_eq!(plan.tasks[0].num_indices_to_merge, Some(3));
+
+        // A budget no segment fits under: only the new fragments are packed,
+        // and a fragment at the budget takes a bin of its own.
+        let plan = plan_index_optimization(&dataset, &size_tiered(64))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        for (task, fragment) in plan.tasks.iter().zip([6, 7]) {
+            assert_eq!(task.segments, vec![s3]);
+            assert_eq!(fragment_ids(task), vec![fragment]);
+            assert_eq!(task.num_indices_to_merge, Some(0));
+        }
+
+        // Without new data the small segments still merge with each other,
+        // and a lone small segment is left alone.
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset = write_new_data_dataset(dir.as_str(), false, &[64; 6], &mut next_id).await;
+        commit_btree_segments(
+            &mut dataset,
+            "id_seg",
+            &[vec![0, 1, 2, 3], vec![4], vec![5]],
+        )
+        .await;
+        let segments = segment_uuids(&dataset, "id_seg").await;
+        let plan = plan_index_optimization(&dataset, &size_tiered(192))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].segments, vec![segments[1], segments[2]]);
+        assert!(plan.tasks[0].fragments.is_empty());
+        assert_eq!(plan.tasks[0].num_indices_to_merge, Some(2));
+        assert!(!plan.tasks[0].shardable, "nothing to shard");
+        let plan = plan_index_optimization(&dataset, &size_tiered(100))
+            .await
+            .unwrap();
+        assert!(plan.tasks.is_empty(), "{plan:?}");
+        let plan = plan_index_optimization(
+            &dataset,
+            &IndexOptimizePlanOptions {
+                index_names: Some(vec!["id_seg".to_string()]),
+                strategy: IndexOptimizeStrategy::SizeTiered {
+                    max_rows_per_segment: 65,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        // Two candidates of 64 rows under a budget of 65: each closes the bin
+        // before the other joins, so both are lone segments and no task is made.
+        assert!(plan.tasks.is_empty(), "{plan:?}");
+    }
+
+    /// Bins never mix vector segments of different models, and the new data
+    /// joins the model of the newest segment.
+    #[tokio::test]
+    async fn size_tiered_packs_vector_segments_per_shared_model() {
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset =
+            write_new_data_dataset(dir.as_str(), false, &[128; 4], &mut next_id).await;
+        // The base segment trains its own centroids; the two tail segments share one set.
+        let base = CreateIndexBuilder::new(
+            &mut dataset,
+            &["vector"],
+            IndexType::Vector,
+            &VectorIndexParams::ivf_flat(2, MetricType::L2),
+        )
+        .name("vector_idx".to_string())
+        .fragments(vec![0, 1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        let shared =
+            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, shared_ivf(&dataset).await);
+        let mut segments = vec![base];
+        for fragment in [2u32, 3] {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &shared)
+                    .name("vector_idx".to_string())
+                    .fragments(vec![fragment])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let uuids: Vec<Uuid> = segments.iter().map(|s| s.uuid).collect();
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap();
+        append_new_data(&mut dataset, &[128, 128], &mut next_id).await;
+
+        let plan = plan_index_optimization(&dataset, &size_tiered(100_000))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1, "{plan:?}");
+        let task = &plan.tasks[0];
+        assert_eq!(
+            task.segments,
+            vec![uuids[1], uuids[2]],
+            "the base segment has its own model"
+        );
+        assert_eq!(fragment_ids(task), vec![4, 5]);
+        assert_eq!(task.num_indices_to_merge, Some(2));
+        assert!(task.shardable);
+
+        // Executing it leaves the base segment in place.
+        let result = task.execute(&dataset).await.unwrap();
+        assert_eq!(result.removed_segments, vec![uuids[1], uuids[2]]);
+        commit_index_optimization(&mut dataset, vec![result], None)
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+        let after = segment_uuids(&dataset, "vector_idx").await;
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0], uuids[0]);
+        assert_eq!(
+            coverage(&dataset, "vector_idx").await,
+            vec![vec![0, 1], vec![2, 3, 4, 5]]
+        );
+    }
+
+    /// Groups a merge would rebuild or drain go to one task with the
+    /// single-process defaults, and cannot be sharded.
+    #[tokio::test]
+    async fn size_tiered_hands_rebuilding_groups_to_one_task() {
+        // Too few rows to train the quantizer: a definition-only segment.
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset = write_new_data_dataset(dir.as_str(), false, &[64], &mut next_id).await;
+        create_new_data_indices(&mut dataset, &ivf_pq_params()).await;
+        let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert!(
+            is_definition_only_segment(&segments[0]),
+            "fixture: {segments:?}"
+        );
+        append_new_data(&mut dataset, &[256, 256], &mut next_id).await;
+        let plan = plan_index_optimization(&dataset, &size_tiered(64))
+            .await
+            .unwrap();
+        let task = task_for(&plan, "vector_idx");
+        assert_eq!(task.segments, vec![segments[0].uuid]);
+        assert_eq!(
+            fragment_ids(task),
+            vec![0, 1, 2],
+            "a definition-only segment covers nothing, so its own fragment is new data too"
+        );
+        assert_eq!(task.num_indices_to_merge, None);
+        assert!(!task.shardable);
+        // The scalar indices of the same table pack normally.
+        assert_eq!(fragment_ids(task_for(&plan, "id_idx")), vec![1]);
+
+        // Every covered fragment replaced by a full rewrite of the column: the
+        // definition is retained as a dormant segment with no live coverage.
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset = write_new_data_dataset(dir.as_str(), true, &[64, 64], &mut next_id).await;
+        create_new_data_indices(
+            &mut dataset,
+            &VectorIndexParams::ivf_flat(2, MetricType::L2),
+        )
+        .await;
+        let constant = format!(
+            "array[{}]",
+            std::iter::repeat_n("1.0", NEW_DATA_DIM)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut dataset = crate::dataset::UpdateBuilder::new(Arc::new(dataset))
+            .set("vector", &constant)
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+        append_new_data(&mut dataset, &[64], &mut next_id).await;
+        let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert!(
+            segments[0]
+                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .unwrap()
+                .is_empty(),
+            "fixture: {segments:?}"
+        );
+        let plan = plan_index_optimization(&dataset, &size_tiered(1_000))
+            .await
+            .unwrap();
+        let task = task_for(&plan, "vector_idx");
+        assert_eq!(task.segments, vec![segments[0].uuid]);
+        assert_eq!(task.num_indices_to_merge, None);
+        assert!(!task.shardable);
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        assert!(!task_for(&plan, "vector_idx").shardable);
+
+        // The legacy v1 IVF format cannot merge new data segments.
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset =
+            write_new_data_dataset(dir.as_str(), false, &[256; 2], &mut next_id).await;
+        let mut legacy = VectorIndexParams::ivf_pq(2, 8, 4, MetricType::L2, 10);
+        legacy.version(IndexFileVersion::Legacy);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".into()),
+                &legacy,
+                true,
+            )
+            .await
+            .unwrap();
+        append_new_data(&mut dataset, &[256], &mut next_id).await;
+        for options in [size_tiered(1_000), delta_merge(Some(1))] {
+            let plan = plan_index_optimization(&dataset, &options).await.unwrap();
+            let task = task_for(&plan, "vector_idx");
+            assert!(!task.shardable, "{options:?}");
+            assert_eq!(fragment_ids(task), vec![2]);
+        }
+    }
+
+    /// A segment counts the physical rows of its live fragments (deleted rows
+    /// are still copied under address-style row ids) and a new fragment counts
+    /// its live rows.
+    #[tokio::test]
+    async fn size_tiered_sizes_segments_by_physical_rows_and_fragments_by_live_rows() {
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset =
+            write_new_data_dataset(dir.as_str(), false, &[64, 64], &mut next_id).await;
+        commit_btree_segments(&mut dataset, "id_seg", &[vec![0], vec![1]]).await;
+        dataset.delete("id < 32").await.unwrap();
+        append_new_data(&mut dataset, &[64], &mut next_id).await;
+        dataset.delete("id >= 128 AND id < 160").await.unwrap();
+        let segments = segment_uuids(&dataset, "id_seg").await;
+
+        // Sizes 64, 64 and 32: the two segments fill a bin of 128 and the
+        // fragment starts another. Counting the first segment's live rows (32)
+        // would have packed all three together.
+        let plan = plan_index_optimization(&dataset, &size_tiered(128))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 2, "{plan:?}");
+        assert_eq!(plan.tasks[0].segments, segments);
+        assert!(plan.tasks[0].fragments.is_empty());
+        assert_eq!(plan.tasks[1].segments, vec![segments[1]]);
+        assert_eq!(
+            plan.tasks[1].fragments,
+            vec![FragmentRows {
+                id: 2,
+                num_rows: 32
+            }]
+        );
+    }
+
+    /// A segment counts only the fragments it covers that are still live: a
+    /// fragment a compaction retired, still listed in the bitmap, adds
+    /// nothing, and a segment without a bitmap has no size at all.
+    #[tokio::test]
+    async fn size_tiered_counts_only_live_covered_fragments() {
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset =
+            write_new_data_dataset(dir.as_str(), false, &[64, 512], &mut next_id).await;
+        dataset.delete("id < 32").await.unwrap();
+        let metrics = fragment_metrics(&dataset).await.unwrap();
+        let segment = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "id_seg".to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1, 7])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        // Fragment 7 does not exist and fragment 0 counts its physical rows.
+        assert_eq!(
+            SizeTieredPlanner::segment_rows(&segment, &dataset, &metrics),
+            Some(64 + 512)
+        );
+        let unknown = IndexMetadata {
+            fragment_bitmap: None,
+            ..segment
+        };
+        assert_eq!(
+            SizeTieredPlanner::segment_rows(&unknown, &dataset, &metrics),
+            None
+        );
+    }
+
+    // ---- shardable and shard ----------------------------------------------
+
+    #[tokio::test]
+    async fn shardable_follows_the_index_family_and_the_reuse_history() {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), false, &ivf_pq_params(), 1).await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Bitmap,
+                Some("id_bitmap".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                true,
+            )
+            .await
+            .unwrap();
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        for (name, expected) in [
+            ("vector_idx", true),
+            ("id_idx", true),
+            ("text_idx", true),
+            ("ngram_idx", true),
+            ("id_bitmap", false),
+        ] {
+            assert_eq!(task_for(&plan, name).shardable, expected, "{name}");
+        }
+
+        // A tagged fragment reuse history: the manifest entry's version says
+        // so, and no task may be sharded.
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset =
+            write_new_data_dataset(dir.as_str(), false, &[128, 128], &mut next_id).await;
+        create_new_data_indices(&mut dataset, &ivf_pq_params()).await;
+        tag_table(&mut dataset).await;
+        deferred_compaction(&mut dataset, 256).await;
+        assert!(has_tagged_fragment_reuse_history(&dataset).await.unwrap());
+        append_new_data(&mut dataset, &[256], &mut next_id).await;
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 4);
+        assert!(plan.tasks.iter().all(|task| !task.shardable), "{plan:?}");
+    }
+
+    #[tokio::test]
+    async fn shard_validates_its_fragments_and_builds_an_append_task() {
+        let dir = TempStrDir::default();
+        let dataset = indexed_dataset(dir.as_str(), false, &ivf_pq_params(), 2).await;
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        let task = task_for(&plan, "vector_idx");
+
+        let shard = task.shard(&[5]).unwrap();
+        assert_eq!(shard.read_version, task.read_version);
+        assert_eq!(shard.index_name, task.index_name);
+        assert_eq!(shard.segments, vec![*task.segments.last().unwrap()]);
+        assert_eq!(
+            shard.fragments,
+            vec![FragmentRows {
+                id: 5,
+                num_rows: 256
+            }]
+        );
+        assert_eq!(shard.num_indices_to_merge, Some(0));
+        assert!(!shard.retrain);
+        assert!(!shard.shardable);
+        // Order follows the task, whatever the caller's order.
+        assert_eq!(fragment_ids(&task.shard(&[5, 4]).unwrap()), vec![4, 5]);
+
+        for (ids, what) in [
+            (vec![], "empty"),
+            (vec![4, 4], "duplicate"),
+            (vec![4, 9], "unknown"),
+        ] {
+            let err = task.shard(&ids).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{what}: {err}");
+        }
+        let err = shard.shard(&[5]).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "a shard: {err}");
+    }
+
+    // ---- map + reduce ------------------------------------------------------
+
+    /// Executing the shards and merging their results gives the same segment
+    /// as executing the task.
+    #[rstest]
+    #[case::ivf_pq("vector_idx", ivf_pq_params())]
+    #[case::ivf_hnsw_sq("vector_idx", ivf_hnsw_sq_params())]
+    #[case::btree("id_idx", ivf_pq_params())]
+    #[case::ngram("ngram_idx", ivf_pq_params())]
+    #[case::inverted("text_idx", ivf_pq_params())]
+    #[tokio::test]
+    async fn merging_shard_results_matches_executing_the_task(
+        #[case] name: &str,
+        #[case] params: VectorIndexParams,
+    ) {
+        let dir = TempStrDir::default();
+        let dataset = indexed_dataset(dir.as_str(), false, &params, 2).await;
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        let task = task_for(&plan, name);
+
+        let direct = task.execute(&dataset).await.unwrap();
+        let mut shard_results = Vec::new();
+        for shard in [task.shard(&[4]).unwrap(), task.shard(&[5]).unwrap()] {
+            let result = shard.execute(&dataset).await.unwrap();
+            assert!(result.removed_segments.is_empty());
+            assert_eq!(
+                result.new_segment.as_ref().unwrap().fragment_bitmap,
+                Some(shard.fragments.iter().map(|f| f.id).collect())
+            );
+            shard_results.push(result);
+        }
+        let reduced = task.merge(&dataset, shard_results).await.unwrap();
+
+        assert_eq!(reduced.removed_segments, direct.removed_segments);
+        assert_eq!(reduced.removed_segments, task.segments);
+        let direct_segment = direct.new_segment.clone().unwrap();
+        let reduced_segment = reduced.new_segment.unwrap();
+        assert_eq!(
+            reduced_segment.fragment_bitmap,
+            direct_segment.fragment_bitmap
+        );
+        assert_eq!(reduced_segment.name, name);
+
+        if name == "vector_idx" {
+            assert_vector_segments_equivalent(&dataset, &direct_segment, &reduced_segment).await;
+        } else {
+            let expected = scalar_query_ids(&dataset, name, false).await;
+            let mut with_direct = dataset.clone();
+            commit_index_optimization(&mut with_direct, vec![direct.clone()], None)
+                .await
+                .unwrap();
+            assert_eq!(scalar_query_ids(&with_direct, name, true).await, expected);
+            let with_reduced =
+                commit_segments(&with_direct, vec![reduced_segment], vec![direct_segment]).await;
+            assert_eq!(
+                with_reduced.load_indices_by_name(name).await.unwrap().len(),
+                1
+            );
+            assert_eq!(scalar_query_ids(&with_reduced, name, true).await, expected);
+        }
+    }
+
+    /// Rows deleted or retired before the plan are handled the same on both
+    /// paths: retired fragments' rows are dropped; rows deleted inside a live
+    /// fragment survive under address-style row ids and are dropped under
+    /// stable row ids.
+    #[rstest]
+    #[case::address(false)]
+    #[case::stable(true)]
+    #[tokio::test]
+    async fn merging_shard_results_filters_stale_rows_like_the_task(#[case] stable_row_ids: bool) {
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset =
+            write_new_data_dataset(dir.as_str(), stable_row_ids, &[128, 128, 512], &mut next_id)
+                .await;
+        create_new_data_indices(&mut dataset, &ivf_pq_params()).await;
+        dataset
+            .delete("id < 16 OR (id >= 256 AND id < 272)")
+            .await
+            .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 256,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(dataset.fragment_bitmap.contains(2) && !dataset.fragment_bitmap.contains(0));
+        append_new_data(&mut dataset, &[256; 2], &mut next_id).await;
+
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        let task = task_for(&plan, "vector_idx");
+        let direct = task.execute(&dataset).await.unwrap();
+        let mut shard_results = Vec::new();
+        for id in fragment_ids(task) {
+            shard_results.push(task.shard(&[id]).unwrap().execute(&dataset).await.unwrap());
+        }
+        let reduced = task.merge(&dataset, shard_results).await.unwrap();
+        let direct_segment = direct.new_segment.clone().unwrap();
+        let reduced_segment = reduced.new_segment.unwrap();
+        assert_vector_segments_equivalent(&dataset, &direct_segment, &reduced_segment).await;
+
+        let stored = vector_row_ids(&dataset, &reduced_segment).await;
+        let live = live_row_ids(&dataset).await;
+        let stale: Vec<u64> = stored.difference(&live).copied().collect();
+        if stable_row_ids {
+            assert_eq!(stored, live, "stale rows survived: {stale:?}");
+        } else {
+            assert!(
+                stored
+                    .iter()
+                    .all(|row| dataset.fragment_bitmap.contains((row >> 32) as u32))
+            );
+            assert_eq!(
+                stale.len(),
+                16,
+                "deleted rows of a live fragment are copied"
+            );
+            assert!(stale.iter().all(|row| (row >> 32) == 2));
+        }
+    }
+
+    /// The bins of one plan run independently -- one as shards then merge,
+    /// one as a shard committed as is -- and commit together.
+    #[tokio::test]
+    async fn bins_run_in_parallel_and_commit_together() {
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset = write_new_data_dataset(dir.as_str(), false, &[64; 6], &mut next_id).await;
+        commit_btree_segments(
+            &mut dataset,
+            "id_seg",
+            &[vec![0, 1, 2, 3], vec![4], vec![5]],
+        )
+        .await;
+        append_new_data(&mut dataset, &[64, 64], &mut next_id).await;
+        let before = segment_uuids(&dataset, "id_seg").await;
+        let expected = ids_matching(&dataset, "id >= 0", false).await;
+        assert_eq!(expected.len(), 512);
+
+        let plan = plan_index_optimization(&dataset, &size_tiered(192))
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        let merged_bin = async {
+            let task = &plan.tasks[0];
+            let shard = task.shard(&[6]).unwrap();
+            let shard_result = shard.execute(&dataset).await.unwrap();
+            task.merge(&dataset, vec![shard_result]).await.unwrap()
+        };
+        let delta_bin = async {
+            let task = &plan.tasks[1];
+            task.shard(&[7]).unwrap().execute(&dataset).await.unwrap()
+        };
+        let (merged, delta) = futures::join!(merged_bin, delta_bin);
+        assert_eq!(merged.removed_segments, vec![before[1], before[2]]);
+        assert!(delta.removed_segments.is_empty());
+
+        commit_index_optimization(&mut dataset, vec![merged, delta], None)
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+        let after = dataset.load_indices_by_name("id_seg").await.unwrap();
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0].uuid, before[0], "the large segment is untouched");
+        assert_eq!(
+            coverage(&dataset, "id_seg").await,
+            vec![vec![0, 1, 2, 3], vec![4, 5, 6], vec![7]]
+        );
+        assert_eq!(ids_matching(&dataset, "id >= 0", true).await, expected);
+        assert_eq!(
+            ids_matching(&dataset, "id >= 300 AND id < 500", true).await,
+            (300..500).collect::<Vec<u32>>()
+        );
+    }
+
+    // ---- commit ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn commit_rejects_inconsistent_results_before_writing() {
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), false, &ivf_pq_params(), 2).await;
+        let version = dataset.manifest.version;
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        let task = task_for(&plan, "id_idx");
+        let result = task.execute(&dataset).await.unwrap();
+        let shard = task.shard(&[4]).unwrap().execute(&dataset).await.unwrap();
+
+        let invalid = |err: Error| {
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        };
+        // Results of two plans.
+        let mut other_plan = result.clone();
+        other_plan.read_version += 1;
+        invalid(
+            commit_index_optimization(&mut dataset, vec![result.clone(), other_plan], None)
+                .await
+                .unwrap_err(),
+        );
+        // The same segment replaced twice.
+        invalid(
+            commit_index_optimization(&mut dataset, vec![result.clone(), result.clone()], None)
+                .await
+                .unwrap_err(),
+        );
+        // A replaced segment that is not one of the index's at that version.
+        let mut foreign = result.clone();
+        foreign.removed_segments = vec![Uuid::new_v4()];
+        invalid(
+            commit_index_optimization(&mut dataset, vec![foreign], None)
+                .await
+                .unwrap_err(),
+        );
+        // Coverage overlap: the merged segment covers fragment 4 and so does
+        // the shard's.
+        invalid(
+            commit_index_optimization(&mut dataset, vec![result.clone(), shard], None)
+                .await
+                .unwrap_err(),
+        );
+        // Nothing to commit.
+        let nothing = IndexOptimizeResult {
+            read_version: version,
+            index_name: "id_idx".to_string(),
+            new_segment: None,
+            removed_segments: vec![],
+        };
+        commit_index_optimization(&mut dataset, vec![nothing], None)
+            .await
+            .unwrap();
+        commit_index_optimization(&mut dataset, vec![], None)
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, version, "no commit was made");
+
+        // Valid results commit, carrying the transaction properties.
+        let properties = Arc::new(HashMap::from([("job".to_string(), "optimize".to_string())]));
+        commit_index_optimization(&mut dataset, vec![result], Some(properties))
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, version + 1);
+        dataset.validate().await.unwrap();
+        let transaction = dataset.read_transaction().await.unwrap().unwrap();
+        assert_eq!(
+            transaction
+                .transaction_properties
+                .as_ref()
+                .and_then(|p| p.get("job").cloned()),
+            Some("optimize".to_string())
+        );
+    }
+
+    /// The transaction is anchored at the plan's version, so the commit is
+    /// accepted from a handle at that version or at a later one, and a
+    /// concurrent optimize of the same index is reported as a retryable
+    /// conflict rather than as invalid input.
+    #[tokio::test]
+    async fn commit_anchors_at_the_plan_version() {
+        let dir = TempStrDir::default();
+        let dataset = indexed_dataset(dir.as_str(), false, &ivf_pq_params(), 2).await;
+        let version = dataset.manifest.version;
+        let plan = plan_index_optimization(
+            &dataset,
+            &IndexOptimizePlanOptions {
+                index_names: Some(vec!["id_idx".to_string()]),
+                ..delta_merge(Some(1))
+            },
+        )
+        .await
+        .unwrap();
+        let result = plan.tasks[0].execute(&dataset).await.unwrap();
+
+        // From a handle that moved on through an unrelated append.
+        let mut latest = dataset.clone();
+        let mut next_id = 6 * 256;
+        append_new_data(&mut latest, &[64], &mut next_id).await;
+        assert_eq!(latest.manifest.version, version + 1);
+        commit_index_optimization(&mut latest, vec![result.clone()], None)
+            .await
+            .unwrap();
+        assert_eq!(latest.manifest.version, version + 2);
+        latest.validate().await.unwrap();
+        assert_eq!(
+            coverage(&latest, "id_idx").await,
+            vec![vec![0, 1, 2, 3, 4, 5]]
+        );
+        assert_eq!(
+            latest.unindexed_fragments("id_idx").await.unwrap().len(),
+            1,
+            "the appended fragment stays unindexed"
+        );
+
+        // From the handle at the plan's version, on a fresh table.
+        let dir = TempStrDir::default();
+        let mut dataset = indexed_dataset(dir.as_str(), false, &ivf_pq_params(), 2).await;
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        let task = task_for(&plan, "id_idx");
+        let result = task.execute(&dataset).await.unwrap();
+        // Another writer optimized the same index in the meantime.
+        let mut other = dataset.clone();
+        let mut options = OptimizeOptions::merge(1);
+        options.index_names = Some(vec!["id_idx".to_string()]);
+        other.optimize_indices(&options).await.unwrap();
+        let err = commit_index_optimization(&mut other, vec![result.clone()], None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "{err}"
+        );
+        // ... and from the original handle the conflict is the same.
+        let err = commit_index_optimization(&mut dataset, vec![result], None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "{err}"
+        );
+    }
+
+    /// What lands between the plan and the commit decides the outcome: an
+    /// append or a delete is fine, a compaction that rewrote covered fragments
+    /// conflicts (retryable), unless the table keeps a tagged reuse history
+    /// whose lineage records the rewrite; an NGram segment always conflicts.
+    #[rstest]
+    #[case::append("append")]
+    #[case::delete("delete")]
+    #[case::plain_compaction("compact")]
+    #[case::tagged_compaction("tagged")]
+    #[case::ngram_compaction("ngram")]
+    #[tokio::test]
+    async fn commit_after_the_table_moved_on(#[case] drift: &str) {
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset =
+            write_new_data_dataset(dir.as_str(), false, &[128; 3], &mut next_id).await;
+        if drift == "tagged" {
+            tag_table(&mut dataset).await;
+        }
+        let (name, column, index_type) = if drift == "ngram" {
+            ("ngram_idx", "ngram_text", IndexType::NGram)
+        } else {
+            ("id_idx", "id", IndexType::BTree)
+        };
+        dataset
+            .create_index(
+                &[column],
+                index_type,
+                Some(name.into()),
+                &ScalarIndexParams::for_builtin(index_type.try_into().unwrap()),
+                true,
+            )
+            .await
+            .unwrap();
+        append_new_data(&mut dataset, &[128], &mut next_id).await;
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        let result = task_for(&plan, name).execute(&dataset).await.unwrap();
+
+        let mut latest = dataset.clone();
+        match drift {
+            "append" => append_new_data(&mut latest, &[128], &mut next_id).await,
+            "delete" => {
+                latest.delete("id < 10").await.unwrap();
+            }
+            "compact" | "ngram" | "tagged" => {
+                compact_files(
+                    &mut latest,
+                    CompactionOptions {
+                        target_rows_per_fragment: 1024,
+                        defer_index_remap: drift != "compact",
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    !latest.fragment_bitmap.contains(0),
+                    "covered fragments rewritten"
+                );
+            }
+            other => panic!("unknown drift {other}"),
+        }
+        let committed = commit_index_optimization(&mut latest, vec![result], None).await;
+        match drift {
+            "append" | "delete" | "tagged" => {
+                committed.unwrap();
+                latest.validate().await.unwrap();
+                assert_eq!(latest.load_indices_by_name(name).await.unwrap().len(), 1);
+            }
+            _ => {
+                let err = committed.unwrap_err();
+                assert!(
+                    matches!(err, Error::RetryableCommitConflict { .. }),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    /// On a tagged table a rebuild reports coverage in the live coordinate
+    /// system while the stored provenance of the old segment is not, which is
+    /// why the result is not checked against the old coverage; the commit
+    /// still validates and lands.
+    #[tokio::test]
+    async fn tagged_rebuild_commits_live_coverage() {
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset =
+            write_new_data_dataset(dir.as_str(), false, &[128, 128], &mut next_id).await;
+        create_new_data_indices(
+            &mut dataset,
+            &VectorIndexParams::ivf_flat(2, MetricType::L2),
+        )
+        .await;
+        tag_table(&mut dataset).await;
+        deferred_compaction(&mut dataset, 256).await;
+        append_new_data(&mut dataset, &[128], &mut next_id).await;
+        let live: RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+        let stored = load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .find(|s| s.name == "vector_idx")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            stored.fragment_bitmap,
+            Some(RoaringBitmap::from_iter([0u32, 1])),
+            "the stored provenance stays the retired sources"
+        );
+
+        let plan = plan_index_optimization(
+            &dataset,
+            &IndexOptimizePlanOptions {
+                index_names: Some(vec!["vector_idx".to_string()]),
+                ..delta_merge(None)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let result = plan.tasks[0].execute(&dataset).await.unwrap();
+        assert_eq!(result.removed_segments, vec![stored.uuid]);
+        assert_eq!(
+            result.new_segment.as_ref().unwrap().fragment_bitmap,
+            Some(live.clone())
+        );
+        commit_index_optimization(&mut dataset, vec![result], None)
+            .await
+            .unwrap();
+        let after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].fragment_bitmap, Some(live));
+    }
+
+    // ---- serialization -----------------------------------------------------
+
+    #[tokio::test]
+    async fn options_plan_task_and_result_round_trip_through_json() {
+        for options in [
+            delta_merge(Some(2)),
+            IndexOptimizePlanOptions {
+                index_names: Some(vec!["a".to_string()]),
+                strategy: IndexOptimizeStrategy::DeltaMerge {
+                    num_indices_to_merge: None,
+                    retrain: true,
+                },
+            },
+            size_tiered(1_000),
+            IndexOptimizePlanOptions::default(),
+        ] {
+            let json = serde_json::to_string(&options).unwrap();
+            assert_eq!(
+                serde_json::from_str::<IndexOptimizePlanOptions>(&json).unwrap(),
+                options
+            );
+        }
+        assert_eq!(
+            IndexOptimizePlanOptions::default().strategy,
+            IndexOptimizeStrategy::SizeTiered {
+                max_rows_per_segment: DEFAULT_MAX_ROWS_PER_SEGMENT
+            }
+        );
+        assert!(SizeTieredPlanner::new(None, 0).is_err());
+
+        let dir = TempStrDir::default();
+        let dataset = indexed_dataset(dir.as_str(), false, &ivf_pq_params(), 2).await;
+        let plan = plan_index_optimization(&dataset, &delta_merge(Some(1)))
+            .await
+            .unwrap();
+        let json = serde_json::to_string(&plan).unwrap();
+        let decoded: IndexOptimizePlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, plan);
+        let task = task_for(&plan, "id_idx");
+        let decoded: IndexOptimizeTask =
+            serde_json::from_str(&serde_json::to_string(task).unwrap()).unwrap();
+        assert_eq!(&decoded, task);
+
+        // A task received over the wire executes like the original.
+        let result = decoded.execute(&dataset).await.unwrap();
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: IndexOptimizeResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.read_version, result.read_version);
+        assert_eq!(decoded.removed_segments, result.removed_segments);
+        let (a, b) = (decoded.new_segment.unwrap(), result.new_segment.unwrap());
+        assert_eq!(a.uuid, b.uuid);
+        assert_eq!(a.fragment_bitmap, b.fragment_bitmap);
+        assert_eq!(a.files, b.files);
+        assert_eq!(a.index_details, b.index_details);
+        let none = IndexOptimizeResult {
+            new_segment: None,
+            ..decoded
+        };
+        let decoded: IndexOptimizeResult =
+            serde_json::from_str(&serde_json::to_string(&none).unwrap()).unwrap();
+        assert!(decoded.new_segment.is_none());
+    }
 
     #[derive(Serialize, Deserialize)]
     struct Carrier {

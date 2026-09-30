@@ -1666,6 +1666,452 @@ pub async fn merge_indices_impl<'a>(
     }))
 }
 
+/// Fixtures shared by the tests of merging from new data segments and of the
+/// plan / execute / commit steps in `index::optimize`.
+#[cfg(test)]
+pub mod test_fixtures {
+    use std::collections::{BTreeMap, HashSet};
+    use std::sync::Arc;
+
+    use arrow::datatypes::{Float32Type, UInt8Type, UInt32Type, UInt64Type};
+    use arrow_array::cast::AsArray;
+    use arrow_array::{
+        Array, ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray,
+        UInt32Array,
+    };
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::TryStreamExt;
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::ROW_ID;
+    use lance_index::IndexType;
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::{
+        BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
+    };
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::pq::storage::transpose;
+    use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::{PQ_CODE_COLUMN, SQ_CODE_COLUMN, VectorIndex};
+    use lance_linalg::distance::MetricType;
+    use lance_table::format::{Fragment, IndexMetadata};
+    use lance_testing::datagen::generate_random_array_with_seed;
+    use roaring::RoaringBitmap;
+
+    use super::{IndexMergeResults, merge_indices_with_unindexed_frags};
+    use crate::Dataset;
+    use crate::dataset::WriteParams;
+    use crate::dataset::transaction::{Operation, TransactionBuilder};
+    use crate::index::vector::VectorIndexParams;
+    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+
+    pub const NEW_DATA_DIM: usize = 16;
+
+    pub fn new_data_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    NEW_DATA_DIM as i32,
+                ),
+                true,
+            ),
+            Field::new("text", DataType::Utf8, false),
+            Field::new("ngram_text", DataType::Utf8, false),
+        ]))
+    }
+
+    pub fn new_data_batch(start: u32, rows: usize) -> RecordBatch {
+        let vectors = generate_random_array_with_seed::<Float32Type>(
+            rows * NEW_DATA_DIM,
+            [(start % 251) as u8; 32],
+        );
+        let words = (start..start + rows as u32).map(|i| format!("word{} common", i % 7));
+        RecordBatch::try_new(
+            new_data_schema(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(start..start + rows as u32)),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(vectors, NEW_DATA_DIM as i32).unwrap(),
+                ),
+                Arc::new(StringArray::from_iter_values(words.clone())),
+                Arc::new(StringArray::from_iter_values(words)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// One fragment per entry of `sizes`, ids continuing from `next_id`.
+    pub async fn append_new_data(dataset: &mut Dataset, sizes: &[usize], next_id: &mut u32) {
+        for &size in sizes {
+            dataset
+                .append(
+                    RecordBatchIterator::new(
+                        vec![Ok(new_data_batch(*next_id, size))],
+                        new_data_schema(),
+                    ),
+                    Some(WriteParams {
+                        max_rows_per_file: size,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            *next_id += size as u32;
+        }
+    }
+
+    pub async fn write_new_data_dataset(
+        uri: &str,
+        stable_row_ids: bool,
+        sizes: &[usize],
+        next_id: &mut u32,
+    ) -> Dataset {
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(new_data_batch(0, sizes[0]))], new_data_schema()),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: sizes[0],
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        *next_id = sizes[0] as u32;
+        append_new_data(&mut dataset, &sizes[1..], next_id).await;
+        dataset
+    }
+
+    /// `vector_idx`, `id_idx` (BTree), `text_idx` (inverted) and `ngram_idx`
+    /// (NGram on its own column, so the query planner never has to pick).
+    pub async fn create_new_data_indices(dataset: &mut Dataset, vector_params: &VectorIndexParams) {
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".into()),
+                vector_params,
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_idx".into()),
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["ngram_text"],
+                IndexType::NGram,
+                Some("ngram_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
+    pub fn ivf_pq_params() -> VectorIndexParams {
+        VectorIndexParams::ivf_pq(4, 8, 4, MetricType::L2, 10)
+    }
+
+    pub fn ivf_hnsw_sq_params() -> VectorIndexParams {
+        VectorIndexParams::with_ivf_hnsw_sq_params(
+            MetricType::L2,
+            IvfBuildParams::new(4),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        )
+    }
+
+    /// Same assembly as `optimize_indices` does from a merge result.
+    pub fn segment_from_result(
+        res: &IndexMergeResults<'_>,
+        template: &IndexMetadata,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            uuid: res.new_uuid,
+            name: template.name.clone(),
+            fields: template.fields.clone(),
+            covering_fields: template.covering_fields.clone(),
+            dataset_version: res.new_dataset_version,
+            fragment_bitmap: Some(res.new_fragment_bitmap.clone()),
+            index_details: Some(Arc::new(res.new_index_details.clone())),
+            index_version: res.new_index_version,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: Some(res.files.clone()),
+        }
+    }
+
+    pub async fn commit_segments(
+        dataset: &Dataset,
+        new: Vec<IndexMetadata>,
+        removed: Vec<IndexMetadata>,
+    ) -> Dataset {
+        let mut committed = dataset.clone();
+        let transaction = TransactionBuilder::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: new,
+                removed_indices: removed,
+            },
+        )
+        .build();
+        committed
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        committed
+    }
+
+    /// The committed segments of `name`, its unindexed fragments, and one
+    /// segment per half of those fragments built the way a worker would: an
+    /// append from the last committed segment's model.
+    pub async fn build_shard_segments(
+        dataset: &Arc<Dataset>,
+        name: &str,
+    ) -> (Vec<IndexMetadata>, Vec<Fragment>, Vec<IndexMetadata>) {
+        let segments = dataset.load_indices_by_name(name).await.unwrap();
+        let unindexed = dataset.unindexed_fragments(name).await.unwrap();
+        assert!(
+            unindexed.len() >= 2,
+            "{name}: need at least two unindexed fragments"
+        );
+        let mid = unindexed.len() / 2;
+        let mut shards = Vec::new();
+        for slice in [&unindexed[..mid], &unindexed[mid..]] {
+            let res = merge_indices_with_unindexed_frags(
+                dataset.clone(),
+                &[segments.last().unwrap()],
+                slice,
+                &OptimizeOptions::append(),
+            )
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name}: shard append produced nothing"));
+            assert!(res.removed_indices.is_empty(), "{name}");
+            assert_eq!(
+                res.new_fragment_bitmap,
+                slice.iter().map(|f| f.id as u32).collect::<RoaringBitmap>(),
+                "{name}"
+            );
+            shards.push(segment_from_result(&res, &segments[0]));
+        }
+        (segments, unindexed, shards)
+    }
+
+    /// (row id -> quantized code bytes) per partition.
+    pub async fn partition_contents(index: &Arc<dyn VectorIndex>) -> Vec<BTreeMap<u64, Vec<u8>>> {
+        let mut out = Vec::new();
+        for part in 0..index.ivf_model().num_partitions() {
+            let mut rows = BTreeMap::new();
+            if index.partition_size(part) > 0 {
+                let mut reader = index
+                    .partition_reader(part, true, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                while let Some(batch) = reader.try_next().await.unwrap() {
+                    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                    let code_idx = batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .position(|f| f.name() == PQ_CODE_COLUMN || f.name() == SQ_CODE_COLUMN)
+                        .expect("code column");
+                    let is_pq = batch.schema().field(code_idx).name() == PQ_CODE_COLUMN;
+                    let codes = batch.column(code_idx).as_fixed_size_list().clone();
+                    // PQ codes are stored transposed per batch.
+                    let codes = if is_pq {
+                        let values = codes.values().as_primitive::<UInt8Type>();
+                        let bytes_per_row = values.len() / batch.num_rows();
+                        FixedSizeListArray::try_new_from_values(
+                            transpose(values, bytes_per_row, batch.num_rows()),
+                            bytes_per_row as i32,
+                        )
+                        .unwrap()
+                    } else {
+                        codes
+                    };
+                    for i in 0..batch.num_rows() {
+                        let bytes = codes.value(i).as_primitive::<UInt8Type>().values().to_vec();
+                        assert!(
+                            rows.insert(row_ids.value(i), bytes).is_none(),
+                            "duplicate row id in partition {part}"
+                        );
+                    }
+                }
+            }
+            out.push(rows);
+        }
+        out
+    }
+
+    pub async fn sample_queries(dataset: &Dataset, n: usize) -> Vec<ArrayRef> {
+        let batch = dataset
+            .scan()
+            .project(&["vector"])
+            .unwrap()
+            .limit(Some(n as i64), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let vectors = batch["vector"].as_fixed_size_list();
+        (0..vectors.len()).map(|i| vectors.value(i)).collect()
+    }
+
+    /// Recall of the index search against exact search, over `queries`.
+    pub async fn vector_recall(dataset: &Dataset, queries: &[ArrayRef], k: usize) -> f32 {
+        let mut hits = 0usize;
+        for q in queries {
+            let mut exact = dataset.scan();
+            exact
+                .with_row_id()
+                .project(&["id"])
+                .unwrap()
+                .nearest("vector", q.as_ref(), k)
+                .unwrap()
+                .use_index(false);
+            let exact: HashSet<u64> = exact.try_into_batch().await.unwrap()[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            let mut approx = dataset.scan();
+            approx
+                .with_row_id()
+                .project(&["id"])
+                .unwrap()
+                .nearest("vector", q.as_ref(), k)
+                .unwrap()
+                .nprobes(4)
+                .ef(64);
+            hits += approx.try_into_batch().await.unwrap()[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .filter(|r| exact.contains(r))
+                .count();
+        }
+        hits as f32 / (queries.len() * k) as f32
+    }
+
+    /// Data-level equality (row ids and codes per partition) and search-level
+    /// closeness (recall against exact search) of two uncommitted segments that
+    /// both replace the committed `vector_idx` segments.
+    pub async fn assert_vector_segments_equivalent(
+        dataset: &Dataset,
+        a: &IndexMetadata,
+        b: &IndexMetadata,
+    ) {
+        let ia = dataset
+            .open_vector_index_from_metadata("vector", a, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ib = dataset
+            .open_vector_index_from_metadata("vector", b, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            ia.ivf_model().num_partitions(),
+            ib.ivf_model().num_partitions()
+        );
+        let ca = partition_contents(&ia).await;
+        let cb = partition_contents(&ib).await;
+        let mut total = 0;
+        for (part, (x, y)) in ca.iter().zip(cb.iter()).enumerate() {
+            assert_eq!(x.len(), y.len(), "partition {part} row count");
+            assert_eq!(x, y, "partition {part} contents");
+            total += x.len();
+        }
+        assert_eq!(total as u64, ia.num_rows());
+
+        let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let queries = sample_queries(dataset, 8).await;
+        let with_a = commit_segments(dataset, vec![a.clone()], segments).await;
+        let recall_a = vector_recall(&with_a, &queries, 10).await;
+        let with_b = commit_segments(&with_a, vec![b.clone()], vec![a.clone()]).await;
+        let recall_b = vector_recall(&with_b, &queries, 10).await;
+        assert!(
+            (recall_a - recall_b).abs() <= 0.1,
+            "recall drifted: from fragments {recall_a}, from segments {recall_b}"
+        );
+    }
+
+    /// Row ids stored by an uncommitted vector segment.
+    pub async fn vector_row_ids(dataset: &Dataset, segment: &IndexMetadata) -> HashSet<u64> {
+        let index = dataset
+            .open_vector_index_from_metadata("vector", segment, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        partition_contents(&index)
+            .await
+            .into_iter()
+            .flat_map(|rows| rows.into_keys())
+            .collect()
+    }
+
+    /// The row ids of every live row of the table.
+    pub async fn live_row_ids(dataset: &Dataset) -> HashSet<u64> {
+        let mut scan = dataset.scan();
+        scan.with_row_id().project(&["id"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// The ids `name`'s index returns for a query that spans old and new rows,
+    /// with the index (`use_index`) or by scanning.
+    pub async fn scalar_query_ids(dataset: &Dataset, name: &str, use_index: bool) -> Vec<u32> {
+        let mut scan = dataset.scan();
+        scan.project(&["id"]).unwrap();
+        scan.use_scalar_index(use_index);
+        match name {
+            "id_idx" => {
+                scan.filter("id >= 250 AND id < 1300").unwrap();
+            }
+            "ngram_idx" => {
+                scan.filter("contains(ngram_text, 'word3')").unwrap();
+            }
+            "text_idx" => {
+                scan.full_text_search(FullTextSearchQuery::new("word3".to_owned()))
+                    .unwrap();
+            }
+            other => panic!("unknown index {other}"),
+        }
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut ids = batch["id"].as_primitive::<UInt32Type>().values().to_vec();
+        ids.sort_unstable();
+        ids
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5132,391 +5578,9 @@ mod tests {
     // merging from the unindexed fragments themselves.
     // ----------------------------------------------------------------------
 
-    use std::collections::{BTreeMap, HashSet};
-
-    use arrow::datatypes::{UInt8Type, UInt64Type};
-    use lance_core::ROW_ID;
     use lance_index::scalar::FullTextSearchQuery;
-    use lance_index::vector::pq::storage::transpose;
-    use lance_index::vector::{PQ_CODE_COLUMN, SQ_CODE_COLUMN, VectorIndex};
 
-    use crate::dataset::transaction::TransactionBuilder;
-
-    const NEW_DATA_DIM: usize = 16;
-
-    fn new_data_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::UInt32, false),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    NEW_DATA_DIM as i32,
-                ),
-                true,
-            ),
-            Field::new("text", DataType::Utf8, false),
-            Field::new("ngram_text", DataType::Utf8, false),
-        ]))
-    }
-
-    fn new_data_batch(start: u32, rows: usize) -> RecordBatch {
-        let vectors = generate_random_array_with_seed::<Float32Type>(
-            rows * NEW_DATA_DIM,
-            [(start % 251) as u8; 32],
-        );
-        let words = (start..start + rows as u32).map(|i| format!("word{} common", i % 7));
-        RecordBatch::try_new(
-            new_data_schema(),
-            vec![
-                Arc::new(UInt32Array::from_iter_values(start..start + rows as u32)),
-                Arc::new(
-                    FixedSizeListArray::try_new_from_values(vectors, NEW_DATA_DIM as i32).unwrap(),
-                ),
-                Arc::new(StringArray::from_iter_values(words.clone())),
-                Arc::new(StringArray::from_iter_values(words)),
-            ],
-        )
-        .unwrap()
-    }
-
-    /// One fragment per entry of `sizes`, ids continuing from `next_id`.
-    async fn append_new_data(dataset: &mut Dataset, sizes: &[usize], next_id: &mut u32) {
-        for &size in sizes {
-            dataset
-                .append(
-                    RecordBatchIterator::new(
-                        vec![Ok(new_data_batch(*next_id, size))],
-                        new_data_schema(),
-                    ),
-                    Some(WriteParams {
-                        max_rows_per_file: size,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap();
-            *next_id += size as u32;
-        }
-    }
-
-    async fn write_new_data_dataset(
-        uri: &str,
-        stable_row_ids: bool,
-        sizes: &[usize],
-        next_id: &mut u32,
-    ) -> Dataset {
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(new_data_batch(0, sizes[0]))], new_data_schema()),
-            uri,
-            Some(WriteParams {
-                max_rows_per_file: sizes[0],
-                enable_stable_row_ids: stable_row_ids,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        *next_id = sizes[0] as u32;
-        append_new_data(&mut dataset, &sizes[1..], next_id).await;
-        dataset
-    }
-
-    /// `vector_idx`, `id_idx` (BTree), `text_idx` (inverted) and `ngram_idx`
-    /// (NGram on its own column, so the query planner never has to pick).
-    async fn create_new_data_indices(dataset: &mut Dataset, vector_params: &VectorIndexParams) {
-        dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                Some("vector_idx".into()),
-                vector_params,
-                true,
-            )
-            .await
-            .unwrap();
-        dataset
-            .create_index(
-                &["id"],
-                IndexType::BTree,
-                Some("id_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
-                true,
-            )
-            .await
-            .unwrap();
-        dataset
-            .create_index(
-                &["text"],
-                IndexType::Inverted,
-                Some("text_idx".into()),
-                &InvertedIndexParams::default(),
-                true,
-            )
-            .await
-            .unwrap();
-        dataset
-            .create_index(
-                &["ngram_text"],
-                IndexType::NGram,
-                Some("ngram_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
-                true,
-            )
-            .await
-            .unwrap();
-    }
-
-    fn ivf_pq_params() -> VectorIndexParams {
-        VectorIndexParams::ivf_pq(4, 8, 4, MetricType::L2, 10)
-    }
-
-    fn ivf_hnsw_sq_params() -> VectorIndexParams {
-        VectorIndexParams::with_ivf_hnsw_sq_params(
-            MetricType::L2,
-            IvfBuildParams::new(4),
-            HnswBuildParams::default(),
-            SQBuildParams::default(),
-        )
-    }
-
-    /// Same assembly as `optimize_indices` does from a merge result.
-    fn segment_from_result(res: &IndexMergeResults<'_>, template: &IndexMetadata) -> IndexMetadata {
-        IndexMetadata {
-            uuid: res.new_uuid,
-            name: template.name.clone(),
-            fields: template.fields.clone(),
-            covering_fields: template.covering_fields.clone(),
-            dataset_version: res.new_dataset_version,
-            fragment_bitmap: Some(res.new_fragment_bitmap.clone()),
-            index_details: Some(Arc::new(res.new_index_details.clone())),
-            index_version: res.new_index_version,
-            created_at: Some(chrono::Utc::now()),
-            base_id: None,
-            files: Some(res.files.clone()),
-        }
-    }
-
-    async fn commit_segments(
-        dataset: &Dataset,
-        new: Vec<IndexMetadata>,
-        removed: Vec<IndexMetadata>,
-    ) -> Dataset {
-        let mut committed = dataset.clone();
-        let transaction = TransactionBuilder::new(
-            dataset.manifest.version,
-            Operation::CreateIndex {
-                new_indices: new,
-                removed_indices: removed,
-            },
-        )
-        .build();
-        committed
-            .apply_commit(transaction, &Default::default(), &Default::default())
-            .await
-            .unwrap();
-        committed
-    }
-
-    /// The committed segments of `name`, its unindexed fragments, and one
-    /// segment per half of those fragments built the way a worker would: an
-    /// append from the last committed segment's model.
-    async fn build_shard_segments(
-        dataset: &Arc<Dataset>,
-        name: &str,
-    ) -> (Vec<IndexMetadata>, Vec<Fragment>, Vec<IndexMetadata>) {
-        let segments = dataset.load_indices_by_name(name).await.unwrap();
-        let unindexed = dataset.unindexed_fragments(name).await.unwrap();
-        assert!(
-            unindexed.len() >= 2,
-            "{name}: need at least two unindexed fragments"
-        );
-        let mid = unindexed.len() / 2;
-        let mut shards = Vec::new();
-        for slice in [&unindexed[..mid], &unindexed[mid..]] {
-            let res = merge_indices_with_unindexed_frags(
-                dataset.clone(),
-                &[segments.last().unwrap()],
-                slice,
-                &OptimizeOptions::append(),
-            )
-            .await
-            .unwrap()
-            .unwrap_or_else(|| panic!("{name}: shard append produced nothing"));
-            assert!(res.removed_indices.is_empty(), "{name}");
-            assert_eq!(
-                res.new_fragment_bitmap,
-                slice.iter().map(|f| f.id as u32).collect::<RoaringBitmap>(),
-                "{name}"
-            );
-            shards.push(segment_from_result(&res, &segments[0]));
-        }
-        (segments, unindexed, shards)
-    }
-
-    /// (row id -> quantized code bytes) per partition.
-    async fn partition_contents(index: &Arc<dyn VectorIndex>) -> Vec<BTreeMap<u64, Vec<u8>>> {
-        let mut out = Vec::new();
-        for part in 0..index.ivf_model().num_partitions() {
-            let mut rows = BTreeMap::new();
-            if index.partition_size(part) > 0 {
-                let mut reader = index
-                    .partition_reader(part, true, &NoOpMetricsCollector)
-                    .await
-                    .unwrap();
-                while let Some(batch) = reader.try_next().await.unwrap() {
-                    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                    let code_idx = batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .position(|f| f.name() == PQ_CODE_COLUMN || f.name() == SQ_CODE_COLUMN)
-                        .expect("code column");
-                    let is_pq = batch.schema().field(code_idx).name() == PQ_CODE_COLUMN;
-                    let codes = batch.column(code_idx).as_fixed_size_list().clone();
-                    // PQ codes are stored transposed per batch.
-                    let codes = if is_pq {
-                        let values = codes.values().as_primitive::<UInt8Type>();
-                        let bytes_per_row = values.len() / batch.num_rows();
-                        FixedSizeListArray::try_new_from_values(
-                            transpose(values, bytes_per_row, batch.num_rows()),
-                            bytes_per_row as i32,
-                        )
-                        .unwrap()
-                    } else {
-                        codes
-                    };
-                    for i in 0..batch.num_rows() {
-                        let bytes = codes.value(i).as_primitive::<UInt8Type>().values().to_vec();
-                        assert!(
-                            rows.insert(row_ids.value(i), bytes).is_none(),
-                            "duplicate row id in partition {part}"
-                        );
-                    }
-                }
-            }
-            out.push(rows);
-        }
-        out
-    }
-
-    async fn sample_queries(dataset: &Dataset, n: usize) -> Vec<ArrayRef> {
-        let batch = dataset
-            .scan()
-            .project(&["vector"])
-            .unwrap()
-            .limit(Some(n as i64), None)
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let vectors = batch["vector"].as_fixed_size_list();
-        (0..vectors.len()).map(|i| vectors.value(i)).collect()
-    }
-
-    /// Recall of the index search against exact search, over `queries`.
-    async fn vector_recall(dataset: &Dataset, queries: &[ArrayRef], k: usize) -> f32 {
-        let mut hits = 0usize;
-        for q in queries {
-            let mut exact = dataset.scan();
-            exact
-                .with_row_id()
-                .project(&["id"])
-                .unwrap()
-                .nearest("vector", q.as_ref(), k)
-                .unwrap()
-                .use_index(false);
-            let exact: HashSet<u64> = exact.try_into_batch().await.unwrap()[ROW_ID]
-                .as_primitive::<UInt64Type>()
-                .values()
-                .iter()
-                .copied()
-                .collect();
-            let mut approx = dataset.scan();
-            approx
-                .with_row_id()
-                .project(&["id"])
-                .unwrap()
-                .nearest("vector", q.as_ref(), k)
-                .unwrap()
-                .nprobes(4)
-                .ef(64);
-            hits += approx.try_into_batch().await.unwrap()[ROW_ID]
-                .as_primitive::<UInt64Type>()
-                .values()
-                .iter()
-                .filter(|r| exact.contains(r))
-                .count();
-        }
-        hits as f32 / (queries.len() * k) as f32
-    }
-
-    /// Data-level equality (row ids and codes per partition) and search-level
-    /// closeness (recall against exact search) of two uncommitted segments that
-    /// both replace the committed `vector_idx` segments.
-    async fn assert_vector_segments_equivalent(
-        dataset: &Dataset,
-        a: &IndexMetadata,
-        b: &IndexMetadata,
-    ) {
-        let ia = dataset
-            .open_vector_index_from_metadata("vector", a, &NoOpMetricsCollector)
-            .await
-            .unwrap();
-        let ib = dataset
-            .open_vector_index_from_metadata("vector", b, &NoOpMetricsCollector)
-            .await
-            .unwrap();
-        assert_eq!(
-            ia.ivf_model().num_partitions(),
-            ib.ivf_model().num_partitions()
-        );
-        let ca = partition_contents(&ia).await;
-        let cb = partition_contents(&ib).await;
-        let mut total = 0;
-        for (part, (x, y)) in ca.iter().zip(cb.iter()).enumerate() {
-            assert_eq!(x.len(), y.len(), "partition {part} row count");
-            assert_eq!(x, y, "partition {part} contents");
-            total += x.len();
-        }
-        assert_eq!(total as u64, ia.num_rows());
-
-        let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
-        let queries = sample_queries(dataset, 8).await;
-        let with_a = commit_segments(dataset, vec![a.clone()], segments).await;
-        let recall_a = vector_recall(&with_a, &queries, 10).await;
-        let with_b = commit_segments(&with_a, vec![b.clone()], vec![a.clone()]).await;
-        let recall_b = vector_recall(&with_b, &queries, 10).await;
-        assert!(
-            (recall_a - recall_b).abs() <= 0.1,
-            "recall drifted: from fragments {recall_a}, from segments {recall_b}"
-        );
-    }
-
-    /// The ids `name`'s index returns for a query that spans old and new rows,
-    /// with the index (`use_index`) or by scanning.
-    async fn scalar_query_ids(dataset: &Dataset, name: &str, use_index: bool) -> Vec<u32> {
-        let mut scan = dataset.scan();
-        scan.project(&["id"]).unwrap();
-        scan.use_scalar_index(use_index);
-        match name {
-            "id_idx" => {
-                scan.filter("id >= 250 AND id < 1300").unwrap();
-            }
-            "ngram_idx" => {
-                scan.filter("contains(ngram_text, 'word3')").unwrap();
-            }
-            "text_idx" => {
-                scan.full_text_search(FullTextSearchQuery::new("word3".to_owned()))
-                    .unwrap();
-            }
-            other => panic!("unknown index {other}"),
-        }
-        let batch = scan.try_into_batch().await.unwrap();
-        let mut ids = batch["id"].as_primitive::<UInt32Type>().values().to_vec();
-        ids.sort_unstable();
-        ids
-    }
+    use super::test_fixtures::*;
 
     #[rstest]
     #[case::ivf_pq(ivf_pq_params())]
