@@ -3878,6 +3878,7 @@ dependencies = [
  "either",
  "fst",
  "futures",
+ "hex",
  "humantime",
  "itertools 0.14.0",
  "lance-arrow",

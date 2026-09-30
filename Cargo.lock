@@ -4504,6 +4504,7 @@ dependencies = [
  "geoarrow-array",
  "geoarrow-schema",
  "half",
+ "hex",
  "humantime",
  "itertools 0.14.0",
  "lance-arrow",

@@ -74,6 +74,7 @@ url.workspace = true
 rand.workspace = true
 rayon.workspace = true
 futures.workspace = true
+hex.workspace = true
 uuid.workspace = true
 arrow.workspace = true
 # TODO: use datafusion sub-modules to reduce build size?
