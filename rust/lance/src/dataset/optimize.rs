@@ -1100,7 +1100,7 @@ pub async fn compact_files_with_planner(
 
 /// Information about a fragment used to decide its fate in compaction
 #[derive(Debug)]
-struct FragmentMetrics {
+pub(crate) struct FragmentMetrics {
     /// The number of original rows in the fragment
     pub physical_rows: usize,
     /// The number of rows that have been deleted
@@ -1118,12 +1118,12 @@ impl FragmentMetrics {
     }
 
     /// The number of rows that are still in the fragment
-    fn num_rows(&self) -> usize {
+    pub(crate) fn num_rows(&self) -> usize {
         self.physical_rows - self.num_deletions
     }
 }
 
-async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
+pub(crate) async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
     let physical_rows = fragment.physical_rows();
     let num_deletions = fragment.count_deletions();
     let (physical_rows, num_deletions) =

@@ -478,7 +478,7 @@ pub(crate) enum VectorSegmentCompatibility {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VectorModelMismatch {
+pub(crate) enum VectorModelMismatch {
     StorageFormat,
     IvfCentroids,
     QuantizerMetadata,
@@ -550,7 +550,9 @@ pub(crate) fn validate_vector_query_compatibility(
     Ok(())
 }
 
-fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModelMismatch> {
+pub(crate) fn vector_model_mismatch(
+    indices: &[Arc<dyn VectorIndex>],
+) -> Option<VectorModelMismatch> {
     let first = indices.first()?;
     let first_centroids = first.ivf_model().centroids_array();
     let first_quantizer = first.quantizer();

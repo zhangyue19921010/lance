@@ -2577,96 +2577,13 @@ impl DatasetIndexExt for Dataset {
 
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
         let dataset = Arc::new(self.clone());
-        // Grouped from the complete list so a name's segments are all accounted
-        // for. A segment this build cannot read is still coverage, and merging
-        // against a group whose coverage is only partly visible would commit a
-        // new segment claiming fragments an existing one already holds.
         let indices = load_all_indices(self).await?;
-
-        let indices_to_optimize = options
-            .index_names
-            .as_ref()
-            .map(|names| names.iter().collect::<HashSet<_>>());
-        let name_to_indices = indices
-            .iter()
-            .filter(|idx| {
-                indices_to_optimize
-                    .as_ref()
-                    .is_none_or(|names| names.contains(&idx.name))
-                    && !is_system_index(idx)
-            })
-            .map(|idx| (idx.name.clone(), idx))
-            .into_group_map();
+        let groups = eligible_index_groups(self, options.index_names.as_deref()).await?;
 
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
-        for (name, deltas) in name_to_indices.iter() {
-            if let Some(index) = deltas.iter().find(|idx| !index_type_is_known(idx)) {
-                let type_url = index
-                    .index_details
-                    .as_ref()
-                    .map(|details| details.type_url.as_str())
-                    .unwrap_or("<legacy>");
-                log::warn!(
-                    "Skipping optimization of index '{}' because this build does not recognize index type '{}'",
-                    index.name,
-                    type_url
-                );
-                continue;
-            }
-
-            // Optimizing a covered index would republish its declaration on a
-            // segment rebuilt without the carried values: `scan_vector_fragments`
-            // projects the keyed field and `_rowid` only, and the scalar merges
-            // reconstruct value plus row id.
-            //
-            // What decides is the caller's intent, not whether this group is
-            // stale. An unfiltered `optimize_indices()` is a table-wide
-            // maintenance request, and erroring aborts the loop before the
-            // replacements accumulated for the other groups are committed -- so
-            // one index this build cannot rebuild would leave every other index
-            // on the table stale. Skip it with a warning instead.
-            //
-            // A caller that listed this index in `index_names` asked for it
-            // specifically, so refuse out loud. The loop is already filtered by
-            // that list, so reaching here with it set means this group was named.
-            if let Some(covered) = deltas
-                .iter()
-                .find(|index| !index.covering_fields.is_empty())
-            {
-                if options.index_names.is_none() {
-                    log::warn!(
-                        "Skipping index '{}': it declares covering fields {:?}, \
-                         which no index builder writes or preserves yet.",
-                        covered.name,
-                        covered.covering_fields,
-                    );
-                    continue;
-                }
-                return Err(Error::index(format!(
-                    "Optimizing index '{}' is not supported: it declares \
-                     covering fields {:?}, which no index builder writes or \
-                     preserves yet",
-                    covered.name, covered.covering_fields,
-                )));
-            }
-
-            // Optimizing a name means replacing its segments with one that
-            // covers their union, which this build cannot compute when it
-            // cannot read one of them: the merged segment would overlap the
-            // segment left behind, and `Dataset::validate` calls that
-            // corruption. Leave the whole name to a build that can read it.
-            if let Some(max_supported_version) =
-                deltas.iter().find_map(|idx| unsupported_index_version(idx))
-            {
-                log::warn!(
-                    "Index {} has a segment newer than version {}, which this build cannot read; \
-                     skipping its optimization",
-                    name,
-                    max_supported_version,
-                );
-                continue;
-            }
+        for (_, group) in groups.iter() {
+            let deltas: Vec<&IndexMetadata> = group.iter().collect();
             // Scalar indices have no rebalance concept, so skip them entirely
             // when every fragment is already covered and the caller hasn't
             // asked for retrain or an explicit delta merge. Vector indices
@@ -2674,14 +2591,13 @@ impl DatasetIndexExt for Dataset {
             // merge_indices_with_unindexed_frags.
             if !options.retrain
                 && options.num_indices_to_merge.is_none_or(|n| n == 0)
-                && index_group_is_scalar(self, deltas)
-                && index_group_has_no_unindexed(self, deltas)
+                && index_group_is_scalar(self, &deltas)
+                && index_group_has_no_unindexed(self, &deltas)
             {
                 continue;
             }
 
-            let Some(res) = merge_indices(dataset.clone(), deltas.as_slice(), options).await?
-            else {
+            let Some(res) = merge_indices(dataset.clone(), &deltas, options).await? else {
                 continue;
             };
 
@@ -2769,6 +2685,116 @@ impl DatasetIndexExt for Dataset {
             .read_partition(partition_id, with_vector)
             .await
     }
+}
+
+/// The logical indices an optimize pass may act on, as `(name, segments)`
+/// with names in manifest order and each group holding every segment of that
+/// name, also in manifest order. `index_names` restricts the pass to those
+/// names; `None` is a table-wide pass.
+///
+/// Grouped from the complete list so a name's segments are all accounted
+/// for. A segment this build cannot read is still coverage, and merging
+/// against a group whose coverage is only partly visible would commit a
+/// new segment claiming fragments an existing one already holds. So a name
+/// is left out, with a warning, when any of its segments is of a type this
+/// build does not recognize or of a version newer than it reads. Whether a
+/// scalar group with nothing unindexed is worth a task is left to the caller.
+pub(crate) async fn eligible_index_groups(
+    dataset: &Dataset,
+    index_names: Option<&[String]>,
+) -> Result<Vec<(String, Vec<IndexMetadata>)>> {
+    let indices = load_all_indices(dataset).await?;
+    let requested = index_names.map(|names| names.iter().collect::<HashSet<_>>());
+    let mut groups: Vec<(String, Vec<IndexMetadata>)> = Vec::new();
+    let mut position: HashMap<&str, usize> = HashMap::new();
+    for idx in indices.iter() {
+        if is_system_index(idx)
+            || requested
+                .as_ref()
+                .is_some_and(|names| !names.contains(&idx.name))
+        {
+            continue;
+        }
+        match position.get(idx.name.as_str()) {
+            Some(&at) => groups[at].1.push(idx.clone()),
+            None => {
+                position.insert(idx.name.as_str(), groups.len());
+                groups.push((idx.name.clone(), vec![idx.clone()]));
+            }
+        }
+    }
+
+    let mut eligible = Vec::with_capacity(groups.len());
+    for (name, deltas) in groups {
+        if let Some(index) = deltas.iter().find(|idx| !index_type_is_known(idx)) {
+            let type_url = index
+                .index_details
+                .as_ref()
+                .map(|details| details.type_url.as_str())
+                .unwrap_or("<legacy>");
+            log::warn!(
+                "Skipping optimization of index '{}' because this build does not recognize index type '{}'",
+                index.name,
+                type_url
+            );
+            continue;
+        }
+
+        // Optimizing a covered index would republish its declaration on a
+        // segment rebuilt without the carried values: `scan_vector_fragments`
+        // projects the keyed field and `_rowid` only, and the scalar merges
+        // reconstruct value plus row id.
+        //
+        // What decides is the caller's intent, not whether this group is
+        // stale. An unfiltered `optimize_indices()` is a table-wide
+        // maintenance request, and erroring aborts the pass before the
+        // replacements accumulated for the other groups are committed -- so
+        // one index this build cannot rebuild would leave every other index
+        // on the table stale. Skip it with a warning instead.
+        //
+        // A caller that listed this index in `index_names` asked for it
+        // specifically, so refuse out loud. The groups are already filtered by
+        // that list, so reaching here with it set means this group was named.
+        if let Some(covered) = deltas
+            .iter()
+            .find(|index| !index.covering_fields.is_empty())
+        {
+            if index_names.is_none() {
+                log::warn!(
+                    "Skipping index '{}': it declares covering fields {:?}, \
+                     which no index builder writes or preserves yet.",
+                    covered.name,
+                    covered.covering_fields,
+                );
+                continue;
+            }
+            return Err(Error::index(format!(
+                "Optimizing index '{}' is not supported: it declares \
+                 covering fields {:?}, which no index builder writes or \
+                 preserves yet",
+                covered.name, covered.covering_fields,
+            )));
+        }
+
+        // Optimizing a name means replacing its segments with one that
+        // covers their union, which this build cannot compute when it
+        // cannot read one of them: the merged segment would overlap the
+        // segment left behind, and `Dataset::validate` calls that
+        // corruption. Leave the whole name to a build that can read it.
+        if let Some(max_supported_version) =
+            deltas.iter().find_map(|idx| unsupported_index_version(idx))
+        {
+            log::warn!(
+                "Index {} has a segment newer than version {}, which this build cannot read; \
+                 skipping its optimization",
+                name,
+                max_supported_version,
+            );
+            continue;
+        }
+        eligible.push((name, deltas));
+    }
+    Ok(eligible)
 }
 
 fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
