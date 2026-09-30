@@ -876,7 +876,7 @@ pub(crate) fn normalize_inverted_details(
 /// `InvertedIndex::merge_segments` is shaped as "merge old segments plus new
 /// rows", so even a pure segment merge needs a stream with the document column
 /// and `_rowid` fields. The stream intentionally contains no batches.
-fn empty_inverted_update_stream(
+pub(crate) fn empty_inverted_update_stream(
     dataset: &Dataset,
     resolved: &ResolvedFtsField,
 ) -> Result<SendableRecordBatchStream> {

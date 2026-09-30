@@ -28,6 +28,7 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use super::vector::builder::ExistingIndex;
 use super::vector::ivf::{
     SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
     optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
@@ -52,6 +53,88 @@ pub struct IndexMergeResults<'a> {
     pub new_index_details: prost_types::Any,
     /// List of files and their sizes for the merged index
     pub files: Vec<lance_table::format::IndexFile>,
+}
+
+/// Where a merge takes the rows that no segment in `old_indices` holds yet.
+#[derive(Debug, Clone, Copy)]
+pub enum NewIndexData<'a> {
+    /// Unindexed fragments, scanned and indexed as part of the merge.
+    Fragments(&'a [Fragment]),
+    /// Segments already built over the unindexed fragments with the same model
+    /// as `old_indices`, for example by parallel workers over disjoint
+    /// fragments. Their rows are read back from the segments instead of being
+    /// scanned, and they are never reported as removed.
+    // Constructed by the optimize task's reduce step; see `index::optimize`.
+    #[allow(dead_code)]
+    Segments(&'a [IndexMetadata]),
+}
+
+impl NewIndexData<'_> {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Fragments(fragments) => fragments.is_empty(),
+            Self::Segments(segments) => segments.is_empty(),
+        }
+    }
+
+    fn segments(&self) -> &[IndexMetadata] {
+        match self {
+            Self::Fragments(_) => &[],
+            Self::Segments(segments) => segments,
+        }
+    }
+
+    /// The fragments the new data covers.
+    fn fragment_bitmap(&self) -> Result<RoaringBitmap> {
+        match self {
+            Self::Fragments(fragments) => Ok(fragments.iter().map(|frag| frag.id as u32).collect()),
+            Self::Segments(segments) => {
+                let mut bitmap = RoaringBitmap::new();
+                for segment in segments.iter() {
+                    bitmap |= segment.fragment_bitmap.as_ref().ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "new data segment {} has no fragment coverage",
+                            segment.uuid
+                        ))
+                    })?;
+                }
+                Ok(bitmap)
+            }
+        }
+    }
+
+    /// The rows a vector merge shuffles: a scan of the fragments, or nothing
+    /// when the rows come from segments.
+    async fn vector_stream(
+        &self,
+        dataset: &Dataset,
+        field_path: &str,
+        column_nullable: bool,
+    ) -> Result<Option<crate::dataset::scanner::DatasetRecordBatchStream>> {
+        match self {
+            Self::Fragments(fragments) if !fragments.is_empty() => Ok(Some(
+                scan_vector_fragments(dataset, field_path, column_nullable, fragments).await?,
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    /// The new data segments opened as builder sources. They are unfiltered:
+    /// every row they hold was live when they were built at this version.
+    async fn vector_sources(
+        &self,
+        dataset: &Dataset,
+        field_path: &str,
+    ) -> Result<Vec<ExistingIndex>> {
+        let mut sources = Vec::with_capacity(self.segments().len());
+        for segment in self.segments() {
+            let index = dataset
+                .open_vector_index_from_metadata(field_path, segment, &NoOpMetricsCollector)
+                .await?;
+            sources.push(ExistingIndex::unfiltered(index));
+        }
+        Ok(sources)
+    }
 }
 
 async fn build_stable_row_id_filter(
@@ -435,7 +518,7 @@ fn select_segments_to_merge<'a>(
 async fn merge_scalar_indices<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
-    unindexed: &[Fragment],
+    new_data: NewIndexData<'_>,
     options: &OptimizeOptions,
     index_type: IndexType,
     field_path: &str,
@@ -459,7 +542,7 @@ async fn merge_scalar_indices<'a>(
     let selected_old_indices = select_segments_to_merge(dataset.as_ref(), old_indices, options);
 
     // No new data + ≤1 old selected = rewriting one segment to itself.
-    if unindexed.is_empty() && selected_old_indices.len() <= 1 {
+    if new_data.is_empty() && selected_old_indices.len() <= 1 {
         return Ok(None);
     }
 
@@ -485,6 +568,14 @@ async fn merge_scalar_indices<'a>(
     // Scalar Index that expos an N:1 segment-merge primitive reachable without
     // rescanning the dataset
     let has_segment_merge_primitive = matches!(index_type, IndexType::BTree | IndexType::NGram);
+    // Only a type with an N:1 merge primitive can take its new rows from
+    // segments; the others read one old segment and scan the new rows.
+    let new_segments = new_data.segments();
+    if !new_segments.is_empty() && !has_segment_merge_primitive {
+        return Err(Error::not_supported(format!(
+            "merging new data segments is not supported for {index_type:?} indices"
+        )));
+    }
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
     let ngram_requires_rebuild = index_type == IndexType::NGram
         && frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
@@ -502,7 +593,7 @@ async fn merge_scalar_indices<'a>(
     //     `selected_old_indices.len() == 1` (any scalar type can `update` one).
     // Otherwise (e.g. ≥2 selected segments of a type without an N:1 merge
     // primitive) the index is rebuilt from scratch over `frag_bitmap`.
-    let can_merge_segments = !effective_old_frags.is_empty()
+    let can_merge_segments = (!effective_old_frags.is_empty() || !new_segments.is_empty())
         && !update_criteria.requires_old_data
         && !ngram_requires_rebuild
         && (has_segment_merge_primitive || selected_old_indices.len() == 1);
@@ -533,38 +624,67 @@ async fn merge_scalar_indices<'a>(
         let plugin = details.get_plugin()?;
         // Only open data files looking for seeds when the plugin confirms this
         // index type and configuration can actually produce them.
-        let maybe_created = if plugin.might_use_seeds(&index_details) {
-            if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
-            {
-                plugin
-                    .update_from_seeds(seeds, reference_index.clone(), &index_details, &new_store)
-                    .await?
-            } else {
-                None
+        let maybe_created = match new_data {
+            NewIndexData::Fragments(unindexed) if plugin.might_use_seeds(&index_details) => {
+                if let Some(seeds) =
+                    try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
+                {
+                    plugin
+                        .update_from_seeds(
+                            seeds,
+                            reference_index.clone(),
+                            &index_details,
+                            &new_store,
+                        )
+                        .await?
+                } else {
+                    None
+                }
             }
-        } else {
-            None
+            _ => None,
         };
 
         let created_index = if let Some(created) = maybe_created {
             created
         } else {
-            let new_data_stream = load_unindexed_training_data(
-                dataset.as_ref(),
-                field_path,
-                &update_criteria,
-                unindexed,
-            )
-            .await?;
+            let new_data_stream = match new_data {
+                NewIndexData::Fragments(unindexed) => {
+                    load_unindexed_training_data(
+                        dataset.as_ref(),
+                        field_path,
+                        &update_criteria,
+                        unindexed,
+                    )
+                    .await?
+                }
+                // The rows come from the segments below; the merge still takes
+                // a (schema-carrying) stream for the new rows.
+                NewIndexData::Segments(_) => {
+                    load_training_data(
+                        dataset.as_ref(),
+                        field_path,
+                        &update_criteria.data_criteria,
+                        None,
+                        false,
+                        None,
+                    )
+                    .await?
+                }
+            };
+            // The old segments carry their coverage filters; a new data segment
+            // was built from live rows only and keeps every row.
+            let (_, mut old_data_filters) =
+                build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
+            let mut segments = selected_old_indices.clone();
+            segments.extend(new_segments.iter());
+            old_data_filters.extend(new_segments.iter().map(|_| None));
 
             match index_type {
                 IndexType::BTree => {
-                    let (_, old_data_filters) =
-                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
                     crate::index::scalar::btree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
-                        &selected_old_indices,
+                        &segments,
                         new_data_stream,
                         &new_store,
                         &old_data_filters,
@@ -572,11 +692,9 @@ async fn merge_scalar_indices<'a>(
                     .await?
                 }
                 IndexType::NGram => {
-                    let (_, old_data_filters) =
-                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
-                        &selected_old_indices,
+                        &segments,
                         Some(new_data_stream),
                         &new_store,
                         &old_data_filters,
@@ -839,6 +957,26 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     unindexed: &[Fragment],
     options: &OptimizeOptions,
 ) -> Result<Option<IndexMergeResults<'a>>> {
+    merge_indices_impl(
+        dataset,
+        old_indices,
+        NewIndexData::Fragments(unindexed),
+        options,
+    )
+    .await
+}
+
+/// [`merge_indices_with_unindexed_frags`] with the new rows coming from either
+/// unindexed fragments or segments already built over them (see
+/// [`NewIndexData`]). The segment selection -- which of `old_indices` are
+/// replaced -- is the same for both; the removed segments never include new
+/// data segments.
+pub(crate) async fn merge_indices_impl<'a>(
+    dataset: Arc<Dataset>,
+    old_indices: &[&'a IndexMetadata],
+    new_data: NewIndexData<'_>,
+    options: &OptimizeOptions,
+) -> Result<Option<IndexMergeResults<'a>>> {
     if old_indices.is_empty() {
         return Err(Error::index(
             "Append index: no previous index found".to_string(),
@@ -891,10 +1029,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         }
     }
 
-    let mut base_unindexed_bitmap = RoaringBitmap::new();
-    unindexed.iter().for_each(|frag| {
-        base_unindexed_bitmap.insert(frag.id as u32);
-    });
+    let base_unindexed_bitmap = new_data.fragment_bitmap()?;
 
     let (new_uuid, removed_indices, new_fragment_bitmap, created_index, new_dataset_version) =
         if first_is_vector_index {
@@ -918,10 +1053,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             if !dormant_segments.is_empty() && !live_segments.is_empty() && !options.retrain {
                 // Optimize the live segments as usual; the dormant segments
                 // are superseded by whatever that produces.
-                let mut merged = Box::pin(merge_indices_with_unindexed_frags(
+                let mut merged = Box::pin(merge_indices_impl(
                     dataset.clone(),
                     &live_segments,
-                    unindexed,
+                    new_data,
                     options,
                 ))
                 .await?;
@@ -942,8 +1077,18 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             // Rebuilding and first training both read the whole column, so
             // neither has anything to do until a fragment sits outside the
             // index.
-            if unindexed.is_empty() && (rebuild_dormant || awaits_training) {
+            if new_data.is_empty() && (rebuild_dormant || awaits_training) {
                 return Ok(None);
+            }
+            // A rebuild scans the whole column, so segments built over the new
+            // rows would be ignored; that merge must be given the fragments.
+            if !new_data.segments().is_empty()
+                && (awaits_training || options.retrain || rebuild_dormant)
+            {
+                return Err(Error::not_supported(
+                    "Optimize vector index: a rebuild cannot take new data segments; \
+                     merge from the unindexed fragments instead",
+                ));
             }
 
             if awaits_training {
@@ -1020,7 +1165,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let default_append_for_heterogeneous_models = options.num_indices_to_merge.is_none()
                 && compatibility == VectorSegmentCompatibility::QueryCompatibleModelsDiffer;
 
-            if !unindexed.is_empty() && (explicit_append || default_append_for_heterogeneous_models)
+            if !new_data.is_empty() && (explicit_append || default_append_for_heterogeneous_models)
             {
                 // CreateIndex commits append new segments at the end of the manifest's
                 // stable index order. Reusing the current suffix model keeps consecutive
@@ -1039,22 +1184,21 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     vec![(reference_metadata.clone(), reference_index.clone())],
                 )?;
                 let reference_ivf_view = reference_logical_index.as_ivf()?;
-                let new_data_stream = scan_vector_fragments(
-                    dataset.as_ref(),
-                    &field_path,
-                    column.nullable,
-                    unindexed,
-                )
-                .await?;
+                let new_data_stream = new_data
+                    .vector_stream(dataset.as_ref(), &field_path, column.nullable)
+                    .await?;
+                let new_data_sources = new_data
+                    .vector_sources(dataset.as_ref(), &field_path)
+                    .await?;
                 let mut append_options = options.clone();
                 append_options.num_indices_to_merge = Some(0);
                 append_options.retrain = false;
                 let (new_uuid, indices_merged, files) = optimize_vector_indices(
                     dataset.as_ref().clone(),
-                    Some(new_data_stream),
+                    new_data_stream,
                     &field_path,
                     &reference_ivf_view,
-                    Vec::new(),
+                    new_data_sources,
                     &append_options,
                 )
                 .boxed()
@@ -1082,11 +1226,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
             // Append is a steady-state no-op when every fragment is already
             // indexed. Default optimize may still rebalance one segment.
-            if unindexed.is_empty() && options.num_indices_to_merge == Some(0) {
+            if new_data.is_empty() && options.num_indices_to_merge == Some(0) {
                 return Ok(None);
             }
             let steady_state_rebalance =
-                if unindexed.is_empty() && options.num_indices_to_merge.is_none() {
+                if new_data.is_empty() && options.num_indices_to_merge.is_none() {
                     let Some(rebalance) = select_steady_state_rebalance(&ivf_view, compatibility)?
                     else {
                         return Ok(None);
@@ -1182,26 +1326,19 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 )?;
                 let merge_ivf_view = merge_logical_index.as_ivf()?;
 
-                let new_data_stream = if unindexed.is_empty() {
-                    None
-                } else {
-                    Some(
-                        scan_vector_fragments(
-                            dataset.as_ref(),
-                            &field_path,
-                            column.nullable,
-                            unindexed,
-                        )
-                        .await?,
-                    )
-                };
+                let new_data_stream = new_data
+                    .vector_stream(dataset.as_ref(), &field_path, column.nullable)
+                    .await?;
+                let new_data_sources = new_data
+                    .vector_sources(dataset.as_ref(), &field_path)
+                    .await?;
 
                 let (new_uuid, indices_merged, files) = optimize_vector_indices(
                     dataset.as_ref().clone(),
                     new_data_stream,
                     &field_path,
                     &merge_ivf_view,
-                    Vec::new(),
+                    new_data_sources,
                     options,
                 )
                 .boxed()
@@ -1300,7 +1437,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 IndexType::Inverted => {
                     let selected_old_indices =
                         select_segments_to_merge(dataset.as_ref(), old_indices, options);
-                    if unindexed.is_empty() && selected_old_indices.len() <= 1 {
+                    if new_data.is_empty() && selected_old_indices.len() <= 1 {
                         return Ok(None);
                     }
                     let reference_idx = selected_old_indices
@@ -1312,6 +1449,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         .await?;
                     let update_criteria = reference_index.update_criteria();
                     if update_criteria.requires_old_data {
+                        if !new_data.segments().is_empty() {
+                            return Err(Error::not_supported(
+                                "Optimize inverted index: a legacy segment is rebuilt from the \
+                                 table and cannot take new data segments",
+                            ));
+                        }
                         let params = reference_index.derive_index_params()?;
                         let resolved = resolved_fts.as_ref().ok_or_else(|| {
                             Error::internal(
@@ -1350,21 +1493,32 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         }));
                     }
 
-                    let fragments = Some(unindexed.to_vec());
                     let resolved = resolved_fts.as_ref().ok_or_else(|| {
                         Error::internal(
                             "Inverted index metadata did not resolve an FTS field".to_string(),
                         )
                     })?;
-                    let new_data_stream = load_fts_training_data(
-                        dataset.as_ref(),
-                        resolved,
-                        &update_criteria.data_criteria,
-                        fragments,
-                        true,
-                        None,
-                    )
-                    .await?;
+                    let new_data_stream = match new_data {
+                        NewIndexData::Fragments(unindexed) => {
+                            load_fts_training_data(
+                                dataset.as_ref(),
+                                resolved,
+                                &update_criteria.data_criteria,
+                                Some(unindexed.to_vec()),
+                                true,
+                                None,
+                            )
+                            .await?
+                        }
+                        // The rows come from the segments; the merge still takes
+                        // a (schema-carrying) stream for the new rows.
+                        NewIndexData::Segments(_) => {
+                            super::scalar::inverted::empty_inverted_update_stream(
+                                dataset.as_ref(),
+                                resolved,
+                            )?
+                        }
+                    };
 
                     let mut frag_bitmap = base_unindexed_bitmap;
                     let mut effective_old_frags = RoaringBitmap::new();
@@ -1406,9 +1560,39 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         })
                     };
 
+                    // Each source segment gets its own filter: the selected old
+                    // segments share the coverage filter, and a new data segment,
+                    // built from live rows only, keeps every row. Widening the old
+                    // segments' allow-list to the new coverage instead would keep
+                    // stale postings whose row id is live again elsewhere.
+                    let mut source_indices = selected_indices;
+                    let mut old_data_filters: Vec<Option<&OldIndexDataFilter>> =
+                        vec![old_data_filter.as_ref(); source_indices.len()];
+                    for segment in new_data.segments() {
+                        let scalar_index = super::scalar::open_scalar_index(
+                            dataset.as_ref(),
+                            &field_path,
+                            segment,
+                            &NoOpMetricsCollector,
+                        )
+                        .await?;
+                        let inverted_index = scalar_index
+                            .as_any()
+                            .downcast_ref::<InvertedIndex>()
+                            .ok_or_else(|| {
+                                Error::index(format!(
+                                    "Append index: expected inverted new data segment {}, got {:?}",
+                                    segment.uuid,
+                                    scalar_index.index_type()
+                                ))
+                            })?;
+                        source_indices.push(Arc::new(inverted_index.clone()));
+                        old_data_filters.push(None);
+                    }
+
                     let new_uuid = Uuid::new_v4();
                     let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
-                    let (created_index, new_dataset_version) = if selected_indices.is_empty() {
+                    let (created_index, new_dataset_version) = if source_indices.is_empty() {
                         (
                             super::scalar::build_scalar_index(
                                 dataset.as_ref(),
@@ -1426,10 +1610,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     } else {
                         (
                             InvertedIndex::merge_segments(
-                                &selected_indices,
+                                &source_indices,
                                 new_data_stream,
                                 &new_store,
-                                &vec![old_data_filter.as_ref(); selected_indices.len()],
+                                &old_data_filters,
                                 options.progress.clone(),
                             )
                             .await?,
@@ -1453,7 +1637,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     let Some(result) = merge_scalar_indices(
                         dataset.clone(),
                         old_indices,
-                        unindexed,
+                        new_data,
                         options,
                         it,
                         &field_path,
@@ -4943,5 +5127,799 @@ mod tests {
             .unwrap()
             .num_rows();
         assert_eq!(total, 150, "no rows may be lost across compaction + merge");
+    }
+
+    // ----------------------------------------------------------------------
+    // Merging from new data segments (`NewIndexData::Segments`) against
+    // merging from the unindexed fragments themselves.
+    // ----------------------------------------------------------------------
+
+    use std::collections::{BTreeMap, HashSet};
+
+    use arrow::datatypes::{UInt8Type, UInt64Type};
+    use lance_core::ROW_ID;
+    use lance_index::scalar::FullTextSearchQuery;
+    use lance_index::vector::pq::storage::transpose;
+    use lance_index::vector::{PQ_CODE_COLUMN, SQ_CODE_COLUMN, VectorIndex};
+
+    use crate::dataset::transaction::TransactionBuilder;
+
+    const NEW_DATA_DIM: usize = 16;
+
+    fn new_data_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    NEW_DATA_DIM as i32,
+                ),
+                true,
+            ),
+            Field::new("text", DataType::Utf8, false),
+            Field::new("ngram_text", DataType::Utf8, false),
+        ]))
+    }
+
+    fn new_data_batch(start: u32, rows: usize) -> RecordBatch {
+        let vectors = generate_random_array_with_seed::<Float32Type>(
+            rows * NEW_DATA_DIM,
+            [(start % 251) as u8; 32],
+        );
+        let words = (start..start + rows as u32).map(|i| format!("word{} common", i % 7));
+        RecordBatch::try_new(
+            new_data_schema(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(start..start + rows as u32)),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(vectors, NEW_DATA_DIM as i32).unwrap(),
+                ),
+                Arc::new(StringArray::from_iter_values(words.clone())),
+                Arc::new(StringArray::from_iter_values(words)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// One fragment per entry of `sizes`, ids continuing from `next_id`.
+    async fn append_new_data(dataset: &mut Dataset, sizes: &[usize], next_id: &mut u32) {
+        for &size in sizes {
+            dataset
+                .append(
+                    RecordBatchIterator::new(
+                        vec![Ok(new_data_batch(*next_id, size))],
+                        new_data_schema(),
+                    ),
+                    Some(WriteParams {
+                        max_rows_per_file: size,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            *next_id += size as u32;
+        }
+    }
+
+    async fn write_new_data_dataset(
+        uri: &str,
+        stable_row_ids: bool,
+        sizes: &[usize],
+        next_id: &mut u32,
+    ) -> Dataset {
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(new_data_batch(0, sizes[0]))], new_data_schema()),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: sizes[0],
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        *next_id = sizes[0] as u32;
+        append_new_data(&mut dataset, &sizes[1..], next_id).await;
+        dataset
+    }
+
+    /// `vector_idx`, `id_idx` (BTree), `text_idx` (inverted) and `ngram_idx`
+    /// (NGram on its own column, so the query planner never has to pick).
+    async fn create_new_data_indices(dataset: &mut Dataset, vector_params: &VectorIndexParams) {
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".into()),
+                vector_params,
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_idx".into()),
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["ngram_text"],
+                IndexType::NGram,
+                Some("ngram_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn ivf_pq_params() -> VectorIndexParams {
+        VectorIndexParams::ivf_pq(4, 8, 4, MetricType::L2, 10)
+    }
+
+    fn ivf_hnsw_sq_params() -> VectorIndexParams {
+        VectorIndexParams::with_ivf_hnsw_sq_params(
+            MetricType::L2,
+            IvfBuildParams::new(4),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        )
+    }
+
+    /// Same assembly as `optimize_indices` does from a merge result.
+    fn segment_from_result(res: &IndexMergeResults<'_>, template: &IndexMetadata) -> IndexMetadata {
+        IndexMetadata {
+            uuid: res.new_uuid,
+            name: template.name.clone(),
+            fields: template.fields.clone(),
+            covering_fields: template.covering_fields.clone(),
+            dataset_version: res.new_dataset_version,
+            fragment_bitmap: Some(res.new_fragment_bitmap.clone()),
+            index_details: Some(Arc::new(res.new_index_details.clone())),
+            index_version: res.new_index_version,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: Some(res.files.clone()),
+        }
+    }
+
+    async fn commit_segments(
+        dataset: &Dataset,
+        new: Vec<IndexMetadata>,
+        removed: Vec<IndexMetadata>,
+    ) -> Dataset {
+        let mut committed = dataset.clone();
+        let transaction = TransactionBuilder::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: new,
+                removed_indices: removed,
+            },
+        )
+        .build();
+        committed
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        committed
+    }
+
+    /// The committed segments of `name`, its unindexed fragments, and one
+    /// segment per half of those fragments built the way a worker would: an
+    /// append from the last committed segment's model.
+    async fn build_shard_segments(
+        dataset: &Arc<Dataset>,
+        name: &str,
+    ) -> (Vec<IndexMetadata>, Vec<Fragment>, Vec<IndexMetadata>) {
+        let segments = dataset.load_indices_by_name(name).await.unwrap();
+        let unindexed = dataset.unindexed_fragments(name).await.unwrap();
+        assert!(
+            unindexed.len() >= 2,
+            "{name}: need at least two unindexed fragments"
+        );
+        let mid = unindexed.len() / 2;
+        let mut shards = Vec::new();
+        for slice in [&unindexed[..mid], &unindexed[mid..]] {
+            let res = merge_indices_with_unindexed_frags(
+                dataset.clone(),
+                &[segments.last().unwrap()],
+                slice,
+                &OptimizeOptions::append(),
+            )
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name}: shard append produced nothing"));
+            assert!(res.removed_indices.is_empty(), "{name}");
+            assert_eq!(
+                res.new_fragment_bitmap,
+                slice.iter().map(|f| f.id as u32).collect::<RoaringBitmap>(),
+                "{name}"
+            );
+            shards.push(segment_from_result(&res, &segments[0]));
+        }
+        (segments, unindexed, shards)
+    }
+
+    /// (row id -> quantized code bytes) per partition.
+    async fn partition_contents(index: &Arc<dyn VectorIndex>) -> Vec<BTreeMap<u64, Vec<u8>>> {
+        let mut out = Vec::new();
+        for part in 0..index.ivf_model().num_partitions() {
+            let mut rows = BTreeMap::new();
+            if index.partition_size(part) > 0 {
+                let mut reader = index
+                    .partition_reader(part, true, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                while let Some(batch) = reader.try_next().await.unwrap() {
+                    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                    let code_idx = batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .position(|f| f.name() == PQ_CODE_COLUMN || f.name() == SQ_CODE_COLUMN)
+                        .expect("code column");
+                    let is_pq = batch.schema().field(code_idx).name() == PQ_CODE_COLUMN;
+                    let codes = batch.column(code_idx).as_fixed_size_list().clone();
+                    // PQ codes are stored transposed per batch.
+                    let codes = if is_pq {
+                        let values = codes.values().as_primitive::<UInt8Type>();
+                        let bytes_per_row = values.len() / batch.num_rows();
+                        FixedSizeListArray::try_new_from_values(
+                            transpose(values, bytes_per_row, batch.num_rows()),
+                            bytes_per_row as i32,
+                        )
+                        .unwrap()
+                    } else {
+                        codes
+                    };
+                    for i in 0..batch.num_rows() {
+                        let bytes = codes.value(i).as_primitive::<UInt8Type>().values().to_vec();
+                        assert!(
+                            rows.insert(row_ids.value(i), bytes).is_none(),
+                            "duplicate row id in partition {part}"
+                        );
+                    }
+                }
+            }
+            out.push(rows);
+        }
+        out
+    }
+
+    async fn sample_queries(dataset: &Dataset, n: usize) -> Vec<ArrayRef> {
+        let batch = dataset
+            .scan()
+            .project(&["vector"])
+            .unwrap()
+            .limit(Some(n as i64), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let vectors = batch["vector"].as_fixed_size_list();
+        (0..vectors.len()).map(|i| vectors.value(i)).collect()
+    }
+
+    /// Recall of the index search against exact search, over `queries`.
+    async fn vector_recall(dataset: &Dataset, queries: &[ArrayRef], k: usize) -> f32 {
+        let mut hits = 0usize;
+        for q in queries {
+            let mut exact = dataset.scan();
+            exact
+                .with_row_id()
+                .project(&["id"])
+                .unwrap()
+                .nearest("vector", q.as_ref(), k)
+                .unwrap()
+                .use_index(false);
+            let exact: HashSet<u64> = exact.try_into_batch().await.unwrap()[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            let mut approx = dataset.scan();
+            approx
+                .with_row_id()
+                .project(&["id"])
+                .unwrap()
+                .nearest("vector", q.as_ref(), k)
+                .unwrap()
+                .nprobes(4)
+                .ef(64);
+            hits += approx.try_into_batch().await.unwrap()[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .filter(|r| exact.contains(r))
+                .count();
+        }
+        hits as f32 / (queries.len() * k) as f32
+    }
+
+    /// Data-level equality (row ids and codes per partition) and search-level
+    /// closeness (recall against exact search) of two uncommitted segments that
+    /// both replace the committed `vector_idx` segments.
+    async fn assert_vector_segments_equivalent(
+        dataset: &Dataset,
+        a: &IndexMetadata,
+        b: &IndexMetadata,
+    ) {
+        let ia = dataset
+            .open_vector_index_from_metadata("vector", a, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let ib = dataset
+            .open_vector_index_from_metadata("vector", b, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            ia.ivf_model().num_partitions(),
+            ib.ivf_model().num_partitions()
+        );
+        let ca = partition_contents(&ia).await;
+        let cb = partition_contents(&ib).await;
+        let mut total = 0;
+        for (part, (x, y)) in ca.iter().zip(cb.iter()).enumerate() {
+            assert_eq!(x.len(), y.len(), "partition {part} row count");
+            assert_eq!(x, y, "partition {part} contents");
+            total += x.len();
+        }
+        assert_eq!(total as u64, ia.num_rows());
+
+        let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let queries = sample_queries(dataset, 8).await;
+        let with_a = commit_segments(dataset, vec![a.clone()], segments).await;
+        let recall_a = vector_recall(&with_a, &queries, 10).await;
+        let with_b = commit_segments(&with_a, vec![b.clone()], vec![a.clone()]).await;
+        let recall_b = vector_recall(&with_b, &queries, 10).await;
+        assert!(
+            (recall_a - recall_b).abs() <= 0.1,
+            "recall drifted: from fragments {recall_a}, from segments {recall_b}"
+        );
+    }
+
+    /// The ids `name`'s index returns for a query that spans old and new rows,
+    /// with the index (`use_index`) or by scanning.
+    async fn scalar_query_ids(dataset: &Dataset, name: &str, use_index: bool) -> Vec<u32> {
+        let mut scan = dataset.scan();
+        scan.project(&["id"]).unwrap();
+        scan.use_scalar_index(use_index);
+        match name {
+            "id_idx" => {
+                scan.filter("id >= 250 AND id < 1300").unwrap();
+            }
+            "ngram_idx" => {
+                scan.filter("contains(ngram_text, 'word3')").unwrap();
+            }
+            "text_idx" => {
+                scan.full_text_search(FullTextSearchQuery::new("word3".to_owned()))
+                    .unwrap();
+            }
+            other => panic!("unknown index {other}"),
+        }
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut ids = batch["id"].as_primitive::<UInt32Type>().values().to_vec();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[rstest]
+    #[case::ivf_pq(ivf_pq_params())]
+    #[case::ivf_hnsw_sq(ivf_hnsw_sq_params())]
+    #[tokio::test]
+    async fn test_vector_merge_from_segments_matches_merge_from_fragments(
+        #[case] params: VectorIndexParams,
+    ) {
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset =
+            write_new_data_dataset(dir.as_str(), false, &[256; 4], &mut next_id).await;
+        create_new_data_indices(&mut dataset, &params).await;
+        append_new_data(&mut dataset, &[256; 4], &mut next_id).await;
+        let ds = Arc::new(dataset);
+
+        let (segments, unindexed, shards) = build_shard_segments(&ds, "vector_idx").await;
+        let refs: Vec<&IndexMetadata> = segments.iter().collect();
+        let options = OptimizeOptions::merge(segments.len());
+        let from_fragments =
+            merge_indices_with_unindexed_frags(ds.clone(), &refs, &unindexed, &options)
+                .await
+                .unwrap()
+                .unwrap();
+        let from_segments =
+            merge_indices_impl(ds.clone(), &refs, NewIndexData::Segments(&shards), &options)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            from_segments
+                .removed_indices
+                .iter()
+                .map(|s| s.uuid)
+                .collect::<Vec<_>>(),
+            from_fragments
+                .removed_indices
+                .iter()
+                .map(|s| s.uuid)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            from_segments.new_fragment_bitmap,
+            from_fragments.new_fragment_bitmap
+        );
+        assert_vector_segments_equivalent(
+            &ds,
+            &segment_from_result(&from_fragments, &segments[0]),
+            &segment_from_result(&from_segments, &segments[0]),
+        )
+        .await;
+
+        // Append mode from segments: the shards are concatenated into one delta
+        // and nothing is replaced.
+        {
+            let options = OptimizeOptions::append();
+            let delta =
+                merge_indices_impl(ds.clone(), &refs, NewIndexData::Segments(&shards), &options)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(delta.removed_indices.is_empty());
+            assert_eq!(
+                delta.new_fragment_bitmap,
+                unindexed
+                    .iter()
+                    .map(|f| f.id as u32)
+                    .collect::<RoaringBitmap>()
+            );
+            let opened = ds
+                .open_vector_index_from_metadata(
+                    "vector",
+                    &segment_from_result(&delta, &segments[0]),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            assert_eq!(opened.num_rows(), 4 * 256);
+        }
+    }
+
+    #[rstest]
+    #[case::btree("id_idx")]
+    #[case::ngram("ngram_idx")]
+    #[case::inverted("text_idx")]
+    #[tokio::test]
+    async fn test_scalar_merge_from_segments_matches_merge_from_fragments(#[case] name: &str) {
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset =
+            write_new_data_dataset(dir.as_str(), false, &[256; 4], &mut next_id).await;
+        create_new_data_indices(&mut dataset, &ivf_pq_params()).await;
+        append_new_data(&mut dataset, &[256; 4], &mut next_id).await;
+        let ds = Arc::new(dataset);
+
+        let (segments, unindexed, shards) = build_shard_segments(&ds, name).await;
+        let refs: Vec<&IndexMetadata> = segments.iter().collect();
+        let options = OptimizeOptions::merge(segments.len());
+        let from_fragments =
+            merge_indices_with_unindexed_frags(ds.clone(), &refs, &unindexed, &options)
+                .await
+                .unwrap()
+                .unwrap();
+        let from_segments =
+            merge_indices_impl(ds.clone(), &refs, NewIndexData::Segments(&shards), &options)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            from_segments
+                .removed_indices
+                .iter()
+                .map(|s| s.uuid)
+                .collect::<Vec<_>>(),
+            from_fragments
+                .removed_indices
+                .iter()
+                .map(|s| s.uuid)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            from_segments.new_fragment_bitmap,
+            from_fragments.new_fragment_bitmap
+        );
+
+        let expected = scalar_query_ids(&ds, name, false).await;
+        assert!(!expected.is_empty());
+        let a = segment_from_result(&from_fragments, &segments[0]);
+        let b = segment_from_result(&from_segments, &segments[0]);
+        let with_a = commit_segments(&ds, vec![a.clone()], segments.clone()).await;
+        assert_eq!(with_a.load_indices_by_name(name).await.unwrap().len(), 1);
+        assert_eq!(
+            scalar_query_ids(&with_a, name, true).await,
+            expected,
+            "{name}: from fragments"
+        );
+        let with_b = commit_segments(&with_a, vec![b], vec![a]).await;
+        assert_eq!(with_b.load_indices_by_name(name).await.unwrap().len(), 1);
+        assert_eq!(
+            scalar_query_ids(&with_b, name, true).await,
+            expected,
+            "{name}: from segments"
+        );
+
+        // Nothing selected (append mode): the shards alone become the segment.
+        let delta = merge_indices_impl(
+            ds.clone(),
+            &refs,
+            NewIndexData::Segments(&shards),
+            &OptimizeOptions::append(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(delta.removed_indices.is_empty());
+        assert_eq!(
+            delta.new_fragment_bitmap,
+            unindexed
+                .iter()
+                .map(|f| f.id as u32)
+                .collect::<RoaringBitmap>()
+        );
+        let delta = segment_from_result(&delta, &segments[0]);
+        let (column, expected_rows) = match name {
+            "id_idx" => ("id", 4 * 256),
+            "ngram_idx" => (
+                "ngram_text",
+                (1024u32..2048).filter(|id| id % 7 == 3).count(),
+            ),
+            "text_idx" => ("text", (1024u32..2048).filter(|id| id % 7 == 3).count()),
+            other => panic!("unknown index {other}"),
+        };
+        let query: Box<dyn lance_index::scalar::AnyQuery> = match name {
+            "id_idx" => Box::new(lance_index::scalar::SargableQuery::Range(
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded,
+            )),
+            "ngram_idx" => Box::new(TextQuery::StringContains("word3".to_string())),
+            _ => Box::new(lance_index::scalar::TokenQuery::TokensContains(
+                "word3".to_string(),
+            )),
+        };
+        let opened =
+            crate::index::scalar::open_scalar_index(&ds, column, &delta, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        let rows = match opened
+            .search(query.as_ref(), &NoOpMetricsCollector)
+            .await
+            .unwrap()
+        {
+            SearchResult::Exact(rows) | SearchResult::AtMost(rows) => rows,
+            other => panic!("unexpected search result {other:?}"),
+        };
+        assert_eq!(
+            rows.true_rows().row_addrs().unwrap().count(),
+            expected_rows,
+            "{name}: delta"
+        );
+    }
+
+    /// Under stable row ids an update deletes a row's old copy and rewrites it
+    /// under the same row id in a new fragment. When that fragment arrives as a
+    /// new data segment, the old segment must still be filtered by its own
+    /// coverage: an allow-list widened to the new coverage would keep the old
+    /// value's posting, because the row id is live again in the new fragment.
+    #[tokio::test]
+    async fn test_fts_merge_from_segments_filters_each_source() {
+        use crate::dataset::UpdateBuilder;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|i| if i < 50 { "alpha" } else { "beta" }),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 50,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = InvertedIndexParams::default();
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["body"], IndexType::Inverted, &params)
+                    .name("body_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("body_idx", "body", segments)
+            .await
+            .unwrap();
+
+        // Rows 0..25 (in the older segment's fragment) become "beta"; the
+        // rewritten copies land in a new, unindexed fragment.
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id < 25")
+            .unwrap()
+            .set("body", "'beta'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+        let ds = Arc::new(dataset);
+        let (segments, unindexed, _) = {
+            let segments = ds.load_indices_by_name("body_idx").await.unwrap();
+            let unindexed = ds.unindexed_fragments("body_idx").await.unwrap();
+            assert_eq!(unindexed.len(), 1);
+            (segments, unindexed, ())
+        };
+        let refs: Vec<&IndexMetadata> = segments.iter().collect();
+        let shard = merge_indices_with_unindexed_frags(
+            ds.clone(),
+            &[segments.last().unwrap()],
+            &unindexed,
+            &OptimizeOptions::append(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let shard = segment_from_result(&shard, &segments[0]);
+
+        let count = |dataset: Dataset, term: &'static str| async move {
+            let mut scan = dataset.scan();
+            scan.full_text_search(FullTextSearchQuery::new(term.to_owned()))
+                .unwrap();
+            scan.count_rows().await.unwrap()
+        };
+        // Default options: the newest segment plus, under stable row ids, the
+        // older one that covers the fragment with deletions.
+        let from_segments = merge_indices_impl(
+            ds.clone(),
+            &refs,
+            NewIndexData::Segments(std::slice::from_ref(&shard)),
+            &OptimizeOptions::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(from_segments.removed_indices.len(), 2);
+        let removed = from_segments
+            .removed_indices
+            .iter()
+            .map(|s| (*s).clone())
+            .collect();
+        let committed = commit_segments(
+            &ds,
+            vec![segment_from_result(&from_segments, &segments[0])],
+            removed,
+        )
+        .await;
+        assert_eq!(
+            count(committed.clone(), "alpha").await,
+            25,
+            "stale alpha postings survived"
+        );
+        assert_eq!(count(committed.clone(), "beta").await, 75);
+
+        let from_fragments = merge_indices_with_unindexed_frags(
+            ds.clone(),
+            &refs,
+            &unindexed,
+            &OptimizeOptions::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(from_fragments.removed_indices.len(), 2);
+        let merged_from_segments = committed.load_indices_by_name("body_idx").await.unwrap();
+        let committed = commit_segments(
+            &committed,
+            vec![segment_from_result(&from_fragments, &segments[0])],
+            merged_from_segments,
+        )
+        .await;
+        assert_eq!(count(committed.clone(), "alpha").await, 25);
+        assert_eq!(count(committed, "beta").await, 75);
+    }
+
+    /// Paths that rebuild from the table, or types without a segment merge
+    /// primitive, refuse new data segments instead of silently ignoring them.
+    #[tokio::test]
+    async fn test_merge_from_segments_is_refused_where_segments_would_be_ignored() {
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset =
+            write_new_data_dataset(dir.as_str(), false, &[256; 2], &mut next_id).await;
+        create_new_data_indices(&mut dataset, &ivf_pq_params()).await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Bitmap,
+                Some("id_bitmap".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                true,
+            )
+            .await
+            .unwrap();
+        append_new_data(&mut dataset, &[256; 2], &mut next_id).await;
+        let ds = Arc::new(dataset);
+
+        // Retraining a vector index scans the whole column.
+        let (segments, _, shards) = build_shard_segments(&ds, "vector_idx").await;
+        let refs: Vec<&IndexMetadata> = segments.iter().collect();
+        let err = merge_indices_impl(
+            ds.clone(),
+            &refs,
+            NewIndexData::Segments(&shards),
+            &OptimizeOptions::retrain(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+
+        // A bitmap index reads one old segment and scans the new rows.
+        let segments = ds.load_indices_by_name("id_bitmap").await.unwrap();
+        let unindexed = ds.unindexed_fragments("id_bitmap").await.unwrap();
+        let shard = merge_indices_with_unindexed_frags(
+            ds.clone(),
+            &[&segments[0]],
+            &unindexed,
+            &OptimizeOptions::append(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let shard = segment_from_result(&shard, &segments[0]);
+        let err = merge_indices_impl(
+            ds.clone(),
+            &[&segments[0]],
+            NewIndexData::Segments(std::slice::from_ref(&shard)),
+            &OptimizeOptions::merge(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
     }
 }
