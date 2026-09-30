@@ -143,14 +143,9 @@ impl InvertedIndex {
         &self.deleted_fragments
     }
 
-    /// Merge `segments` and `new_data` into one segment written to `dest_store`.
-    ///
-    /// `old_data_filters` pairs each segment, by position, with the filter that
-    /// keeps the rows it may still contribute (`None` keeps every row). A
-    /// segment built from live rows only, such as one a worker built from
-    /// unindexed fragments, takes `None`; widening one segment's filter to
-    /// cover another's rows would keep stale postings whose row id is live
-    /// again elsewhere.
+    /// Merge `segments` and `new_data` into `dest_store`. `old_data_filters`
+    /// pairs each segment by position with the filter keeping the rows it may
+    /// still contribute (`None` keeps every row).
     pub async fn merge_segments(
         segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,

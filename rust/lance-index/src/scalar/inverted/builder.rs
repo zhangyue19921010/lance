@@ -265,9 +265,7 @@ impl InvertedIndexBuilder {
         Ok(files)
     }
 
-    /// Merge `old_segments` and `new_data` into `dest_store`. `old_data_filters`
-    /// pairs each old segment, by position, with the filter that keeps the rows
-    /// it may still contribute; see [`InvertedIndex::merge_segments`].
+    /// `old_data_filters` is aligned with `old_segments`; see [`InvertedIndex::merge_segments`].
     pub async fn update_from_segments(
         &mut self,
         new_data: SendableRecordBatchStream,

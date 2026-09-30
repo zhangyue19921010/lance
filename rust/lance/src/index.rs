@@ -2579,10 +2579,8 @@ impl DatasetIndexExt for Dataset {
 
     #[instrument(skip_all)]
 
-    /// Plan one task per index with [`DeltaMergePlanner`], execute the tasks
-    /// (`options.num_threads` at a time, one by default) and commit their
-    /// results together: the same steps a distributed optimize runs, in one
-    /// process. Any task failing aborts the pass before the commit.
+    /// Plan one task per index, execute them (`options.num_threads` at a time)
+    /// and commit the results together, as a distributed optimize does.
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
         let plan = DeltaMergePlanner::new(
             options.index_names.clone(),
@@ -2646,18 +2644,10 @@ impl DatasetIndexExt for Dataset {
     }
 }
 
-/// The logical indices an optimize pass may act on, as `(name, segments)`
-/// with names in manifest order and each group holding every segment of that
-/// name, also in manifest order. `index_names` restricts the pass to those
-/// names; `None` is a table-wide pass.
-///
-/// Grouped from the complete list so a name's segments are all accounted
-/// for. A segment this build cannot read is still coverage, and merging
-/// against a group whose coverage is only partly visible would commit a
-/// new segment claiming fragments an existing one already holds. So a name
-/// is left out, with a warning, when any of its segments is of a type this
-/// build does not recognize or of a version newer than it reads. Whether a
-/// scalar group with nothing unindexed is worth a task is left to the caller.
+/// The `(name, segments)` groups an optimize pass may act on, in manifest
+/// order. A name with a segment this build cannot read (unknown type, newer
+/// version) is skipped with a warning: merging against partly visible
+/// coverage would commit a segment overlapping the one left behind.
 pub(crate) async fn eligible_index_groups(
     dataset: &Dataset,
     index_names: Option<&[String]>,
@@ -2699,21 +2689,9 @@ pub(crate) async fn eligible_index_groups(
             continue;
         }
 
-        // Optimizing a covered index would republish its declaration on a
-        // segment rebuilt without the carried values: `scan_vector_fragments`
-        // projects the keyed field and `_rowid` only, and the scalar merges
-        // reconstruct value plus row id.
-        //
-        // What decides is the caller's intent, not whether this group is
-        // stale. An unfiltered `optimize_indices()` is a table-wide
-        // maintenance request, and erroring aborts the pass before the
-        // replacements accumulated for the other groups are committed -- so
-        // one index this build cannot rebuild would leave every other index
-        // on the table stale. Skip it with a warning instead.
-        //
-        // A caller that listed this index in `index_names` asked for it
-        // specifically, so refuse out loud. The groups are already filtered by
-        // that list, so reaching here with it set means this group was named.
+        // No builder preserves carried values yet, so a covered index cannot be
+        // rebuilt. A table-wide pass skips it with a warning so the other
+        // indices still get optimized; a caller that named it is refused.
         if let Some(covered) = deltas
             .iter()
             .find(|index| !index.covering_fields.is_empty())
@@ -2735,11 +2713,6 @@ pub(crate) async fn eligible_index_groups(
             )));
         }
 
-        // Optimizing a name means replacing its segments with one that
-        // covers their union, which this build cannot compute when it
-        // cannot read one of them: the merged segment would overlap the
-        // segment left behind, and `Dataset::validate` calls that
-        // corruption. Leave the whole name to a build that can read it.
         if let Some(max_supported_version) = deltas.iter().find_map(unsupported_index_version) {
             log::warn!(
                 "Index {} has a segment newer than version {}, which this build cannot read; \

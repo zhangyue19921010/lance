@@ -672,10 +672,7 @@ fn existing_index_sources(
 
 // TODO: move to `lance-index` crate.
 ///
-/// `new_data_sources` are segments already built from the unindexed rows with
-/// the same model (the outputs of parallel workers); they are merged into the
-/// new segment unconditionally and never counted as merged. See
-/// [`IvfIndexBuilder::with_new_data_sources`].
+/// `new_data_sources`: see [`IvfIndexBuilder::with_new_data_sources`].
 ///
 /// Returns (new_uuid, num_indices_merged, files)
 pub(crate) async fn optimize_vector_indices(
@@ -693,8 +690,7 @@ pub(crate) async fn optimize_vector_indices(
             "optimizing vector index: no existing index found".to_string(),
         ));
     }
-    // The new data segments are written into the same output, so they must
-    // share the model too.
+    // The new data segments must share the model too.
     let model_scope = existing_indices
         .iter()
         .chain(new_data_sources.iter().map(|source| &source.index))
