@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Read-only health check for a Lance table. Prints one JSON report.
 
-Only touches the manifest of the latest version: no data file or index file
+Reads only the manifest of the latest version: no data file or index file
 is opened and no older manifest is read, so the cost grows with the size of
-that manifest, not with the amount of data.
+that manifest, not with the amount of data. The exception is a table written
+by an old version of Lance whose fragments carry no row count: counting the
+rows and planning a compaction then read every data file, and the check gets
+slow on such a table with many fragments. It stays read-only.
 """
 
 from __future__ import annotations

@@ -80,8 +80,9 @@ Do not use `num_small_fragments` or `num_deleted_rows` alone to decide whether t
 
 The check reads only the manifest of the latest version, so its cost grows with the size of that
 manifest, not with the amount of data. On tables written by old versions of Lance, fragments may
-lack row counts. Then the fragment statistics have to open data files and the check gets slow, and
-the `indices` section fails with a message that asks for a write with a current version.
+lack row counts. Then `num_rows` and `compaction_tasks` read every data file to count the rows, so
+the check gets slow on such a table with many fragments; the `indices` section fails with a message
+that asks for a write with a current version.
 
 The time it took to open the table and the time each section took are logged on stderr; the report
 on stdout is not affected. For a table in an object store most of the time goes into opening it,
