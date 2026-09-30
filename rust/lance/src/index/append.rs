@@ -1054,6 +1054,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     Some(new_data_stream),
                     &field_path,
                     &reference_ivf_view,
+                    Vec::new(),
                     &append_options,
                 )
                 .boxed()
@@ -1133,6 +1134,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     >::None,
                     &field_path,
                     &selected_ivf_view,
+                    Vec::new(),
                     options,
                 ))
                 .await?;
@@ -1199,6 +1201,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     new_data_stream,
                     &field_path,
                     &merge_ivf_view,
+                    Vec::new(),
                     options,
                 )
                 .boxed()

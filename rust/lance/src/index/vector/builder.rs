@@ -356,6 +356,10 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
 
     // fields for merging indices / remapping
     existing_indices: Vec<ExistingIndex>,
+    // new data that is already indexed: segments built from the unindexed rows
+    // with this builder's model (for example by parallel workers over disjoint
+    // fragments). Always merged into the output, never counted in `merged_num`.
+    new_data_sources: Vec<ExistingIndex>,
 
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 
@@ -469,6 +473,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             shuffle_data_input: Mutex::new(None),
             existing_indices: Vec::new(),
+            new_data_sources: Vec::new(),
             frag_reuse_index,
             fragment_filter: None,
             optimize_options: None,
@@ -537,6 +542,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             shuffle_reader: None,
             shuffle_data_input: Mutex::new(None),
             existing_indices: vec![ExistingIndex::unfiltered(index)],
+            new_data_sources: Vec::new(),
             frag_reuse_index: None,
             fragment_filter: None,
             optimize_options: None,
@@ -661,6 +667,27 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     pub fn with_existing_index_sources(&mut self, sources: Vec<ExistingIndex>) -> &mut Self {
         self.existing_indices = sources;
         self
+    }
+
+    /// Rows of the new data that are already indexed: segments built from the
+    /// unindexed rows with the same model as this builder's, for example by
+    /// parallel workers over disjoint fragments. They are merged into the
+    /// output unconditionally and are never counted as merged candidates:
+    /// `num_indices_to_merge` and the split / join decision only select among
+    /// the sources given to [`Self::with_existing_index_sources`].
+    pub fn with_new_data_sources(&mut self, sources: Vec<ExistingIndex>) -> &mut Self {
+        self.new_data_sources = sources;
+        self
+    }
+
+    /// Every segment whose rows may end up in the output: the candidates, then
+    /// the new data segments. Partition sizing and the split / join row
+    /// collection read all of them; skipping the new data segments there would
+    /// silently drop their rows.
+    fn all_sources(&self) -> impl Iterator<Item = &ExistingIndex> + '_ {
+        self.existing_indices
+            .iter()
+            .chain(self.new_data_sources.iter())
     }
 
     /// Set fragment filter for distributed indexing
@@ -1103,16 +1130,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 [self.existing_indices.len().saturating_sub(num_to_merge)..]
                 .to_vec();
 
-            (ivf.num_partitions(), Arc::new(indices_to_merge), None)
+            (ivf.num_partitions(), indices_to_merge, None)
         };
 
-        let (num_partitions, merge_indices, partition_adjustment) = if num_indices_to_merge
+        // The candidates selected for the merge; the new data segments are added
+        // below, after they have been counted.
+        let (num_partitions, merged_candidates, partition_adjustment) = if num_indices_to_merge
             .is_some()
             || self.optimize_options.is_none()
         {
             no_partition_adjustment()
         } else {
             let target_partition_size = self.effective_target_partition_size()?;
+            let all_sources = self.all_sources().cloned().collect::<Vec<_>>();
             let PartitionAdjustmentPlan {
                 splits,
                 joins,
@@ -1120,7 +1150,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             } = Self::check_partition_adjustment(
                 ivf,
                 reader.as_ref(),
-                &self.existing_indices,
+                &all_sources,
                 target_partition_size,
             )?;
             let split_result = if splits.is_empty() {
@@ -1145,7 +1175,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 ivf.centroids = Some(split_result.new_centroids);
                 (
                     ivf.num_partitions(),
-                    Arc::new(self.existing_indices.clone()),
+                    self.existing_indices.clone(),
                     Some(PartitionAdjustment::Split {
                         affected_partitions: split_result.affected_partitions,
                         split_shuffle_reader: split_result.shuffle_reader,
@@ -1175,7 +1205,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 ivf.centroids = Some(results.new_centroids);
                 (
                     results.kept_partitions.len(),
-                    Arc::new(self.existing_indices.clone()),
+                    self.existing_indices.clone(),
                     Some(PartitionAdjustment::Join {
                         kept_partitions: results.kept_partitions,
                         reindexed_row_ids: results.reindexed_row_ids,
@@ -1186,11 +1216,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 no_partition_adjustment()
             }
         };
-        self.merged_num = merge_indices.len();
+        self.merged_num = merged_candidates.len();
         log::info!(
-            "merge {}/{} delta indices",
+            "merge {}/{} delta indices and {} new data segments",
             self.merged_num,
-            self.existing_indices.len()
+            self.existing_indices.len(),
+            self.new_data_sources.len()
+        );
+        let merge_indices = Arc::new(
+            merged_candidates
+                .into_iter()
+                .chain(self.new_data_sources.iter().cloned())
+                .collect::<Vec<_>>(),
         );
 
         let distance_type = self.distance_type;
@@ -1198,6 +1235,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let frag_reuse_index = self.frag_reuse_index.clone();
         if self.optimize_options.is_none()
             && self.existing_indices.is_empty()
+            && self.new_data_sources.is_empty()
             && partition_adjustment.is_none()
         {
             return Self::build_fresh_partitions_windowed(
@@ -2801,9 +2839,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     async fn partition_row_ids(&self, part_idx: usize) -> Result<Vec<u64>> {
-        // existing part: read from the existing indices
+        // existing part: read from the existing indices and the new data segments
         let mut row_ids = Vec::new();
-        for source in self.existing_indices.iter() {
+        for source in self.all_sources() {
             let index = &source.index;
             if part_idx >= index.ivf_model().num_partitions() {
                 // there was a bug that may cause delta indices have different number of partitions,
@@ -4342,5 +4380,225 @@ mod tests {
         assert!(batches[0].column_by_name(PART_ID_COLUMN).is_none());
         let row_ids = batches[0][ROW_ID].as_primitive::<UInt64Type>();
         assert_eq!(row_ids.values(), &[4, 3, 2, 1, 0]);
+    }
+
+    type EmptyInput = RecordBatchStreamAdapter<stream::Empty<Result<RecordBatch>>>;
+
+    /// `vector_idx` (IVF_FLAT, two partitions) over one 512-row fragment, then
+    /// two appended 128-row fragments each indexed as its own segment with the
+    /// committed segment's model, the way a parallel worker would build it.
+    async fn dataset_with_shard_segments(
+        uri: &str,
+    ) -> (
+        Dataset,
+        lance_table::format::IndexMetadata,
+        Vec<lance_table::format::IndexMetadata>,
+    ) {
+        use crate::dataset::WriteParams;
+        use crate::index::vector::VectorIndexParams;
+        use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+        use arrow_array::{RecordBatchIterator, UInt32Array};
+        use arrow_schema::Schema as ArrowSchema;
+        use lance_index::optimize::OptimizeOptions;
+        use lance_linalg::distance::MetricType;
+        use lance_testing::datagen::generate_random_array_with_seed;
+
+        const DIM: usize = 8;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                true,
+            ),
+        ]));
+        let make_batch = |start: u32, rows: usize| {
+            let vectors =
+                generate_random_array_with_seed::<Float32Type>(rows * DIM, [start as u8; 32]);
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from_iter_values(start..start + rows as u32)),
+                    Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap()),
+                ],
+            )
+            .unwrap()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch(0, 512))], schema.clone()),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 512,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".into()),
+                &VectorIndexParams::ivf_flat(2, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+        for start in [512u32, 640] {
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(make_batch(start, 128))], schema.clone()),
+                    Some(WriteParams {
+                        max_rows_per_file: 128,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        let committed = dataset
+            .load_indices_by_name("vector_idx")
+            .await
+            .unwrap()
+            .remove(0);
+        let unindexed = dataset.unindexed_fragments("vector_idx").await.unwrap();
+        assert_eq!(unindexed.len(), 2);
+
+        let shared = Arc::new(dataset.clone());
+        let mut shards = Vec::new();
+        for fragment in unindexed {
+            let res = crate::index::append::merge_indices_with_unindexed_frags(
+                shared.clone(),
+                &[&committed],
+                std::slice::from_ref(&fragment),
+                &OptimizeOptions::append(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(res.removed_indices.is_empty());
+            shards.push(lance_table::format::IndexMetadata {
+                uuid: res.new_uuid,
+                dataset_version: res.new_dataset_version,
+                fragment_bitmap: Some(res.new_fragment_bitmap),
+                index_details: Some(Arc::new(res.new_index_details)),
+                index_version: res.new_index_version,
+                files: Some(res.files),
+                ..committed.clone()
+            });
+        }
+        (dataset, committed, shards)
+    }
+
+    /// Runs `optimize_vector_indices_v2` with the committed segment as the only
+    /// candidate and the two shard segments as new data sources. Returns the
+    /// merged-candidate count, the output index, the candidate's row count and
+    /// the shard segments' row count.
+    async fn optimize_with_shard_sources(
+        options: &lance_index::optimize::OptimizeOptions,
+        target_partition_size: Option<usize>,
+    ) -> (usize, Arc<dyn VectorIndex>, usize, usize) {
+        use crate::index::DatasetIndexInternalExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (dataset, committed, shards) =
+            dataset_with_shard_segments(tmp.path().to_str().unwrap()).await;
+        let candidate = dataset
+            .open_vector_index("vector", &committed.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let candidates = vec![ExistingIndex::with_coverage(
+            candidate.clone(),
+            dataset.clone(),
+            committed
+                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .unwrap(),
+            committed
+                .deleted_fragment_bitmap(&dataset.fragment_bitmap)
+                .unwrap(),
+        )];
+        let mut new_data_sources = Vec::new();
+        let mut shard_rows = 0;
+        for shard in &shards {
+            let index = dataset
+                .open_vector_index_from_metadata("vector", shard, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            shard_rows += index.num_rows() as usize;
+            new_data_sources.push(ExistingIndex::unfiltered(index));
+        }
+        assert_eq!(shard_rows, 256);
+
+        let (uuid, indices_merged, files) = crate::index::vector::ivf::optimize_vector_indices_v2(
+            &dataset,
+            Option::<EmptyInput>::None,
+            "vector",
+            &candidates,
+            new_data_sources,
+            options,
+            target_partition_size,
+        )
+        .await
+        .unwrap();
+        let output = lance_table::format::IndexMetadata {
+            uuid,
+            files: Some(files),
+            ..committed.clone()
+        };
+        let opened = dataset
+            .open_vector_index_from_metadata("vector", &output, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        (
+            indices_merged,
+            opened,
+            candidate.num_rows() as usize,
+            shard_rows,
+        )
+    }
+
+    #[tokio::test]
+    async fn new_data_sources_merge_with_the_selected_candidates() {
+        use lance_index::optimize::OptimizeOptions;
+        let (merged, index, candidate_rows, shard_rows) =
+            optimize_with_shard_sources(&OptimizeOptions::merge(1), None).await;
+        assert_eq!(merged, 1, "only the candidate counts as merged");
+        assert_eq!(index.num_rows() as usize, candidate_rows + shard_rows);
+        assert_eq!(index.ivf_model().num_partitions(), 2);
+    }
+
+    #[tokio::test]
+    async fn new_data_sources_alone_become_the_delta_when_no_partition_adjusts() {
+        use lance_index::optimize::OptimizeOptions;
+        // Two partitions of roughly 384 rows sit between the join threshold
+        // (a quarter of 256) and the split threshold (four times 256).
+        let (merged, index, _, shard_rows) =
+            optimize_with_shard_sources(&OptimizeOptions::new(), Some(256)).await;
+        assert_eq!(merged, 0, "no candidate is merged without a split or join");
+        assert_eq!(
+            index.num_rows() as usize,
+            shard_rows,
+            "the delta holds exactly the new data segments' rows"
+        );
+        assert_eq!(index.ivf_model().num_partitions(), 2);
+    }
+
+    #[tokio::test]
+    async fn new_data_sources_follow_a_split_that_merges_every_candidate() {
+        use lance_index::optimize::OptimizeOptions;
+        // 768 rows over two partitions is well over 4 * 64 per partition, so the
+        // default options split, which merges every candidate.
+        let (merged, index, candidate_rows, shard_rows) =
+            optimize_with_shard_sources(&OptimizeOptions::new(), Some(64)).await;
+        assert_eq!(merged, 1, "a split merges every candidate");
+        assert_eq!(
+            index.num_rows() as usize,
+            candidate_rows + shard_rows,
+            "the split must re-shuffle the new data segments' rows too"
+        );
+        assert!(index.ivf_model().num_partitions() > 2);
     }
 }

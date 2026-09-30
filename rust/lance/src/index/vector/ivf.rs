@@ -672,12 +672,18 @@ fn existing_index_sources(
 
 // TODO: move to `lance-index` crate.
 ///
+/// `new_data_sources` are segments already built from the unindexed rows with
+/// the same model (the outputs of parallel workers); they are merged into the
+/// new segment unconditionally and never counted as merged. See
+/// [`IvfIndexBuilder::with_new_data_sources`].
+///
 /// Returns (new_uuid, num_indices_merged, files)
 pub(crate) async fn optimize_vector_indices(
     dataset: Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     logical_index: &LogicalIvfView<'_>,
+    new_data_sources: Vec<ExistingIndex>,
     options: &OptimizeOptions,
 ) -> Result<(Uuid, usize, Vec<IndexFile>)> {
     let existing_indices = logical_index.indices().cloned().collect::<Vec<_>>();
@@ -687,7 +693,14 @@ pub(crate) async fn optimize_vector_indices(
             "optimizing vector index: no existing index found".to_string(),
         ));
     }
-    validate_shared_vector_model(&existing_indices, "optimizing vector index")?;
+    // The new data segments are written into the same output, so they must
+    // share the model too.
+    let model_scope = existing_indices
+        .iter()
+        .chain(new_data_sources.iter().map(|source| &source.index))
+        .cloned()
+        .collect::<Vec<_>>();
+    validate_shared_vector_model(&model_scope, "optimizing vector index")?;
 
     // try cast to v1 IVFIndex,
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
@@ -703,10 +716,16 @@ pub(crate) async fn optimize_vector_indices(
             unindexed,
             vector_column,
             &sources,
+            new_data_sources,
             options,
             target_partition_size,
         )
         .await;
+    }
+    if !new_data_sources.is_empty() {
+        return Err(Error::not_supported(
+            "optimizing vector index: a legacy IVF index cannot merge new data segments",
+        ));
     }
 
     let new_uuid = Uuid::new_v4();
@@ -771,11 +790,13 @@ pub(crate) async fn optimize_vector_indices(
     Ok((new_uuid, merged, files))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn optimize_vector_indices_v2(
     dataset: &Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     existing_indices: &[ExistingIndex],
+    new_data_sources: Vec<ExistingIndex>,
     options: &OptimizeOptions,
     target_partition_size: Option<usize>,
 ) -> Result<(Uuid, usize, Vec<IndexFile>)> {
@@ -821,6 +842,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_index_sources(existing_indices.clone())
+                .with_new_data_sources(new_data_sources.clone())
                 .with_progress(options.progress.clone())
                 .with_target_partition_size(target_partition_size)
                 .shuffle_data_input(unindexed)
@@ -840,6 +862,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_index_sources(existing_indices.clone())
+                .with_new_data_sources(new_data_sources.clone())
                 .with_progress(options.progress.clone())
                 .with_target_partition_size(target_partition_size)
                 .shuffle_data_input(unindexed)
@@ -862,6 +885,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
+            .with_new_data_sources(new_data_sources.clone())
             .with_progress(options.progress.clone())
             .with_target_partition_size(target_partition_size)
             .shuffle_data_input(unindexed)
@@ -883,6 +907,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
+            .with_new_data_sources(new_data_sources.clone())
             .with_progress(options.progress.clone())
             .with_target_partition_size(target_partition_size)
             .shuffle_data_input(unindexed)
@@ -904,6 +929,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
+            .with_new_data_sources(new_data_sources.clone())
             .with_progress(options.progress.clone())
             .with_target_partition_size(target_partition_size)
             .shuffle_data_input(unindexed)
@@ -924,6 +950,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
+            .with_new_data_sources(new_data_sources.clone())
             .with_progress(options.progress.clone())
             .with_target_partition_size(target_partition_size)
             .shuffle_data_input(unindexed)
@@ -946,6 +973,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_index_sources(existing_indices.clone())
+                .with_new_data_sources(new_data_sources.clone())
                 .with_progress(options.progress.clone())
                 .with_target_partition_size(target_partition_size)
                 .shuffle_data_input(unindexed)
@@ -965,6 +993,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_index_sources(existing_indices.clone())
+                .with_new_data_sources(new_data_sources.clone())
                 .with_progress(options.progress.clone())
                 .with_target_partition_size(target_partition_size)
                 .shuffle_data_input(unindexed)
@@ -987,6 +1016,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
+            .with_new_data_sources(new_data_sources.clone())
             .with_progress(options.progress.clone())
             .with_target_partition_size(target_partition_size)
             .shuffle_data_input(unindexed)
@@ -1008,6 +1038,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
+            .with_new_data_sources(new_data_sources.clone())
             .with_progress(options.progress.clone())
             .with_target_partition_size(target_partition_size)
             .shuffle_data_input(unindexed)
@@ -5144,6 +5175,7 @@ mod tests {
             Some(new_data(unindexed.clone()).await),
             "vector",
             &sources,
+            Vec::new(),
             &OptimizeOptions::new(),
             None,
         )
@@ -5160,6 +5192,7 @@ mod tests {
             Some(new_data(unindexed).await),
             "vector",
             &sources,
+            Vec::new(),
             &OptimizeOptions::merge(1),
             None,
         )
