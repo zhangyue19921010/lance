@@ -139,7 +139,11 @@ pub enum Operation {
     /// specification for resolution, coverage, and versioning rules.
     DataOverlay { groups: Vec<DataOverlayGroup> },
     /// Merge a new column in
-    /// 'fragments' is the final fragments include all data files, the new fragments must align with old ones at rows.
+    /// 'fragments' is the final fragment list: the merged version of every existing
+    /// fragment (aligned with the old one at rows) and, optionally, brand-new fragments
+    /// listed after them. New fragments use id 0 (assigned a fresh id at commit time) or
+    /// a pre-reserved id; either way, on stable row id datasets they are also assigned
+    /// row ids at commit time, like Append. New fragments must not carry row id metadata.
     /// 'schema' is not forced to include existed columns, which means we could use Merge to drop column data
     Merge {
         fragments: Vec<Fragment>,
