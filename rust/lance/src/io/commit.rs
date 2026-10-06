@@ -280,8 +280,11 @@ async fn verify_commit_outcome(
     }
 
     // Durable form of this attempt's transaction, matching what the commit
-    // path serialized.
-    let transaction_pb = pb::Transaction::from(transaction);
+    // path serialized. The commit path already rejected anything that fails
+    // to serialize, so this cannot fail in practice; stay conservative if it does.
+    let Ok(transaction_pb) = pb::Transaction::try_from(transaction) else {
+        return CommitOutcome::Unknown;
+    };
 
     let mut backoff = Backoff::default();
     let failure = loop {
@@ -429,7 +432,7 @@ async fn do_commit_new_dataset(
     metadata_cache: &DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    let pb_transaction = pb::Transaction::from(transaction);
+    let pb_transaction = pb::Transaction::try_from(transaction)?;
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
     // copy would tie the verdict to the payload size instead.
@@ -1250,7 +1253,7 @@ pub(crate) async fn do_commit_detached_transaction(
              fragment reuse entry; commit the rewrite on the main version chain",
         ));
     }
-    let pb_transaction = pb::Transaction::from(transaction);
+    let pb_transaction = pb::Transaction::try_from(transaction)?;
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
     // copy would tie the verdict to the payload size instead.
@@ -1391,7 +1394,11 @@ pub(crate) async fn do_commit_detached_transaction(
                 }
                 // The inline copy was moved into the failed attempt; rebuild
                 // it for the retry with a new random version.
-                inline_tx = inline_transaction.then(|| pb::Transaction::from(transaction).into());
+                inline_tx = if inline_transaction {
+                    Some(pb::Transaction::try_from(transaction)?.into())
+                } else {
+                    None
+                };
             }
             Err(CommitError::OtherError(err)) => {
                 match verify_commit_outcome(
@@ -1714,7 +1721,7 @@ pub(crate) async fn commit_transaction(
 
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
-        let pb_transaction = pb::Transaction::from(&transaction);
+        let pb_transaction = pb::Transaction::try_from(&transaction)?;
         let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
         // Classified from the operation itself. Reading it back off the inline
         // copy would tie the verdict to the payload size instead.
@@ -2179,7 +2186,7 @@ mod tests {
         let file_name = write_transaction_file(
             &object_store,
             &base_path,
-            &pb::Transaction::from(&transaction),
+            &pb::Transaction::try_from(&transaction).unwrap(),
         )
         .await
         .unwrap();
@@ -3988,7 +3995,7 @@ mod tests {
             None,
         );
         // What the commit wrote, and what verification reads back.
-        let durable = pb::Transaction::from(&transaction);
+        let durable = pb::Transaction::try_from(&transaction).unwrap();
         let read_back = pb::Transaction::decode(durable.encode_to_vec().as_slice()).unwrap();
         // The old comparison (read-back deserialized into memory, compared
         // with `Transaction::eq`) misclassifies our own landed commit: the
@@ -4001,6 +4008,6 @@ mod tests {
         );
         // The comparison `verify_commit_outcome` performs: read-back durable
         // form against the regenerated durable form of this attempt.
-        assert_eq!(read_back, pb::Transaction::from(&transaction));
+        assert_eq!(read_back, pb::Transaction::try_from(&transaction).unwrap());
     }
 }
