@@ -113,8 +113,8 @@ use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
 pub use optimize::{
-    DeltaMergePlanner, FragmentRows, IndexOptimizePlan, IndexOptimizePlanner, IndexOptimizeResult,
-    IndexOptimizeTask, SizeTieredPlanner, commit_index_optimization, plan_index_optimization,
+    FragmentRows, IndexOptimizePlan, IndexOptimizeResult, IndexOptimizeTask,
+    commit_index_optimization, plan_index_optimization,
 };
 
 fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {

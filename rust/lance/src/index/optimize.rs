@@ -36,14 +36,15 @@ use crate::io::commit::detect_overlapping_fragments;
 
 /// Produces an [`IndexOptimizePlan`] for one version of a dataset.
 #[async_trait]
-pub trait IndexOptimizePlanner: Send + Sync {
+pub(crate) trait IndexOptimizePlanner: Send + Sync {
     async fn plan(&self, dataset: &Dataset) -> Result<IndexOptimizePlan>;
 }
 
-/// Plan with the strategy `options` select: `max_rows_per_segment` picks
-/// [`SizeTieredPlanner`], otherwise [`DeltaMergePlanner`] merges the trailing
-/// `num_indices_to_merge` segments (the single-process behavior). The two are
-/// mutually exclusive.
+/// Plan with the strategy `options` select: `max_rows_per_segment` packs
+/// segments and new fragments size-tiered, otherwise the trailing
+/// `num_indices_to_merge` segments are merged (the single-process behavior).
+/// The two are mutually exclusive. A caller with its own grouping builds the
+/// [`IndexOptimizePlan`] directly; its tasks are plain data.
 pub async fn plan_index_optimization(
     dataset: &Dataset,
     options: &OptimizeOptions,
@@ -755,14 +756,14 @@ async fn index_groups(
 /// One task per index with every segment as a candidate: the single-process
 /// `optimize_indices` behavior.
 #[derive(Debug, Clone)]
-pub struct DeltaMergePlanner {
+pub(crate) struct DeltaMergePlanner {
     index_names: Option<Vec<String>>,
     num_indices_to_merge: Option<usize>,
     retrain: bool,
 }
 
 impl DeltaMergePlanner {
-    pub fn new(
+    pub(crate) fn new(
         index_names: Option<Vec<String>>,
         num_indices_to_merge: Option<usize>,
         retrain: bool,
@@ -816,13 +817,13 @@ impl IndexOptimizePlanner for DeltaMergePlanner {
 /// fragment's its live row count; both come from the manifest and deletion
 /// files alone.
 #[derive(Debug, Clone)]
-pub struct SizeTieredPlanner {
+pub(crate) struct SizeTieredPlanner {
     index_names: Option<Vec<String>>,
     max_rows_per_segment: u64,
 }
 
 impl SizeTieredPlanner {
-    pub fn new(index_names: Option<Vec<String>>, max_rows_per_segment: u64) -> Result<Self> {
+    pub(crate) fn new(index_names: Option<Vec<String>>, max_rows_per_segment: u64) -> Result<Self> {
         if max_rows_per_segment == 0 {
             return Err(Error::invalid_input(
                 "max_rows_per_segment must be at least 1",
