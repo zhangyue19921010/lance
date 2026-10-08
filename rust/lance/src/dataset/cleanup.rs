@@ -62,13 +62,15 @@ use lance_table::{
 };
 use object_store::ObjectMeta;
 use object_store::path::Path;
+use prost::Message;
 use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
+use tokio::sync::OnceCell;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_stream::wrappers::IntervalStream;
 use tracing::{Span, debug, info, instrument, warn};
@@ -309,6 +311,18 @@ struct CleanupTask<'a> {
     include_referenced_branches: bool,
 }
 
+/// The visible descriptor rows and base namespace used by one fragment scan.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ManagedScanKey {
+    store_prefix: String,
+    data_dir: Path,
+    bases: Vec<(u32, String, bool)>,
+    fragment: Vec<u8>,
+    fields: Vec<arrow_schema::Field>,
+    field_ids: Vec<i32>,
+    retained: bool,
+}
+
 /// A manifest that has aged out and is queued for deletion.
 #[derive(Clone, Debug)]
 struct ExpiredManifest {
@@ -321,6 +335,9 @@ struct ExpiredManifest {
 /// Information about the dataset that we learn by inspecting all of the manifests
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
+    // Completed scans have already added their paths to the sets below. Keep
+    // only whether they found owner paths, not another copy of all references.
+    managed_scans: HashMap<ManagedScanKey, Arc<OnceCell<bool>>>,
     old_manifests: HashMap<Path, ExpiredManifest>,
     /// Store records to retire once their manifests are gone, by version;
     /// see `CommitHandler::forget_version`.
@@ -570,6 +587,95 @@ impl<'a> CleanupTask<'a> {
         Ok(inspection.into_inner().unwrap())
     }
 
+    async fn inspect_managed_blobs(
+        &self,
+        dataset: &Dataset,
+        retained: bool,
+        inspection: &Mutex<CleanupInspection>,
+    ) -> Result<bool> {
+        let names = dataset
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| super::blob::field_contains_blob(field))
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Ok(false);
+        }
+        let projection = dataset.schema().project(&names)?;
+        let fields = projection
+            .fields
+            .iter()
+            .map(arrow_schema::Field::from)
+            .collect::<Vec<_>>();
+        let field_ids = projection.field_ids();
+        let mut bases = dataset
+            .manifest
+            .base_paths
+            .iter()
+            .map(|(id, base)| (*id, base.path.clone(), base.is_dataset_root))
+            .collect::<Vec<_>>();
+        bases.sort_unstable();
+        let mut found = false;
+        // Manifests are already read concurrently. Scan their fragments in order
+        // to avoid multiplying concurrent descriptor buffers and path sets.
+        for fragment in dataset.get_fragments() {
+            let key = ManagedScanKey {
+                store_prefix: dataset.object_store.store_prefix.clone(),
+                data_dir: dataset.data_dir(),
+                bases: bases.clone(),
+                fragment: lance_table::format::pb::DataFragment::from(&fragment.metadata)
+                    .encode_to_vec(),
+                fields: fields.clone(),
+                field_ids: field_ids.clone(),
+                retained,
+            };
+            let cell = inspection
+                .lock()
+                .unwrap()
+                .managed_scans
+                .entry(key)
+                .or_default()
+                .clone();
+            let scanned = cell
+                .get_or_try_init(|| async {
+                    let paths =
+                        super::blob::managed_paths(dataset, self.dataset, fragment.scan()).await?;
+                    let found = !paths.is_empty();
+                    let mut inspection = inspection.lock().unwrap();
+                    for path in paths {
+                        let relative = remove_prefix(&path, &self.dataset.base);
+                        if retained {
+                            inspection
+                                .verified_files
+                                .managed_blob_paths
+                                .remove(&relative);
+                            inspection
+                                .referenced_files
+                                .managed_blob_paths
+                                .insert(relative);
+                        } else {
+                            inspection
+                                .verified_files
+                                .managed_blob_paths
+                                .insert(relative);
+                        }
+                    }
+                    Ok::<_, Error>(found)
+                })
+                .await;
+            match scanned {
+                Ok(has_paths) => found |= *has_paths,
+                // An expired descriptor can disappear during concurrent cleanup.
+                // Do not mark failed scans complete: retained reads must still fail.
+                Err(error) if !retained && error.is_not_found() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(found)
+    }
+
     async fn process_manifest_file(
         &self,
         location: ManifestLocation,
@@ -621,33 +727,15 @@ impl<'a> CleanupTask<'a> {
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
         let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
-        let managed_paths = if manifest.has_managed_blobs() {
+        if manifest.has_managed_blobs() {
             let snapshot = self
                 .dataset
                 .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
                 .await?;
-            match super::blob::managed_paths(&snapshot, self.dataset).await {
-                Ok(paths) => paths,
-                // A concurrent cleanup may already have removed expired data
-                // files. Losing deletion proof is safe; losing retained references
-                // is not. Other failures still stop cleanup before any deletion.
-                Err(error) if !in_working_set && error.is_not_found() => HashSet::new(),
-                Err(error) => return Err(error),
-            }
-        } else {
-            HashSet::new()
-        };
+            self.inspect_managed_blobs(&snapshot, in_working_set, inspection)
+                .await?;
+        }
         let mut inspection = inspection.lock().unwrap();
-        let references = if in_working_set {
-            &mut inspection.referenced_files
-        } else {
-            &mut inspection.verified_files
-        };
-        references.managed_blob_paths.extend(
-            managed_paths
-                .into_iter()
-                .map(|path| remove_prefix(&path, &self.dataset.base)),
-        );
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
         // Only track tagged when it is old.
@@ -1651,14 +1739,15 @@ impl<'a> CleanupTask<'a> {
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
         ensure_can_read_manifest(&manifest)?;
         ensure_can_write_manifest(&manifest)?;
-        let managed_paths = if manifest.has_managed_blobs() {
+        let managed_referenced = if manifest.has_managed_blobs() {
             let snapshot = self
                 .dataset
                 .checkout_version((manifest.branch.as_deref(), Some(manifest.version)))
                 .await?;
-            super::blob::managed_paths(&snapshot, self.dataset).await?
+            self.inspect_managed_blobs(&snapshot, true, inspection)
+                .await?
         } else {
-            HashSet::new()
+            false
         };
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
@@ -1692,19 +1781,7 @@ impl<'a> CleanupTask<'a> {
         }
 
         let mut inspection = inspection.lock().unwrap();
-        let mut is_referenced = false;
-        for path in managed_paths {
-            let relative = remove_prefix(&path, &self.dataset.base);
-            inspection
-                .verified_files
-                .managed_blob_paths
-                .remove(&relative);
-            inspection
-                .referenced_files
-                .managed_blob_paths
-                .insert(relative);
-            is_referenced = true;
-        }
+        let mut is_referenced = managed_referenced;
 
         for fragment in manifest.fragments.iter() {
             for file in fragment.referenced_lance_files() {

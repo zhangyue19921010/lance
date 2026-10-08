@@ -5194,7 +5194,7 @@ fn resolve_managed_base_id(
     Ok(file.base_id)
 }
 
-fn field_contains_blob(field: &LanceField) -> bool {
+pub(super) fn field_contains_blob(field: &LanceField) -> bool {
     field.is_blob_v2() || field.children.iter().any(field_contains_blob)
 }
 
@@ -5279,7 +5279,10 @@ fn visit_managed_row(
 }
 
 /// Discover referenced objects from stored descriptors without reading payloads.
-async fn managed_references(dataset: &Dataset) -> Result<HashSet<(Option<u32>, String)>> {
+async fn managed_references(
+    dataset: &Dataset,
+    mut scan: super::scanner::Scanner,
+) -> Result<HashSet<(Option<u32>, String)>> {
     let fields = dataset
         .schema()
         .fields
@@ -5293,7 +5296,6 @@ async fn managed_references(dataset: &Dataset) -> Result<HashSet<(Option<u32>, S
         .iter()
         .map(|field| field.name.as_str())
         .collect::<Vec<_>>();
-    let mut scan = dataset.scan();
     scan.project(&names)?;
     scan.with_row_address();
     let mut stream = scan.try_into_stream().await?;
@@ -5322,8 +5324,12 @@ async fn managed_references(dataset: &Dataset) -> Result<HashSet<(Option<u32>, S
 }
 
 /// Resolve only objects within the cleanup owner's deletion jurisdiction.
-pub(super) async fn managed_paths(dataset: &Dataset, owner: &Dataset) -> Result<HashSet<Path>> {
-    let references = managed_references(dataset).await?;
+pub(super) async fn managed_paths(
+    dataset: &Dataset,
+    owner: &Dataset,
+    scan: super::scanner::Scanner,
+) -> Result<HashSet<Path>> {
+    let references = managed_references(dataset, scan).await?;
     let mut paths = HashSet::new();
     let mut bases = HashMap::new();
     for (id, uri) in references {
@@ -5569,7 +5575,10 @@ mod tests {
         let flag = lance_table::feature_flags::FLAG_MANAGED_BLOBS;
         assert_ne!(dataset.manifest.reader_feature_flags & flag, 0);
         assert_ne!(dataset.manifest.writer_feature_flags & flag, 0);
-        for (_, uri) in super::managed_references(&dataset).await.unwrap() {
+        for (_, uri) in super::managed_references(&dataset, dataset.scan())
+            .await
+            .unwrap()
+        {
             assert!(uri.starts_with("_blobs/"), "{uri}");
             assert_eq!(uri.split('/').count(), 2);
             Uuid::parse_str(uri.trim_start_matches("_blobs/").trim_end_matches(".blob")).unwrap();
