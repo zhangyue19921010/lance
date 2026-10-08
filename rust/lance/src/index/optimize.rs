@@ -562,6 +562,7 @@ mod segment_serde {
 enum IndexKind {
     Vector { legacy: bool },
     BTree,
+    Bitmap,
     NGram,
     Inverted { legacy: bool },
     Other,
@@ -596,7 +597,7 @@ impl IndexGroup {
             IndexKind::Vector { legacy } => {
                 !legacy && !self.has_dormant && !self.has_definition_only
             }
-            IndexKind::BTree | IndexKind::NGram => true,
+            IndexKind::BTree | IndexKind::Bitmap | IndexKind::NGram => true,
             IndexKind::Inverted { legacy } => !legacy,
             IndexKind::Other => false,
         }
@@ -661,6 +662,8 @@ async fn index_kind(
     let type_url = details.type_url.as_str();
     if type_url.ends_with("BTreeIndexDetails") {
         Ok(IndexKind::BTree)
+    } else if type_url.ends_with("BitmapIndexDetails") {
+        Ok(IndexKind::Bitmap)
     } else if type_url.ends_with("NGramIndexDetails") {
         Ok(IndexKind::NGram)
     } else if type_url.ends_with("InvertedIndexDetails") {
@@ -1018,6 +1021,7 @@ impl IndexOptimizePlanner for SizeTieredPlanner {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashSet};
+    use std::ops::Bound;
     use std::sync::Arc;
 
     use arrow::datatypes::{Float32Type, UInt8Type, UInt32Type, UInt64Type};
@@ -1027,12 +1031,14 @@ mod tests {
         StringArray, UInt32Array,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::common::ScalarValue;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::IndexType;
     use lance_index::scalar::{
-        BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
+        BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, SargableQuery,
+        ScalarIndexParams, SearchResult,
     };
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -1392,6 +1398,33 @@ mod tests {
         ids
     }
 
+    /// Sorted row addresses a bitmap segment returns for ids in [250, 1300).
+    async fn bitmap_rows(dataset: &Dataset, segment: &IndexMetadata) -> Vec<u64> {
+        let range = SargableQuery::Range(
+            Bound::Included(ScalarValue::UInt32(Some(250))),
+            Bound::Excluded(ScalarValue::UInt32(Some(1300))),
+        );
+        let index =
+            crate::index::scalar::open_scalar_index(dataset, "id", segment, &NoOpMetricsCollector);
+        let SearchResult::Exact(rows) = index
+            .await
+            .unwrap()
+            .search(&range, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+        else {
+            panic!("bitmap search must be exact");
+        };
+        let mut rows: Vec<u64> = rows
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(u64::from)
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
     async fn tag_table(dataset: &mut Dataset) {
         let indices = load_all_indices(dataset).await.unwrap().as_ref().clone();
         let manifest = Arc::make_mut(&mut dataset.manifest);
@@ -1600,16 +1633,26 @@ mod tests {
     #[tokio::test]
     async fn shardable_follows_the_index_family_and_the_reuse_history() {
         let dir = TempStrDir::default();
-        let mut dataset = indexed_dataset(dir.as_str(), &ivf_pq(), 1).await;
-        let bitmap = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
-        let name = Some("id_bitmap".to_string());
-        dataset
-            .create_index(&["id"], IndexType::Bitmap, name, &bitmap, true)
-            .await
-            .unwrap();
+        let mut next_id = 0;
+        let mut dataset = write_dataset(dir.as_str(), false, &[256; 4], &mut next_id).await;
+        create_indices(&mut dataset, &ivf_pq()).await;
+        let extra = [
+            ("id_bitmap", IndexType::Bitmap, BuiltinIndexType::Bitmap),
+            ("id_zonemap", IndexType::ZoneMap, BuiltinIndexType::ZoneMap),
+        ];
+        for (name, kind, builtin) in extra {
+            let params = ScalarIndexParams::for_builtin(builtin);
+            let name = Some(name.to_string());
+            dataset
+                .create_index(&["id"], kind, name, &params, true)
+                .await
+                .unwrap();
+        }
+        append_rows(&mut dataset, &[256], &mut next_id).await;
         let planned = plan(&dataset, &delta_merge(Some(1))).await;
         assert!(NAMES.iter().all(|name| task_for(&planned, name).shardable));
-        assert!(!task_for(&planned, "id_bitmap").shardable);
+        assert!(task_for(&planned, "id_bitmap").shardable);
+        assert!(!task_for(&planned, "id_zonemap").shardable);
 
         let dir = TempStrDir::default();
         let mut next_id = 0;
@@ -1653,6 +1696,7 @@ mod tests {
     #[case::ivf_pq("vector_idx", ivf_pq())]
     #[case::ivf_hnsw_sq("vector_idx", ivf_hnsw_sq())]
     #[case::btree("id_idx", ivf_pq())]
+    #[case::bitmap("id_bitmap", ivf_pq())]
     #[case::ngram("ngram_idx", ivf_pq())]
     #[case::inverted("text_idx", ivf_pq())]
     #[tokio::test]
@@ -1661,7 +1705,18 @@ mod tests {
         #[case] params: VectorIndexParams,
     ) {
         let dir = TempStrDir::default();
-        let dataset = indexed_dataset(dir.as_str(), &params, 2).await;
+        let mut next_id = 0;
+        let mut dataset = write_dataset(dir.as_str(), false, &[256; 4], &mut next_id).await;
+        create_indices(&mut dataset, &params).await;
+        if name == "id_bitmap" {
+            let bitmap = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+            let name = Some(name.to_string());
+            dataset
+                .create_index(&["id"], IndexType::Bitmap, name, &bitmap, true)
+                .await
+                .unwrap();
+        }
+        append_rows(&mut dataset, &[256; 2], &mut next_id).await;
         let planned = plan(&dataset, &delta_merge(Some(1))).await;
         let task = task_for(&planned, name);
         let direct = task.execute(&dataset).await.unwrap();
@@ -1685,6 +1740,13 @@ mod tests {
         assert_eq!(a.fragment_bitmap, b.fragment_bitmap);
         if name == "vector_idx" {
             assert_vector_equivalent(&dataset, &a, &b).await;
+        } else if name == "id_bitmap" {
+            // Two indices share the column, so ask the segments themselves.
+            let (ra, rb) = (
+                bitmap_rows(&dataset, &a).await,
+                bitmap_rows(&dataset, &b).await,
+            );
+            assert!(ra.len() == 1050 && ra == rb);
         } else {
             let expected = query_ids(&dataset, name, false).await;
             let mut with_direct = dataset.clone();

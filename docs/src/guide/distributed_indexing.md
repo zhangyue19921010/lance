@@ -265,7 +265,7 @@ case prefer shards of consecutive fragment ids, because compaction only
 rewrites neighbouring fragments that the same segments cover.
 
 Shards are available for IVF vector indices in the current (v3) format, BTree,
-NGram and inverted indices. They are not available for a vector index that
+Bitmap, NGram and inverted indices. They are not available for a vector index that
 has to be retrained or rebuilt (a dormant or definition-only segment, the
 legacy IVF format), for legacy inverted segments, for the other scalar index
 families, or on a table whose fragment reuse history uses the tagged format;
