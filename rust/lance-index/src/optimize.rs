@@ -49,7 +49,8 @@ pub struct OptimizeOptions {
     /// Progress callback for index building during optimization.
     pub progress: Arc<dyn IndexBuildProgress>,
 
-    /// How many indices are optimized concurrently; `None` means 1. A merge can
+    /// How many optimize tasks run concurrently (one per index under delta
+    /// merge, one per bin under size-tiered); `None` or `0` means 1. A task can
     /// rewrite a large segment, so raise this only with the memory to match.
     pub num_threads: Option<usize>,
 
