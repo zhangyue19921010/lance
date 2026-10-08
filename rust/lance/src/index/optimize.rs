@@ -7,6 +7,7 @@
 //! [`OptimizeOptions`].
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,7 +17,7 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_table::format::{Fragment, IndexMetadata};
-use lance_table::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_table::system_index::frag_reuse::metadata::is_tagged;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,8 @@ use super::scalar::fetch_index_details;
 use super::vector::ivf::{IVFIndex as LegacyIvfIndex, vector_model_mismatch};
 use super::{DatasetIndexInternalExt, eligible_index_groups, load_all_indices};
 use crate::Dataset;
-use crate::dataset::optimize::{FragmentMetrics, collect_metrics};
+use crate::dataset::fragment::FileFragment;
+use crate::dataset::optimize::collect_metrics;
 use crate::dataset::transaction::{Operation, TransactionBuilder};
 use crate::io::commit::detect_overlapping_fragments;
 
@@ -199,6 +201,16 @@ impl IndexOptimizeTask {
         dataset: &Dataset,
         shard_results: Vec<IndexOptimizeResult>,
     ) -> Result<IndexOptimizeResult> {
+        self.merge_with_progress(dataset, shard_results, noop_progress())
+            .await
+    }
+
+    pub async fn merge_with_progress(
+        &self,
+        dataset: &Dataset,
+        shard_results: Vec<IndexOptimizeResult>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<IndexOptimizeResult> {
         let dataset = self.checkout(dataset).await?;
         let segments = self.resolve_segments(&dataset).await?;
         let reference = segments.last().ok_or_else(|| {
@@ -271,7 +283,7 @@ impl IndexOptimizeTask {
             dataset,
             segments,
             NewIndexData::Segments(&new_segments),
-            noop_progress(),
+            progress,
         )
         .await
     }
@@ -401,6 +413,9 @@ impl IndexOptimizeTask {
 /// commit's conflict resolution (a rewrite of covered fragments or a concurrent
 /// optimize is a retryable conflict). Results without a segment are skipped;
 /// with none left, nothing is committed unless the MemWAL catch-up needs it.
+/// New segments are appended in the order of the segments they replace, with
+/// pure additions last, so the manifest's last segment stays the newest one
+/// whatever order the results arrive in.
 pub async fn commit_index_optimization(
     dataset: &mut Dataset,
     results: Vec<IndexOptimizeResult>,
@@ -437,10 +452,31 @@ pub async fn commit_index_optimization(
     };
     let stored = load_all_indices(&snapshot).await?;
     let by_uuid: HashMap<Uuid, &IndexMetadata> = stored.iter().map(|s| (s.uuid, s)).collect();
+    let position: HashMap<Uuid, usize> = stored
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.uuid, i))
+        .collect();
+    let mut produced = produced;
+    produced.sort_by_key(|result| {
+        let last_replaced = result
+            .removed_segments
+            .iter()
+            .filter_map(|u| position.get(u))
+            .max();
+        last_replaced.map_or((1, 0), |p| (0, *p))
+    });
     let names: HashSet<&str> = produced.iter().map(|r| r.index_name.as_str()).collect();
     let mut removed_indices = Vec::new();
     let mut removed_uuids = HashSet::new();
     for result in &produced {
+        let segment = result.new_segment.as_ref().expect("filtered to Some");
+        if segment.name != result.index_name {
+            return Err(Error::invalid_input(format!(
+                "result for '{}' carries a segment named '{}'",
+                result.index_name, segment.name
+            )));
+        }
         for uuid in &result.removed_segments {
             let segment = by_uuid
                 .get(uuid)
@@ -532,12 +568,12 @@ mod segment_serde {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IndexKind {
-    Vector { legacy: bool },
+enum IndexFamily {
+    Vector,
     BTree,
     Bitmap,
     NGram,
-    Inverted { legacy: bool },
+    Inverted,
     Other,
 }
 
@@ -549,7 +585,7 @@ struct IndexGroup {
     /// table, stored coverage intersected with the live fragments elsewhere.
     /// Absent for a segment without stored coverage.
     live_coverage: HashMap<Uuid, RoaringBitmap>,
-    kind: IndexKind,
+    family: IndexFamily,
     /// A segment with stored rows but no live coverage.
     has_dormant: bool,
     /// A segment that is only a definition: no files, no coverage.
@@ -558,133 +594,150 @@ struct IndexGroup {
 
 impl IndexGroup {
     fn is_vector(&self) -> bool {
-        matches!(self.kind, IndexKind::Vector { .. })
+        self.family == IndexFamily::Vector
     }
 
-    /// Whether the new data can be built as shards and merged from segments.
-    fn shardable(&self, tagged_reuse_history: bool) -> bool {
-        if tagged_reuse_history {
-            return false;
+    /// Whether the family can take its new data from shards; a legacy format
+    /// (see [`Self::legacy_format`]) still rules it out.
+    fn family_shardable(&self) -> bool {
+        match self.family {
+            IndexFamily::Vector => !self.has_dormant && !self.has_definition_only,
+            IndexFamily::BTree | IndexFamily::Bitmap | IndexFamily::NGram => true,
+            IndexFamily::Inverted => true,
+            IndexFamily::Other => false,
         }
-        match self.kind {
-            IndexKind::Vector { legacy } => {
-                !legacy && !self.has_dormant && !self.has_definition_only
+    }
+
+    /// Whether the last segment is in a format that cannot merge from
+    /// segments (v1 IVF, legacy inverted) and is rebuilt whole. Opens it
+    /// through the maintenance entry, as the merge does, so a segment the
+    /// tagged reader excludes opens as empty; `None` when it cannot be opened
+    /// at all, which the merge reports and skips as well.
+    async fn legacy_format(&self, dataset: &Dataset) -> Result<Option<bool>> {
+        let last = self
+            .segments
+            .last()
+            .expect("a group has at least one segment");
+        let field_path = dataset.schema().field_path(last.fields[0])?;
+        let opened = match self.family {
+            IndexFamily::Vector if is_definition_only_segment(last) => return Ok(Some(false)),
+            IndexFamily::Vector => dataset
+                .open_vector_index_for_maintenance(&field_path, &last.uuid, &NoOpMetricsCollector)
+                .await
+                .map(|index| index.as_any().is::<LegacyIvfIndex>()),
+            IndexFamily::Inverted => {
+                let details = fetch_index_details(dataset, &field_path, last).await?;
+                let details =
+                    lance_index::pbold::InvertedIndexDetails::decode(details.value.as_slice())
+                        .map_err(|error| {
+                            Error::io(format!(
+                                "failed to decode InvertedIndexDetails payload: {error}"
+                            ))
+                        })?;
+                let granularity = lance_index::scalar::inverted::DocumentGranularity::try_from(
+                    details.document_granularity,
+                )?;
+                let resolved = super::scalar::inverted::resolve_fts_field_by_id(
+                    dataset.schema(),
+                    last.fields[0],
+                    granularity,
+                )?;
+                dataset
+                    .open_scalar_index_for_maintenance(
+                        &resolved.canonical_path,
+                        &last.uuid,
+                        &NoOpMetricsCollector,
+                    )
+                    .await
+                    .map(|index| index.update_criteria().requires_old_data)
             }
-            IndexKind::BTree | IndexKind::Bitmap | IndexKind::NGram => true,
-            IndexKind::Inverted { legacy } => !legacy,
-            IndexKind::Other => false,
+            _ => return Ok(Some(false)),
+        };
+        match opened {
+            Ok(legacy) => Ok(Some(legacy)),
+            Err(error) => {
+                log::warn!(
+                    "Skipping optimization of index '{}': cannot open segment {}: {error}",
+                    last.name,
+                    last.uuid
+                );
+                Ok(None)
+            }
         }
-    }
-
-    /// Whether a merge would rebuild the whole index or replace segments
-    /// beyond the merged ones, so the group must be one task.
-    fn needs_whole_task(&self) -> bool {
-        self.has_dormant
-            || self.has_definition_only
-            || matches!(
-                self.kind,
-                IndexKind::Vector { legacy: true } | IndexKind::Inverted { legacy: true }
-            )
     }
 }
 
-async fn fragment_metrics(dataset: &Dataset) -> Result<HashMap<u32, FragmentMetrics>> {
-    futures::stream::iter(dataset.get_fragments())
-        .map(|fragment| async move {
-            let metrics = collect_metrics(&fragment).await?;
-            Ok::<_, Error>((fragment.id() as u32, metrics))
+/// The index family, from metadata alone.
+async fn index_family(dataset: &Dataset, last: &IndexMetadata) -> Result<IndexFamily> {
+    if metadata_is_vector_index(dataset, last).await? {
+        return Ok(IndexFamily::Vector);
+    }
+    let field_path = dataset.schema().field_path(last.fields[0])?;
+    let details = fetch_index_details(dataset, &field_path, last).await?;
+    let type_url = details.type_url.as_str();
+    Ok(if type_url.ends_with("BTreeIndexDetails") {
+        IndexFamily::BTree
+    } else if type_url.ends_with("BitmapIndexDetails") {
+        IndexFamily::Bitmap
+    } else if type_url.ends_with("NGramIndexDetails") {
+        IndexFamily::NGram
+    } else if type_url.ends_with("InvertedIndexDetails") {
+        IndexFamily::Inverted
+    } else {
+        IndexFamily::Other
+    })
+}
+
+async fn count_rows<Fut>(
+    dataset: &Dataset,
+    ids: HashSet<u32>,
+    count: impl Fn(FileFragment) -> Fut,
+) -> Result<HashMap<u32, u64>>
+where
+    Fut: Future<Output = Result<u64>>,
+{
+    let count = &count;
+    futures::stream::iter(ids)
+        .map(|id| async move {
+            let fragment = dataset
+                .get_fragment(id as usize)
+                .ok_or_else(|| Error::internal(format!("fragment {id} is not in the manifest")))?;
+            Ok::<_, Error>((id, count(fragment).await?))
         })
         .buffer_unordered(dataset.object_store.io_parallelism())
         .try_collect()
         .await
 }
 
+/// Live rows (physical rows minus deletions) of `ids`; the deletion count is
+/// read from the deletion file when the manifest does not carry it.
+async fn live_rows(dataset: &Dataset, ids: HashSet<u32>) -> Result<HashMap<u32, u64>> {
+    count_rows(dataset, ids, |fragment| async move {
+        Ok(collect_metrics(&fragment).await?.num_rows() as u64)
+    })
+    .await
+}
+
+/// Physical rows of `ids`, from the manifest where it records them.
+async fn physical_rows(dataset: &Dataset, ids: HashSet<u32>) -> Result<HashMap<u32, u64>> {
+    count_rows(dataset, ids, |fragment| async move {
+        Ok(fragment.physical_rows().await? as u64)
+    })
+    .await
+}
+
 /// A tagged (v1) fragment reuse history cannot open uncommitted segments, so
 /// shard outputs could not be merged. Decided from the entry's version, never
 /// from what the reader does with it.
 async fn has_tagged_fragment_reuse_history(dataset: &Dataset) -> Result<bool> {
-    Ok(load_all_indices(dataset)
-        .await?
-        .iter()
-        .any(|index| index.name == FRAG_REUSE_INDEX_NAME && index.index_version != 0))
+    Ok(load_all_indices(dataset).await?.iter().any(is_tagged))
 }
 
-/// `None` when the group's last segment cannot be opened: the merge would
-/// report the same and skip the group, so it is left out of the plan rather
-/// than failing the pass for every other index.
-async fn index_kind(dataset: &Dataset, segments: &[IndexMetadata]) -> Result<Option<IndexKind>> {
-    let last = segments.last().expect("a group has at least one segment");
-    let field_path = dataset.schema().field_path(last.fields[0])?;
-    let skip = |error: Error| {
-        log::warn!(
-            "Skipping optimization of index '{}': cannot open segment {}: {error}",
-            last.name,
-            last.uuid
-        );
-        Ok(None)
-    };
-    // Segments are opened through the maintenance entry, as the merge opens
-    // them: a segment the tagged reader excludes opens as empty instead of
-    // failing. A definition without files has nothing to open.
-    if metadata_is_vector_index(dataset, last).await? {
-        if is_definition_only_segment(last) {
-            return Ok(Some(IndexKind::Vector { legacy: false }));
-        }
-        let opened = dataset
-            .open_vector_index_for_maintenance(&field_path, &last.uuid, &NoOpMetricsCollector)
-            .await;
-        return match opened {
-            Ok(index) => Ok(Some(IndexKind::Vector {
-                legacy: index.as_any().is::<LegacyIvfIndex>(),
-            })),
-            Err(error) => skip(error),
-        };
-    }
-    let details = fetch_index_details(dataset, &field_path, last).await?;
-    let type_url = details.type_url.as_str();
-    if type_url.ends_with("BTreeIndexDetails") {
-        Ok(Some(IndexKind::BTree))
-    } else if type_url.ends_with("BitmapIndexDetails") {
-        Ok(Some(IndexKind::Bitmap))
-    } else if type_url.ends_with("NGramIndexDetails") {
-        Ok(Some(IndexKind::NGram))
-    } else if type_url.ends_with("InvertedIndexDetails") {
-        let details = lance_index::pbold::InvertedIndexDetails::decode(details.value.as_slice())
-            .map_err(|error| {
-                Error::io(format!(
-                    "failed to decode InvertedIndexDetails payload: {error}"
-                ))
-            })?;
-        let granularity = lance_index::scalar::inverted::DocumentGranularity::try_from(
-            details.document_granularity,
-        )?;
-        let resolved = super::scalar::inverted::resolve_fts_field_by_id(
-            dataset.schema(),
-            last.fields[0],
-            granularity,
-        )?;
-        let opened = dataset
-            .open_scalar_index_for_maintenance(
-                &resolved.canonical_path,
-                &last.uuid,
-                &NoOpMetricsCollector,
-            )
-            .await;
-        match opened {
-            Ok(index) => Ok(Some(IndexKind::Inverted {
-                legacy: index.update_criteria().requires_old_data,
-            })),
-            Err(error) => skip(error),
-        }
-    } else {
-        Ok(Some(IndexKind::Other))
-    }
-}
-
+/// The eligible groups with their unindexed fragments sized; nothing is
+/// opened and only the unindexed fragments are counted.
 async fn index_groups(
     dataset: &Dataset,
     index_names: Option<&[String]>,
-    metrics: &HashMap<u32, FragmentMetrics>,
 ) -> Result<Vec<IndexGroup>> {
     let mut groups = Vec::new();
     for (name, segments) in eligible_index_groups(dataset, index_names).await? {
@@ -692,17 +745,11 @@ async fn index_groups(
             .unindexed_fragments(&name)
             .await?
             .iter()
-            .map(|fragment| {
-                let id = fragment.id as u32;
-                let num_rows = metrics
-                    .get(&id)
-                    .map(|metrics| metrics.num_rows() as u64)
-                    .ok_or_else(|| {
-                        Error::internal(format!("no metrics for unindexed fragment {id}"))
-                    })?;
-                Ok(FragmentRows { id, num_rows })
+            .map(|fragment| FragmentRows {
+                id: fragment.id as u32,
+                num_rows: 0,
             })
-            .collect::<Result<_>>()?;
+            .collect();
         unindexed.sort_by_key(|fragment| fragment.id);
         let refs: Vec<&IndexMetadata> = segments.iter().collect();
         let tagged = tagged_segment_coverage(dataset, &refs, None).await?;
@@ -735,9 +782,8 @@ async fn index_groups(
                     .get(&segment.uuid)
                     .is_some_and(|b| b.is_empty())
         };
-        let Some(kind) = index_kind(dataset, &segments).await? else {
-            continue;
-        };
+        let last = segments.last().expect("a group has at least one segment");
+        let family = index_family(dataset, last).await?;
         let has_dormant = segments.iter().any(dormant);
         let has_definition_only = segments.iter().any(is_definition_only_segment);
         groups.push(IndexGroup {
@@ -745,10 +791,21 @@ async fn index_groups(
             segments,
             unindexed,
             live_coverage,
-            kind,
+            family,
             has_dormant,
             has_definition_only,
         });
+    }
+    let ids: HashSet<u32> = groups
+        .iter()
+        .flat_map(|group| group.unindexed.iter().map(|f| f.id))
+        .collect();
+    let rows = live_rows(dataset, ids).await?;
+    for fragment in groups
+        .iter_mut()
+        .flat_map(|group| group.unindexed.iter_mut())
+    {
+        fragment.num_rows = rows[&fragment.id];
     }
     Ok(groups)
 }
@@ -780,10 +837,9 @@ impl DeltaMergePlanner {
 impl IndexOptimizePlanner for DeltaMergePlanner {
     async fn plan(&self, dataset: &Dataset) -> Result<IndexOptimizePlan> {
         let read_version = dataset.manifest.version;
-        let metrics = fragment_metrics(dataset).await?;
         let tagged = has_tagged_fragment_reuse_history(dataset).await?;
         let mut tasks = Vec::new();
-        for group in index_groups(dataset, self.index_names.as_deref(), &metrics).await? {
+        for group in index_groups(dataset, self.index_names.as_deref()).await? {
             // A fully covered scalar index has nothing to do unless a retrain or
             // an explicit merge was asked for; a vector one may still rebalance.
             if !self.retrain
@@ -793,7 +849,15 @@ impl IndexOptimizePlanner for DeltaMergePlanner {
             {
                 continue;
             }
-            let shardable = !self.retrain && !group.unindexed.is_empty() && group.shardable(tagged);
+            let mut shardable =
+                !self.retrain && !group.unindexed.is_empty() && !tagged && group.family_shardable();
+            // Only a task that could be sharded needs the segment's format.
+            if shardable && matches!(group.family, IndexFamily::Vector | IndexFamily::Inverted) {
+                match group.legacy_format(dataset).await? {
+                    Some(legacy) => shardable = !legacy,
+                    None => continue,
+                }
+            }
             tasks.push(IndexOptimizeTask {
                 read_version,
                 index_name: group.name,
@@ -838,17 +902,12 @@ impl SizeTieredPlanner {
     /// The physical rows of a segment's live fragments; `None` when unknown.
     fn segment_rows(
         live_coverage: Option<&RoaringBitmap>,
-        metrics: &HashMap<u32, FragmentMetrics>,
+        physical_rows: &HashMap<u32, u64>,
     ) -> Option<u64> {
         Some(
             live_coverage?
                 .iter()
-                .map(|id| {
-                    metrics
-                        .get(&id)
-                        .map(|metrics| metrics.physical_rows as u64)
-                        .unwrap_or(0)
-                })
+                .map(|id| physical_rows.get(&id).copied().unwrap_or(0))
                 .sum(),
         )
     }
@@ -901,14 +960,23 @@ impl IndexOptimizePlanner for SizeTieredPlanner {
     async fn plan(&self, dataset: &Dataset) -> Result<IndexOptimizePlan> {
         let read_version = dataset.manifest.version;
         let budget = self.max_rows_per_segment;
-        let metrics = fragment_metrics(dataset).await?;
         let tagged = has_tagged_fragment_reuse_history(dataset).await?;
+        let mut physical: HashMap<u32, u64> = HashMap::new();
         let mut tasks = Vec::new();
-        for group in index_groups(dataset, self.index_names.as_deref(), &metrics).await? {
+        for group in index_groups(dataset, self.index_names.as_deref()).await? {
             let uuids: Vec<Uuid> = group.segments.iter().map(|s| s.uuid).collect();
             let reference = *uuids.last().expect("a group has at least one segment");
 
-            if group.needs_whole_task() {
+            // A rebuild, or a replacement that reaches beyond the merged
+            // segments, cannot be split: one task with the single-process defaults.
+            let mut whole = group.has_dormant || group.has_definition_only;
+            if !whole && matches!(group.family, IndexFamily::Vector | IndexFamily::Inverted) {
+                match group.legacy_format(dataset).await? {
+                    Some(legacy) => whole = legacy,
+                    None => continue,
+                }
+            }
+            if whole {
                 if group.unindexed.is_empty() && !group.is_vector() {
                     continue;
                 }
@@ -924,7 +992,14 @@ impl IndexOptimizePlanner for SizeTieredPlanner {
                 continue;
             }
 
-            let shardable = group.shardable(tagged);
+            let shardable = !tagged && group.family_shardable();
+            let missing: HashSet<u32> = group
+                .live_coverage
+                .values()
+                .flat_map(|bitmap| bitmap.iter())
+                .filter(|id| !physical.contains_key(id))
+                .collect();
+            physical.extend(physical_rows(dataset, missing).await?);
             let classes = self.model_classes(dataset, &group).await?;
             let reference_class = classes
                 .iter()
@@ -937,7 +1012,7 @@ impl IndexOptimizePlanner for SizeTieredPlanner {
                     .iter()
                     .filter_map(|&position| {
                         let live = group.live_coverage.get(&group.segments[position].uuid);
-                        let rows = Self::segment_rows(live, &metrics)?;
+                        let rows = Self::segment_rows(live, &physical)?;
                         (rows < budget).then_some((BinItem::Segment(position), rows))
                     })
                     .collect();
@@ -1584,15 +1659,15 @@ mod tests {
         assert_eq!(shape(&planned), expected);
         assert_eq!(planned.tasks[1].fragments[0].num_rows, 32);
         // A retired fragment left in the bitmap adds nothing; no bitmap, no size.
-        let metrics = fragment_metrics(&dataset).await.unwrap();
+        let rows = physical_rows(&dataset, [0, 1, 2].into()).await.unwrap();
         let mut segment = segments(&dataset, "id_seg").await.remove(0);
         segment.fragment_bitmap = Some(RoaringBitmap::from_iter([0u32, 1, 7]));
         let live = segment.effective_fragment_bitmap(&dataset.fragment_bitmap);
         assert_eq!(
-            SizeTieredPlanner::segment_rows(live.as_ref(), &metrics),
+            SizeTieredPlanner::segment_rows(live.as_ref(), &rows),
             Some(128)
         );
-        assert_eq!(SizeTieredPlanner::segment_rows(None, &metrics), None);
+        assert_eq!(SizeTieredPlanner::segment_rows(None, &rows), None);
     }
 
     // ---- shardable and shard ----------------------------------------------
@@ -1893,11 +1968,17 @@ mod tests {
         let (merged, delta) = futures::join!(merged, delta);
         assert_eq!(merged.removed_segments, [before[1], before[2]]);
         assert!(delta.removed_segments.is_empty());
-        commit_index_optimization(&mut dataset, vec![merged, delta], None)
+        let new_uuid = |r: &IndexOptimizeResult| r.new_segment.as_ref().unwrap().uuid;
+        let (merged_uuid, delta_uuid) = (new_uuid(&merged), new_uuid(&delta));
+        // Results in any order: the manifest keeps the pure addition last.
+        commit_index_optimization(&mut dataset, vec![delta, merged], None)
             .await
             .unwrap();
         dataset.validate().await.unwrap();
-        assert_eq!(uuids(&dataset, "id_idx").await[0], before[0]);
+        assert_eq!(
+            uuids(&dataset, "id_idx").await,
+            [before[0], merged_uuid, delta_uuid]
+        );
         assert_eq!(
             coverage(&dataset, "id_idx").await,
             [vec![0, 1, 2, 3], vec![4, 5, 6], vec![7]]
@@ -1920,11 +2001,14 @@ mod tests {
         other_plan.read_version += 1;
         let mut foreign = result.clone();
         foreign.removed_segments = vec![Uuid::new_v4()];
+        let mut renamed = result.clone();
+        renamed.new_segment.as_mut().unwrap().name = "text_idx".to_string();
         let overlapping = vec![result.clone(), shard];
         for results in [
             vec![result.clone(), other_plan],
             vec![result.clone(), result.clone()],
             vec![foreign],
+            vec![renamed],
             overlapping,
         ] {
             invalid(
