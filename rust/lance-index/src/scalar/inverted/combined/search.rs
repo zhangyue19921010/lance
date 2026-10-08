@@ -88,6 +88,7 @@ pub async fn combined_fields_search(
     for column in columns {
         let weight = column.weight;
         for index in &column.indices {
+            let mask = index.restrict_mask(mask.clone());
             for partition in &index.partitions {
                 let docs = partition.docs.address_keyed().await?;
                 let is_legacy = partition.is_legacy();
@@ -104,6 +105,7 @@ pub async fn combined_fields_search(
                         docs: docs.clone(),
                         is_legacy,
                         posting,
+                        mask: mask.clone(),
                     });
                 }
                 length_sources.push((weight, docs));
@@ -129,7 +131,7 @@ pub async fn combined_fields_search(
         let terms: Vec<CombinedTermPostings> = terms
             .iter()
             .zip(loaded)
-            .map(|(term, sources)| build_term_postings(term, sources, &mask, scorer.as_ref()))
+            .map(|(term, sources)| build_term_postings(term, sources, scorer.as_ref()))
             .collect();
 
         // Score every candidate: the union of the terms' postings for `Or`, and the

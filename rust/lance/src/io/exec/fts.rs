@@ -263,41 +263,71 @@ impl ExecutionPlan for FtsDocumentExec {
 }
 
 /// Open one FTS segment as an [`InvertedIndex`].
+///
+/// With `restrict_rows` the segment may only report live rows currently stored in the
+/// fragments it covers (see [`open_fts_segments`]).
 async fn open_fts_segment(
     dataset: &Dataset,
     column: &str,
     segment: &IndexMetadata,
+    restrict_rows: bool,
     metrics: &IndexMetrics,
 ) -> Result<Arc<InvertedIndex>> {
-    let index = dataset
-        .open_scalar_index(column, &segment.uuid, metrics)
-        .await?;
-    let inverted = index
-        .as_any()
-        .downcast_ref::<InvertedIndex>()
-        .ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Index for column {} and segment {} is not an inverted index",
-                column, segment.uuid
-            ))
-        })?;
-    Ok(Arc::new(inverted.clone()))
+    let open = async {
+        let index = dataset
+            .open_scalar_index(column, &segment.uuid, metrics)
+            .await?;
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .cloned()
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Index for column {} and segment {} is not an inverted index",
+                    column, segment.uuid
+                ))
+            })
+    };
+    let allowed_rows = async {
+        let coverage = if restrict_rows {
+            segment.effective_fragment_bitmap(&dataset.fragment_bitmap)
+        } else {
+            None
+        };
+        match coverage.and_then(|coverage| {
+            DatasetPreFilter::create_restricted_deletion_mask(Arc::new(dataset.clone()), coverage)
+        }) {
+            Some(mask) => Ok(Some(mask.await?)),
+            None => Ok(None),
+        }
+    };
+    let (inverted, allowed_rows) = futures::try_join!(open, allowed_rows)?;
+    Ok(Arc::new(match allowed_rows {
+        Some(allowed_rows) => inverted.with_allowed_rows(allowed_rows),
+        None => inverted,
+    }))
 }
 
 /// Open all committed FTS segments for a column.
 ///
 /// Exact multi-segment BM25 still needs every segment's local corpus statistics, so the
 /// current correctness-first path opens each committed segment before scoring.
+///
+/// Under stable row ids a rewritten row keeps its row id while it moves to a fragment
+/// another segment may cover, so the old segment still lists it under its old tokens. The
+/// shared prefilter only knows the union of all segments, so each segment is restricted to
+/// the live rows currently stored in the fragments it covers.
 async fn open_fts_segments(
     dataset: &Dataset,
     column: &str,
     segments: &[IndexMetadata],
     metrics: &IndexMetrics,
 ) -> Result<Vec<Arc<InvertedIndex>>> {
+    let restrict_rows = dataset.manifest.uses_stable_row_ids() && segments.len() > 1;
     try_join_all(
         segments
             .iter()
-            .map(|segment| open_fts_segment(dataset, column, segment, metrics)),
+            .map(|segment| open_fts_segment(dataset, column, segment, restrict_rows, metrics)),
     )
     .await
 }
@@ -3715,9 +3745,11 @@ impl FlatMatchFilterExec {
                     column
                 ))
             })?;
-            return Ok(open_fts_segment(dataset, column, index_meta, metrics)
-                .await?
-                .tokenizer());
+            return Ok(
+                open_fts_segment(dataset, column, index_meta, false, metrics)
+                    .await?
+                    .tokenizer(),
+            );
         }
         Ok(default_text_tokenizer())
     }
@@ -3731,9 +3763,11 @@ impl FlatMatchFilterExec {
         let index_meta = segments.first().ok_or_else(|| {
             DataFusionError::Execution(format!("FTS index for column {} has no segments", column))
         })?;
-        Ok(open_fts_segment(dataset, column, index_meta, metrics)
-            .await?
-            .tokenizer())
+        Ok(
+            open_fts_segment(dataset, column, index_meta, false, metrics)
+                .await?
+                .tokenizer(),
+        )
     }
 
     pub fn new(
@@ -7935,5 +7969,93 @@ mod tests {
             .downcast_ref::<UnionExec>()
             .expect("RepartitionExec should wrap a UnionExec");
         assert_eq!(inner.children().len(), 2);
+    }
+
+    /// Under stable row ids a rewritten row keeps its row id, so after an append-only
+    /// optimize the old segment still lists it under its old token while a newer segment
+    /// covers the fragment it now lives in.
+    #[tokio::test]
+    async fn stale_posting_after_update_with_stable_row_ids() {
+        use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, UInt32Array};
+        use arrow_schema::{Field, Schema};
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_index::optimize::OptimizeOptions;
+
+        use crate::dataset::{Dataset, UpdateBuilder, WriteParams};
+
+        async fn count(dataset: &Dataset, query: FullTextSearchQuery) -> usize {
+            let mut scan = dataset.scan();
+            scan.full_text_search(query).unwrap();
+            scan.try_into_batch().await.unwrap().num_rows()
+        }
+        fn match_query(token: &str) -> FullTextSearchQuery {
+            FullTextSearchQuery::new(token.into())
+        }
+        fn phrase_query(token: &str) -> FullTextSearchQuery {
+            FullTextSearchQuery::new_query(PhraseQuery::new(token.into()).into())
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let ids = Arc::new(UInt32Array::from_iter_values(0..256));
+        let text = Arc::new(StringArray::from_iter_values(
+            (0..256).map(|i| if i == 0 { "stale" } else { "keep" }),
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, text]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dir = TempStrDir::default();
+        let params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, dir.as_str(), Some(params))
+            .await
+            .unwrap();
+        let index_params = InvertedIndexParams::default().with_position(true);
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_idx".into()),
+                &index_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // The update moves the row to a new fragment while it keeps its row id.
+        let mut dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("text = 'stale'")
+            .unwrap()
+            .set("text", "'fresh'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+        // Append-only optimize keeps the old segment and gives the new fragment its own.
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset
+                .load_indices_by_name("text_idx")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        assert_eq!(count(&dataset, match_query("fresh")).await, 1);
+        assert_eq!(count(&dataset, phrase_query("fresh")).await, 1);
+        assert_eq!(count(&dataset, match_query("stale")).await, 0);
+        assert_eq!(count(&dataset, phrase_query("stale")).await, 0);
     }
 }
