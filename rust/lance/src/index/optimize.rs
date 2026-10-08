@@ -618,16 +618,17 @@ impl IndexGroup {
     /// Whether the last segment is in a format that cannot merge from
     /// segments (v1 IVF, legacy inverted) and is rebuilt whole. Opens it
     /// through the maintenance entry, as the merge does, so a segment the
-    /// tagged reader excludes opens as empty; `None` when it cannot be opened
-    /// at all, which the merge reports and skips as well.
-    async fn legacy_format(&self, dataset: &Dataset) -> Result<Option<bool>> {
+    /// tagged reader excludes opens as empty. A segment that cannot be opened
+    /// at all counts as legacy: the task runs unsplit and the merge, which
+    /// opens it again, decides whether to fail or skip.
+    async fn legacy_format(&self, dataset: &Dataset) -> Result<bool> {
         let last = self
             .segments
             .last()
             .expect("a group has at least one segment");
         let field_path = dataset.schema().field_path(last.fields[0])?;
         let opened = match self.family {
-            IndexFamily::Vector if is_definition_only_segment(last) => return Ok(Some(false)),
+            IndexFamily::Vector if is_definition_only_segment(last) => return Ok(false),
             IndexFamily::Vector => dataset
                 .open_vector_index_for_maintenance(&field_path, &last.uuid, &NoOpMetricsCollector)
                 .await
@@ -658,17 +659,17 @@ impl IndexGroup {
                     .await
                     .map(|index| index.update_criteria().requires_old_data)
             }
-            _ => return Ok(Some(false)),
+            _ => return Ok(false),
         };
         match opened {
-            Ok(legacy) => Ok(Some(legacy)),
+            Ok(legacy) => Ok(legacy),
             Err(error) => {
                 log::warn!(
-                    "Skipping optimization of index '{}': cannot open segment {}: {error}",
+                    "Planning index '{}' as one task: cannot open segment {}: {error}",
                     last.name,
                     last.uuid
                 );
-                Ok(None)
+                Ok(true)
             }
         }
     }
@@ -860,10 +861,7 @@ impl IndexOptimizePlanner for DeltaMergePlanner {
                 !self.retrain && !group.unindexed.is_empty() && !tagged && group.family_shardable();
             // Only a task that could be sharded needs the segment's format.
             if shardable && matches!(group.family, IndexFamily::Vector | IndexFamily::Inverted) {
-                match group.legacy_format(dataset).await? {
-                    Some(legacy) => shardable = !legacy,
-                    None => continue,
-                }
+                shardable = !group.legacy_format(dataset).await?;
             }
             tasks.push(IndexOptimizeTask {
                 read_version,
@@ -980,10 +978,7 @@ impl IndexOptimizePlanner for SizeTieredPlanner {
             // segments, cannot be split: one task with the single-process defaults.
             let mut whole = group.has_dormant || group.has_definition_only;
             if !whole && matches!(group.family, IndexFamily::Vector | IndexFamily::Inverted) {
-                match group.legacy_format(dataset).await? {
-                    Some(legacy) => whole = legacy,
-                    None => continue,
-                }
+                whole = group.legacy_format(dataset).await?;
             }
             if whole {
                 if group.unindexed.is_empty() && !group.is_vector() {
