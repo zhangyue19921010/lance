@@ -212,21 +212,23 @@ JSON, so a scheduler can send them to workers and collect the results.
 
 ### Strategies
 
-The plan is made by one of two strategies, selected through
-`IndexOptimizePlanOptions`; they are mutually exclusive:
+The plan is made by one of two strategies, both selected through the same
+`OptimizeOptions` that `optimize_indices` takes; they are mutually exclusive:
 
-- **`DeltaMerge { num_indices_to_merge, retrain }`** reproduces what
-  `optimize_indices` does in a single process: one task per index, which
-  merges the most recent `num_indices_to_merge` segments with the new data.
-  `retrain` and the automatic partition rebalancing of vector indices are only
-  available here, and only as a single task.
-- **`SizeTiered { max_rows_per_segment }`** (the default) packs the segments
-  holding fewer rows than the budget, together with the new fragments, into
-  bins of at most `max_rows_per_segment` rows. Every bin is one task, so one
-  index's merge work runs as several tasks in parallel, and a segment at or
-  above the budget is never rewritten. Vector segments are packed per shared
-  model, since only segments that share IVF centroids and quantizer state can
-  be merged into one; the new data joins the model of the newest segment.
+- **Delta merge** (the default) reproduces what `optimize_indices` does in a
+  single process: one task per index, which merges the most recent
+  `num_indices_to_merge` segments with the new data. `retrain` and the
+  automatic partition rebalancing of vector indices are only available here,
+  and only as a single task.
+- **Size-tiered**, chosen by setting `max_rows_per_segment`, packs the
+  segments holding fewer rows than that budget, together with the new
+  fragments, into bins of at most that many rows. Every bin is one task, so
+  one index's merge work runs as several tasks in parallel, and a segment at
+  or above the budget is never rewritten. Vector segments are packed per
+  shared model, since only segments that share IVF centroids and quantizer
+  state can be merged into one; the new data joins the model of the newest
+  segment. A maintenance job that wants every index compacted up to a budget
+  picks this strategy explicitly.
 
 Sizes come from the manifest and the deletion files alone: a segment counts
 the physical rows of the live fragments it covers, a fragment its live rows.
@@ -286,7 +288,7 @@ is never committed are unreferenced index directories and are cleaned up
 by `cleanup_old_versions(...)`.
 
 The single-process `optimize_indices` is the same three steps in one process:
-it plans with `DeltaMerge`, executes the tasks (`num_threads` at a time, one
+it plans with its options, executes the tasks (`num_threads` at a time, one
 by default) and commits their results together.
 
 ## Responsibility Boundaries

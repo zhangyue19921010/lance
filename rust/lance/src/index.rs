@@ -113,8 +113,7 @@ use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
 pub use optimize::{
-    DEFAULT_MAX_ROWS_PER_SEGMENT, DeltaMergePlanner, FragmentRows, IndexOptimizePlan,
-    IndexOptimizePlanOptions, IndexOptimizePlanner, IndexOptimizeResult, IndexOptimizeStrategy,
+    DeltaMergePlanner, FragmentRows, IndexOptimizePlan, IndexOptimizePlanner, IndexOptimizeResult,
     IndexOptimizeTask, SizeTieredPlanner, commit_index_optimization, plan_index_optimization,
 };
 
@@ -2833,19 +2832,14 @@ impl DatasetIndexExt for Dataset {
 
     #[instrument(skip_all)]
 
-    /// Plan one task per index, execute them (`options.num_threads` at a time)
-    /// and commit the results together, as a distributed optimize does.
+    /// Plan with `options` (see [`plan_index_optimization`]), execute the tasks
+    /// (`options.num_threads` at a time) and commit the results together, as a
+    /// distributed optimize does.
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
         if skip_uninterpretable_reuse_history(self).await? {
             return Ok(());
         }
-        let plan = DeltaMergePlanner::new(
-            options.index_names.clone(),
-            options.num_indices_to_merge,
-            options.retrain,
-        )
-        .plan(self)
-        .await?;
+        let plan = plan_index_optimization(self, options).await?;
         let results: Vec<IndexOptimizeResult> = {
             let dataset: &Dataset = self;
             futures::stream::iter(plan.tasks)

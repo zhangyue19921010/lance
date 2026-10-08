@@ -3,6 +3,8 @@
 
 //! Index optimization as plan, execute and commit steps, so the work can run
 //! on several workers the way compaction does (see [`crate::dataset::optimize`]).
+//! The single-process `optimize_indices` runs the same steps with the same
+//! [`OptimizeOptions`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -32,64 +34,34 @@ use crate::dataset::optimize::{FragmentMetrics, collect_metrics};
 use crate::dataset::transaction::{Operation, TransactionBuilder};
 use crate::io::commit::detect_overlapping_fragments;
 
-/// The row budget [`IndexOptimizeStrategy::SizeTiered`] uses by default.
-pub const DEFAULT_MAX_ROWS_PER_SEGMENT: u64 = 1_000_000_000;
-
-/// Options for planning an index optimization.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct IndexOptimizePlanOptions {
-    /// The indices to plan for; `None` is every index.
-    pub index_names: Option<Vec<String>>,
-    pub strategy: IndexOptimizeStrategy,
-}
-
-/// How a plan chooses which segments to merge. The two are mutually exclusive.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum IndexOptimizeStrategy {
-    /// One task per index merging the trailing `num_indices_to_merge` segments
-    /// with the new data: what a single-process `optimize_indices` does.
-    DeltaMerge {
-        num_indices_to_merge: Option<usize>,
-        retrain: bool,
-    },
-    /// Segments under `max_rows_per_segment` rows and the new fragments are
-    /// packed in order into bins of at most that many rows, one task per bin;
-    /// larger segments are left alone.
-    SizeTiered { max_rows_per_segment: u64 },
-}
-
-impl Default for IndexOptimizeStrategy {
-    fn default() -> Self {
-        Self::SizeTiered {
-            max_rows_per_segment: DEFAULT_MAX_ROWS_PER_SEGMENT,
-        }
-    }
-}
-
 /// Produces an [`IndexOptimizePlan`] for one version of a dataset.
 #[async_trait]
 pub trait IndexOptimizePlanner: Send + Sync {
     async fn plan(&self, dataset: &Dataset) -> Result<IndexOptimizePlan>;
 }
 
-/// Plan with the planner `options.strategy` selects.
+/// Plan with the strategy `options` select: `max_rows_per_segment` picks
+/// [`SizeTieredPlanner`], otherwise [`DeltaMergePlanner`] merges the trailing
+/// `num_indices_to_merge` segments (the single-process behavior). The two are
+/// mutually exclusive.
 pub async fn plan_index_optimization(
     dataset: &Dataset,
-    options: &IndexOptimizePlanOptions,
+    options: &OptimizeOptions,
 ) -> Result<IndexOptimizePlan> {
-    match &options.strategy {
-        IndexOptimizeStrategy::DeltaMerge {
-            num_indices_to_merge,
-            retrain,
-        } => {
-            DeltaMergePlanner::new(options.index_names.clone(), *num_indices_to_merge, *retrain)
+    let index_names = options.index_names.clone();
+    match options.max_rows_per_segment {
+        Some(max_rows_per_segment) => {
+            if options.num_indices_to_merge.is_some() || options.retrain {
+                return Err(Error::invalid_input(
+                    "max_rows_per_segment cannot be combined with num_indices_to_merge or retrain",
+                ));
+            }
+            SizeTieredPlanner::new(index_names, max_rows_per_segment)?
                 .plan(dataset)
                 .await
         }
-        IndexOptimizeStrategy::SizeTiered {
-            max_rows_per_segment,
-        } => {
-            SizeTieredPlanner::new(options.index_names.clone(), *max_rows_per_segment)?
+        None => {
+            DeltaMergePlanner::new(index_names, options.num_indices_to_merge, options.retrain)
                 .plan(dataset)
                 .await
         }
@@ -1077,7 +1049,6 @@ mod tests {
     const NAMES: [&str; 4] = ["vector_idx", "id_idx", "text_idx", "ngram_idx"];
     type Plan = IndexOptimizePlan;
     type Task = IndexOptimizeTask;
-    type Options = IndexOptimizePlanOptions;
     type Shape = (Vec<Uuid>, Vec<u32>, Option<usize>, bool);
 
     fn schema() -> Arc<Schema> {
@@ -1175,36 +1146,19 @@ mod tests {
         VectorIndexParams::with_ivf_hnsw_sq_params(MetricType::L2, ivf, hnsw, sq)
     }
 
-    fn delta_merge(num_indices_to_merge: Option<usize>) -> Options {
-        let retrain = false;
-        let strategy = IndexOptimizeStrategy::DeltaMerge {
-            num_indices_to_merge,
-            retrain,
-        };
-        Options {
-            index_names: None,
-            strategy,
-        }
+    fn delta_merge(num_indices_to_merge: Option<usize>) -> OptimizeOptions {
+        OptimizeOptions::default().num_indices_to_merge(num_indices_to_merge)
     }
 
-    fn size_tiered(max_rows_per_segment: u64) -> Options {
-        let strategy = IndexOptimizeStrategy::SizeTiered {
-            max_rows_per_segment,
-        };
-        Options {
-            index_names: None,
-            strategy,
-        }
+    fn size_tiered(max_rows_per_segment: u64) -> OptimizeOptions {
+        OptimizeOptions::default().max_rows_per_segment(max_rows_per_segment)
     }
 
-    fn only(name: &str, options: Options) -> Options {
-        Options {
-            index_names: Some(vec![name.to_string()]),
-            ..options
-        }
+    fn only(name: &str, options: OptimizeOptions) -> OptimizeOptions {
+        options.index_names(vec![name.to_string()])
     }
 
-    async fn plan(dataset: &Dataset, options: &Options) -> Plan {
+    async fn plan(dataset: &Dataset, options: &OptimizeOptions) -> Plan {
         plan_index_optimization(dataset, options).await.unwrap()
     }
 
@@ -2190,17 +2144,35 @@ mod tests {
     // ---- serialization -----------------------------------------------------
 
     #[tokio::test]
-    async fn options_plan_task_and_result_round_trip_through_json() {
-        for options in [delta_merge(Some(2)), size_tiered(1_000), Options::default()] {
-            let json = serde_json::to_string(&options).unwrap();
-            assert_eq!(serde_json::from_str::<Options>(&json).unwrap(), options);
+    async fn strategies_are_mutually_exclusive_and_default_to_delta_merge() {
+        let dir = TempStrDir::default();
+        let dataset = indexed_dataset(dir.as_str(), &ivf_pq(), 1).await;
+        let mut retrain = size_tiered(100);
+        retrain.retrain = true;
+        for options in [
+            size_tiered(100).num_indices_to_merge(Some(1)),
+            retrain,
+            size_tiered(0),
+        ] {
+            invalid(
+                plan_index_optimization(&dataset, &options)
+                    .await
+                    .unwrap_err(),
+            );
         }
-        let default = IndexOptimizeStrategy::SizeTiered {
-            max_rows_per_segment: DEFAULT_MAX_ROWS_PER_SEGMENT,
-        };
-        assert_eq!(Options::default().strategy, default);
+        let planned = plan(&dataset, &OptimizeOptions::default()).await;
+        assert_eq!(planned.tasks.len(), 4);
+        assert!(
+            planned
+                .tasks
+                .iter()
+                .all(|t| t.num_indices_to_merge.is_none() && !t.retrain)
+        );
         assert!(SizeTieredPlanner::new(None, 0).is_err());
+    }
 
+    #[tokio::test]
+    async fn plan_task_and_result_round_trip_through_json() {
         let dir = TempStrDir::default();
         let dataset = indexed_dataset(dir.as_str(), &ivf_pq(), 2).await;
         let planned = plan(&dataset, &delta_merge(Some(1))).await;

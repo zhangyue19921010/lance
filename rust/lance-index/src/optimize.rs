@@ -52,6 +52,13 @@ pub struct OptimizeOptions {
     /// How many indices are optimized concurrently; `None` means 1. A merge can
     /// rewrite a large segment, so raise this only with the memory to match.
     pub num_threads: Option<usize>,
+
+    /// Size-tiered merging: segments holding fewer rows than this and the
+    /// unindexed fragments are packed, in order, into merges of at most this
+    /// many rows; larger segments are left alone. Mutually exclusive with
+    /// `num_indices_to_merge` and `retrain`. `None` (the default) merges the
+    /// trailing `num_indices_to_merge` segments instead.
+    pub max_rows_per_segment: Option<u64>,
 }
 
 impl Default for OptimizeOptions {
@@ -63,6 +70,7 @@ impl Default for OptimizeOptions {
             transaction_properties: None,
             progress: noop_progress(),
             num_threads: None,
+            max_rows_per_segment: None,
         }
     }
 }
@@ -122,6 +130,12 @@ impl OptimizeOptions {
     /// Set how many indices are optimized concurrently.
     pub fn num_threads(mut self, num_threads: usize) -> Self {
         self.num_threads = Some(num_threads);
+        self
+    }
+
+    /// Merge size-tiered, with at most `max_rows_per_segment` rows per merge.
+    pub fn max_rows_per_segment(mut self, max_rows_per_segment: u64) -> Self {
+        self.max_rows_per_segment = Some(max_rows_per_segment);
         self
     }
 }
