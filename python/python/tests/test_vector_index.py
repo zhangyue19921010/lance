@@ -1970,6 +1970,24 @@ def test_knn_with_deletions(tmp_path):
     assert expected == [r.as_py() for r in results]
 
 
+def test_create_index_warns_that_index_cache_size_is_ignored(tmp_path):
+    # The parameter is accepted for backwards compatibility but never reaches
+    # Rust, so the only honest behavior is to say so.
+    tbl = create_table(nvec=256, ndim=16)
+    dataset = lance.write_dataset(tbl, tmp_path / "test")
+
+    with pytest.warns(DeprecationWarning, match="index_cache_size"):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=2,
+            num_sub_vectors=2,
+            index_cache_size=10,
+        )
+
+    assert len(dataset.describe_indices()) == 1
+
+
 def test_index_cache_size(tmp_path):
     rng = np.random.default_rng(seed=42)
 
@@ -2696,6 +2714,19 @@ def test_vector_index_with_nprobes(indexed_dataset):
 
     assert "minimum_nprobes=7" in res
     assert "maximum_nprobes=Some(7)" in res
+
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "nprobes": 10,
+            "minimum_nprobes": 7,
+        }
+    ).explain_plan()
+
+    assert "minimum_nprobes=7" in res
+    assert "maximum_nprobes=Some(10)" in res
 
     res = indexed_dataset.scanner(
         nearest={

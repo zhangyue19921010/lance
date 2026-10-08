@@ -39,7 +39,7 @@ use lance::dataset::AutoCleanupParams;
 use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
-    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
+    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExprFilter,
     MaterializationStyle, QueryFilter, RowAddrMask, RowAddrTreeMap,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
@@ -2006,11 +2006,20 @@ impl Dataset {
     fn delete(
         &mut self,
         py: Python<'_>,
-        predicate: String,
+        predicate: &Bound<'_, PyAny>,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
     ) -> PyResult<Py<PyAny>> {
-        let mut builder = DeleteBuilder::new(self.ds.clone(), predicate);
+        let mut builder = if let Ok(sql) = predicate.cast::<PyString>() {
+            DeleteBuilder::new(self.ds.clone(), sql.to_str()?)
+        } else if let Ok(bytes) = predicate.cast::<PyBytes>() {
+            let expr = ExprFilter::Substrait(bytes.as_bytes().to_vec())
+                .to_datafusion(self.ds.schema(), self.ds.schema())
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            DeleteBuilder::from_expr(self.ds.clone(), expr)
+        } else {
+            return Err(PyTypeError::new_err("predicate must be a string or bytes"));
+        };
 
         if let Some(retries) = conflict_retries {
             builder = builder.conflict_retries(retries);
@@ -2033,16 +2042,24 @@ impl Dataset {
     fn update(
         &mut self,
         updates: &Bound<'_, PyDict>,
-        predicate: Option<&str>,
+        predicate: Option<&Bound<'_, PyAny>>,
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
         data_storage_version: Option<&str>,
     ) -> PyResult<Py<PyAny>> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
-            builder = builder
-                .update_where(predicate)
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            builder = if let Ok(sql) = predicate.cast::<PyString>() {
+                builder.update_where(sql.to_str()?)
+            } else if let Ok(bytes) = predicate.cast::<PyBytes>() {
+                let expr = ExprFilter::Substrait(bytes.as_bytes().to_vec())
+                    .to_datafusion(self.ds.schema(), self.ds.schema())
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                builder.update_where_expr(expr)
+            } else {
+                return Err(PyTypeError::new_err("predicate must be a string or bytes"));
+            }
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
         if let Some(retries) = conflict_retries {
@@ -3840,7 +3857,6 @@ impl Dataset {
             stats_log_interval_ms,
             hnsw_params,
         )?;
-        let maintained_indexes = maintained_indexes.unwrap_or_default();
 
         let mut ds = Arc::clone(&self.ds);
         let new_ds = rt()
@@ -3854,7 +3870,11 @@ impl Dataset {
                 } else if unsharded {
                     builder = builder.unsharded();
                 }
-                builder = builder.maintained_indexes(maintained_indexes);
+                // Flattening `None` to an empty list here would ask for no
+                // index at all rather than every one.
+                if let Some(maintained_indexes) = maintained_indexes {
+                    builder = builder.maintained_indexes(maintained_indexes);
+                }
                 if let Some(config) = writer_config {
                     builder = builder.writer_config_defaults(config);
                 }
@@ -3870,7 +3890,11 @@ impl Dataset {
     /// has not been initialized.
     ///
     /// The returned dict has `num_shards`, `maintained_indexes`,
-    /// `writer_config_defaults`, and `sharding_specs`.
+    /// `maintain_all_indexes`, `writer_config_defaults`, and `sharding_specs`.
+    ///
+    /// `maintain_all_indexes` is what distinguishes maintaining every index
+    /// the table has from maintaining none: both leave `maintained_indexes`
+    /// empty.
     fn mem_wal_index_details<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
 
@@ -3885,6 +3909,7 @@ impl Dataset {
         let dict = PyDict::new(py);
         dict.set_item("num_shards", details.num_shards)?;
         dict.set_item("maintained_indexes", details.maintained_indexes)?;
+        dict.set_item("maintain_all_indexes", details.maintain_all_indexes)?;
         dict.set_item("writer_config_defaults", details.writer_config_defaults)?;
 
         let specs = PyList::empty(py);

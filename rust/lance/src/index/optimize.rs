@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use super::append::{
     NewIndexData, is_definition_only_segment, merge_indices_impl, metadata_is_vector_index,
+    tagged_segment_coverage,
 };
 use super::scalar::fetch_index_details;
 use super::vector::ivf::{IVFIndex as LegacyIvfIndex, vector_model_mismatch};
@@ -570,6 +571,10 @@ struct IndexGroup {
     name: String,
     segments: Vec<IndexMetadata>,
     unindexed: Vec<FragmentRows>,
+    /// Each segment's live coverage: derived through the lineage on a tagged
+    /// table, stored coverage intersected with the live fragments elsewhere.
+    /// Absent for a segment without stored coverage.
+    live_coverage: HashMap<Uuid, RoaringBitmap>,
     kind: IndexKind,
     /// A segment with stored rows but no live coverage.
     has_dormant: bool,
@@ -630,11 +635,18 @@ async fn has_tagged_fragment_reuse_history(dataset: &Dataset) -> Result<bool> {
         .any(|index| index.name == FRAG_REUSE_INDEX_NAME && index.index_version != 0))
 }
 
-async fn index_kind(dataset: &Dataset, segments: &[IndexMetadata]) -> Result<IndexKind> {
+/// `open_last` is false when the last segment cannot be opened by itself (a
+/// definition only, or a segment the tagged reader excludes); such a group is
+/// rebuilt whole, so its format need not be known.
+async fn index_kind(
+    dataset: &Dataset,
+    segments: &[IndexMetadata],
+    open_last: bool,
+) -> Result<IndexKind> {
     let last = segments.last().expect("a group has at least one segment");
     let field_path = dataset.schema().field_path(last.fields[0])?;
     if metadata_is_vector_index(dataset, last).await? {
-        let legacy = if is_definition_only_segment(last) {
+        let legacy = if !open_last {
             false
         } else {
             dataset
@@ -704,21 +716,47 @@ async fn index_groups(
             })
             .collect::<Result<_>>()?;
         unindexed.sort_by_key(|fragment| fragment.id);
-        let kind = index_kind(dataset, &segments).await?;
-        let has_dormant = segments.iter().any(|segment| {
-            segment
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(|bitmap| !bitmap.is_empty())
-                && segment
-                    .effective_fragment_bitmap(&dataset.fragment_bitmap)
-                    .is_some_and(|bitmap| bitmap.is_empty())
-        });
+        let refs: Vec<&IndexMetadata> = segments.iter().collect();
+        let tagged = tagged_segment_coverage(dataset, &refs, None).await?;
+        let is_tagged = tagged.is_some();
+        let live_coverage: HashMap<Uuid, RoaringBitmap> = match tagged {
+            Some(derived) => derived,
+            None => segments
+                .iter()
+                .filter_map(|s| {
+                    Some((
+                        s.uuid,
+                        s.effective_fragment_bitmap(&dataset.fragment_bitmap)?,
+                    ))
+                })
+                .collect(),
+        };
+        // Stored rows but no live coverage: the merge replaces such a segment
+        // (and rebuilds when none is live), as it does in a single process.
+        let dormant = |segment: &IndexMetadata| {
+            let has_stored_rows = if is_tagged {
+                !is_definition_only_segment(segment)
+            } else {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|b| !b.is_empty())
+            };
+            has_stored_rows
+                && live_coverage
+                    .get(&segment.uuid)
+                    .is_some_and(|b| b.is_empty())
+        };
+        let last = segments.last().expect("a group has at least one segment");
+        let open_last = !is_definition_only_segment(last) && !dormant(last);
+        let kind = index_kind(dataset, &segments, open_last).await?;
+        let has_dormant = segments.iter().any(dormant);
         let has_definition_only = segments.iter().any(is_definition_only_segment);
         groups.push(IndexGroup {
             name,
             segments,
             unindexed,
+            live_coverage,
             kind,
             has_dormant,
             has_definition_only,
@@ -809,14 +847,13 @@ impl SizeTieredPlanner {
         })
     }
 
+    /// The physical rows of a segment's live fragments; `None` when unknown.
     fn segment_rows(
-        segment: &IndexMetadata,
-        dataset: &Dataset,
+        live_coverage: Option<&RoaringBitmap>,
         metrics: &HashMap<u32, FragmentMetrics>,
     ) -> Option<u64> {
-        let effective = segment.effective_fragment_bitmap(&dataset.fragment_bitmap)?;
         Some(
-            effective
+            live_coverage?
                 .iter()
                 .map(|id| {
                     metrics
@@ -911,8 +948,8 @@ impl IndexOptimizePlanner for SizeTieredPlanner {
                 let mut items: Vec<(BinItem, u64)> = class
                     .iter()
                     .filter_map(|&position| {
-                        let rows =
-                            Self::segment_rows(&group.segments[position], dataset, &metrics)?;
+                        let live = group.live_coverage.get(&group.segments[position].uuid);
+                        let rows = Self::segment_rows(live, &metrics)?;
                         (rows < budget).then_some((BinItem::Segment(position), rows))
                     })
                     .collect();
@@ -1550,15 +1587,12 @@ mod tests {
         let metrics = fragment_metrics(&dataset).await.unwrap();
         let mut segment = segments(&dataset, "id_seg").await.remove(0);
         segment.fragment_bitmap = Some(RoaringBitmap::from_iter([0u32, 1, 7]));
+        let live = segment.effective_fragment_bitmap(&dataset.fragment_bitmap);
         assert_eq!(
-            SizeTieredPlanner::segment_rows(&segment, &dataset, &metrics),
+            SizeTieredPlanner::segment_rows(live.as_ref(), &metrics),
             Some(128)
         );
-        segment.fragment_bitmap = None;
-        assert_eq!(
-            SizeTieredPlanner::segment_rows(&segment, &dataset, &metrics),
-            None
-        );
+        assert_eq!(SizeTieredPlanner::segment_rows(None, &metrics), None);
     }
 
     // ---- shardable and shard ----------------------------------------------
@@ -1956,10 +1990,11 @@ mod tests {
         }
     }
 
-    /// On a tagged table a rebuild reports live coverage while the old
-    /// segment's stored provenance is not, so no containment check applies.
+    /// On a tagged table a merged segment keeps its sources' provenance
+    /// coordinates and the reader derives the live coverage, so a result is
+    /// never checked against stored coverage; the commit validates and lands.
     #[tokio::test]
-    async fn tagged_rebuild_commits_live_coverage() {
+    async fn tagged_merge_keeps_provenance_coverage() {
         let dir = TempStrDir::default();
         let mut next_id = 0;
         let mut dataset = write_dataset(dir.as_str(), false, &[128, 128], &mut next_id).await;
@@ -1969,9 +2004,8 @@ mod tests {
         )
         .await;
         tag_table(&mut dataset).await;
-        compact(&mut dataset, 256, true).await;
-        append_rows(&mut dataset, &[128], &mut next_id).await;
-        let live: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+        compact(&mut dataset, 256, true).await; // fragments 0 and 1 become 2
+        append_rows(&mut dataset, &[128], &mut next_id).await; // fragment 3
         let stored = load_all_indices(&dataset).await.unwrap();
         let stored = stored.iter().find(|s| s.name == "vector_idx").unwrap();
         assert_eq!(
@@ -1989,11 +2023,19 @@ mod tests {
             .fragment_bitmap
             .clone()
             .unwrap();
-        assert_eq!(bitmap.iter().collect::<Vec<u32>>(), live);
+        assert_eq!(
+            bitmap.iter().collect::<Vec<u32>>(),
+            [0, 1, 3],
+            "provenance plus new"
+        );
         commit_index_optimization(&mut dataset, vec![result], None)
             .await
             .unwrap();
-        assert_eq!(coverage(&dataset, "vector_idx").await, [live]);
+        assert_eq!(
+            coverage(&dataset, "vector_idx").await,
+            [vec![2, 3]],
+            "derived"
+        );
     }
 
     // ---- serialization -----------------------------------------------------

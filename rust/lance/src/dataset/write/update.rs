@@ -110,13 +110,35 @@ impl UpdateBuilder {
         (&merged).into()
     }
 
-    pub fn update_where(mut self, filter: &str) -> Result<Self> {
+    pub fn update_where(self, filter: &str) -> Result<Self> {
         let filter_schema = Self::filterable_schema(self.dataset.schema());
         let planner = Planner::new(Arc::new(filter_schema));
         let expr = planner
             .parse_filter(filter)
             .map_err(box_error)
             .context(InvalidInputSnafu {})?;
+        self.update_where_expr(expr)
+    }
+
+    /// Set the row filter from a DataFusion expression.
+    ///
+    /// This is equivalent to [`Self::update_where`] for callers that already
+    /// have an expression instead of a SQL string.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::UpdateBuilder;
+    /// # use datafusion::prelude::{col, lit};
+    /// # use std::sync::Arc;
+    /// # fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let builder = UpdateBuilder::new(dataset)
+    ///     .update_where_expr(col("region_id").eq(lit(10)))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update_where_expr(mut self, expr: Expr) -> Result<Self> {
+        let filter_schema = Self::filterable_schema(self.dataset.schema());
+        let planner = Planner::new(Arc::new(filter_schema));
         self.condition = Some(
             planner
                 .optimize_expr(expr)
@@ -392,6 +414,7 @@ impl UpdateJob {
             let rewrite_plan = Arc::new(crate::dataset::optimize::BlobV2BatchRewritePlan::try_new(
                 self.dataset.schema(),
                 scan_schema.as_ref(),
+                false,
                 false,
             )?);
             let output_schema = rewrite_plan.output_schema().clone();
