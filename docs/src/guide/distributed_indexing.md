@@ -227,7 +227,9 @@ The plan is made by one of two strategies, both selected through the same
   or above the budget is never rewritten. Vector segments are packed per
   shared model, since only segments that share IVF centroids and quantizer
   state can be merged into one; the new data joins the model of the newest
-  segment. A maintenance job that wants every index compacted up to a budget
+  segment, and segments of other models are merged only in a round that also
+  has new data, so the newest model's segment stays the last one in the
+  manifest. A maintenance job that wants every index compacted up to a budget
   picks this strategy explicitly.
 
 Sizes come from the manifest and the deletion files alone: a segment counts
@@ -279,7 +281,10 @@ such tasks run as one unit.
 `CreateIndex` transaction anchored at the plan's version. Results are checked
 against the manifest at that version (every replaced segment exists under
 the result's index name, no segment is replaced twice, the remaining coverage
-does not overlap) before anything is written. What changed on the table since
+does not overlap) before anything is written. New segments holding fragments
+nothing covered at that version are appended after the others, so the
+manifest's last segment stays the one holding the newest data whatever order
+the results arrive in. What changed on the table since
 the plan is handled by the commit's conflict resolution: an append or a
 delete is fine, while a compaction that rewrote covered fragments, or another
 optimize that replaced the same segments, is reported as a retryable

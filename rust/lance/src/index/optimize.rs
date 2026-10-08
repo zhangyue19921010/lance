@@ -413,9 +413,9 @@ impl IndexOptimizeTask {
 /// commit's conflict resolution (a rewrite of covered fragments or a concurrent
 /// optimize is a retryable conflict). Results without a segment are skipped;
 /// with none left, nothing is committed unless the MemWAL catch-up needs it.
-/// New segments are appended in the order of the segments they replace, with
-/// pure additions last, so the manifest's last segment stays the newest one
-/// whatever order the results arrive in.
+/// Segments holding new data are appended after the others, so the manifest's
+/// last segment stays the one holding the newest data (and the model the next
+/// append takes) whatever order the results arrive in.
 pub async fn commit_index_optimization(
     dataset: &mut Dataset,
     results: Vec<IndexOptimizeResult>,
@@ -452,20 +452,27 @@ pub async fn commit_index_optimization(
     };
     let stored = load_all_indices(&snapshot).await?;
     let by_uuid: HashMap<Uuid, &IndexMetadata> = stored.iter().map(|s| (s.uuid, s)).collect();
-    let position: HashMap<Uuid, usize> = stored
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.uuid, i))
-        .collect();
+    // Results indexing fragments nothing covered at V are appended after the
+    // others, so the manifest's last segment keeps holding the newest data,
+    // and the model the next append takes, whatever order results arrive in.
+    let mut covered_at_v: HashMap<&str, RoaringBitmap> = HashMap::new();
+    for segment in stored.iter() {
+        if let Some(bitmap) = &segment.fragment_bitmap {
+            *covered_at_v.entry(segment.name.as_str()).or_default() |= bitmap;
+        }
+    }
+    let carries_new_data = |result: &&IndexOptimizeResult| {
+        let covered = covered_at_v.get(result.index_name.as_str());
+        let segment = result.new_segment.as_ref().expect("filtered to Some");
+        let bitmap = segment.fragment_bitmap.as_ref();
+        bitmap.is_some_and(|bitmap| {
+            bitmap
+                .iter()
+                .any(|id| !covered.is_some_and(|c| c.contains(id)))
+        })
+    };
     let mut produced = produced;
-    produced.sort_by_key(|result| {
-        let last_replaced = result
-            .removed_segments
-            .iter()
-            .filter_map(|u| position.get(u))
-            .max();
-        last_replaced.map_or((1, 0), |p| (0, *p))
-    });
+    produced.sort_by_key(carries_new_data);
     let names: HashSet<&str> = produced.iter().map(|r| r.index_name.as_str()).collect();
     let mut removed_indices = Vec::new();
     let mut removed_uuids = HashSet::new();
@@ -879,7 +886,9 @@ impl IndexOptimizePlanner for DeltaMergePlanner {
 /// order and per shared vector model, into bins of at most that many rows. A
 /// segment's size is the physical row count of its live fragments, a
 /// fragment's its live row count; both come from the manifest and deletion
-/// files alone.
+/// files alone. The new data joins the model of the newest segment; other
+/// models' segments are merged only in a round that also has new data, which
+/// keeps the newest model's segment last in the manifest.
 #[derive(Debug, Clone)]
 pub(crate) struct SizeTieredPlanner {
     index_names: Option<Vec<String>>,
@@ -1006,6 +1015,12 @@ impl IndexOptimizePlanner for SizeTieredPlanner {
                 .position(|class| class.contains(&(group.segments.len() - 1)))
                 .expect("the last segment is in a class");
             for (class_index, class) in classes.iter().enumerate() {
+                // A merge of another model class lands after the newest
+                // model's segment unless a new-data segment follows it (the
+                // commit appends those last), so it waits for new data.
+                if class_index != reference_class && group.unindexed.is_empty() {
+                    continue;
+                }
                 // Candidates in manifest order, then (in the reference class,
                 // whose model the new data takes) the new fragments.
                 let mut items: Vec<(BinItem, u64)> = class
@@ -1080,31 +1095,27 @@ impl IndexOptimizePlanner for SizeTieredPlanner {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashSet};
-    use std::ops::Bound;
+    use std::collections::{BTreeSet, HashSet};
     use std::sync::Arc;
 
-    use arrow::datatypes::{Float32Type, UInt8Type, UInt32Type, UInt64Type};
+    use arrow::datatypes::{Float32Type, UInt32Type, UInt64Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
-        StringArray, UInt32Array,
+        FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
+        UInt32Array,
     };
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::common::ScalarValue;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_index::IndexType;
     use lance_index::scalar::{
-        BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, SargableQuery,
-        ScalarIndexParams, SearchResult,
+        BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
+    use lance_index::vector::VectorIndex;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
-    use lance_index::vector::pq::storage::transpose;
     use lance_index::vector::sq::builder::SQBuildParams;
-    use lance_index::vector::{PQ_CODE_COLUMN, SQ_CODE_COLUMN, VectorIndex};
+    use lance_index::{IndexParams, IndexType};
     use lance_io::stream::RecordBatchStreamAdapter;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
@@ -1126,6 +1137,7 @@ mod tests {
     type Plan = IndexOptimizePlan;
     type Task = IndexOptimizeTask;
     type Shape = (Vec<Uuid>, Vec<u32>, Option<usize>, bool);
+    type NoStream = Option<RecordBatchStreamAdapter<futures::stream::Empty<Result<RecordBatch>>>>;
 
     fn schema() -> Arc<Schema> {
         let item = Arc::new(Field::new("item", DataType::Float32, true));
@@ -1180,23 +1192,22 @@ mod tests {
         dataset
     }
 
-    /// `vector_idx`, `id_idx` (BTree), `text_idx` (inverted), `ngram_idx` (NGram).
-    async fn create_indices(dataset: &mut Dataset, vector: &VectorIndexParams) {
-        let btree = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+    /// `vector_idx`, `id_idx` (`scalar`: BTree or Bitmap), `text_idx` (inverted),
+    /// `ngram_idx` (NGram).
+    async fn create_indices(dataset: &mut Dataset, vector: &VectorIndexParams, scalar: IndexType) {
+        let id = ScalarIndexParams::for_builtin(scalar.try_into().unwrap());
         let ngram = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
         let inverted = InvertedIndexParams::default();
-        let specs: [(&str, IndexType, &str, &dyn lance_index::IndexParams); 4] = [
+        let specs: [(&str, IndexType, &str, &dyn IndexParams); 4] = [
             ("vector", IndexType::Vector, "vector_idx", vector),
-            ("id", IndexType::BTree, "id_idx", &btree),
+            ("id", scalar, "id_idx", &id),
             ("text", IndexType::Inverted, "text_idx", &inverted),
             ("ngram_text", IndexType::NGram, "ngram_idx", &ngram),
         ];
-        for (column, index_type, name, params) in specs {
-            let name = Some(name.to_string());
-            dataset
-                .create_index(&[column], index_type, name, params, true)
-                .await
-                .unwrap();
+        for (column, kind, name, params) in specs {
+            let (columns, name) = ([column], Some(name.to_string()));
+            let created = dataset.create_index(&columns, kind, name, params, true);
+            created.await.unwrap();
         }
     }
 
@@ -1204,7 +1215,7 @@ mod tests {
     async fn indexed_dataset(uri: &str, vector: &VectorIndexParams, new: usize) -> Dataset {
         let mut next_id = 0;
         let mut dataset = write_dataset(uri, false, &[256; 4], &mut next_id).await;
-        create_indices(&mut dataset, vector).await;
+        create_indices(&mut dataset, vector, IndexType::BTree).await;
         append_rows(&mut dataset, &vec![256; new], &mut next_id).await;
         dataset
     }
@@ -1214,12 +1225,20 @@ mod tests {
     }
 
     fn ivf_hnsw_sq() -> VectorIndexParams {
-        let (ivf, hnsw, sq) = (
-            IvfBuildParams::new(4),
-            HnswBuildParams::default(),
-            SQBuildParams::default(),
-        );
+        let ivf = IvfBuildParams::new(4);
+        let hnsw = HnswBuildParams::default();
+        let sq = SQBuildParams::default();
         VectorIndexParams::with_ivf_hnsw_sq_params(MetricType::L2, ivf, hnsw, sq)
+    }
+
+    /// IVF_FLAT with two fixed centroids, so segments built with the same
+    /// `value` share a model and segments built with different values do not.
+    fn fixed_model(value: f32) -> VectorIndexParams {
+        let values = (0..2 * DIM).map(|i| value + (i / DIM) as f32);
+        let centroids = Float32Array::from_iter_values(values);
+        let centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
+        let ivf = IvfBuildParams::try_with_centroids(2, Arc::new(centroids)).unwrap();
+        VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf)
     }
 
     fn delta_merge(num_indices_to_merge: Option<usize>) -> OptimizeOptions {
@@ -1238,6 +1257,10 @@ mod tests {
         plan_index_optimization(dataset, options).await.unwrap()
     }
 
+    async fn commit(dataset: &mut Dataset, results: Vec<IndexOptimizeResult>) -> Result<()> {
+        commit_index_optimization(dataset, results, None).await
+    }
+
     fn task_for<'a>(plan: &'a Plan, name: &str) -> &'a Task {
         let task = plan.tasks.iter().find(|task| task.index_name == name);
         task.unwrap_or_else(|| panic!("no task for {name} in {plan:?}"))
@@ -1249,15 +1272,22 @@ mod tests {
 
     /// (segments, fragment ids, num_indices_to_merge, shardable) of every task.
     fn shape(plan: &Plan) -> Vec<Shape> {
-        let shape = |t: &Task| {
-            (
-                t.segments.clone(),
-                fragment_ids(t),
-                t.num_indices_to_merge,
-                t.shardable,
-            )
-        };
-        plan.tasks.iter().map(shape).collect()
+        plan.tasks
+            .iter()
+            .map(|t| {
+                (
+                    t.segments.clone(),
+                    fragment_ids(t),
+                    t.num_indices_to_merge,
+                    t.shardable,
+                )
+            })
+            .collect()
+    }
+
+    fn new_coverage(result: &IndexOptimizeResult) -> Vec<u32> {
+        let segment = result.new_segment.as_ref().unwrap();
+        segment.fragment_bitmap.as_ref().unwrap().iter().collect()
     }
 
     async fn segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
@@ -1265,11 +1295,8 @@ mod tests {
     }
 
     async fn uuids(dataset: &Dataset, name: &str) -> Vec<Uuid> {
-        segments(dataset, name)
-            .await
-            .iter()
-            .map(|s| s.uuid)
-            .collect()
+        let segments = segments(dataset, name).await;
+        segments.iter().map(|s| s.uuid).collect()
     }
 
     /// Sorted per-segment coverage of `name`.
@@ -1280,87 +1307,50 @@ mod tests {
         out
     }
 
-    /// `name` over `column` committed as one segment per fragment group.
+    /// `name` over `column` committed as one segment per `(params, fragment ids)`.
     async fn commit_grouped(
         dataset: &mut Dataset,
         name: &str,
         column: &str,
         kind: IndexType,
-        params: &dyn lance_index::IndexParams,
-        groups: &[Vec<u32>],
-    ) {
+        groups: &[(&dyn IndexParams, Vec<u32>)],
+    ) -> Vec<Uuid> {
         let mut staged = Vec::new();
-        for group in groups {
-            let mut builder = CreateIndexBuilder::new(dataset, &[column], kind, params)
+        for (params, group) in groups {
+            let mut builder = CreateIndexBuilder::new(dataset, &[column], kind, *params)
                 .name(name.to_string())
                 .fragments(group.clone());
             staged.push(builder.execute_uncommitted().await.unwrap());
         }
-        dataset
-            .commit_existing_index_segments(name, column, staged)
-            .await
-            .unwrap();
+        let ids = staged.iter().map(|s| s.uuid).collect();
+        let committed = dataset.commit_existing_index_segments(name, column, staged);
+        committed.await.unwrap();
+        ids
     }
 
-    async fn commit_btree_segments(dataset: &mut Dataset, name: &str, groups: &[Vec<u32>]) {
-        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
-        commit_grouped(dataset, name, "id", IndexType::BTree, &params, groups).await;
-    }
-
-    async fn commit_segments(
-        dataset: &Dataset,
-        new: Vec<IndexMetadata>,
-        removed: Vec<IndexMetadata>,
-    ) -> Dataset {
-        let mut committed = dataset.clone();
-        let operation = Operation::CreateIndex {
-            new_indices: new,
-            removed_indices: removed,
-        };
-        let transaction = TransactionBuilder::new(dataset.manifest.version, operation).build();
-        let (write, commit) = (Default::default(), Default::default());
-        committed
-            .apply_commit(transaction, &write, &commit)
-            .await
-            .unwrap();
-        committed
+    async fn commit_btree(dataset: &mut Dataset, name: &str, groups: &[Vec<u32>]) -> Vec<Uuid> {
+        let btree = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let params = &btree as &dyn IndexParams;
+        let groups: Vec<_> = groups.iter().map(|g| (params, g.clone())).collect();
+        commit_grouped(dataset, name, "id", IndexType::BTree, &groups).await
     }
 
     async fn open_vector(dataset: &Dataset, segment: &IndexMetadata) -> Arc<dyn VectorIndex> {
-        let opened =
-            dataset.open_vector_index_from_metadata("vector", segment, &NoOpMetricsCollector);
+        let metrics = NoOpMetricsCollector;
+        let opened = dataset.open_vector_index_from_metadata("vector", segment, &metrics);
         opened.await.unwrap()
     }
 
-    /// (row id -> code bytes) per partition; PQ codes are stored transposed.
-    async fn partition_contents(index: &Arc<dyn VectorIndex>) -> Vec<BTreeMap<u64, Vec<u8>>> {
+    /// Row ids per IVF partition.
+    async fn partition_rows(index: &Arc<dyn VectorIndex>) -> Vec<BTreeSet<u64>> {
         let mut out = Vec::new();
         for part in 0..index.ivf_model().num_partitions() {
-            let mut rows = BTreeMap::new();
+            let mut rows = BTreeSet::new();
             if index.partition_size(part) > 0 {
-                let mut reader = index
-                    .partition_reader(part, true, &NoOpMetricsCollector)
-                    .await
-                    .unwrap();
+                let metrics = NoOpMetricsCollector;
+                let mut reader = index.partition_reader(part, true, &metrics).await.unwrap();
                 while let Some(batch) = reader.try_next().await.unwrap() {
-                    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                    let fields = batch.schema().fields().clone();
-                    let is_code = |f: &Arc<Field>| {
-                        [PQ_CODE_COLUMN, SQ_CODE_COLUMN].contains(&f.name().as_str())
-                    };
-                    let code_idx = fields.iter().position(is_code).unwrap();
-                    let mut codes = batch.column(code_idx).as_fixed_size_list().clone();
-                    if fields[code_idx].name() == PQ_CODE_COLUMN {
-                        let values = codes.values().as_primitive::<UInt8Type>();
-                        let width = values.len() / batch.num_rows();
-                        let original = transpose(values, width, batch.num_rows());
-                        codes = FixedSizeListArray::try_new_from_values(original, width as i32)
-                            .unwrap();
-                    }
-                    for i in 0..batch.num_rows() {
-                        let bytes = codes.value(i).as_primitive::<UInt8Type>().values().to_vec();
-                        assert!(rows.insert(row_ids.value(i), bytes).is_none());
-                    }
+                    rows.extend(batch[ROW_ID].as_primitive::<UInt64Type>().values().iter());
                 }
             }
             out.push(rows);
@@ -1368,59 +1358,9 @@ mod tests {
         out
     }
 
-    async fn row_ids(dataset: &Dataset, segment: &IndexMetadata) -> HashSet<u64> {
-        let contents = partition_contents(&open_vector(dataset, segment).await).await;
-        contents
-            .into_iter()
-            .flat_map(|rows| rows.into_keys())
-            .collect()
-    }
-
-    /// Recall of the index search against exact search over the first eight rows.
-    async fn recall(dataset: &Dataset) -> f32 {
-        let mut scan = dataset.scan();
-        scan.project(&["vector"])
-            .unwrap()
-            .limit(Some(8), None)
-            .unwrap();
-        let batch = scan.try_into_batch().await.unwrap();
-        let vectors = batch["vector"].as_fixed_size_list();
-        let queries: Vec<ArrayRef> = (0..vectors.len()).map(|i| vectors.value(i)).collect();
-        let mut hits = 0;
-        for query in &queries {
-            let mut exact = dataset.scan();
-            exact
-                .with_row_id()
-                .nearest("vector", query.as_ref(), 10)
-                .unwrap()
-                .use_index(false);
-            let mut approx = dataset.scan();
-            approx
-                .with_row_id()
-                .nearest("vector", query.as_ref(), 10)
-                .unwrap()
-                .nprobes(4)
-                .ef(64);
-            let ids = |b: RecordBatch| b[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
-            let exact = ids(exact.try_into_batch().await.unwrap());
-            let approx = ids(approx.try_into_batch().await.unwrap());
-            hits += approx.iter().filter(|id| exact.contains(id)).count();
-        }
-        hits as f32 / (queries.len() * 10) as f32
-    }
-
-    /// Same partitions (row ids and codes), and the same recall once committed.
-    async fn assert_vector_equivalent(dataset: &Dataset, a: &IndexMetadata, b: &IndexMetadata) {
+    async fn assert_same_partitions(dataset: &Dataset, a: &IndexMetadata, b: &IndexMetadata) {
         let (ia, ib) = (open_vector(dataset, a).await, open_vector(dataset, b).await);
-        assert_eq!(partition_contents(&ia).await, partition_contents(&ib).await);
-        let with_a = commit_segments(
-            dataset,
-            vec![a.clone()],
-            segments(dataset, "vector_idx").await,
-        )
-        .await;
-        let with_b = commit_segments(&with_a, vec![b.clone()], vec![a.clone()]).await;
-        assert!((recall(&with_a).await - recall(&with_b).await).abs() <= 0.1);
+        assert_eq!(partition_rows(&ia).await, partition_rows(&ib).await);
     }
 
     /// Ids a query spanning old and new rows returns for `name`.
@@ -1440,33 +1380,6 @@ mod tests {
         ids
     }
 
-    /// Sorted row addresses a bitmap segment returns for ids in [250, 1300).
-    async fn bitmap_rows(dataset: &Dataset, segment: &IndexMetadata) -> Vec<u64> {
-        let range = SargableQuery::Range(
-            Bound::Included(ScalarValue::UInt32(Some(250))),
-            Bound::Excluded(ScalarValue::UInt32(Some(1300))),
-        );
-        let index =
-            crate::index::scalar::open_scalar_index(dataset, "id", segment, &NoOpMetricsCollector);
-        let SearchResult::Exact(rows) = index
-            .await
-            .unwrap()
-            .search(&range, &NoOpMetricsCollector)
-            .await
-            .unwrap()
-        else {
-            panic!("bitmap search must be exact");
-        };
-        let mut rows: Vec<u64> = rows
-            .true_rows()
-            .row_addrs()
-            .unwrap()
-            .map(u64::from)
-            .collect();
-        rows.sort_unstable();
-        rows
-    }
-
     async fn tag_table(dataset: &mut Dataset) {
         let indices = load_all_indices(dataset).await.unwrap().as_ref().clone();
         let manifest = Arc::make_mut(&mut dataset.manifest);
@@ -1475,24 +1388,22 @@ mod tests {
         crate::index::frag_reuse_reader::tests::persist_fixture(dataset, indices).await;
     }
 
-    async fn compact(
-        dataset: &mut Dataset,
-        target_rows_per_fragment: usize,
-        defer_index_remap: bool,
-    ) {
+    async fn compact(dataset: &mut Dataset, target: usize, defer_remap: bool) {
         let options = CompactionOptions {
-            target_rows_per_fragment,
-            defer_index_remap,
+            target_rows_per_fragment: target,
+            defer_index_remap: defer_remap,
             ..Default::default()
         };
         compact_files(dataset, options, None).await.unwrap();
     }
 
-    fn invalid(err: Error) {
+    fn invalid<T>(result: Result<T>) {
+        let err = result.err().expect("an InvalidInput error");
         assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
     }
 
-    fn retryable(err: Error) {
+    fn retryable<T>(result: Result<T>) {
+        let err = result.err().expect("a RetryableCommitConflict error");
         assert!(
             matches!(err, Error::RetryableCommitConflict { .. }),
             "{err}"
@@ -1530,6 +1441,22 @@ mod tests {
         assert!(planned.tasks.len() == 4 && planned.tasks.iter().all(|t| !t.shardable));
     }
 
+    #[tokio::test]
+    async fn strategies_are_mutually_exclusive_and_default_to_delta_merge() {
+        let dir = TempStrDir::default();
+        let dataset = indexed_dataset(dir.as_str(), &ivf_pq(), 1).await;
+        let mut retrain = size_tiered(100);
+        retrain.retrain = true;
+        let both = size_tiered(100).num_indices_to_merge(Some(1));
+        for options in [both, retrain, size_tiered(0)] {
+            invalid(plan_index_optimization(&dataset, &options).await);
+        }
+        let planned = plan(&dataset, &OptimizeOptions::default()).await;
+        assert_eq!(planned.tasks.len(), 4);
+        let delta = |t: &Task| t.num_indices_to_merge.is_none() && !t.retrain;
+        assert!(planned.tasks.iter().all(delta));
+    }
+
     /// `s1` covers four fragments, `s2` / `s3` one each, two fragments are new:
     /// with a budget of three fragments `[s2, s3, f6, f7]` packs as `[s2, s3, f6]`, `[f7]`.
     #[tokio::test]
@@ -1537,15 +1464,10 @@ mod tests {
         let dir = TempStrDir::default();
         let mut next_id = 0;
         let mut dataset = write_dataset(dir.as_str(), false, &[64; 6], &mut next_id).await;
-        commit_btree_segments(
-            &mut dataset,
-            "id_seg",
-            &[vec![0, 1, 2, 3], vec![4], vec![5]],
-        )
-        .await;
+        let groups = [vec![0, 1, 2, 3], vec![4], vec![5]];
+        let s = commit_btree(&mut dataset, "id_seg", &groups).await;
         let no_new_data = dataset.clone();
         append_rows(&mut dataset, &[64, 64], &mut next_id).await;
-        let s = uuids(&dataset, "id_seg").await;
 
         let expected = [
             (vec![s[1], s[2]], vec![6], Some(2), true),
@@ -1563,49 +1485,40 @@ mod tests {
         assert!(plan(&no_new_data, &size_tiered(65)).await.tasks.is_empty());
     }
 
+    /// Bins never mix vector models. New data joins the newest segment's
+    /// model; merges of older models wait for a round with new data, whose
+    /// segments the commit appends last, so the newest model's segment stays
+    /// the last one in the manifest.
     #[tokio::test]
-    async fn size_tiered_packs_vector_segments_per_model() {
+    async fn size_tiered_keeps_the_newest_model_last() {
         let dir = TempStrDir::default();
         let mut next_id = 0;
-        let mut dataset = write_dataset(dir.as_str(), false, &[128; 4], &mut next_id).await;
-        // The base segment trains its own centroids; the tail shares fixed ones.
-        let own = VectorIndexParams::ivf_flat(2, MetricType::L2);
-        let centroids = Float32Array::from_iter_values((0..2 * DIM).map(|i| (i / DIM) as f32));
-        let centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf = IvfBuildParams::try_with_centroids(2, Arc::new(centroids)).unwrap();
-        let shared = VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf);
-        let specs: [(&dyn lance_index::IndexParams, Vec<u32>); 3] =
-            [(&own, vec![0, 1]), (&shared, vec![2]), (&shared, vec![3])];
-        let mut staged = Vec::new();
-        for (params, fragments) in specs {
-            let mut builder =
-                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, params)
-                    .name("vector_idx".to_string())
-                    .fragments(fragments);
-            staged.push(builder.execute_uncommitted().await.unwrap());
-        }
-        let ids: Vec<Uuid> = staged.iter().map(|s| s.uuid).collect();
-        dataset
-            .commit_existing_index_segments("vector_idx", "vector", staged)
-            .await
-            .unwrap();
-        append_rows(&mut dataset, &[128, 128], &mut next_id).await;
-
+        let mut dataset = write_dataset(dir.as_str(), false, &[128; 3], &mut next_id).await;
+        let (older, newer) = (fixed_model(1.0), fixed_model(2.0));
+        let groups: [(&dyn IndexParams, Vec<u32>); 3] =
+            [(&older, vec![0]), (&older, vec![1]), (&newer, vec![2])];
+        let kind = IndexType::Vector;
+        let ids = commit_grouped(&mut dataset, "vector_idx", "vector", kind, &groups).await;
         let planned = plan(&dataset, &size_tiered(100_000)).await;
-        assert_eq!(
-            shape(&planned),
-            [(ids[1..].to_vec(), vec![4, 5], Some(2), true)]
-        );
-        let result = planned.tasks[0].execute(&dataset).await.unwrap();
-        commit_index_optimization(&mut dataset, vec![result], None)
-            .await
-            .unwrap();
+        assert!(planned.tasks.is_empty(), "older model waits");
+
+        append_rows(&mut dataset, &[128, 128], &mut next_id).await;
+        let planned = plan(&dataset, &size_tiered(100_000)).await;
+        let expected = [
+            (vec![ids[0], ids[1]], vec![], Some(2), false),
+            (vec![ids[2]], vec![3, 4], Some(1), true),
+        ];
+        assert_eq!(shape(&planned), expected);
+        let mut results = Vec::new();
+        for task in planned.tasks.iter().rev() {
+            results.push(task.execute(&dataset).await.unwrap());
+        }
+        commit(&mut dataset, results).await.unwrap();
         dataset.validate().await.unwrap();
-        assert_eq!(uuids(&dataset, "vector_idx").await[0], ids[0]);
-        assert_eq!(
-            coverage(&dataset, "vector_idx").await,
-            [vec![0, 1], vec![2, 3, 4, 5]]
-        );
+        let bitmap = |s: &IndexMetadata| s.fragment_bitmap.as_ref().unwrap().iter().collect();
+        let segments = segments(&dataset, "vector_idx").await;
+        let in_manifest_order: Vec<Vec<u32>> = segments.iter().map(bitmap).collect();
+        assert_eq!(in_manifest_order, [vec![0, 1], vec![2, 3, 4]]);
     }
 
     /// Definition-only and legacy groups become one unsharded task.
@@ -1614,7 +1527,7 @@ mod tests {
         let dir = TempStrDir::default();
         let mut next_id = 0;
         let mut dataset = write_dataset(dir.as_str(), false, &[64], &mut next_id).await;
-        create_indices(&mut dataset, &ivf_pq()).await; // too few rows to train PQ
+        create_indices(&mut dataset, &ivf_pq(), IndexType::BTree).await; // too few rows to train PQ
         let segment = segments(&dataset, "vector_idx").await.remove(0);
         assert!(is_definition_only_segment(&segment));
         append_rows(&mut dataset, &[256, 256], &mut next_id).await;
@@ -1644,11 +1557,10 @@ mod tests {
         let dir = TempStrDir::default();
         let mut next_id = 0;
         let mut dataset = write_dataset(dir.as_str(), false, &[64, 64], &mut next_id).await;
-        commit_btree_segments(&mut dataset, "id_seg", &[vec![0], vec![1]]).await;
+        let s = commit_btree(&mut dataset, "id_seg", &[vec![0], vec![1]]).await;
         dataset.delete("id < 32").await.unwrap();
         append_rows(&mut dataset, &[64], &mut next_id).await;
         dataset.delete("id >= 128 AND id < 160").await.unwrap();
-        let s = uuids(&dataset, "id_seg").await;
         // Sizes 64, 64, 32 under a budget of 128: the segments fill one bin and
         // the fragment starts another; counting live rows would pack all three.
         let planned = plan(&dataset, &size_tiered(128)).await;
@@ -1658,54 +1570,24 @@ mod tests {
         ];
         assert_eq!(shape(&planned), expected);
         assert_eq!(planned.tasks[1].fragments[0].num_rows, 32);
-        // A retired fragment left in the bitmap adds nothing; no bitmap, no size.
-        let rows = physical_rows(&dataset, [0, 1, 2].into()).await.unwrap();
-        let mut segment = segments(&dataset, "id_seg").await.remove(0);
-        segment.fragment_bitmap = Some(RoaringBitmap::from_iter([0u32, 1, 7]));
-        let live = segment.effective_fragment_bitmap(&dataset.fragment_bitmap);
-        assert_eq!(
-            SizeTieredPlanner::segment_rows(live.as_ref(), &rows),
-            Some(128)
-        );
-        assert_eq!(SizeTieredPlanner::segment_rows(None, &rows), None);
     }
 
     // ---- shardable and shard ----------------------------------------------
 
     #[tokio::test]
-    async fn shardable_follows_the_index_family_and_the_reuse_history() {
+    async fn shardable_follows_the_index_family() {
         let dir = TempStrDir::default();
         let mut next_id = 0;
         let mut dataset = write_dataset(dir.as_str(), false, &[256; 4], &mut next_id).await;
-        create_indices(&mut dataset, &ivf_pq()).await;
-        let extra = [
-            ("id_bitmap", IndexType::Bitmap, BuiltinIndexType::Bitmap),
-            ("id_zonemap", IndexType::ZoneMap, BuiltinIndexType::ZoneMap),
-        ];
-        for (name, kind, builtin) in extra {
-            let params = ScalarIndexParams::for_builtin(builtin);
-            let name = Some(name.to_string());
-            dataset
-                .create_index(&["id"], kind, name, &params, true)
-                .await
-                .unwrap();
-        }
+        create_indices(&mut dataset, &ivf_pq(), IndexType::Bitmap).await;
+        let zonemap = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        let name = Some("id_zonemap".to_string());
+        let created = dataset.create_index(&["id"], IndexType::ZoneMap, name, &zonemap, true);
+        created.await.unwrap();
         append_rows(&mut dataset, &[256], &mut next_id).await;
         let planned = plan(&dataset, &delta_merge(Some(1))).await;
         assert!(NAMES.iter().all(|name| task_for(&planned, name).shardable));
-        assert!(task_for(&planned, "id_bitmap").shardable);
         assert!(!task_for(&planned, "id_zonemap").shardable);
-
-        let dir = TempStrDir::default();
-        let mut next_id = 0;
-        let mut dataset = write_dataset(dir.as_str(), false, &[128, 128], &mut next_id).await;
-        create_indices(&mut dataset, &ivf_pq()).await;
-        tag_table(&mut dataset).await;
-        compact(&mut dataset, 256, true).await;
-        assert!(has_tagged_fragment_reuse_history(&dataset).await.unwrap());
-        append_rows(&mut dataset, &[256], &mut next_id).await;
-        let planned = plan(&dataset, &delta_merge(Some(1))).await;
-        assert!(planned.tasks.len() == 4 && planned.tasks.iter().all(|t| !t.shardable));
     }
 
     #[tokio::test]
@@ -1717,47 +1599,35 @@ mod tests {
         let shard = task.shard(&[5]).unwrap();
         assert!(shard.read_version == task.read_version && shard.index_name == "vector_idx");
         assert_eq!(shard.segments, [*task.segments.last().unwrap()]);
-        assert_eq!(
-            shard.fragments,
-            [FragmentRows {
-                id: 5,
-                num_rows: 256
-            }]
-        );
+        assert_eq!(fragment_ids(&shard), [5]);
+        assert_eq!(shard.fragments[0].num_rows, 256);
         assert!(shard.num_indices_to_merge == Some(0) && !shard.retrain && !shard.shardable);
         assert_eq!(fragment_ids(&task.shard(&[5, 4]).unwrap()), [4, 5]);
         for ids in [vec![], vec![4, 4], vec![4, 9]] {
-            invalid(task.shard(&ids).unwrap_err());
+            invalid(task.shard(&ids));
         }
-        invalid(shard.shard(&[5]).unwrap_err());
+        invalid(shard.shard(&[5]));
     }
 
     // ---- map + reduce ------------------------------------------------------
 
     #[rstest]
-    #[case::ivf_pq("vector_idx", ivf_pq())]
-    #[case::ivf_hnsw_sq("vector_idx", ivf_hnsw_sq())]
-    #[case::btree("id_idx", ivf_pq())]
-    #[case::bitmap("id_bitmap", ivf_pq())]
-    #[case::ngram("ngram_idx", ivf_pq())]
-    #[case::inverted("text_idx", ivf_pq())]
+    #[case::ivf_pq("vector_idx", IndexType::BTree, ivf_pq())]
+    #[case::ivf_hnsw_sq("vector_idx", IndexType::BTree, ivf_hnsw_sq())]
+    #[case::btree("id_idx", IndexType::BTree, ivf_pq())]
+    #[case::bitmap("id_idx", IndexType::Bitmap, ivf_pq())]
+    #[case::ngram("ngram_idx", IndexType::BTree, ivf_pq())]
+    #[case::inverted("text_idx", IndexType::BTree, ivf_pq())]
     #[tokio::test]
     async fn merging_shard_results_matches_executing_the_task(
         #[case] name: &str,
+        #[case] scalar: IndexType,
         #[case] params: VectorIndexParams,
     ) {
         let dir = TempStrDir::default();
         let mut next_id = 0;
         let mut dataset = write_dataset(dir.as_str(), false, &[256; 4], &mut next_id).await;
-        create_indices(&mut dataset, &params).await;
-        if name == "id_bitmap" {
-            let bitmap = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
-            let name = Some(name.to_string());
-            dataset
-                .create_index(&["id"], IndexType::Bitmap, name, &bitmap, true)
-                .await
-                .unwrap();
-        }
+        create_indices(&mut dataset, &params, scalar).await;
         append_rows(&mut dataset, &[256; 2], &mut next_id).await;
         let planned = plan(&dataset, &delta_merge(Some(1))).await;
         let task = task_for(&planned, name);
@@ -1765,39 +1635,21 @@ mod tests {
         let mut shard_results = Vec::new();
         for id in [4, 5] {
             let result = task.shard(&[id]).unwrap().execute(&dataset).await.unwrap();
-            let bitmap = result.new_segment.as_ref().unwrap().fragment_bitmap.clone();
-            assert!(
-                result.removed_segments.is_empty()
-                    && bitmap == Some(RoaringBitmap::from_iter([id]))
-            );
+            assert!(result.removed_segments.is_empty() && new_coverage(&result) == [id]);
             shard_results.push(result);
         }
         let reduced = task.merge(&dataset, shard_results).await.unwrap();
         assert_eq!(reduced.removed_segments, direct.removed_segments);
         assert_eq!(reduced.removed_segments, task.segments);
-        let (a, b) = (
-            direct.new_segment.clone().unwrap(),
-            reduced.new_segment.unwrap(),
-        );
-        assert_eq!(a.fragment_bitmap, b.fragment_bitmap);
+        assert_eq!(new_coverage(&reduced), new_coverage(&direct));
         if name == "vector_idx" {
-            assert_vector_equivalent(&dataset, &a, &b).await;
-        } else if name == "id_bitmap" {
-            // Two indices share the column, so ask the segments themselves.
-            let (ra, rb) = (
-                bitmap_rows(&dataset, &a).await,
-                bitmap_rows(&dataset, &b).await,
-            );
-            assert!(ra.len() == 1050 && ra == rb);
+            let direct = direct.new_segment.unwrap();
+            let reduced = reduced.new_segment.unwrap();
+            assert_same_partitions(&dataset, &direct, &reduced).await;
         } else {
             let expected = query_ids(&dataset, name, false).await;
-            let mut with_direct = dataset.clone();
-            commit_index_optimization(&mut with_direct, vec![direct], None)
-                .await
-                .unwrap();
-            assert_eq!(query_ids(&with_direct, name, true).await, expected);
-            let with_reduced = commit_segments(&with_direct, vec![b], vec![a]).await;
-            assert_eq!(query_ids(&with_reduced, name, true).await, expected);
+            commit(&mut dataset, vec![reduced]).await.unwrap();
+            assert_eq!(query_ids(&dataset, name, true).await, expected);
         }
     }
 
@@ -1810,12 +1662,11 @@ mod tests {
     async fn merging_shard_results_filters_stale_rows_like_the_task(#[case] stable: bool) {
         let dir = TempStrDir::default();
         let mut next_id = 0;
-        let mut dataset = write_dataset(dir.as_str(), stable, &[128, 128, 512], &mut next_id).await;
-        create_indices(&mut dataset, &ivf_pq()).await;
-        dataset
-            .delete("id < 16 OR (id >= 256 AND id < 272)")
-            .await
-            .unwrap();
+        let sizes = [128, 128, 512];
+        let mut dataset = write_dataset(dir.as_str(), stable, &sizes, &mut next_id).await;
+        create_indices(&mut dataset, &ivf_pq(), IndexType::BTree).await;
+        let deleted = "id < 16 OR (id >= 256 AND id < 272)";
+        dataset.delete(deleted).await.unwrap();
         compact(&mut dataset, 256, false).await;
         assert!(dataset.fragment_bitmap.contains(2) && !dataset.fragment_bitmap.contains(0));
         append_rows(&mut dataset, &[256; 2], &mut next_id).await;
@@ -1827,37 +1678,24 @@ mod tests {
         for id in fragment_ids(task) {
             shard_results.push(task.shard(&[id]).unwrap().execute(&dataset).await.unwrap());
         }
-        let reduced = task
-            .merge(&dataset, shard_results)
-            .await
-            .unwrap()
-            .new_segment
-            .unwrap();
-        assert_vector_equivalent(&dataset, &direct, &reduced).await;
+        let reduced = task.merge(&dataset, shard_results).await.unwrap();
+        let reduced = reduced.new_segment.unwrap();
+        assert_same_partitions(&dataset, &direct, &reduced).await;
 
-        let stored = row_ids(&dataset, &reduced).await;
+        let index = open_vector(&dataset, &reduced).await;
+        let stored: HashSet<u64> = partition_rows(&index).await.into_iter().flatten().collect();
         let mut scan = dataset.scan();
         scan.with_row_id().project(&["id"]).unwrap();
         let batch = scan.try_into_batch().await.unwrap();
-        let live: HashSet<u64> = batch[ROW_ID]
-            .as_primitive::<UInt64Type>()
-            .values()
-            .iter()
-            .copied()
-            .collect();
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let live: HashSet<u64> = row_ids.values().iter().copied().collect();
+        assert!(live.is_subset(&stored));
         let stale: Vec<u64> = stored.difference(&live).copied().collect();
         if stable {
-            assert_eq!(stored, live);
+            assert!(stale.is_empty(), "{stale:?}");
         } else {
-            assert!(
-                stored
-                    .iter()
-                    .all(|row| dataset.fragment_bitmap.contains((row >> 32) as u32))
-            );
-            assert!(
-                stale.len() == 16 && stale.iter().all(|row| row >> 32 == 2),
-                "{stale:?}"
-            );
+            assert_eq!(stale.len(), 16, "{stale:?}");
+            assert!(stale.iter().all(|row| row >> 32 == 2), "{stale:?}");
         }
     }
 
@@ -1867,48 +1705,29 @@ mod tests {
     async fn new_data_sources_are_merged_but_not_counted() {
         let dir = TempStrDir::default();
         let mut next_id = 0;
-        let mut dataset = write_dataset(dir.as_str(), false, &[512, 128, 128], &mut next_id).await;
+        let sizes = [512, 128, 128];
+        let mut dataset = write_dataset(dir.as_str(), false, &sizes, &mut next_id).await;
         let flat = VectorIndexParams::ivf_flat(2, MetricType::L2);
-        commit_grouped(
-            &mut dataset,
-            "vector_idx",
-            "vector",
-            IndexType::Vector,
-            &flat,
-            &[vec![0]],
-        )
-        .await;
+        let groups: [(&dyn IndexParams, Vec<u32>); 1] = [(&flat, vec![0])];
+        let kind = IndexType::Vector;
+        commit_grouped(&mut dataset, "vector_idx", "vector", kind, &groups).await;
         let committed = segments(&dataset, "vector_idx").await.remove(0);
-        let live = dataset.fragment_bitmap.as_ref();
-        let (effective, deleted) = (
-            committed.effective_fragment_bitmap(live),
-            committed.deleted_fragment_bitmap(live),
-        );
         let candidate = open_vector(&dataset, &committed).await;
-        let candidates = vec![ExistingIndex::with_coverage(
-            candidate,
-            dataset.clone(),
-            effective.unwrap(),
-            deleted.unwrap(),
-        )];
+        let candidates = vec![ExistingIndex::unfiltered(candidate)];
         let task = task_for(&plan(&dataset, &delta_merge(Some(1))).await, "vector_idx").clone();
         let mut shards = Vec::new();
         for id in [1, 2] {
             let result = task.shard(&[id]).unwrap().execute(&dataset).await.unwrap();
-            shards.push(ExistingIndex::unfiltered(
-                open_vector(&dataset, &result.new_segment.unwrap()).await,
-            ));
+            let index = open_vector(&dataset, &result.new_segment.unwrap()).await;
+            shards.push(ExistingIndex::unfiltered(index));
         }
-        // (options, target partition size) -> (candidates merged, output rows, split happened)
+        // (options, target partition size) -> (candidates merged, output rows)
         let cases = [
-            (OptimizeOptions::merge(1), None, 1, 768, false),
-            (OptimizeOptions::new(), Some(256), 0, 256, false), // ~384 rows per partition: no split, no join
-            (OptimizeOptions::new(), Some(64), 1, 768, true), // over 4 * 64: a split merges every candidate
+            (OptimizeOptions::merge(1), None, 1, 768),
+            (OptimizeOptions::new(), Some(256), 0, 256), // ~384 rows per partition: no split, no join
         ];
-        for (options, target, merged, rows, split) in cases {
-            let none = Option::<
-                RecordBatchStreamAdapter<futures::stream::Empty<Result<RecordBatch>>>,
-            >::None;
+        for (options, target, merged, rows) in cases {
+            let none: NoStream = None;
             let sources = shards.clone();
             let built = optimize_vector_indices_v2(
                 &dataset,
@@ -1920,17 +1739,11 @@ mod tests {
                 target,
             );
             let (uuid, indices_merged, files) = built.await.unwrap();
-            let output = IndexMetadata {
-                uuid,
-                files: Some(files),
-                ..committed.clone()
-            };
+            let mut output = committed.clone();
+            output.uuid = uuid;
+            output.files = Some(files);
             let index = open_vector(&dataset, &output).await;
-            let partitions = index.ivf_model().num_partitions();
-            assert_eq!(
-                (indices_merged, index.num_rows() as usize, partitions > 2),
-                (merged, rows, split)
-            );
+            assert_eq!((indices_merged, index.num_rows() as usize), (merged, rows));
         }
     }
 
@@ -1940,14 +1753,9 @@ mod tests {
         let dir = TempStrDir::default();
         let mut next_id = 0;
         let mut dataset = write_dataset(dir.as_str(), false, &[64; 6], &mut next_id).await;
-        commit_btree_segments(
-            &mut dataset,
-            "id_idx",
-            &[vec![0, 1, 2, 3], vec![4], vec![5]],
-        )
-        .await;
+        let groups = [vec![0, 1, 2, 3], vec![4], vec![5]];
+        let before = commit_btree(&mut dataset, "id_idx", &groups).await;
         append_rows(&mut dataset, &[64, 64], &mut next_id).await;
-        let before = uuids(&dataset, "id_idx").await;
         let expected = query_ids(&dataset, "id_idx", false).await;
         assert_eq!(expected, (250..512).collect::<Vec<u32>>());
 
@@ -1957,32 +1765,20 @@ mod tests {
             let shard_result = task.shard(&[6]).unwrap().execute(&dataset).await.unwrap();
             task.merge(&dataset, vec![shard_result]).await.unwrap()
         };
-        let delta = async {
-            planned.tasks[1]
-                .shard(&[7])
-                .unwrap()
-                .execute(&dataset)
-                .await
-                .unwrap()
-        };
-        let (merged, delta) = futures::join!(merged, delta);
+        let shard = planned.tasks[1].shard(&[7]).unwrap();
+        let (merged, delta) = futures::join!(merged, shard.execute(&dataset));
+        let delta = delta.unwrap();
         assert_eq!(merged.removed_segments, [before[1], before[2]]);
         assert!(delta.removed_segments.is_empty());
         let new_uuid = |r: &IndexOptimizeResult| r.new_segment.as_ref().unwrap().uuid;
         let (merged_uuid, delta_uuid) = (new_uuid(&merged), new_uuid(&delta));
-        // Results in any order: the manifest keeps the pure addition last.
-        commit_index_optimization(&mut dataset, vec![delta, merged], None)
-            .await
-            .unwrap();
+        commit(&mut dataset, vec![delta, merged]).await.unwrap();
         dataset.validate().await.unwrap();
-        assert_eq!(
-            uuids(&dataset, "id_idx").await,
-            [before[0], merged_uuid, delta_uuid]
-        );
-        assert_eq!(
-            coverage(&dataset, "id_idx").await,
-            [vec![0, 1, 2, 3], vec![4, 5, 6], vec![7]]
-        );
+        // Both hold new data, so they keep their input order after the untouched segment.
+        let after = uuids(&dataset, "id_idx").await;
+        assert_eq!(after, [before[0], delta_uuid, merged_uuid]);
+        let expected_coverage = [vec![0, 1, 2, 3], vec![4, 5, 6], vec![7]];
+        assert_eq!(coverage(&dataset, "id_idx").await, expected_coverage);
         assert_eq!(query_ids(&dataset, "id_idx", true).await, expected);
     }
 
@@ -2011,51 +1807,33 @@ mod tests {
             vec![renamed],
             overlapping,
         ] {
-            invalid(
-                commit_index_optimization(&mut dataset, results, None)
-                    .await
-                    .unwrap_err(),
-            );
+            invalid(commit(&mut dataset, results).await);
         }
-        let nothing = IndexOptimizeResult {
-            new_segment: None,
-            removed_segments: vec![],
-            ..result.clone()
-        };
-        commit_index_optimization(&mut dataset, vec![nothing], None)
-            .await
-            .unwrap();
+        let mut nothing = result.clone();
+        nothing.new_segment = None;
+        nothing.removed_segments.clear();
+        commit(&mut dataset, vec![nothing]).await.unwrap();
         assert_eq!(dataset.manifest.version, version, "nothing to commit");
 
         // From a handle that moved on through an unrelated append.
         let mut latest = dataset.clone();
         append_rows(&mut latest, &[64], &mut (6 * 256)).await;
-        commit_index_optimization(&mut latest, vec![result.clone()], None)
-            .await
-            .unwrap();
+        commit(&mut latest, vec![result.clone()]).await.unwrap();
         latest.validate().await.unwrap();
         assert_eq!(coverage(&latest, "id_idx").await, [vec![0, 1, 2, 3, 4, 5]]);
         assert_eq!(latest.unindexed_fragments("id_idx").await.unwrap().len(), 1);
 
-        // Another writer optimized the same index: a retryable conflict, from either handle.
+        // Another writer optimized the same index: a retryable conflict from either handle.
         let dir = TempStrDir::default();
         let mut dataset = indexed_dataset(dir.as_str(), &ivf_pq(), 2).await;
         let planned = plan(&dataset, &only("id_idx", delta_merge(Some(1)))).await;
         let result = planned.tasks[0].execute(&dataset).await.unwrap();
         let mut other = dataset.clone();
-        let mut options = OptimizeOptions::merge(1);
-        options.index_names = Some(vec!["id_idx".to_string()]);
+        let options = only("id_idx", delta_merge(Some(1)));
         other.optimize_indices(&options).await.unwrap();
-        retryable(
-            commit_index_optimization(&mut other, vec![result.clone()], None)
-                .await
-                .unwrap_err(),
-        );
-        retryable(
-            commit_index_optimization(&mut dataset, vec![result], None)
-                .await
-                .unwrap_err(),
-        );
+        for handle in [&mut other, &mut dataset] {
+            retryable(commit(handle, vec![result.clone()]).await);
+        }
     }
 
     /// An append or delete after the plan commits; a compaction of covered
@@ -2079,10 +1857,9 @@ mod tests {
             _ => ("id_idx", "id", IndexType::BTree),
         };
         let params = ScalarIndexParams::for_builtin(kind.try_into().unwrap());
-        dataset
-            .create_index(&[column], kind, Some(name.into()), &params, true)
-            .await
-            .unwrap();
+        let columns = [column];
+        let created = dataset.create_index(&columns, kind, Some(name.into()), &params, true);
+        created.await.unwrap();
         append_rows(&mut dataset, &[128], &mut next_id).await;
         let planned = plan(&dataset, &delta_merge(Some(1))).await;
         let result = task_for(&planned, name).execute(&dataset).await.unwrap();
@@ -2093,62 +1870,39 @@ mod tests {
             "delete" => drop(latest.delete("id < 10").await.unwrap()),
             _ => compact(&mut latest, 1024, drift != "compact").await,
         }
-        let committed = commit_index_optimization(&mut latest, vec![result], None).await;
+        let committed = commit(&mut latest, vec![result]).await;
         if matches!(drift, "append" | "delete" | "tagged") {
             committed.unwrap();
             latest.validate().await.unwrap();
             assert_eq!(segments(&latest, name).await.len(), 1);
         } else {
-            retryable(committed.unwrap_err());
+            retryable(committed);
         }
     }
 
     /// On a tagged table a merged segment keeps its sources' provenance
     /// coordinates and the reader derives the live coverage, so a result is
     /// never checked against stored coverage; the commit validates and lands.
+    /// Shards are not available there.
     #[tokio::test]
     async fn tagged_merge_keeps_provenance_coverage() {
         let dir = TempStrDir::default();
         let mut next_id = 0;
         let mut dataset = write_dataset(dir.as_str(), false, &[128, 128], &mut next_id).await;
-        create_indices(
-            &mut dataset,
-            &VectorIndexParams::ivf_flat(2, MetricType::L2),
-        )
-        .await;
+        let flat = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        create_indices(&mut dataset, &flat, IndexType::BTree).await;
         tag_table(&mut dataset).await;
         compact(&mut dataset, 256, true).await; // fragments 0 and 1 become 2
         append_rows(&mut dataset, &[128], &mut next_id).await; // fragment 3
-        let stored = load_all_indices(&dataset).await.unwrap();
-        let stored = stored.iter().find(|s| s.name == "vector_idx").unwrap();
-        assert_eq!(
-            stored.fragment_bitmap,
-            Some(RoaringBitmap::from_iter([0u32, 1]))
-        );
-
-        let planned = plan(&dataset, &only("vector_idx", delta_merge(None))).await;
-        let result = planned.tasks[0].execute(&dataset).await.unwrap();
-        assert_eq!(result.removed_segments, [stored.uuid]);
-        let bitmap = result
-            .new_segment
-            .as_ref()
-            .unwrap()
-            .fragment_bitmap
-            .clone()
-            .unwrap();
-        assert_eq!(
-            bitmap.iter().collect::<Vec<u32>>(),
-            [0, 1, 3],
-            "provenance plus new"
-        );
-        commit_index_optimization(&mut dataset, vec![result], None)
+        let planned = plan(&dataset, &delta_merge(None)).await;
+        assert!(planned.tasks.len() == 4 && planned.tasks.iter().all(|t| !t.shardable));
+        let result = task_for(&planned, "vector_idx")
+            .execute(&dataset)
             .await
             .unwrap();
-        assert_eq!(
-            coverage(&dataset, "vector_idx").await,
-            [vec![2, 3]],
-            "derived"
-        );
+        assert_eq!(new_coverage(&result), [0, 1, 3], "provenance plus new");
+        commit(&mut dataset, vec![result]).await.unwrap();
+        assert_eq!(coverage(&dataset, "vector_idx").await, [vec![2, 3]]);
     }
 
     /// An in-place rewrite of an indexed column on a tagged table withdraws
@@ -2164,23 +1918,17 @@ mod tests {
         let dir = TempStrDir::default();
         let mut next_id = 0;
         let mut dataset = write_dataset(dir.as_str(), false, &[128, 128], &mut next_id).await;
-        create_indices(
-            &mut dataset,
-            &VectorIndexParams::ivf_flat(2, MetricType::L2),
-        )
-        .await;
+        let flat = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        create_indices(&mut dataset, &flat, IndexType::BTree).await;
         tag_table(&mut dataset).await;
         compact(&mut dataset, 256, true).await;
         // One row's text rewritten in place: the whole transition is withdrawn from `text_idx`.
         let schema = dataset.schema().project(&["id", "text"]).unwrap();
-        let source = RecordBatch::try_new(
-            Arc::new(Schema::from(&schema)),
-            vec![
-                Arc::new(UInt32Array::from(vec![5u32])),
-                Arc::new(StringArray::from(vec!["rewritten"])),
-            ],
-        )
-        .unwrap();
+        let columns: Vec<arrow_array::ArrayRef> = vec![
+            Arc::new(UInt32Array::from(vec![5u32])),
+            Arc::new(StringArray::from(vec!["rewritten"])),
+        ];
+        let source = RecordBatch::try_new(Arc::new(Schema::from(&schema)), columns).unwrap();
         MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()])
             .unwrap()
             .when_matched(WhenMatched::UpdateAll)
@@ -2192,69 +1940,29 @@ mod tests {
             .await
             .unwrap();
         let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
-        let stored = load_all_indices(&dataset).await.unwrap();
-        assert!(
-            stored.iter().any(|s| s.name == "text_idx"),
-            "the withdrawn segment stays registered"
-        );
-        assert!(
-            segments(&dataset, "text_idx")
-                .await
-                .iter()
-                .all(|s| s.fragment_bitmap.as_ref().is_none_or(|b| b.is_empty()))
-        );
+        let withdrawn = |s: &IndexMetadata| s.fragment_bitmap.as_ref().is_none_or(|b| b.is_empty());
+        assert!(segments(&dataset, "text_idx").await.iter().all(withdrawn));
 
         let planned = plan(&dataset, &delta_merge(None)).await;
         let task = task_for(&planned, "text_idx");
         assert!(task.segments.len() == 1 && !task.shardable);
-        assert!(task_for(&planned, "vector_idx").segments.len() == 1);
-        dataset
-            .optimize_indices(&OptimizeOptions::default())
-            .await
-            .unwrap();
+        assert_eq!(task_for(&planned, "vector_idx").segments.len(), 1);
+        let options = OptimizeOptions::default();
+        dataset.optimize_indices(&options).await.unwrap();
         let live: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
         assert_eq!(coverage(&dataset, "text_idx").await, [live]);
         let mut scan = dataset.scan();
+        let query = FullTextSearchQuery::new("rewritten".into());
         scan.project(&["id"])
             .unwrap()
-            .full_text_search(FullTextSearchQuery::new("rewritten".into()))
+            .full_text_search(query)
             .unwrap();
         let batch = scan.try_into_batch().await.unwrap();
-        assert_eq!(
-            batch["id"].as_primitive::<UInt32Type>().values().to_vec(),
-            [5]
-        );
+        let ids = batch["id"].as_primitive::<UInt32Type>().values();
+        assert_eq!(ids, &[5]);
     }
 
     // ---- serialization -----------------------------------------------------
-
-    #[tokio::test]
-    async fn strategies_are_mutually_exclusive_and_default_to_delta_merge() {
-        let dir = TempStrDir::default();
-        let dataset = indexed_dataset(dir.as_str(), &ivf_pq(), 1).await;
-        let mut retrain = size_tiered(100);
-        retrain.retrain = true;
-        for options in [
-            size_tiered(100).num_indices_to_merge(Some(1)),
-            retrain,
-            size_tiered(0),
-        ] {
-            invalid(
-                plan_index_optimization(&dataset, &options)
-                    .await
-                    .unwrap_err(),
-            );
-        }
-        let planned = plan(&dataset, &OptimizeOptions::default()).await;
-        assert_eq!(planned.tasks.len(), 4);
-        assert!(
-            planned
-                .tasks
-                .iter()
-                .all(|t| t.num_indices_to_merge.is_none() && !t.retrain)
-        );
-        assert!(SizeTieredPlanner::new(None, 0).is_err());
-    }
 
     #[tokio::test]
     async fn plan_task_and_result_round_trip_through_json() {
@@ -2264,33 +1972,18 @@ mod tests {
         let json = serde_json::to_string(&planned).unwrap();
         assert_eq!(serde_json::from_str::<Plan>(&json).unwrap(), planned);
         let json = serde_json::to_string(task_for(&planned, "id_idx")).unwrap();
-        let result = serde_json::from_str::<Task>(&json)
-            .unwrap()
-            .execute(&dataset)
-            .await
-            .unwrap();
+        let task: Task = serde_json::from_str(&json).unwrap();
+        let result = task.execute(&dataset).await.unwrap();
         let json = serde_json::to_string(&result).unwrap();
         let decoded: IndexOptimizeResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            (decoded.read_version, &decoded.removed_segments),
-            (result.read_version, &result.removed_segments)
-        );
-        let (a, b) = (
-            decoded.new_segment.clone().unwrap(),
-            result.new_segment.unwrap(),
-        );
+        assert_eq!(decoded.removed_segments, result.removed_segments);
+        let a = decoded.new_segment.clone().unwrap();
+        let b = result.new_segment.unwrap();
         assert!(a.uuid == b.uuid && a.fragment_bitmap == b.fragment_bitmap && a.files == b.files);
-        assert_eq!(a.index_details, b.index_details);
-        let none = IndexOptimizeResult {
-            new_segment: None,
-            ..decoded
-        };
+        let mut none = decoded;
+        none.new_segment = None;
         let json = serde_json::to_string(&none).unwrap();
-        assert!(
-            serde_json::from_str::<IndexOptimizeResult>(&json)
-                .unwrap()
-                .new_segment
-                .is_none()
-        );
+        let none: IndexOptimizeResult = serde_json::from_str(&json).unwrap();
+        assert!(none.new_segment.is_none());
     }
 }
