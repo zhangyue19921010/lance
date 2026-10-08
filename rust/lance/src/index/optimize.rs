@@ -636,36 +636,45 @@ async fn has_tagged_fragment_reuse_history(dataset: &Dataset) -> Result<bool> {
         .any(|index| index.name == FRAG_REUSE_INDEX_NAME && index.index_version != 0))
 }
 
-/// `open_last` is false when the last segment cannot be opened by itself (a
-/// definition only, or a segment the tagged reader excludes); such a group is
-/// rebuilt whole, so its format need not be known.
-async fn index_kind(
-    dataset: &Dataset,
-    segments: &[IndexMetadata],
-    open_last: bool,
-) -> Result<IndexKind> {
+/// `None` when the group's last segment cannot be opened: the merge would
+/// report the same and skip the group, so it is left out of the plan rather
+/// than failing the pass for every other index.
+async fn index_kind(dataset: &Dataset, segments: &[IndexMetadata]) -> Result<Option<IndexKind>> {
     let last = segments.last().expect("a group has at least one segment");
     let field_path = dataset.schema().field_path(last.fields[0])?;
+    let skip = |error: Error| {
+        log::warn!(
+            "Skipping optimization of index '{}': cannot open segment {}: {error}",
+            last.name,
+            last.uuid
+        );
+        Ok(None)
+    };
+    // Segments are opened through the maintenance entry, as the merge opens
+    // them: a segment the tagged reader excludes opens as empty instead of
+    // failing. A definition without files has nothing to open.
     if metadata_is_vector_index(dataset, last).await? {
-        let legacy = if !open_last {
-            false
-        } else {
-            dataset
-                .open_vector_index_from_metadata(&field_path, last, &NoOpMetricsCollector)
-                .await?
-                .as_any()
-                .is::<LegacyIvfIndex>()
+        if is_definition_only_segment(last) {
+            return Ok(Some(IndexKind::Vector { legacy: false }));
+        }
+        let opened = dataset
+            .open_vector_index_for_maintenance(&field_path, &last.uuid, &NoOpMetricsCollector)
+            .await;
+        return match opened {
+            Ok(index) => Ok(Some(IndexKind::Vector {
+                legacy: index.as_any().is::<LegacyIvfIndex>(),
+            })),
+            Err(error) => skip(error),
         };
-        return Ok(IndexKind::Vector { legacy });
     }
     let details = fetch_index_details(dataset, &field_path, last).await?;
     let type_url = details.type_url.as_str();
     if type_url.ends_with("BTreeIndexDetails") {
-        Ok(IndexKind::BTree)
+        Ok(Some(IndexKind::BTree))
     } else if type_url.ends_with("BitmapIndexDetails") {
-        Ok(IndexKind::Bitmap)
+        Ok(Some(IndexKind::Bitmap))
     } else if type_url.ends_with("NGramIndexDetails") {
-        Ok(IndexKind::NGram)
+        Ok(Some(IndexKind::NGram))
     } else if type_url.ends_with("InvertedIndexDetails") {
         let details = lance_index::pbold::InvertedIndexDetails::decode(details.value.as_slice())
             .map_err(|error| {
@@ -681,18 +690,21 @@ async fn index_kind(
             last.fields[0],
             granularity,
         )?;
-        let index = super::scalar::open_scalar_index(
-            dataset,
-            &resolved.canonical_path,
-            last,
-            &NoOpMetricsCollector,
-        )
-        .await?;
-        Ok(IndexKind::Inverted {
-            legacy: index.update_criteria().requires_old_data,
-        })
+        let opened = dataset
+            .open_scalar_index_for_maintenance(
+                &resolved.canonical_path,
+                &last.uuid,
+                &NoOpMetricsCollector,
+            )
+            .await;
+        match opened {
+            Ok(index) => Ok(Some(IndexKind::Inverted {
+                legacy: index.update_criteria().requires_old_data,
+            })),
+            Err(error) => skip(error),
+        }
     } else {
-        Ok(IndexKind::Other)
+        Ok(Some(IndexKind::Other))
     }
 }
 
@@ -750,9 +762,9 @@ async fn index_groups(
                     .get(&segment.uuid)
                     .is_some_and(|b| b.is_empty())
         };
-        let last = segments.last().expect("a group has at least one segment");
-        let open_last = !is_definition_only_segment(last) && !dormant(last);
-        let kind = index_kind(dataset, &segments, open_last).await?;
+        let Some(kind) = index_kind(dataset, &segments).await? else {
+            continue;
+        };
         let has_dormant = segments.iter().any(dormant);
         let has_definition_only = segments.iter().any(is_definition_only_segment);
         groups.push(IndexGroup {
@@ -2097,6 +2109,81 @@ mod tests {
             coverage(&dataset, "vector_idx").await,
             [vec![2, 3]],
             "derived"
+        );
+    }
+
+    /// An in-place rewrite of an indexed column on a tagged table withdraws
+    /// that index's coverage. The planner still plans the other indices, hands
+    /// the withdrawn one to a whole task, and `optimize_indices` rebuilds it.
+    #[tokio::test]
+    #[serial_test::serial(frag_reuse_maintenance)]
+    async fn withdrawn_segment_is_rebuilt_instead_of_failing_the_plan() {
+        use crate::dataset::{
+            MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
+        };
+
+        let dir = TempStrDir::default();
+        let mut next_id = 0;
+        let mut dataset = write_dataset(dir.as_str(), false, &[128, 128], &mut next_id).await;
+        create_indices(
+            &mut dataset,
+            &VectorIndexParams::ivf_flat(2, MetricType::L2),
+        )
+        .await;
+        tag_table(&mut dataset).await;
+        compact(&mut dataset, 256, true).await;
+        // One row's text rewritten in place: the whole transition is withdrawn from `text_idx`.
+        let schema = dataset.schema().project(&["id", "text"]).unwrap();
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::from(&schema)),
+            vec![
+                Arc::new(UInt32Array::from(vec![5u32])),
+                Arc::new(StringArray::from(vec!["rewritten"])),
+            ],
+        )
+        .unwrap();
+        MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .write_mode(MergeInsertWriteMode::RewriteColumns)
+            .try_build()
+            .unwrap()
+            .execute_batches(vec![source])
+            .await
+            .unwrap();
+        let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+        let stored = load_all_indices(&dataset).await.unwrap();
+        assert!(
+            stored.iter().any(|s| s.name == "text_idx"),
+            "the withdrawn segment stays registered"
+        );
+        assert!(
+            segments(&dataset, "text_idx")
+                .await
+                .iter()
+                .all(|s| s.fragment_bitmap.as_ref().is_none_or(|b| b.is_empty()))
+        );
+
+        let planned = plan(&dataset, &delta_merge(None)).await;
+        let task = task_for(&planned, "text_idx");
+        assert!(task.segments.len() == 1 && !task.shardable);
+        assert!(task_for(&planned, "vector_idx").segments.len() == 1);
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let live: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+        assert_eq!(coverage(&dataset, "text_idx").await, [live]);
+        let mut scan = dataset.scan();
+        scan.project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new("rewritten".into()))
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<UInt32Type>().values().to_vec(),
+            [5]
         );
     }
 
