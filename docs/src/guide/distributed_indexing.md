@@ -282,9 +282,9 @@ such tasks run as one unit.
 against the manifest at that version (every replaced segment exists under
 the result's index name, no segment is replaced twice, the remaining coverage
 does not overlap) before anything is written. New segments holding fragments
-nothing covered at that version are appended after the others, so the
-manifest's last segment stays the one holding the newest data whatever order
-the results arrive in. What changed on the table since
+nothing covered at that version are appended after the others, the newest
+such fragment last, so the manifest's last segment stays the one holding the
+newest data whatever order the results arrive in. What changed on the table since
 the plan is handled by the commit's conflict resolution: an append or a
 delete is fine, while a compaction that rewrote covered fragments, or another
 optimize that replaced the same segments, is reported as a retryable

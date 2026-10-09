@@ -385,6 +385,8 @@ impl IndexOptimizeTask {
         let last = segments
             .last()
             .expect("merge_indices_impl refuses an empty segment list");
+        // The protobuf form keeps milliseconds; stamp what survives a round trip.
+        let now = chrono::Utc::now();
         let new_segment = IndexMetadata {
             uuid: merged.new_uuid,
             name: last.name.clone(),
@@ -394,7 +396,7 @@ impl IndexOptimizeTask {
             fragment_bitmap: Some(merged.new_fragment_bitmap),
             index_details: Some(Arc::new(merged.new_index_details)),
             index_version: merged.new_index_version,
-            created_at: Some(chrono::Utc::now()),
+            created_at: chrono::DateTime::from_timestamp_millis(now.timestamp_millis()),
             base_id: None,
             files: Some(merged.files),
         };
@@ -453,26 +455,26 @@ pub async fn commit_index_optimization(
     let stored = load_all_indices(&snapshot).await?;
     let by_uuid: HashMap<Uuid, &IndexMetadata> = stored.iter().map(|s| (s.uuid, s)).collect();
     // Results indexing fragments nothing covered at V are appended after the
-    // others, so the manifest's last segment keeps holding the newest data,
-    // and the model the next append takes, whatever order results arrive in.
+    // others, the newest such fragment last, so the manifest's last segment
+    // keeps holding the newest data, and the model the next append takes,
+    // whatever order results arrive in.
     let mut covered_at_v: HashMap<&str, RoaringBitmap> = HashMap::new();
     for segment in stored.iter() {
         if let Some(bitmap) = &segment.fragment_bitmap {
             *covered_at_v.entry(segment.name.as_str()).or_default() |= bitmap;
         }
     }
-    let carries_new_data = |result: &&IndexOptimizeResult| {
+    let newest_new_fragment = |result: &&IndexOptimizeResult| -> Option<u32> {
         let covered = covered_at_v.get(result.index_name.as_str());
         let segment = result.new_segment.as_ref().expect("filtered to Some");
-        let bitmap = segment.fragment_bitmap.as_ref();
-        bitmap.is_some_and(|bitmap| {
-            bitmap
-                .iter()
-                .any(|id| !covered.is_some_and(|c| c.contains(id)))
-        })
+        let bitmap = segment.fragment_bitmap.as_ref()?;
+        bitmap
+            .iter()
+            .filter(|id| !covered.is_some_and(|c| c.contains(*id)))
+            .max()
     };
     let mut produced = produced;
-    produced.sort_by_key(carries_new_data);
+    produced.sort_by_key(newest_new_fragment);
     let names: HashSet<&str> = produced.iter().map(|r| r.index_name.as_str()).collect();
     let mut removed_indices = Vec::new();
     let mut removed_uuids = HashSet::new();
@@ -930,7 +932,7 @@ impl SizeTieredPlanner {
         }
         let field_path = dataset.schema().field_path(group.segments[0].fields[0])?;
         let logical = dataset
-            .open_logical_vector_index(&field_path, &group.name)
+            .open_logical_vector_index_for_maintenance(&field_path, &group.name)
             .await?;
         let opened: HashMap<Uuid, _> = logical
             .iter()
@@ -1769,9 +1771,9 @@ mod tests {
         let (merged_uuid, delta_uuid) = (new_uuid(&merged), new_uuid(&delta));
         commit(&mut dataset, vec![delta, merged]).await.unwrap();
         dataset.validate().await.unwrap();
-        // Both hold new data, so they keep their input order after the untouched segment.
+        // Both hold new data; the one with the newest fragment goes last, whatever the input order.
         let after = uuids(&dataset, "id_idx").await;
-        assert_eq!(after, [before[0], delta_uuid, merged_uuid]);
+        assert_eq!(after, [before[0], merged_uuid, delta_uuid]);
         let expected_coverage = [vec![0, 1, 2, 3], vec![4, 5, 6], vec![7]];
         assert_eq!(coverage(&dataset, "id_idx").await, expected_coverage);
         assert_eq!(query_ids(&dataset, "id_idx", true).await, expected);
@@ -1970,15 +1972,18 @@ mod tests {
         let task: Task = serde_json::from_str(&json).unwrap();
         let result = task.execute(&dataset).await.unwrap();
         let json = serde_json::to_string(&result).unwrap();
-        let decoded: IndexOptimizeResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.removed_segments, result.removed_segments);
-        let a = decoded.new_segment.clone().unwrap();
-        let b = result.new_segment.unwrap();
-        assert!(a.uuid == b.uuid && a.fragment_bitmap == b.fragment_bitmap && a.files == b.files);
-        let mut none = decoded;
-        none.new_segment = None;
+        assert_eq!(
+            serde_json::from_str::<IndexOptimizeResult>(&json).unwrap(),
+            result
+        );
+        let none = IndexOptimizeResult {
+            new_segment: None,
+            ..result
+        };
         let json = serde_json::to_string(&none).unwrap();
-        let none: IndexOptimizeResult = serde_json::from_str(&json).unwrap();
-        assert!(none.new_segment.is_none());
+        assert_eq!(
+            serde_json::from_str::<IndexOptimizeResult>(&json).unwrap(),
+            none
+        );
     }
 }
