@@ -244,21 +244,28 @@ optimize runs and produces one new segment plus the list of replaced
 segments. Which candidates are replaced is decided while executing, by the
 same rules `optimize_indices` applies.
 
-A task marked `shardable` can have its new data built in parallel:
+The new data, the rows of the task's fragments, can reach the task in two
+ways:
+
+- `execute` scans the fragments. One worker runs the whole task.
+- `merge` reads the new data from segments already built over the
+  fragments, then merges them with the candidate segments the way `execute`
+  does. The result is the same: same coverage, same replaced segments, same
+  rows per IVF partition. For HNSW sub-indices the graph is rebuilt during
+  the merge, so the search results may differ in the way two builds over
+  the same vectors do.
+
+The segments `merge` reads are the results of shards: smaller tasks derived
+with `shard(fragment_ids)` from a task marked `shardable`, each indexing a
+subset of the fragments with the model of the task's last segment and
+replacing nothing. A shard is an ordinary task, run with `execute`; it
+exists so that one task's new data can be built on several workers at once:
 
 ```text
 shards = [task.shard(ids) for ids in <partition of task.fragments>]
 parts  = [shard.execute(dataset) for shard in shards]      # in parallel
 result = task.merge(dataset, parts)                         # one worker
 ```
-
-`shard(fragment_ids)` derives a task over a subset of the fragments that
-indexes them with the model of the task's last segment and replaces nothing;
-`merge` re-runs the task with the shard outputs as its new data instead of
-scanning the fragments. The result equals executing the task directly:
-same coverage, same replaced segments, same rows per IVF partition. For HNSW
-sub-indices the graph is rebuilt during the merge, so the search results may
-differ in the way two builds over the same vectors do.
 
 How the fragments are partitioned is up to the caller; the row counts on the
 task are there to balance the shards (for example, the same size-based

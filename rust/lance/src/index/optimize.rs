@@ -85,9 +85,15 @@ pub struct FragmentRows {
     pub num_rows: u64,
 }
 
-/// Produce one new segment of `index_name` from some of `segments` and all
-/// of `fragments`, and report which of `segments` it replaces. A shard (see
-/// [`Self::shard`]) is the same type with `Some(0)` and one segment for the model.
+/// One unit of index optimization: produce one new segment of `index_name`
+/// from some of `segments` and all of `fragments`, and report which of
+/// `segments` it replaces.
+///
+/// The new data, the rows of `fragments`, can come from two places:
+/// [`Self::execute`] scans the fragments, [`Self::merge`] reads it from
+/// segments already built over them. Those segments are the results of
+/// smaller tasks derived with [`Self::shard`], which is how one task's new
+/// data gets built on several workers at once.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexOptimizeTask {
     pub read_version: u64,
@@ -99,7 +105,8 @@ pub struct IndexOptimizeTask {
     pub fragments: Vec<FragmentRows>,
     pub num_indices_to_merge: Option<usize>,
     pub retrain: bool,
-    /// Whether [`Self::shard`] may split the new data; false for a shard.
+    /// Whether [`Self::shard`] may derive smaller tasks from this one; false
+    /// for a task so derived.
     pub shardable: bool,
 }
 
@@ -115,7 +122,8 @@ pub struct IndexOptimizeResult {
 }
 
 impl IndexOptimizeTask {
-    /// Execute at the task's `read_version`, checking `dataset` out if needed.
+    /// Execute at the task's `read_version`, checking `dataset` out if needed,
+    /// scanning the fragments for the new data.
     pub async fn execute(&self, dataset: &Dataset) -> Result<IndexOptimizeResult> {
         self.execute_with_progress(dataset, noop_progress()).await
     }
@@ -137,16 +145,14 @@ impl IndexOptimizeTask {
         .await
     }
 
-    /// Derive a shard of this task.
+    /// Derive a smaller task, a shard, from this one: it indexes only
+    /// `fragment_ids`, a subset of this task's fragments, with the model of
+    /// this task's last segment, and replaces no segment. A shard is an
+    /// ordinary task, run with [`Self::execute`].
     ///
-    /// A shard is a task that indexes only `fragment_ids`, a subset of this
-    /// task's fragments, with the model of this task's last segment, and
-    /// replaces no segment.
-    ///
-    /// Shards let one task's new data be built on several workers at once:
-    /// execute one shard per part of the fragments, then pass their results to
-    /// [`Self::merge`], which yields the same result as executing this task
-    /// directly.
+    /// Executing one shard per part of the fragments and passing their results
+    /// to [`Self::merge`] yields the same result as executing this task
+    /// directly, with the new data built on several workers at once.
     ///
     /// A shard's result is also complete on its own and can be committed as a
     /// delta segment, for example when the merge step is skipped or fails.
@@ -203,9 +209,10 @@ impl IndexOptimizeTask {
         })
     }
 
-    /// Execute with the new data read from `shard_results` instead of the
-    /// fragments. The shard segments must replace nothing and together cover
-    /// exactly this task's fragments.
+    /// Execute with the new data read from `shard_results`, the results of
+    /// this task's shards, instead of scanning the fragments. The shard
+    /// segments must replace nothing and together cover exactly this task's
+    /// fragments.
     pub async fn merge(
         &self,
         dataset: &Dataset,
