@@ -165,39 +165,30 @@ impl IndexOptimizeTask {
                 self.index_name
             )));
         }
-        if fragment_ids.is_empty() {
-            return Err(Error::invalid_input(
-                "an index optimize shard needs at least one fragment",
-            ));
-        }
-        let mut wanted = HashSet::with_capacity(fragment_ids.len());
-        for id in fragment_ids {
-            if !wanted.insert(*id) {
-                return Err(Error::invalid_input(format!(
-                    "fragment {id} is listed twice for the index optimize shard"
-                )));
-            }
-        }
-        let fragments: Vec<FragmentRows> = self
-            .fragments
-            .iter()
-            .filter(|fragment| wanted.contains(&fragment.id))
-            .cloned()
-            .collect();
-        if fragments.len() != wanted.len() {
-            let known: HashSet<u32> = self.fragments.iter().map(|f| f.id).collect();
-            let unknown: Vec<u32> = wanted.difference(&known).copied().collect();
-            return Err(Error::invalid_input(format!(
-                "fragments {unknown:?} are not part of the index optimize task for '{}'",
-                self.index_name
-            )));
-        }
         let reference = *self.segments.last().ok_or_else(|| {
             Error::invalid_input(format!(
                 "index optimize task for '{}' has no segment to take a model from",
                 self.index_name
             ))
         })?;
+        // Keeping the task's order, so the count alone tells whether every id
+        // named a distinct fragment of the task.
+        let wanted: HashSet<u32> = fragment_ids.iter().copied().collect();
+        let fragments: Vec<FragmentRows> = self
+            .fragments
+            .iter()
+            .filter(|fragment| wanted.contains(&fragment.id))
+            .cloned()
+            .collect();
+        if fragments.is_empty() || fragments.len() != fragment_ids.len() {
+            return Err(Error::invalid_input(format!(
+                "an index optimize shard takes distinct fragments of its task; \
+                 {} ids were given, {} of them distinct fragments of the task for '{}'",
+                fragment_ids.len(),
+                fragments.len(),
+                self.index_name
+            )));
+        }
         Ok(Self {
             read_version: self.read_version,
             index_name: self.index_name.clone(),
