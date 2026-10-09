@@ -228,72 +228,46 @@ impl IndexOptimizeTask {
             ))
         })?;
 
-        let expected: RoaringBitmap = self.fragments.iter().map(|f| f.id).collect();
-        let mut covered = RoaringBitmap::new();
+        // A shard result is at this task's version, replaces nothing and
+        // carries a segment of this index on its fields.
         let mut new_segments = Vec::with_capacity(shard_results.len());
+        let mut counted = 0u64;
         for result in shard_results {
-            if result.index_name != self.index_name || result.read_version != self.read_version {
-                return Err(Error::invalid_input(format!(
-                    "shard result for '{}' at version {} does not belong to the task for '{}' \
-                     at version {}",
-                    result.index_name, result.read_version, self.index_name, self.read_version
-                )));
-            }
-            if !result.removed_segments.is_empty() {
-                return Err(Error::invalid_input(format!(
-                    "shard result for '{}' replaced segments {:?}; a shard must replace nothing",
-                    self.index_name, result.removed_segments
-                )));
-            }
-            let Some(segment) = result.new_segment else {
-                return Err(Error::invalid_input(format!(
-                    "shard result for '{}' carries no segment",
-                    self.index_name
-                )));
+            let segment = match result.new_segment {
+                Some(segment)
+                    if result.read_version == self.read_version
+                        && result.removed_segments.is_empty()
+                        && segment.name == self.index_name
+                        && segment.fields == reference.fields =>
+                {
+                    segment
+                }
+                _ => {
+                    return Err(Error::invalid_input(format!(
+                        "shard result for '{}' at version {} is not a shard of the task \
+                         for '{}' at version {}",
+                        result.index_name, result.read_version, self.index_name, self.read_version
+                    )));
+                }
             };
-            if segment.name != self.index_name || segment.fields != reference.fields {
-                return Err(Error::invalid_input(format!(
-                    "shard segment {} is '{}' on fields {:?}, expected '{}' on {:?}",
-                    segment.uuid, segment.name, segment.fields, self.index_name, reference.fields
-                )));
-            }
-            let bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "shard segment {} has no fragment coverage",
-                    segment.uuid
-                ))
-            })?;
-            if !covered.is_disjoint(bitmap) {
-                return Err(Error::invalid_input(format!(
-                    "shard segment {} covers fragments {:?} another shard already covers",
-                    segment.uuid,
-                    covered.clone() & bitmap
-                )));
-            }
-            if !bitmap.is_subset(&expected) {
-                return Err(Error::invalid_input(format!(
-                    "shard segment {} covers fragments {:?} outside the task's {:?}",
-                    segment.uuid,
-                    bitmap.clone() - &expected,
-                    expected
-                )));
-            }
-            covered |= bitmap;
+            counted += segment
+                .fragment_bitmap
+                .as_ref()
+                .map_or(0, RoaringBitmap::len);
             new_segments.push(segment);
         }
-        if covered != expected {
+        // Together the shard segments cover the task's fragments, each once.
+        let new_data = NewIndexData::Segments(&new_segments);
+        let covered = new_data.fragment_bitmap()?;
+        let expected: RoaringBitmap = self.fragments.iter().map(|f| f.id).collect();
+        if covered != expected || counted != expected.len() {
             return Err(Error::invalid_input(format!(
-                "shard results cover fragments {covered:?}, the task's are {expected:?}"
+                "shard segments cover fragments {covered:?} ({counted} in all), \
+                 the task's are {expected:?}"
             )));
         }
 
-        self.run(
-            dataset,
-            segments,
-            NewIndexData::Segments(&new_segments),
-            progress,
-        )
-        .await
+        self.run(dataset, segments, new_data, progress).await
     }
 
     async fn checkout(&self, dataset: &Dataset) -> Result<Dataset> {

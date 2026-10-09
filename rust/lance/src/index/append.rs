@@ -82,7 +82,7 @@ impl NewIndexData<'_> {
     }
 
     /// The fragments the new data covers.
-    fn fragment_bitmap(&self) -> Result<RoaringBitmap> {
+    pub fn fragment_bitmap(&self) -> Result<RoaringBitmap> {
         match self {
             Self::Fragments(fragments) => Ok(fragments.iter().map(|frag| frag.id as u32).collect()),
             Self::Segments(segments) => {
