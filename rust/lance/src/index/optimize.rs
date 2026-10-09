@@ -6,7 +6,7 @@
 //! The single-process `optimize_indices` runs the same steps with the same
 //! [`OptimizeOptions`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -281,44 +281,38 @@ impl IndexOptimizeTask {
     /// The candidate segments in manifest order (the task's order is not
     /// trusted: the merge picks the trailing ones and the last one's model).
     async fn resolve_segments(&self, dataset: &Dataset) -> Result<Vec<IndexMetadata>> {
-        let stored = load_all_indices(dataset).await?;
         let wanted: HashSet<Uuid> = self.segments.iter().copied().collect();
-        if wanted.len() != self.segments.len() {
-            return Err(Error::invalid_input(format!(
-                "index optimize task for '{}' lists a segment twice",
-                self.index_name
-            )));
-        }
-        let segments: Vec<IndexMetadata> = stored
+        let segments: Vec<IndexMetadata> = load_all_indices(dataset)
+            .await?
             .iter()
-            .filter(|segment| wanted.contains(&segment.uuid))
+            .filter(|segment| segment.name == self.index_name && wanted.contains(&segment.uuid))
             .cloned()
             .collect();
-        if segments.len() != wanted.len() {
-            let found: HashSet<Uuid> = segments.iter().map(|s| s.uuid).collect();
-            let missing: Vec<Uuid> = wanted.difference(&found).copied().collect();
+        if segments.len() != self.segments.len() {
             return Err(Error::invalid_input(format!(
-                "segments {missing:?} do not exist at version {}",
+                "index optimize task for '{}' names {} segments, {} of them distinct \
+                 segments of the index at version {}",
+                self.index_name,
+                self.segments.len(),
+                segments.len(),
                 dataset.manifest.version
-            )));
-        }
-        if let Some(other) = segments.iter().find(|s| s.name != self.index_name) {
-            return Err(Error::invalid_input(format!(
-                "segment {} belongs to index '{}', not '{}'",
-                other.uuid, other.name, self.index_name
             )));
         }
         Ok(segments)
     }
 
     fn resolve_fragments(&self, dataset: &Dataset) -> Result<Vec<Fragment>> {
-        let mut ids: Vec<u32> = self.fragments.iter().map(|f| f.id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids.iter()
+        let ids: BTreeSet<u32> = self.fragments.iter().map(|f| f.id).collect();
+        if ids.len() != self.fragments.len() {
+            return Err(Error::invalid_input(format!(
+                "index optimize task for '{}' lists a fragment twice",
+                self.index_name
+            )));
+        }
+        ids.into_iter()
             .map(|id| {
                 dataset
-                    .get_fragment(*id as usize)
+                    .get_fragment(id as usize)
                     .map(|fragment| fragment.metadata().clone())
                     .ok_or_else(|| {
                         Error::invalid_input(format!(
@@ -418,9 +412,9 @@ pub async fn commit_index_optimization(
         .next()
         .unwrap_or(dataset.manifest.version);
 
-    let produced: Vec<&IndexOptimizeResult> = results
+    let mut produced: Vec<(&IndexOptimizeResult, &IndexMetadata)> = results
         .iter()
-        .filter(|result| result.new_segment.is_some())
+        .filter_map(|result| Some((result, result.new_segment.as_ref()?)))
         .collect();
     if produced.is_empty() {
         let indices = load_all_indices(dataset).await?;
@@ -446,22 +440,22 @@ pub async fn commit_index_optimization(
             *covered_at_v.entry(segment.name.as_str()).or_default() |= bitmap;
         }
     }
-    let newest_new_fragment = |result: &&IndexOptimizeResult| -> Option<u32> {
+    let newest_new_fragment = |&(result, segment): &(&IndexOptimizeResult, &IndexMetadata)| {
         let covered = covered_at_v.get(result.index_name.as_str());
-        let segment = result.new_segment.as_ref().expect("filtered to Some");
         let bitmap = segment.fragment_bitmap.as_ref()?;
         bitmap
             .iter()
             .filter(|id| !covered.is_some_and(|c| c.contains(*id)))
             .max()
     };
-    let mut produced = produced;
     produced.sort_by_key(newest_new_fragment);
-    let names: HashSet<&str> = produced.iter().map(|r| r.index_name.as_str()).collect();
+    let names: HashSet<&str> = produced
+        .iter()
+        .map(|(r, _)| r.index_name.as_str())
+        .collect();
     let mut removed_indices = Vec::new();
     let mut removed_uuids = HashSet::new();
-    for result in &produced {
-        let segment = result.new_segment.as_ref().expect("filtered to Some");
+    for (result, segment) in &produced {
         if segment.name != result.index_name {
             return Err(Error::invalid_input(format!(
                 "result for '{}' carries a segment named '{}'",
@@ -489,7 +483,7 @@ pub async fn commit_index_optimization(
     }
     let new_indices: Vec<IndexMetadata> = produced
         .iter()
-        .map(|result| result.new_segment.clone().expect("filtered to Some"))
+        .map(|(_, segment)| (*segment).clone())
         .collect();
     let mut projected: Vec<IndexMetadata> = stored
         .iter()
@@ -1047,12 +1041,11 @@ impl IndexOptimizePlanner for SizeTieredPlanner {
                     if segments.len() == 1 && fragments.is_empty() {
                         continue;
                     }
-                    let (segments, num_indices_to_merge) = if segments.is_empty() {
-                        (vec![reference], Some(0))
-                    } else {
-                        let count = segments.len();
-                        (segments, Some(count))
-                    };
+                    // A bin of fragments alone borrows the reference segment's model.
+                    let num_indices_to_merge = Some(segments.len());
+                    if segments.is_empty() {
+                        segments.push(reference);
+                    }
                     tasks.push(IndexOptimizeTask {
                         read_version,
                         index_name: group.name.clone(),
