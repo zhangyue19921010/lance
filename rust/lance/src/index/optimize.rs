@@ -137,11 +137,15 @@ impl IndexOptimizeTask {
         .await
     }
 
-    /// A task indexing just `fragment_ids` with the last segment's model and
-    /// replacing nothing. Executing every shard of a partition of the fragments
-    /// and passing the results to [`Self::merge`] equals executing this task; a
-    /// shard's result may also be committed as is, in which case runs of
-    /// consecutive fragment ids keep the segments compaction-friendly.
+    /// Derive a shard: a task that indexes only `fragment_ids`, a subset of
+    /// this task's fragments, with the model of this task's last segment, and
+    /// replaces no segment. Shards let one task's new data be built on several
+    /// workers at once: execute one shard per part of the fragments, then pass
+    /// their results to [`Self::merge`], which yields the same result as
+    /// executing this task directly. A shard's result is also complete on its
+    /// own and can be committed as a delta segment, for example when the merge
+    /// step is skipped or fails; shards of consecutive fragment ids then keep
+    /// the segments compaction-friendly.
     pub fn shard(&self, fragment_ids: &[u32]) -> Result<Self> {
         if !self.shardable {
             return Err(Error::invalid_input(format!(
