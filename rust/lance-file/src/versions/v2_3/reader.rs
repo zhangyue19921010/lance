@@ -4,7 +4,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_encoding::{decoder::ColumnInfo, format::pb21};
+use lance_encoding::{
+    decoder::ColumnInfo, encodings::physical::binary::BinaryMiniBlockDecompressor, format::pb21,
+};
 
 use crate::{
     format::pbfile,
@@ -60,6 +62,10 @@ fn validate_compressive_encoding(
         Some(Compression::Flat(_))
         | Some(Compression::InlineBitpacking(_))
         | Some(Compression::Constant(_)) => Ok(()),
+        Some(Compression::Variable(variable)) if position == EncodingPosition::MiniBlock => {
+            // Variable mini-blocks own the optional offset payload and typed codec grammar.
+            BinaryMiniBlockDecompressor::from_variable(variable).map(|_| ())
+        }
         Some(Compression::Variable(variable)) => validate_compressive_encoding(
             required(variable.offsets.as_deref(), "variable offsets")?,
             position.child(),
