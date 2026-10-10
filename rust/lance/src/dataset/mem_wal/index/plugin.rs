@@ -22,6 +22,7 @@ use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::expression::ScalarQueryParser;
 use lance_index::scalar::registry::TrainingCriteria;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
@@ -355,7 +356,8 @@ pub trait MemIndex: Send + Sync + std::fmt::Debug + Any {
     /// Whether this index can answer `query`, asked while planning with the
     /// query [`search`](Self::search) will receive. Only finding which
     /// full-text granularities exist asks a probe instead. A full-text query's
-    /// search options must not decide the answer.
+    /// search options must not decide the answer. Planning a filter does not
+    /// ask: a filter reaches the index through [`MemIndexPlugin::query_parser`].
     fn can_answer(&self, query: &dyn MemQuery) -> bool;
 
     /// Index every row of `batch`. Row `n` occupies position `row_offset + n`.
@@ -375,12 +377,16 @@ pub trait MemIndex: Send + Sync + std::fmt::Debug + Any {
 
     /// Answer `query` with positions at or below
     /// [`SearchContext::max_visible`]; an empty answer means no row matches.
-    /// `None` declines a query [`can_answer`](Self::can_answer) rejects;
-    /// declining one it accepted is an error.
     ///
-    /// A filter is answered with [`MemMatches::Filter`], a search with
-    /// [`MemMatches::Ranked`], scored as every other source scores it: the
-    /// exact distance in the query's metric, or the built-in full-text score.
+    /// A filter is answered with [`MemMatches::Filter`]. `None` declines it,
+    /// as an index may when it matches more than
+    /// [`SearchContext::match_budget`]; the caller then reads every row.
+    ///
+    /// A search is answered with [`MemMatches::Ranked`], scored as every other
+    /// source scores it: the exact distance in the query's metric, or the
+    /// built-in full-text score. `None` declines a search
+    /// [`can_answer`](Self::can_answer) rejects; declining one it accepted is
+    /// an error.
     fn search(&self, query: &dyn MemQuery, ctx: &SearchContext) -> Result<Option<MemMatches>>;
 
     /// Hand the flush what this index can save it. Called once, after the last
@@ -454,6 +460,18 @@ pub trait MemIndexPlugin: Send + Sync + std::fmt::Debug + Any {
     /// parameters.
     fn flush_params(&self, _spec: &MemIndexSpec) -> Result<ScalarIndexParams> {
         Ok(ScalarIndexParams::default())
+    }
+
+    /// The parser the on-disk index of this kind uses, so a filter expression
+    /// it claims reaches this index as the same query. `index_details` are the
+    /// base-table index's, absent for a memtable configured directly. `None`,
+    /// the default, keeps every filter off this kind.
+    fn query_parser(
+        &self,
+        _index_name: String,
+        _index_details: Option<&prost_types::Any>,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        None
     }
 
     /// Resolve this index against the base table: the columns it covers and
@@ -553,8 +571,8 @@ fn check_details_message(plugin: &dyn MemIndexPlugin) -> Result<()> {
     Ok(())
 }
 
-/// One index a memtable maintains: its plugin, its columns, and what the plugin
-/// resolved for it.
+/// One index a memtable maintains: its plugin, its columns, what the plugin
+/// resolved for it, and the base-table index's details.
 #[derive(Clone)]
 pub struct MemIndexSpec {
     /// Index name, matching the base-table index it maintains.
@@ -567,6 +585,9 @@ pub struct MemIndexSpec {
     pub plugin: Arc<dyn MemIndexPlugin>,
     /// What [`MemIndexPlugin::resolve`] returned.
     pub params: Arc<dyn MemIndexParams>,
+    /// The base-table index's details message. The query parser is built from
+    /// it, and a change to it makes a different index.
+    pub index_details: Option<Arc<prost_types::Any>>,
 }
 
 impl MemIndexSpec {
@@ -594,11 +615,12 @@ impl MemIndexSpec {
             columns: vec![column.into()],
             plugin,
             params,
+            index_details: None,
         }
     }
 
     /// Whether `other` describes the same index: name, columns, field ids,
-    /// plugin type, plugin version and settings.
+    /// plugin type, plugin version, settings and base-table index details.
     pub fn same_index(&self, other: &Self) -> bool {
         self.name == other.name
             && self.columns == other.columns
@@ -608,6 +630,7 @@ impl MemIndexSpec {
             && self.plugin.details_message() == other.plugin.details_message()
             && self.plugin.version() == other.plugin.version()
             && self.params.same_as(other.params.as_ref())
+            && self.index_details == other.index_details
     }
 
     /// `params` as `P`, the type its plugin's own
