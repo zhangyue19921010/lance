@@ -834,8 +834,21 @@ async fn load_candidate_cross_column_source(
         column_ordinal,
         segment_ordinal,
         partition,
-        ..
+        mask,
     } = descriptor;
+    // Candidates come from every segment; this source may only score the ones its
+    // segment is allowed to report.
+    let candidates = if mask.is_select_all() {
+        candidates
+    } else {
+        Arc::new(
+            candidates
+                .iter()
+                .copied()
+                .filter(|address| mask.selected(*address))
+                .collect(),
+        )
+    };
     let leaf_ordinals = leaves_by_column
         .get(column_ordinal)
         .ok_or_else(|| Error::internal("cross-column FTS source references a missing column"))?;

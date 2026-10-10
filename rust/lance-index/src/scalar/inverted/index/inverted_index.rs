@@ -174,7 +174,7 @@ impl InvertedIndex {
         segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        old_data_filter: Option<OldIndexDataFilter>,
+        old_data_filters: &[Option<OldIndexDataFilter>],
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let Some(first) = segments.first() else {
@@ -214,7 +214,7 @@ impl InvertedIndex {
             .with_token_set_format(first.token_set_format)
             .with_format_version(first.format_version());
         let files = builder
-            .update_from_segments(new_data, dest_store, segments, old_data_filter)
+            .update_from_segments(new_data, dest_store, segments, old_data_filters)
             .await?;
 
         let details = pbold::InvertedIndexDetails::try_from(&first.params)?;
