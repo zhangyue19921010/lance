@@ -18,7 +18,7 @@ use crate::dataset::mem_wal::TOMBSTONE;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
-use super::generation_read::{GenerationRead, filter_above};
+use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
     validate_projection_names,
@@ -274,8 +274,7 @@ impl LsmScanPlanner {
         let plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
             source_plans.remove(0)
         } else {
-            #[allow(deprecated)]
-            let union = Arc::new(UnionExec::new(source_plans));
+            let union = UnionExec::try_new(source_plans)?;
             Arc::new(CoalescePartitionsExec::new(union))
         };
 
@@ -425,11 +424,7 @@ impl LsmScanPlanner {
                 // generation's own planning nests deeply enough that leaving
                 // this future inlined pushes the `Send` proof past rustc's
                 // recursion limit for callers stacked above it.
-                let reconciled = generation.reconcile(Box::pin(scanner.create_plan()).await?)?;
-                match &above {
-                    Some(expr) => filter_above(reconciled, expr),
-                    None => Ok(reconciled),
-                }
+                generation.reconcile_above(Box::pin(scanner.create_plan()).await?, &above)
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -441,37 +436,59 @@ impl LsmScanPlanner {
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
-
-                // Asked for under the table's own names, which is what a
-                // memtable stores them under: a memtable is created from the
-                // schema its writer holds, so a reader planning against that
-                // same schema needs no resolution. Pairing a memtable with a
-                // schema it was not created from is outside this contract --
-                // pass the memtable its own schema, or reopen the writer.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+
+                // `Some` only for a memtable created before a schema change;
+                // it resolves like a flushed generation.
+                let mut generation =
+                    (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
+                        GenerationRead::for_memtable(
+                            schema,
+                            &self.identity_schema,
+                            &self.pk_columns,
+                            cols.clone(),
+                        )
+                    });
+                let (stored_filter, above) = match &mut generation {
+                    Some(generation) => generation.split_filter(filter),
+                    None => (filter.cloned(), None),
+                };
+
+                match &generation {
+                    Some(generation) => {
+                        scanner.project(&generation.stored_projection())?;
+                    }
+                    None => {
+                        scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                    }
+                }
                 scanner.with_row_address();
 
-                // The dedup scan applies the filter post-dedup; pushing it
-                // into the raw scan would resurrect older versions of PKs
-                // whose newest version fails the predicate. Folding
-                // `NOT _tombstone` here is correct: a tombstone wins the
-                // position-based dedup (suppressing the older real row) and is
-                // then dropped by this predicate. A memtable without the column
-                // (legacy / test) gets no fold.
+                // Filter after dedup: filtering the raw scan would bring back an
+                // older version of a key whose newest version fails the filter.
+                // Adding `NOT _tombstone` is safe: a tombstone still wins the
+                // dedup, hiding the older row, and is then dropped.
                 let folded;
                 let effective: Option<&Expr> = if schema.column_with_name(TOMBSTONE).is_some() {
-                    folded = fold_not_tombstone(filter);
+                    folded = fold_not_tombstone(stored_filter.as_ref());
                     Some(&folded)
                 } else {
-                    filter
+                    stored_filter.as_ref()
                 };
                 if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
 
-                scanner.create_dedup_plan(&self.pk_columns).await
+                let pk_columns = match &generation {
+                    Some(generation) => generation.stored_pk_columns()?,
+                    None => self.pk_columns.clone(),
+                };
+                let deduped = Box::pin(scanner.create_dedup_plan(&pk_columns)).await?;
+                match generation {
+                    Some(generation) => generation.reconcile_above(deduped, &above),
+                    None => Ok(deduped),
+                }
             }
         }
     }
@@ -559,9 +576,10 @@ mod integration_tests {
     use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
-    use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+    use crate::dataset::mem_wal::write::{BatchStore, IndexStore, MemIndexSpec};
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::test::assert_plan_node_equals;
+    use lance_core::datatypes::Schema as LanceSchema;
 
     /// Create test schema with id as primary key.
     fn create_pk_schema() -> Arc<ArrowSchema> {
@@ -1422,9 +1440,13 @@ mod integration_tests {
 
         // Create active memtable with BTree index
         let batch_store = Arc::new(BatchStore::with_capacity(100));
-        let mut index_store = IndexStore::new();
-        // Add BTree index on id column (field_id=0)
-        index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let mut index_store = IndexStore::from_specs(
+            &[MemIndexSpec::btree("id_idx", 0, "id")],
+            &LanceSchema::try_from(schema.as_ref()).unwrap(),
+            100,
+            4,
+        )
+        .unwrap();
         // Reuse it as the PK index so the block-list can dedup this generation.
         index_store.enable_pk_index(&[("id".to_string(), 0)]);
 
@@ -1483,7 +1505,7 @@ mod integration_tests {
 
         let plan = scanner.create_plan().await.unwrap();
 
-        // Verify plan structure with BTree index optimization.
+        // Verify plan structure with a B-tree on the memtable.
         // Instead of complex pattern matching, verify key components directly:
         use datafusion::physical_plan::displayable;
         let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
@@ -1501,15 +1523,15 @@ mod integration_tests {
 
         // 2. The active arm uses the fused dedup scan: it deduplicates to
         //    newest-per-PK *before* applying the predicate, so it deliberately
-        //    forgoes the in-memory BTree skip (the dedup must see every
+        //    forgoes the index route (the dedup must see every
         //    version). See MemTableDedupScanExec.
         assert!(
             plan_str.contains("MemTableDedupScanExec"),
             "Active memtable should use the fused dedup scan"
         );
         assert!(
-            !plan_str.contains("BTreeIndexExec"),
-            "Active filtered read no longer uses the BTree skip"
+            !plan_str.contains("ScalarMemIndexExec"),
+            "the active memtable must not use the index route"
         );
 
         // 3. Verify filter pushdown to flushed and base datasets

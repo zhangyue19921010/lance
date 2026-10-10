@@ -786,18 +786,20 @@ class MergeInsertBuilder(_MergeInsertBuilder):
               CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
                 ProjectionExec: elapsed=..., expr=[...], metrics=[...]
                   RepartitionExec: ...
-                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Left, ...
+                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
+                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
                       ProjectionExec: elapsed=..., expr=[..., true as __merge_source_sentinel], metrics=[...]
                         DataSourceExec: ..., metrics=[]
-                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
 
         The reported plan follows how the source was passed. `new_data` above is a
         `pa.Table`, so it is wrapped in an in-memory table that reports exact
-        statistics, while a `pa.RecordBatchReader` reports none. DataFusion chooses
-        which side of the join to collect from those statistics and from the two
-        sides' sizes, so the same merge can plan differently depending on which one
-        you hand it. Use `explain_plan` only for the streaming shape: it takes a
-        schema rather than data, so it cannot know how the source would be wrapped.
+        statistics, while a `pa.RecordBatchReader` reports none. DataFusion picks
+        the side it collects from those statistics and from the two sides' sizes.
+        The target here is three rows, so it is the collected side either way; with
+        a larger target the same merge can plan differently depending on which
+        source you hand it. Use `explain_plan` only for the streaming shape: it
+        takes a schema rather than data, so it cannot know how the source would be
+        wrapped.
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes
@@ -3163,14 +3165,33 @@ class LanceDataset(pa.dataset.Dataset):
         """
         versions = self._ds.versions()
         for v in versions:
-            # TODO: python datetime supports only microsecond precision. When a
-            # separate Version object is implemented, expose the precise timestamp
-            # (ns) to python.
-            ts_nanos = v["timestamp"]
-            v["timestamp"] = datetime.fromtimestamp(ts_nanos // 1e9) + timedelta(
-                microseconds=(ts_nanos % 1e9) // 1e3
-            )
+            _convert_version_timestamp(v)
         return versions
+
+    def get_version(self) -> Version:
+        """
+        Return the currently checked out version, with its timestamp and the
+        summary of its manifest.
+
+        The summary is in ``metadata``. It counts the fragments, data files,
+        deletion files, rows and bytes of the version, and is computed from the
+        manifest that is already loaded, so nothing is read from storage.
+
+        Use :attr:`version` instead when only the version number is needed.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"x": [1, 2, 3]})
+        >>> dataset = lance.write_dataset(data, "memory://get_version")
+        >>> version = dataset.get_version()
+        >>> version["version"]
+        1
+        >>> version["metadata"]["total_rows"]
+        '3'
+        """
+        return _convert_version_timestamp(self._ds.current_version())
 
     def version_refs(self) -> List[VersionRef]:
         """
@@ -4020,6 +4041,17 @@ class LanceDataset(pa.dataset.Dataset):
                     f"got {field.type.value_type}"
                 )
 
+        if index_cache_size is not None:
+            # The parameter has never reached Rust: index building does not use
+            # the index cache, and the cache is sized on the dataset or session.
+            warnings.warn(
+                "The 'index_cache_size' parameter of create_index is ignored. "
+                "The index cache is sized on the dataset, via "
+                "lance.dataset(..., index_cache_size_bytes=...) or a Session.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+
         if not isinstance(metric, str) or metric.lower() not in [
             "l2",
             "cosine",
@@ -4410,7 +4442,9 @@ class LanceDataset(pa.dataset.Dataset):
             Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
             If not set, use the CPU.
         index_cache_size : int, optional
-            The size of the index cache in number of entries. Default value is 256.
+            Deprecated and ignored. Index building does not read the index cache;
+            size it on the dataset with
+            ``lance.dataset(..., index_cache_size_bytes=...)`` or on a ``Session``.
         shuffle_partition_batches : int, optional
             The number of batches, using the row group size of the dataset, to include
             in each shuffle partition. Default value is 10240.
@@ -5487,10 +5521,10 @@ class LanceDataset(pa.dataset.Dataset):
         if has_compared_against:
             builder = builder.compared_against_version(compared_against)
         else:
-            if begin_version:
+            if begin_version is not None:
                 builder = builder.with_begin_version(begin_version)
 
-            if end_version:
+            if end_version is not None:
                 builder = builder.with_end_version(end_version)
 
         return builder.build()
@@ -6098,6 +6132,17 @@ class Version(TypedDict):
     metadata: Dict[str, str]
 
 
+def _convert_version_timestamp(version: Version) -> Version:
+    # TODO: python datetime supports only microsecond precision. When a
+    # separate Version object is implemented, expose the precise timestamp
+    # (ns) to python.
+    ts_nanos = version["timestamp"]
+    version["timestamp"] = datetime.fromtimestamp(ts_nanos // 1e9) + timedelta(
+        microseconds=(ts_nanos % 1e9) // 1e3
+    )
+    return version
+
+
 class VersionRef(TypedDict):
     version: int
 
@@ -6248,8 +6293,6 @@ class LanceOperation:
         initial_bases: Optional[List[DatasetBasePath]] = None
 
         def __post_init__(self):
-            if isinstance(self.new_schema, pa.Schema):
-                self.new_schema = LanceSchema.from_pyarrow(self.new_schema)
             LanceOperation._validate_fragments(self.fragments)
 
     @dataclass
@@ -6491,7 +6534,6 @@ class LanceOperation:
                     "Please use a LanceSchema instead.",
                     DeprecationWarning,
                 )
-                self.schema = LanceSchema.from_pyarrow(self.schema)
             LanceOperation._validate_fragments(self.fragments)
 
     @dataclass
