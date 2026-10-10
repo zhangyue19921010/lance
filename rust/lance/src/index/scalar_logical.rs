@@ -505,13 +505,16 @@ mod tests {
     use lance_datagen::{ArrayGeneratorExt, array};
     use lance_index::IndexType;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::{
         BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchOptions, SearchResult,
     };
     use lance_select::{RowAddrTreeMap, RowSetOps};
+    use rstest::rstest;
 
     use crate::Dataset;
+    use crate::dataset::UpdateBuilder;
     use crate::dataset::WriteParams;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::write::WriteMode;
@@ -2196,26 +2199,35 @@ mod tests {
             .unwrap_err();
     }
 
-    /// Stable-row-id dataset whose `id_idx` has two segments and a stale posting: an update
-    /// moves the row with `id = 0` to a new fragment (keeping its row id) and an append-only
-    /// optimize gives that fragment its own segment, so the old segment still maps `id = 0`
-    /// to the moved row.
-    async fn stale_posting_dataset(
-        dir: &TempStrDir,
-        index_type: IndexType,
-        builtin: BuiltinIndexType,
-    ) -> Dataset {
-        use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array};
-        use arrow_schema::{DataType, Field, Schema};
-        use lance_index::optimize::OptimizeOptions;
+    /// Rows matching `filter`; asserts the plan uses the scalar index iff `use_index`.
+    async fn count(dataset: &Dataset, filter: &str, use_index: bool) -> usize {
+        let mut scan = dataset.scan();
+        scan.project(&["id"])
+            .unwrap()
+            .use_scalar_index(use_index)
+            .filter(filter)
+            .unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert_eq!(plan.contains("ScalarIndexQuery"), use_index, "{plan}");
+        scan.try_into_batch().await.unwrap().num_rows()
+    }
 
-        use crate::dataset::UpdateBuilder;
-        use crate::index::DatasetIndexExt;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt32, false)]));
-        let ids = Arc::new(UInt32Array::from_iter_values(0..256));
-        let batch = RecordBatch::try_new(schema.clone(), vec![ids]).unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    /// An update moves the row with `id = 0` to a new fragment (keeping its row id) and an
+    /// append-only optimize gives that fragment its own segment, so the old segment still
+    /// maps `id = 0` to the moved row. That stale posting must not be reported. Zone map
+    /// hits are row addresses, so they must not be restricted by a row-id mask.
+    #[rstest]
+    #[case::btree(IndexType::BTree, BuiltinIndexType::BTree)]
+    #[case::zone_map(IndexType::ZoneMap, BuiltinIndexType::ZoneMap)]
+    #[tokio::test]
+    async fn stale_posting_after_update_with_stable_row_ids(
+        #[case] index_type: IndexType,
+        #[case] builtin: BuiltinIndexType,
+    ) {
+        let dir = TempStrDir::default();
+        let batch =
+            arrow_array::record_batch!(("id", UInt32, (0..256u32).collect::<Vec<_>>())).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let params = WriteParams {
             enable_stable_row_ids: true,
             ..Default::default()
@@ -2258,38 +2270,8 @@ mod tests {
             dataset.load_indices_by_name("id_idx").await.unwrap().len(),
             2
         );
-        dataset
-    }
 
-    /// Rows matching `filter`; asserts the plan uses the scalar index iff `use_index`.
-    async fn count(dataset: &Dataset, filter: &str, use_index: bool) -> usize {
-        let mut scan = dataset.scan();
-        scan.project(&["id"])
-            .unwrap()
-            .use_scalar_index(use_index)
-            .filter(filter)
-            .unwrap();
-        let plan = scan.explain_plan(true).await.unwrap();
-        assert_eq!(plan.contains("ScalarIndexQuery"), use_index, "{plan}");
-        scan.try_into_batch().await.unwrap().num_rows()
-    }
-
-    #[tokio::test]
-    async fn stale_posting_after_update_with_stable_row_ids() {
-        let dir = TempStrDir::default();
-        let dataset = stale_posting_dataset(&dir, IndexType::BTree, BuiltinIndexType::BTree).await;
         assert_eq!(count(&dataset, "id = 0", false).await, 0);
-        assert_eq!(count(&dataset, "id = 1000", true).await, 1);
-        // The old segment's stale posting for `id = 0` must not be reported.
-        assert_eq!(count(&dataset, "id = 0", true).await, 0);
-    }
-
-    #[tokio::test]
-    async fn address_domain_segments_keep_hits_with_stable_row_ids() {
-        // Zone map hits are row addresses, so they must not be restricted by a row-id mask.
-        let dir = TempStrDir::default();
-        let dataset =
-            stale_posting_dataset(&dir, IndexType::ZoneMap, BuiltinIndexType::ZoneMap).await;
         assert_eq!(count(&dataset, "id = 1000", true).await, 1);
         assert_eq!(count(&dataset, "id = 0", true).await, 0);
     }
