@@ -15,9 +15,9 @@ use std::{
 };
 
 use super::{
-    AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
-    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult,
-    compute_next_prefix,
+    AnyQuery, BuiltinIndexType, IndexEntry, IndexFile, IndexReader, IndexStore, IndexWriter,
+    MetricsCollector, OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams,
+    SearchOptions, SearchResult, compute_next_prefix,
 };
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
 use crate::scalar::registry::TrainingCriteria;
@@ -60,7 +60,7 @@ use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
 };
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream, stream::BoxStream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
@@ -88,6 +88,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use tracing::{info, instrument};
 
 mod flat;
+mod ordered;
 
 pub const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
@@ -2814,6 +2815,15 @@ impl ScalarIndex for BTreeIndex {
 
     fn training_data_type(&self) -> Option<DataType> {
         Some(self.data_type.clone())
+    }
+
+    fn ordered_entries<'a>(
+        &'a self,
+        range: (Bound<ScalarValue>, Bound<ScalarValue>),
+        descending: bool,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Option<BoxStream<'a, Result<IndexEntry>>> {
+        Some(ordered::entries(self, range, descending, metrics))
     }
 }
 

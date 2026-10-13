@@ -162,6 +162,18 @@ impl FlatIndex {
         self.filter_ids(&arrow::compute::is_not_null(self.values())?)
     }
 
+    /// The page's rows whose value is not NULL, as a `(values, ids)` batch in
+    /// the page's row id order.
+    pub(super) fn non_null_rows(&self) -> Result<RecordBatch> {
+        if !self.has_nulls() {
+            return Ok(self.data.as_ref().clone());
+        }
+        Ok(arrow_select::filter::filter_record_batch(
+            &self.data,
+            &arrow::compute::is_not_null(self.values())?,
+        )?)
+    }
+
     /// Which of `needles` are present in this page.
     ///
     /// Batched existence sibling of [`Self::search`]: it runs the same `IsIn`
@@ -686,6 +698,32 @@ mod tests {
         let index = example_index();
         let remapped = FlatIndex::remap_batch((*index.data).clone(), &remap).unwrap();
         assert_eq!(remapped.num_rows(), 0);
+    }
+
+    #[test]
+    fn test_non_null_rows() {
+        let batch = record_batch!(
+            (BTREE_VALUES_COLUMN, Int32, [Some(3), None, Some(1), None]),
+            (BTREE_IDS_COLUMN, UInt64, [40, 10, 30, 50])
+        )
+        .unwrap();
+        let index = FlatIndex::try_new(batch).unwrap();
+
+        // The page is sorted by id, so the surviving rows keep that order.
+        let rows = index.non_null_rows().unwrap();
+        assert_eq!(rows.num_rows(), 2);
+        assert_eq!(rows.column(VALUES_COL_IDX).null_count(), 0);
+        assert_eq!(
+            rows.column(IDS_COL_IDX)
+                .as_primitive::<UInt64Type>()
+                .values(),
+            &[30, 40]
+        );
+
+        // A page without NULLs hands back its whole batch.
+        let index = example_index();
+        assert_eq!(index.non_null_rows().unwrap(), *index.data);
+        assert_eq!(index.data.num_rows(), 4);
     }
 
     #[test]

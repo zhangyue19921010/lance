@@ -23,7 +23,7 @@ use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::ScalarValue;
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream, stream::BoxStream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
@@ -41,7 +41,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
 
-use super::{AnyQuery, IndexFile, IndexStore, ScalarIndex, SearchOptions};
+use super::{AnyQuery, IndexEntry, IndexFile, IndexStore, ScalarIndex, SearchOptions};
 use super::{
     BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
     btree::{OrderableScalarValue, filter_keeps_nothing},
@@ -1139,6 +1139,49 @@ impl ScalarIndex for BitmapIndex {
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap))
+    }
+
+    fn ordered_entries<'a>(
+        &'a self,
+        range: (Bound<ScalarValue>, Bound<ScalarValue>),
+        descending: bool,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Option<BoxStream<'a, Result<IndexEntry>>> {
+        // The keys a range search with these bounds selects (`search_with_options`'s `Range`
+        // arm); `BTreeMap::range` panics if start > end or both bounds exclude one value.
+        let wrap = |bound: Bound<ScalarValue>| bound.map(OrderableScalarValue);
+        let (lower, upper) = (wrap(range.0), wrap(range.1));
+        let empty = match (&lower, &upper) {
+            (Bound::Included(lower), Bound::Included(upper)) => lower > upper,
+            (
+                Bound::Included(lower) | Bound::Excluded(lower),
+                Bound::Included(upper) | Bound::Excluded(upper),
+            ) => lower >= upper,
+            _ => false,
+        };
+        let keys = (!empty)
+            .then(|| self.index_map.range((lower, upper)))
+            .into_iter()
+            .flatten()
+            .map(|(key, _)| key);
+        // Keys are unique and `index_map` never holds NULL (see `load_key_map`),
+        // so the map's own order is already the entry order.
+        let keys: Box<dyn Iterator<Item = &'a OrderableScalarValue> + Send + 'a> = if descending {
+            Box::new(keys.rev())
+        } else {
+            Box::new(keys)
+        };
+        Some(
+            stream::iter(keys)
+                .then(move |key| async move {
+                    let row_ids = self.load_bitmap(key, Some(metrics)).await?;
+                    Ok(IndexEntry {
+                        value: key.0.clone(),
+                        row_ids,
+                    })
+                })
+                .boxed(),
+        )
     }
 }
 
@@ -4705,5 +4748,159 @@ mod tests {
             error.to_string().contains("Failed to deserialize bitmap"),
             "{error}"
         );
+    }
+
+    /// Train a bitmap index over `batch` (value-sorted, nulls first) in a
+    /// memory store and load it against `cache`.
+    async fn train_and_load(batch: RecordBatch, cache: &LanceCache) -> Arc<BitmapIndex> {
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::memory()),
+            Path::default(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = batch.schema();
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+        BitmapIndex::load(store, None, cache).await.unwrap()
+    }
+
+    const ALL: (Bound<ScalarValue>, Bound<ScalarValue>) = (Bound::Unbounded, Bound::Unbounded);
+
+    /// A Utf8 index of a -> {0, 2}, b -> {1}, c -> {3} and NULL -> {4}.
+    async fn abc_index(cache: &LanceCache) -> Arc<BitmapIndex> {
+        let batch = record_batch!(
+            (
+                "value",
+                Utf8,
+                [None, Some("a"), Some("a"), Some("b"), Some("c")]
+            ),
+            ("_rowid", UInt64, [4, 0, 2, 1, 3])
+        )
+        .unwrap();
+        train_and_load(batch, cache).await
+    }
+
+    /// Every entry of `index` in walk order as `(value, sorted row ids)`.
+    async fn collect_entries(
+        index: &dyn ScalarIndex,
+        range: (Bound<ScalarValue>, Bound<ScalarValue>),
+        descending: bool,
+        metrics: &dyn MetricsCollector,
+    ) -> Vec<(ScalarValue, Vec<u64>)> {
+        let entries: Vec<IndexEntry> = index
+            .ordered_entries(range, descending, metrics)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        entries
+            .into_iter()
+            .map(|entry| {
+                let mut row_ids: Vec<u64> =
+                    entry.row_ids.row_addrs().unwrap().map(u64::from).collect();
+                row_ids.sort_unstable();
+                assert_eq!(entry.row_ids.len(), Some(row_ids.len() as u64));
+                (entry.value, row_ids)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_ordered_entries() {
+        // Values are sorted, row ids are not; NULL rows never become entries.
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = abc_index(&cache).await;
+
+        let utf8 = |s: &str| ScalarValue::Utf8(Some(s.to_string()));
+        let expected = vec![
+            (utf8("a"), vec![0, 2]),
+            (utf8("b"), vec![1]),
+            (utf8("c"), vec![3]),
+        ];
+        let cold = LocalMetricsCollector::default();
+        assert_eq!(
+            collect_entries(index.as_ref(), ALL, false, &cold).await,
+            expected
+        );
+        assert_eq!(cold.index_cache_misses(), 3);
+
+        let mut reversed = expected.clone();
+        reversed.reverse();
+        let warm = LocalMetricsCollector::default();
+        let walked = collect_entries(index.as_ref(), ALL, true, &warm).await;
+        assert_eq!(walked, reversed);
+        assert_eq!(warm.index_cache_hits(), 3);
+
+        // The NULL rows are reachable through an IS NULL search instead.
+        let nulls = index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let SearchResult::Exact(nulls) = nulls else {
+            panic!("IS NULL on a bitmap index must be exact: {nulls:?}");
+        };
+        assert_eq!(nulls.true_rows(), RowAddrTreeMap::from_iter([4]));
+        assert!(nulls.null_rows().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ordered_entries_range() {
+        let index = abc_index(&LanceCache::no_cache()).await;
+        let utf8 = |s: &str| ScalarValue::Utf8(Some(s.to_string()));
+        let inc = |s: &str| Bound::Included(utf8(s));
+        let exc = |s: &str| Bound::Excluded(utf8(s));
+
+        // The last two would make `BTreeMap::range` panic if passed on as is.
+        for (lower, upper, keys) in [
+            (inc("a"), exc("c"), vec!["a", "b"]),
+            (exc("a"), Bound::Unbounded, vec!["b", "c"]),
+            (inc("b"), inc("b"), vec!["b"]),
+            (exc("b"), exc("b"), vec![]),
+            (inc("c"), inc("a"), vec![]),
+        ] {
+            let range = (lower.clone(), upper.clone());
+            // Only the bitmaps of keys in range are loaded.
+            let metrics = LocalMetricsCollector::default();
+            let mut entries = collect_entries(index.as_ref(), range.clone(), false, &metrics).await;
+            let values: Vec<_> = entries.iter().map(|(value, _)| value.clone()).collect();
+            let keys: Vec<_> = keys.into_iter().map(utf8).collect();
+            assert_eq!(values, keys);
+            assert_eq!(metrics.index_cache_misses(), keys.len());
+
+            // The walk selects exactly the rows a range search selects.
+            let query = SargableQuery::Range(lower, upper);
+            let result = index.search(&query, &NoOpMetricsCollector).await;
+            let Ok(SearchResult::Exact(rows)) = result else {
+                panic!("a bitmap range search must be exact: {result:?}");
+            };
+            let walked = entries.iter().flat_map(|(_, ids)| ids.iter().copied());
+            assert_eq!(rows.true_rows(), RowAddrTreeMap::from_iter(walked));
+
+            entries.reverse();
+            assert_eq!(
+                collect_entries(index.as_ref(), range, true, &NoOpMetricsCollector).await,
+                entries
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ordered_entries_empty_index() {
+        // An empty training stream (a 0-row batch) leaves no keys at all.
+        let batch = record_batch!(("value", Int32, [None]), ("_rowid", UInt64, [0]))
+            .unwrap()
+            .slice(0, 0);
+        let cache = LanceCache::no_cache();
+        let index = train_and_load(batch, &cache).await;
+        for descending in [false, true] {
+            assert!(
+                collect_entries(index.as_ref(), ALL, descending, &NoOpMetricsCollector)
+                    .await
+                    .is_empty()
+            );
+        }
     }
 }

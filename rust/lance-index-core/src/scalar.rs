@@ -11,7 +11,7 @@ use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::scalar::ScalarValue;
 use datafusion_expr::Expr;
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -23,7 +23,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
-use std::{any::Any, sync::Arc};
+use std::{any::Any, ops::Bound, sync::Arc};
 
 use crate::metrics::MetricsCollector;
 use crate::{Index, IndexParams, IndexType};
@@ -623,6 +623,21 @@ impl SearchOptions {
     }
 }
 
+/// One non-null value of an indexed column together with rows holding it, as
+/// yielded by [`ScalarIndex::ordered_entries`]. The same value may appear in
+/// consecutive entries when the index stores it in several places.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexEntry {
+    /// The value. Never null.
+    pub value: ScalarValue,
+    /// Rows holding `value`, in the domain the index was trained on: row
+    /// addresses, or stable row ids when the dataset uses them. Rows deleted
+    /// after the index was built may still be listed; callers must check liveness.
+    /// The set may be shared with the index cache (a bitmap index hands out
+    /// the cached bitmap itself), so it is read-only: clone it to modify it.
+    pub row_ids: Arc<RowAddrTreeMap>,
+}
+
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
@@ -757,6 +772,41 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// `Some`, the range is a superset of live values (conservative under
     /// deletes): safe to prune with, not guaranteed tight.
     fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
+        None
+    }
+
+    /// Walk the non-null values of the indexed column that lie in `range`, in
+    /// value order, ascending or (`descending`) descending, with the rows
+    /// holding each value.
+    ///
+    /// `range` is `(lower, upper)`, read like the bounds of a sargable range
+    /// query: `Included(v)`/`Excluded(v)` keep values `>= v`/`> v` as the
+    /// lower bound and `<= v`/`< v` as the upper bound. Every non-null value in
+    /// the range is yielded and no other, compared the way a range search
+    /// compares its bounds; an empty range yields nothing, and `(Unbounded,
+    /// Unbounded)` walks the whole index. Bounds must be non-null values of the
+    /// column's type, as a range search requires.
+    ///
+    /// Entries are non-decreasing (or non-increasing). A value the index stores
+    /// in several places, e.g. across BTree pages, may be yielded as several
+    /// consecutive entries; consumers that need one entry per value must merge
+    /// adjacent equal values. Values compare in Arrow's sort order (bytewise
+    /// for strings, IEEE 754 totalOrder for floats: positive NaN sorts after
+    /// +inf and negative NaN before -inf). NULL rows are never yielded; an
+    /// `IS NULL` search returns them. The stream is lazy and starts at the
+    /// bound it walks from (`lower` ascending, `upper` descending): index data
+    /// is read as it is polled, so a consumer that stops after the first entry
+    /// loads only what that entry needs, wherever the bound lies. Row ids are
+    /// not checked for liveness, see [`IndexEntry::row_ids`].
+    ///
+    /// Returns `None` when the index cannot enumerate its values in order (the
+    /// default); the caller then falls back to scanning the column.
+    fn ordered_entries<'a>(
+        &'a self,
+        _range: (Bound<ScalarValue>, Bound<ScalarValue>),
+        _descending: bool,
+        _metrics: &'a dyn MetricsCollector,
+    ) -> Option<BoxStream<'a, Result<IndexEntry>>> {
         None
     }
 }
