@@ -2649,6 +2649,7 @@ impl Dataset {
             "RTREE" => IndexType::RTree,
             "INVERTED" | "FTS" => IndexType::Inverted,
             "FM" => IndexType::Fm,
+            "MINHASH_LSH" => IndexType::MinHashLsh,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
@@ -2686,6 +2687,10 @@ impl Dataset {
             }),
             "RTREE" => Box::new(ScalarIndexParams {
                 index_type: "rtree".to_string(),
+                params: None,
+            }),
+            "MINHASH_LSH" => Box::new(ScalarIndexParams {
+                index_type: "minhashlsh".to_string(),
                 params: None,
             }),
             "FM" => {

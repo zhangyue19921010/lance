@@ -3557,12 +3557,13 @@ class LanceDataset(pa.dataset.Dataset):
                 "FTS",
                 "BLOOMFILTER",
                 "RTREE",
+                "MINHASH_LSH",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
-                        f"scalar columns.  Received {index_type}",
+                        '"INVERTED", "BLOOMFILTER", "RTREE" or "MINHASH_LSH" are '
+                        f"supported for scalar columns.  Received {index_type}",
                     )
                 )
 
@@ -3664,6 +3665,9 @@ class LanceDataset(pa.dataset.Dataset):
             "ZONEMAP",
             "BLOOMFILTER",
             "LABEL_LIST",
+            "MINHASH_LSH",
+            # Plugin name used by IndexConfig(index_type="minhashlsh").
+            "MINHASHLSH",
         }
 
     @classmethod
@@ -3679,6 +3683,8 @@ class LanceDataset(pa.dataset.Dataset):
             "ZONEMAP",
             "BLOOMFILTER",
             "LABEL_LIST",
+            "MINHASH_LSH",
+            "MINHASHLSH",
         }
 
     def create_scalar_index(
@@ -3694,6 +3700,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
             Literal["RTREE"],
+            Literal["MINHASH_LSH"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -3770,6 +3777,19 @@ class LanceDataset(pa.dataset.Dataset):
         * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
              but can only handle filters with equals and not equals and may require
              more I/O than a btree or bitmap index```
+        * ``MINHASH_LSH``. It is used to find near-duplicate texts in a string
+          column: search with ``nearest=MinHashQuery(text, column)`` to get the
+          rows whose text has the highest estimated Jaccard similarity to
+          ``text``. The string form uses the default parameters. To set them,
+          pass ``IndexConfig(index_type="minhashlsh", parameters={...})`` with
+          any of ``num_hashes`` (default 128; 1 to 4096 and a multiple of
+          ``num_bands``), ``num_bands`` (default 16; 1 to 256), ``shingle_size``
+          (default 3; tokens per shingle) and ``tokenizer`` (a dict with the
+          ``INVERTED`` tokenizer keys; stemming and stop word removal default
+          to off; ``custom_stop_words``, ``lance_tokenizer`` and the ``jieba``
+          and ``lindera`` tokenizers are rejected because the index cannot
+          record them). Every segment of one index must use the same
+          parameters.
 
         Index training sorts can spill to disk under memory pressure.
         ``LANCE_MEM_POOL_SIZE`` configures this pool in bytes; it is not a limit
@@ -3798,7 +3818,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``.
+            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"MINHASH_LSH"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -3942,10 +3962,16 @@ class LanceDataset(pa.dataset.Dataset):
         if fragment_ids is not None and self._requires_uncommitted_scalar_index(
             logical_index_type
         ):
+            # An IndexConfig carries parameters a type string would drop.
+            suggested_index_type = (
+                "<the same IndexConfig>"
+                if index_type == "scalar"
+                else f'"{logical_index_type}"'
+            )
             raise ValueError(
                 f"{logical_index_type} distributed indexing uses "
-                "create_index_uncommitted(..., "
-                f'index_type="{logical_index_type}", fragment_ids=...)'
+                f"create_index_uncommitted(..., index_type={suggested_index_type}, "
+                "fragment_ids=...)"
             )
         # Add fragment_ids and index_uuid to kwargs if provided
         if fragment_ids is not None:
@@ -4685,7 +4711,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         This is the public distributed-build API for vector, BTREE scalar,
         canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
-        ZONEMAP scalar, BLOOMFILTER scalar, and LABEL_LIST scalar index construction.
+        ZONEMAP scalar, BLOOMFILTER scalar, LABEL_LIST scalar, and MINHASH_LSH
+        scalar index construction.
         Unlike :meth:`create_index`, this method does not publish the index into
         the dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4701,11 +4728,15 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER, and
-        LABEL_LIST segments may be merged with
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER,
+        LABEL_LIST, and MINHASH_LSH segments may be merged with
         :meth:`merge_existing_index_segments` before commit. NGRAM segments
         built before a deferred compaction must be merged before commit so
         their postings can be rebuilt against current row addresses.
+        MINHASH_LSH parameters are passed with
+        ``IndexConfig(index_type="minhashlsh", parameters={...})`` and must be
+        identical across the segments of one index; segments built with
+        different parameters are rejected at merge and commit.
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 

@@ -5495,6 +5495,81 @@ def test_bloomfilter_segment_merge_and_commit_from_python(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "index_type",
+    [
+        "MINHASH_LSH",
+        IndexConfig(
+            index_type="minhashlsh",
+            parameters={"num_hashes": 64, "num_bands": 16, "shingle_size": 2},
+        ),
+    ],
+    ids=["default_params", "index_config"],
+)
+@pytest.mark.parametrize("merge", [False, True])
+def test_minhash_lsh_segments_from_python(tmp_path, index_type, merge):
+    base = "the quick brown fox jumps over the lazy dog and runs away very fast"
+    near = "the quick brown fox jumps over the lazy dog and runs away very quickly"
+    texts = [
+        base,
+        near,
+        "completely unrelated sentence about columnar storage in lance files",
+        base,
+        "another unrelated row that talks about vector indices and recall",
+        None,
+    ]
+    ds = lance.write_dataset(
+        pa.table({"id": list(range(len(texts))), "text": texts}),
+        tmp_path,
+        max_rows_per_file=2,
+    )
+
+    # The hint names the call made below, which keeps the IndexConfig parameters.
+    expected_hint = (
+        'create_index_uncommitted(..., index_type="MINHASH_LSH"'
+        if index_type == "MINHASH_LSH"
+        else "create_index_uncommitted(..., index_type=<the same IndexConfig>"
+    )
+    with pytest.raises(ValueError, match=re.escape(expected_hint)):
+        ds.create_scalar_index("text", index_type, fragment_ids=[0])
+
+    index_name = "text_minhash"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    segments = [
+        ds.create_index_uncommitted(
+            column="text",
+            index_type=index_type,
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+    for segment, fragment_id in zip(segments, fragment_ids):
+        assert segment.fragment_ids == {fragment_id}
+    if merge:
+        segments = [ds.merge_existing_index_segments(segments)]
+        assert segments[0].fragment_ids == set(fragment_ids)
+
+    ds = ds.commit_existing_index_segments(index_name, "text", segments)
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "MinHashLsh"
+    assert len(descriptions[index_name].segments) == len(segments)
+    expected_num_hashes = 128 if index_type == "MINHASH_LSH" else 64
+    stats = ds.stats.index_stats(index_name)
+    assert [s["num_hashes"] for s in stats["indices"]] == [expected_num_hashes] * len(
+        segments
+    )
+
+    # The two copies of `base` live in different fragments.
+    query = MinHashQuery(base, "text")
+    plan = ds.scanner(nearest=query, limit=3).explain_plan()
+    assert f"MinHashSearch: column=text, limit=3, segments={len(segments)}" in plan
+    assert "MinHashFlatSearch" not in plan
+    ids = ds.to_table(nearest=query, limit=3, columns=["id"])["id"].to_pylist()
+    assert sorted(ids[:2]) == [0, 3]
+    assert ids[2] == 1
+
+
 def test_merge_index_metadata_btree_soft_break(tmp_path):
     ds = generate_multi_fragment_dataset(
         tmp_path, num_fragments=2, rows_per_fragment=100
