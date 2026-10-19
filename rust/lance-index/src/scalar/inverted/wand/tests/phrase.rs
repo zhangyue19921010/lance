@@ -492,127 +492,6 @@ fn exact_phrase_scan_jumps_with_a_nonzero_anchor_offset(
     );
 }
 
-/// The compound-phrase request from review: drive the exact-phrase check the
-/// way `WandCursor::matches()` does - a phrase leaf inside a compound query -
-/// instead of calling the entries directly.
-#[rstest]
-fn wand_cursor_confirmation_rejects_disjoint_phrase_positions(
-    #[values(false, true)] is_compressed: bool,
-) {
-    let n = 4096u32;
-    let mut docs = DocSet::default();
-    docs.append(0, 1_000_001);
-    let make_postings = || {
-        vec![
-            PostingIterator::new(
-                String::from("a"),
-                0,
-                0,
-                generate_posting_list_with_positions(
-                    vec![0],
-                    vec![(0..n).collect()],
-                    1.0,
-                    is_compressed,
-                ),
-                docs.len(),
-            ),
-            PostingIterator::new(
-                String::from("b"),
-                1,
-                1,
-                generate_posting_list_with_positions(
-                    vec![0],
-                    vec![(2 * n..3 * n).collect()],
-                    1.0,
-                    is_compressed,
-                ),
-                docs.len(),
-            ),
-        ]
-    };
-    let params = FtsSearchParams {
-        phrase_slop: Some(0),
-        ..Default::default()
-    };
-    let metrics = NoOpMetricsCollector;
-    let mut cursor = WandCursor::new(
-        Operator::And,
-        make_postings(),
-        &docs,
-        Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new())),
-        &params,
-        &metrics,
-    );
-    assert_eq!(cursor.next().unwrap(), Some(0));
-
-    let (matched, steps) = counted_anchor_steps(|| cursor.matches().unwrap());
-    assert!(!matched, "disjoint positions cannot form a phrase");
-    assert!(
-        steps <= 2,
-        "the compound path must skip too, took {steps} steps"
-    );
-}
-
-/// Same path, but the phrase really is present: the confirmation has to
-/// survive the jump instead of over-shooting the match.
-#[rstest]
-fn wand_cursor_confirmation_accepts_aligned_phrase_positions(
-    #[values(false, true)] is_compressed: bool,
-) {
-    let n = 4096u32;
-    let mut docs = DocSet::default();
-    docs.append(0, 1_000_001);
-    let make_postings = || {
-        vec![
-            PostingIterator::new(
-                String::from("a"),
-                0,
-                0,
-                generate_posting_list_with_positions(
-                    vec![0],
-                    vec![(0..n).collect()],
-                    1.0,
-                    is_compressed,
-                ),
-                docs.len(),
-            ),
-            PostingIterator::new(
-                String::from("b"),
-                1,
-                1,
-                generate_posting_list_with_positions(
-                    vec![0],
-                    vec![(1..n + 1).collect()],
-                    1.0,
-                    is_compressed,
-                ),
-                docs.len(),
-            ),
-        ]
-    };
-    let params = FtsSearchParams {
-        phrase_slop: Some(0),
-        ..Default::default()
-    };
-    let metrics = NoOpMetricsCollector;
-    let mut cursor = WandCursor::new(
-        Operator::And,
-        make_postings(),
-        &docs,
-        Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new())),
-        &params,
-        &metrics,
-    );
-    assert_eq!(cursor.next().unwrap(), Some(0));
-
-    let (matched, steps) = counted_anchor_steps(|| cursor.matches().unwrap());
-    assert!(matched, "the phrase is present at base 0");
-    assert!(
-        steps <= 2,
-        "took {steps} steps to confirm a first-position match"
-    );
-}
-
 #[rstest]
 fn exact_phrase_heap_path_matches_wide_clause_count(#[values(false, true)] is_compressed: bool) {
     let mut docs = DocSet::default();
@@ -638,4 +517,84 @@ fn exact_phrase_heap_path_matches_wide_clause_count(#[values(false, true)] is_co
     let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
     assert!(wand.check_exact_positions().unwrap());
     assert!(wand.check_exact_positions_bulk().unwrap());
+}
+
+#[rstest]
+#[case::packed_delta(PositionStreamCodec::PackedDelta)]
+#[case::varint_doc_delta(PositionStreamCodec::VarintDocDelta)]
+fn test_shared_position_cursors_use_independent_scratch(
+    #[case] codec: PositionStreamCodec,
+) -> Result<()> {
+    let mut posting_list =
+        generate_posting_list_with_positions(vec![0], vec![vec![1_u32, 3, 10]], 1.0, true);
+    let PostingList::Compressed(ref mut list) = posting_list else {
+        unreachable!("the helper was asked for a compressed posting list");
+    };
+    let mut encoded = Vec::new();
+    encode_position_stream_block_into(&[1, 3, 10], &[3], codec, &mut encoded)?;
+    list.positions = Some(CompressedPositionStorage::SharedStream(
+        SharedPositionStream::new(codec, vec![0], bytes::Bytes::from(encoded)),
+    ));
+
+    let posting = PostingIterator::new(String::from("term"), 0, 0, posting_list, 1);
+    let first = posting.position_cursor()?;
+    let second = posting.position_cursor()?;
+
+    assert_eq!(second.positions.as_slice(), &[1, 3, 10]);
+    assert_eq!(first.positions.as_slice(), &[1, 3, 10]);
+    assert!(posting.position_scratch.borrow().is_none());
+    drop(second);
+    assert!(posting.position_scratch.borrow().is_some());
+    drop(first);
+    assert!(posting.position_scratch.borrow().is_some());
+    Ok(())
+}
+
+#[test]
+fn test_phrase_search_propagates_corrupt_packed_positions() {
+    let mut docs = DocSet::default();
+    docs.append(0, BLOCK_SIZE as u32 + 1);
+
+    let mut corrupt_list = generate_posting_list_with_positions(
+        vec![0],
+        vec![(0..BLOCK_SIZE as u32).collect()],
+        1.0,
+        true,
+    );
+    let PostingList::Compressed(ref mut list) = corrupt_list else {
+        unreachable!("the helper was asked for a compressed posting list");
+    };
+    // A bit width of one requires a 16-byte payload. Keep only the header
+    // to verify malformed on-disk data becomes a search error, not a panic.
+    list.positions = Some(CompressedPositionStorage::SharedStream(
+        SharedPositionStream::new(
+            PositionStreamCodec::PackedDelta,
+            vec![0],
+            bytes::Bytes::from_static(&[1]),
+        ),
+    ));
+
+    let postings = vec![
+        PostingIterator::new(String::from("corrupt"), 0, 0, corrupt_list, docs.len()),
+        PostingIterator::new(
+            String::from("valid"),
+            1,
+            1,
+            generate_posting_list_with_positions(vec![0], vec![vec![BLOCK_SIZE as u32]], 1.0, true),
+            docs.len(),
+        ),
+    ];
+    let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
+    let mut params = FtsSearchParams::default().with_limit(Some(10));
+    params.phrase_slop = Some(0);
+
+    let error = wand
+        .search(&params, &NoOpMetricsCollector)
+        .expect_err("corrupt packed positions should fail the phrase search");
+    let message = error.to_string();
+    assert!(
+        message.contains("packed position group payload"),
+        "{message}"
+    );
+    assert!(message.contains("corrupt"), "{message}");
 }

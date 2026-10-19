@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Inner-window work for MAXSCORE: block skip, two-pointer optional freqs,
-//! and SoA completion for one essential plus at most two optionals.
+//! Bulk MAXSCORE search: essential-clause selection, window score accumulation,
+//! block skipping, and optional-clause completion in query order.
 //!
-//! Lucene's `scoreInnerWindowSingleEssentialClause`. Two-essential compact
-//! union is intentionally not ported.
+//! Single-essential windows use Lucene's `scoreInnerWindowSingleEssentialClause`
+//! with two-pointer optional frequencies and SoA completion for at most two
+//! optionals. Two-essential compact union is intentionally not ported.
 
 use super::*;
 
@@ -17,12 +18,12 @@ use super::super::builder::ScoredDoc;
 use super::super::scorer::{Scorer, bm25_doc_weight_with_norm};
 use super::MAX_POSTING_BLOCK_SIZE;
 use super::{
-    CompetitiveFloorMode, DocInfo, MaxScoreClause, PostingIterator, PostingList, RawDocInfo,
-    TopKCollector, Wand, WandDocuments, score_sum_cannot_compete,
+    CompetitiveFloorMode, DocInfo, PostingIterator, PostingList, RawDocInfo, TopKCollector, Wand,
+    WandDocuments, score_sum_cannot_compete,
 };
 
 #[inline]
-pub(super) fn exclusive_cannot_compete(
+fn exclusive_cannot_compete(
     partial: f32,
     remaining_upper_bound: f64,
     floor: f32,
@@ -217,7 +218,7 @@ impl PostingIterator {
     /// Copy one decompressed posting block (or a 128-doc Plain slice) with
     /// `doc_id <= window_max` into `out`. Leaves the cursor on the first doc
     /// beyond that chunk.
-    pub(super) fn take_docs_one_block_upto(&mut self, window_max: u64, out: &mut Vec<(u64, u32)>) {
+    fn take_docs_one_block_upto(&mut self, window_max: u64, out: &mut Vec<(u64, u32)>) {
         out.clear();
         match self.list {
             PostingList::Compressed(ref list) => {
@@ -1430,5 +1431,152 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         metrics.record_comparisons(num_comparisons);
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
+    }
+}
+
+/// Inner window span (in doc ids) of the bulk MAXSCORE path. Same as Lucene's
+/// `MaxScoreBulkScorer.INNER_WINDOW_SIZE`.
+pub(super) const MAXSCORE_INNER_WINDOW: usize = 1 << 12;
+
+/// One MAXSCORE clause: posting plus the current window bound / prefix used
+/// to pick essential vs optional and to complete scores in query order.
+pub(super) struct MaxScoreClause {
+    pub(super) posting: Box<PostingIterator>,
+    pub(super) query_rank: usize,
+    pub(super) bound: f32,
+    pub(super) prefix_bound: f64,
+}
+
+/// Per-window score/frequency accumulator for the bulk MAXSCORE path. Slot i
+/// covers doc id `window_min + i`; `freqs` is laid out clause-major so accept
+/// paths can recover (term, freq) pairs of the essential clauses.
+struct WindowAccumulator {
+    scores: Vec<f32>,
+    freqs: Vec<u32>,
+    words: Vec<u64>,
+    num_clauses: usize,
+}
+
+impl WindowAccumulator {
+    fn new(num_clauses: usize) -> Self {
+        Self {
+            scores: vec![0.0; MAXSCORE_INNER_WINDOW],
+            freqs: vec![0; num_clauses * MAXSCORE_INNER_WINDOW],
+            words: vec![0; MAXSCORE_INNER_WINDOW / 64],
+            num_clauses,
+        }
+    }
+
+    #[inline]
+    fn add(&mut self, clause_idx: usize, slot: usize, score: f32, freq: u32) {
+        self.scores[slot] += score;
+        // Doc-major layout: one slot's clause frequencies share a cache line.
+        self.freqs[slot * self.num_clauses + clause_idx] = freq;
+        self.words[slot >> 6] |= 1u64 << (slot & 63);
+    }
+
+    #[inline]
+    fn clause_freq(&self, clause_idx: usize, slot: usize) -> u32 {
+        self.freqs[slot * self.num_clauses + clause_idx]
+    }
+
+    #[inline]
+    fn clear_slot(&mut self, slot: usize) {
+        self.scores[slot] = 0.0;
+        self.freqs[slot * self.num_clauses..(slot + 1) * self.num_clauses].fill(0);
+    }
+}
+
+impl PostingIterator {
+    /// Bulk-score every posting in `[current doc, up_to]` into the window
+    /// accumulator (slot = doc - window_min) and leave the iterator on the
+    /// first doc beyond `up_to`. This is the Lucene `nextDocsAndScores`
+    /// equivalent: it walks the decompressed block arrays directly, with no
+    /// per-doc heap traffic.
+    // The norm cache arg tips this hot-path fn over the limit; bundling the
+    // scoring inputs isn't worth the churn here.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_window_scores<S: Scorer + ?Sized, D: WandDocuments>(
+        &mut self,
+        window_min: u64,
+        up_to: u64,
+        clause_idx: usize,
+        docs: &D,
+        scorer: &S,
+        norm_k: Option<(&[u8], &[f32; 256])>,
+        acc: &mut WindowAccumulator,
+    ) {
+        if self.doc().is_some_and(|doc| doc.doc_id() < window_min) {
+            self.next(window_min);
+        }
+        match self.list {
+            PostingList::Compressed(ref list) => {
+                let shift = list.block_shift();
+                let mask = list.block_mask();
+                'blocks: while let Some(doc) = self.current_doc {
+                    if doc.doc_id() > up_to {
+                        break;
+                    }
+                    let block_idx = self.index >> shift;
+                    let block_offset = self.index & mask;
+                    let compressed =
+                        unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+                    for offset in block_offset..compressed.doc_ids.len() {
+                        let doc_id = compressed.doc_ids[offset];
+                        if u64::from(doc_id) > up_to {
+                            self.index = (block_idx << shift) + offset;
+                            self.block_idx = block_idx;
+                            self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id,
+                                frequency: compressed.freqs[offset],
+                            }));
+                            break 'blocks;
+                        }
+                        let freq = compressed.freqs[offset];
+                        // One byte-norm load plus a cached addend replaces
+                        // recomputing the BM25 denominator per doc.
+                        let doc_weight = match norm_k {
+                            Some((norms, cache)) => bm25_doc_weight_with_norm(
+                                freq,
+                                cache[norms[doc_id as usize] as usize],
+                            ),
+                            None => scorer.doc_weight(freq, docs.scoring_num_tokens(doc_id)),
+                        };
+                        let score = self.query_weight * doc_weight;
+                        let slot = (u64::from(doc_id) - window_min) as usize;
+                        acc.add(clause_idx, slot, score, freq);
+                    }
+                    // Block exhausted: step into the next block (or finish).
+                    let next_start = (block_idx + 1) << shift;
+                    if next_start >= list.length as usize {
+                        self.index = list.length as usize;
+                        self.block_idx = self.index >> shift;
+                        self.current_doc = None;
+                        break;
+                    }
+                    self.index = next_start;
+                    self.block_idx = block_idx + 1;
+                    let compressed =
+                        unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx + 1) };
+                    self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                        doc_id: compressed.doc_ids[0],
+                        frequency: compressed.freqs[0],
+                    }));
+                }
+            }
+            PostingList::Plain(_) => {
+                while let Some(doc) = self.doc() {
+                    let doc_id = doc.doc_id();
+                    if doc_id > up_to {
+                        break;
+                    }
+                    let doc_length = docs.doc_length(&doc);
+                    let score = self.score(scorer, doc.frequency(), doc_length);
+                    let slot = (doc_id - window_min) as usize;
+                    acc.add(clause_idx, slot, score, doc.frequency());
+                    self.next(doc_id + 1);
+                }
+            }
+        }
     }
 }

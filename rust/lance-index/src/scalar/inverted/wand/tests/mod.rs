@@ -6,9 +6,9 @@ use rstest::rstest;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::super::documents::resident_row_address_projection_for_test;
 use super::super::impact::build_impact_skip_data;
 use super::*;
+use crate::scalar::inverted::documents::resident_row_address_projection_for_test;
 use crate::scalar::inverted::scorer::{IndexBM25Scorer, MemBM25Scorer};
 use crate::{
     metrics::{LocalMetricsCollector, NoOpMetricsCollector},
@@ -420,9 +420,14 @@ fn sorted_candidate_row_ids(candidates: Vec<DocCandidate<u64>>) -> Vec<u64> {
     row_ids
 }
 
-mod basics;
 mod bulk_and;
+mod collector;
+mod conjunction;
+mod cursor;
+mod disjunction;
 mod maxscore_search;
-mod or_and;
 mod phrase;
+mod posting;
+mod score_bounds;
 mod score_first_and;
+mod search;

@@ -4,49 +4,6 @@
 use super::*;
 
 #[rstest]
-#[case::initial_floor(false)]
-#[case::explicit_zero_floor(true)]
-fn wand_cursor_preserves_zero_score_membership(
-    #[case] set_zero_floor: bool,
-    #[values(Operator::Or, Operator::And)] operator: Operator,
-    #[values(1, 4, 5)] num_terms: u32,
-) {
-    let postings = (0..num_terms)
-        .map(|term| {
-            let list = if operator == Operator::And {
-                generate_impact_posting_list_with_freqs_and_block_size(
-                    vec![0],
-                    vec![1],
-                    vec![1],
-                    MAX_POSTING_BLOCK_SIZE,
-                )
-            } else {
-                generate_posting_list(vec![0], 0.0, None, false)
-            };
-            PostingIterator::with_query_weight(format!("common{term}"), term, term, 0.0, list, 1)
-        })
-        .collect();
-    let mut docs = DocSet::default();
-    docs.append(0, 1);
-    let params = FtsSearchParams::default();
-    let metrics = NoOpMetricsCollector;
-    let mut cursor = WandCursor::new(
-        operator,
-        postings,
-        &docs,
-        Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new())),
-        &params,
-        &metrics,
-    );
-    if set_zero_floor {
-        cursor.set_min_competitive_score(0.0).unwrap();
-    }
-
-    assert_eq!(cursor.next().unwrap(), Some(0));
-    assert_eq!(cursor.current_score().unwrap(), 0.0);
-}
-
-#[rstest]
 #[case::all_essential(false)]
 #[case::single_essential(true)]
 fn maxscore_publishes_query_order_score_bits(#[case] single_essential: bool) {
