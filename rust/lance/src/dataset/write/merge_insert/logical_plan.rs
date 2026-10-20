@@ -296,7 +296,7 @@ impl MergeInsertPlanner {
     /// - `when_matched` is `Delete`
     /// - `insert_not_matched` is `false` (no inserts)
     /// - `delete_not_matched_by_source` is `Keep` (no additional deletes of unmatched target rows)
-    fn is_delete_only(params: &MergeInsertParams) -> bool {
+    pub(super) fn is_delete_only(params: &MergeInsertParams) -> bool {
         matches!(params.when_matched, WhenMatched::Delete)
             && !params.insert_not_matched
             && matches!(

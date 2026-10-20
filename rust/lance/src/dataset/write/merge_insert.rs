@@ -733,6 +733,17 @@ impl MergeInsertParams {
             Ok(None)
         }
     }
+
+    /// Whether the merge needs nothing from the source beyond its join keys.
+    ///
+    /// That holds when it only deletes or keeps rows: no source value is ever
+    /// written, and a `DeleteIf` reads only target columns.
+    fn needs_only_join_keys(&self) -> bool {
+        matches!(
+            self.when_matched,
+            WhenMatched::Delete | WhenMatched::DoNothing
+        ) && !self.insert_not_matched
+    }
 }
 
 /// Where the per-fragment patch tasks in
@@ -2718,6 +2729,22 @@ impl MergeInsertJob {
         } else {
             session_ctx.read_table(provider)?
         };
+        // A merge that writes no rows reads only the join key from the source.
+        // The dataset columns the write exec still looks up are then filled
+        // below like any column the source omits, so the source's other
+        // columns, whatever their types, never reach the join.
+        let source_df = if self.params.needs_only_join_keys() {
+            // `on` may name a column twice, which a projection rejects.
+            let mut on: Vec<&str> = Vec::with_capacity(self.params.on.len());
+            for key in &self.params.on {
+                if !on.contains(&key.as_str()) {
+                    on.push(key.as_str());
+                }
+            }
+            source_df.select_columns(&on)?
+        } else {
+            source_df
+        };
         // Capture the source field names *before* aliasing / joining so we
         // can tell which dataset columns are missing from the source and
         // need to be filled from the target side of the join below.
@@ -2789,7 +2816,11 @@ impl MergeInsertJob {
         // filled with NULL and not scanned. A deferred `DeleteIf` reads its
         // columns through the fill (`MergeConditionExec`), so those are still
         // filled from the target.
-        if write_sink == WriteSink::RewriteRows {
+        //
+        // The delete-only exec reads no data column at all, so nothing is
+        // filled for it.
+        if write_sink == WriteSink::RewriteRows && !MergeInsertPlanner::is_delete_only(&self.params)
+        {
             // Exhaustive, so a new variant has to decide whether it updates.
             let updates = match self.params.when_matched {
                 WhenMatched::UpdateAll
@@ -3026,12 +3057,9 @@ impl MergeInsertJob {
             false
         };
 
-        // Check if this is a delete-only operation (no update/insert writes needed from source)
-        // For delete-only, we don't need the full source schema, just key columns for matching
-        let no_upsert = matches!(
-            self.params.when_matched,
-            WhenMatched::Delete | WhenMatched::DoNothing
-        ) && !self.params.insert_not_matched;
+        // A merge that writes no rows needs only the key columns from the
+        // source; `create_plan` drops the rest
+        let no_upsert = self.params.needs_only_join_keys();
 
         // For delete-only, verify source has all key columns
         let source_has_key_columns = self.params.on.iter().all(|key| {
@@ -15227,6 +15255,247 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .to_vec();
         remaining_keys.sort();
         assert_eq!(remaining_keys, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    /// A merge that writes no rows only joins on the source key, so whatever
+    /// else the source carries changes neither the plan nor the result: other
+    /// dataset columns, a column the dataset lacks, or a struct with only some
+    /// of its fields.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_writing_nothing_reads_only_source_key(
+        #[values(WhenMatched::Delete, WhenMatched::DoNothing)] when_matched: WhenMatched,
+        #[values("keep", "delete", "delete_if")] by_source: &str,
+        #[values("key", "key_value", "full", "key_extra", "key_partial_struct")] source: &str,
+    ) {
+        if when_matched == WhenMatched::DoNothing && by_source == "keep" {
+            // Rejected by `try_build`: it changes nothing.
+            return;
+        }
+        let struct_field = |names: &[&str]| {
+            let fields = names
+                .iter()
+                .map(|name| Field::new(*name, DataType::Int32, true))
+                .collect::<Vec<_>>();
+            Field::new("s", DataType::Struct(fields.into()), true)
+        };
+        let struct_array = |names: &[&str], ids: &[i32]| -> ArrayRef {
+            Arc::new(StructArray::from(
+                names
+                    .iter()
+                    .map(|name| {
+                        (
+                            Arc::new(Field::new(*name, DataType::Int32, true)),
+                            Arc::new(Int32Array::from(ids.to_vec())) as ArrayRef,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        // Mixed case: the key must survive the source projection unquoted.
+        let key = Field::new("Id", DataType::UInt32, false);
+
+        let target_schema = Arc::new(Schema::new(vec![
+            key.clone(),
+            Field::new("value", DataType::UInt32, true),
+            struct_field(&["a", "b"]),
+        ]));
+        let ids = [1, 2, 3, 4, 5, 6];
+        let target = RecordBatch::try_new(
+            target_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(ids.to_vec())),
+                Arc::new(UInt32Array::from(ids.to_vec())),
+                struct_array(&["a", "b"], &[1, 2, 3, 4, 5, 6]),
+            ],
+        )
+        .unwrap();
+        let ds = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(target)], target_schema.clone()),
+                "memory://test_merge_writing_nothing.lance",
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Keys 4, 5, 6 match; 1, 2, 3 are only in the target. Source values
+        // differ from the target's so a write of them would show.
+        let source_ids = [4, 5, 6, 7, 8, 9];
+        let key_array: ArrayRef = Arc::new(UInt32Array::from(source_ids.to_vec()));
+        let value = Field::new("value", DataType::UInt32, true);
+        let value_array: ArrayRef = Arc::new(UInt32Array::from(vec![100; 6]));
+        let (fields, columns) = match source {
+            "key" => (vec![key.clone()], vec![key_array]),
+            "key_value" => (vec![key.clone(), value], vec![key_array, value_array]),
+            "full" => (
+                vec![key.clone(), value, struct_field(&["a", "b"])],
+                vec![key_array, value_array, struct_array(&["a", "b"], &[100; 6])],
+            ),
+            "key_extra" => (
+                vec![key.clone(), Field::new("extra", DataType::Utf8, true)],
+                vec![key_array, Arc::new(StringArray::from(vec!["x"; 6]))],
+            ),
+            "key_partial_struct" => (
+                vec![key.clone(), struct_field(&["a"])],
+                vec![key_array, struct_array(&["a"], &[100; 6])],
+            ),
+            _ => unreachable!(),
+        };
+        let source_schema = Arc::new(Schema::new(fields));
+        let source_batch = RecordBatch::try_new(source_schema.clone(), columns).unwrap();
+
+        let when_not_matched_by_source = match by_source {
+            "keep" => WhenNotMatchedBySource::Keep,
+            "delete" => WhenNotMatchedBySource::Delete,
+            "delete_if" => WhenNotMatchedBySource::delete_if(&ds, "value < 3").unwrap(),
+            _ => unreachable!(),
+        };
+        let job = MergeInsertBuilder::try_new(ds.clone(), vec!["Id".to_string()])
+            .unwrap()
+            .when_matched(when_matched.clone())
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_not_matched_by_source(when_not_matched_by_source)
+            .try_build()
+            .unwrap();
+
+        let key_only_schema = Schema::new(vec![key]);
+        assert_eq!(
+            job.explain_plan(Some(source_schema.as_ref()), false)
+                .await
+                .unwrap(),
+            job.explain_plan(Some(&key_only_schema), false)
+                .await
+                .unwrap(),
+        );
+
+        let source_reader = Box::new(RecordBatchIterator::new([Ok(source_batch)], source_schema));
+        let (merged_dataset, merge_stats) =
+            job.execute(reader_to_stream(source_reader)).await.unwrap();
+
+        let expected_ids: Vec<u32> = ids
+            .into_iter()
+            .filter(|id| !(when_matched == WhenMatched::Delete && *id >= 4))
+            .filter(|id| match by_source {
+                "delete" => *id >= 4,
+                "delete_if" => *id >= 3,
+                _ => true,
+            })
+            .collect();
+        assert_eq!(merge_stats.num_deleted_rows, 6 - expected_ids.len() as u64);
+        assert_eq!(merge_stats.num_inserted_rows, 0);
+        assert_eq!(merge_stats.num_updated_rows, 0);
+
+        let batches = merged_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let merged = concat_batches(&target_schema, &batches).unwrap();
+        let mut rows: Vec<(u32, u32, i32)> = (0..merged.num_rows())
+            .map(|row| {
+                let s = merged.column(2).as_struct();
+                (
+                    merged.column(0).as_primitive::<UInt32Type>().value(row),
+                    merged.column(1).as_primitive::<UInt32Type>().value(row),
+                    s.column(1).as_primitive::<Int32Type>().value(row),
+                )
+            })
+            .collect();
+        rows.sort();
+        let expected_rows: Vec<(u32, u32, i32)> = expected_ids
+            .into_iter()
+            .map(|id| (id, id, id as i32))
+            .collect();
+        assert_eq!(rows, expected_rows);
+    }
+
+    /// Reading only the source key keeps duplicate handling intact: `FirstSeen`
+    /// deduplicates the full source before the projection, `Fail` still names
+    /// the duplicate key, and a key listed twice in `on` is projected once.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_writing_nothing_with_duplicate_keys(
+        #[values(SourceDedupeBehavior::Fail, SourceDedupeBehavior::FirstSeen)]
+        dedupe: SourceDedupeBehavior,
+        #[values(false, true)] delete_if: bool,
+        #[values(false, true)] key_listed_twice: bool,
+    ) {
+        // Keys 1-6
+        let ds = create_test_dataset(
+            "memory://test_merge_writing_nothing_duplicates.lance",
+            LanceFileVersion::V2_0,
+            false,
+        )
+        .await;
+        // Full source; 4 matches twice, 7 matches nothing twice
+        let schema = create_test_schema();
+        let source = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![4, 4, 5, 7, 7])),
+                Arc::new(UInt32Array::from(vec![9; 5])),
+                Arc::new(StringArray::from(vec!["X"; 5])),
+            ],
+        )
+        .unwrap();
+
+        let on = if key_listed_twice {
+            vec!["key".to_string(), "key".to_string()]
+        } else {
+            vec!["key".to_string()]
+        };
+        let when_not_matched_by_source = if delete_if {
+            WhenNotMatchedBySource::delete_if(&ds, "key < 3").unwrap()
+        } else {
+            WhenNotMatchedBySource::Keep
+        };
+        let job = MergeInsertBuilder::try_new(ds.clone(), on)
+            .unwrap()
+            .when_matched(WhenMatched::Delete)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_not_matched_by_source(when_not_matched_by_source)
+            .source_dedupe_behavior(dedupe)
+            .try_build()
+            .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(source)], schema.clone()));
+        let result = job.execute(reader_to_stream(reader)).await;
+
+        if dedupe == SourceDedupeBehavior::Fail {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("Ambiguous merge inserts"), "{err}");
+            assert!(err.contains("key = 4"), "{err}");
+            return;
+        }
+        let (merged_dataset, merge_stats) = result.unwrap();
+        let expected_keys: Vec<u32> = if delete_if {
+            vec![3, 6]
+        } else {
+            vec![1, 2, 3, 6]
+        };
+        assert_eq!(merge_stats.num_deleted_rows, 6 - expected_keys.len() as u64);
+        assert_eq!(merge_stats.num_skipped_duplicates, 2);
+
+        let batches = merged_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let merged = concat_batches(&schema, &batches).unwrap();
+        let mut remaining_keys: Vec<u32> = merged
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        remaining_keys.sort();
+        assert_eq!(remaining_keys, expected_keys);
     }
 
     /// Test that MergeInsertPlanner::is_delete_only correctly identifies delete-only operations.
