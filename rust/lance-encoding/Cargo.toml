@@ -90,5 +90,9 @@ harness = false
 name = "compression_levels"
 harness = false
 
+[[bench]]
+name = "scheme_comparison"
+harness = false
+
 [lints]
 workspace = true
