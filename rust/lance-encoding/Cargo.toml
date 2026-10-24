@@ -94,5 +94,9 @@ harness = false
 name = "scheme_comparison"
 harness = false
 
+[[bench]]
+name = "synthetic_distributions"
+harness = false
+
 [lints]
 workspace = true
