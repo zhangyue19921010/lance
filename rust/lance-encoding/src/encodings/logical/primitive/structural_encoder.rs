@@ -239,6 +239,9 @@ pub(super) struct DictEncodingBudget {
     pub(super) max_encoded_size: usize,
     /// Upper bound on the dictionary's value bytes; see `DICT_MAX_SIZE_META_KEY`.
     pub(super) max_dict_bytes: usize,
+    /// Whether the field's codec bitpacks dictionary indices rather than storing them
+    /// raw; see `dict::dictionary_encode_with_index_codec`.
+    pub(super) packed_indices: bool,
 }
 
 pub(super) enum PrimitivePageStructure {
@@ -1591,11 +1594,14 @@ impl PrimitiveStructuralEncoder {
         }
         Ok(
             Self::should_dictionary_encode(data, field, policy).and_then(|budget| {
-                dict::dictionary_encode(
+                // A zipped sparse fallback stores only the materialized values while the
+                // budget counts every slot, so keep charging four bytes per index there.
+                dict::dictionary_encode_with_index_codec(
                     data,
                     budget.max_dict_entries,
                     budget.max_encoded_size,
                     budget.max_dict_bytes,
+                    budget.packed_indices && num_fallback_values == data.num_values(),
                 )
             }),
         )
@@ -1721,11 +1727,18 @@ impl PrimitiveStructuralEncoder {
             }
         }
 
+        // These codecs store the indices without bitpacking or general compression.
+        let packed_indices = !matches!(
+            field.metadata.get(COMPRESSION_META_KEY).map(String::as_str),
+            Some("none" | "fsst")
+        );
+
         let max_dict_entries = u32::try_from(threshold_cardinality.min(i32::MAX as u64)).ok()?;
         Some(DictEncodingBudget {
             max_dict_entries,
             max_encoded_size,
             max_dict_bytes,
+            packed_indices,
         })
     }
 

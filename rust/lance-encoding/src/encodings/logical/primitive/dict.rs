@@ -172,12 +172,48 @@ pub(super) fn clear_out_of_range_null_keys(array: Arc<dyn Array>) -> Result<Arc<
     }
 }
 
+/// Dictionaries up to this size are budgeted with bitpacked indices.
+///
+/// A cold point read loads the page's whole dictionary, so larger dictionaries keep
+/// the four-byte estimate and are admitted exactly as before.
+const PACKED_INDICES_MAX_DICT_BYTES: usize = 64 * 1024;
+
+/// Estimates the stored size of `num_indices` indices into a dictionary of
+/// `num_entries` entries that occupies `dict_bytes`.
+///
+/// The indices are written as 32-bit values. With `packed_indices`, the default
+/// mini-block codec bitpacks them in blocks of 1024 at the width of the largest
+/// index, each block with a four-byte header, and keeps them raw when that is not
+/// smaller. Fields that request a general codec such as zstd compress the indices
+/// instead, so for them this is only an estimate.
+fn estimated_indices_bytes(
+    num_indices: usize,
+    num_entries: usize,
+    dict_bytes: usize,
+    packed_indices: bool,
+) -> usize {
+    let raw_bytes = num_indices.saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
+    if !packed_indices
+        || !cfg!(feature = "bitpacking")
+        || dict_bytes > PACKED_INDICES_MAX_DICT_BYTES
+    {
+        return raw_bytes;
+    }
+    let max_index = num_entries.saturating_sub(1) as u64;
+    let bits = (u64::BITS - max_index.leading_zeros()).max(1) as usize;
+    num_indices
+        .div_ceil(1024)
+        .saturating_mul(4 + 128 * bits)
+        .min(raw_bytes)
+}
+
 fn dict_encode_variable_width<T>(
     variable_width_data_block: &VariableWidthBlock,
     bits_per_offset: u8,
     max_dict_entries: u32,
     max_encoded_size: usize,
     max_dict_bytes: usize,
+    packed_indices: bool,
 ) -> Option<(DataBlock, DataBlock)>
 where
     T: ArrowNativeType,
@@ -242,16 +278,17 @@ where
 
         indices_buffer.push(idx);
 
-        let indices_bytes = indices_buffer
-            .len()
-            .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
         let offsets_bytes = dictionary_offsets_buffer
             .len()
             .saturating_mul(bytes_per_offset);
-        let encoded_size = dictionary_buffer
-            .len()
-            .saturating_add(indices_bytes)
-            .saturating_add(offsets_bytes);
+        let dict_bytes = dictionary_buffer.len().saturating_add(offsets_bytes);
+        let indices_bytes = estimated_indices_bytes(
+            indices_buffer.len(),
+            curr_idx as usize,
+            dict_bytes,
+            packed_indices,
+        );
+        let encoded_size = dict_bytes.saturating_add(indices_bytes);
         if encoded_size > max_encoded_size {
             return None;
         }
@@ -283,7 +320,8 @@ where
 ///
 /// Gives up (returns `None`) once the dictionary would exceed `max_dict_entries` entries,
 /// once dictionary plus indices would exceed `max_encoded_size`, or, for variable-width
-/// values, once the dictionary values would exceed `max_dict_bytes`.
+/// values, once the dictionary values would exceed `max_dict_bytes`. The indices are
+/// sized as the default mini-block codec stores them.
 ///
 /// Returns a block of indices (will always be a fixed width data block) and a block of dictionary
 pub fn dictionary_encode(
@@ -291,6 +329,24 @@ pub fn dictionary_encode(
     max_dict_entries: u32,
     max_encoded_size: usize,
     max_dict_bytes: usize,
+) -> Option<(DataBlock, DataBlock)> {
+    dictionary_encode_with_index_codec(
+        data_block,
+        max_dict_entries,
+        max_encoded_size,
+        max_dict_bytes,
+        true,
+    )
+}
+
+/// Like [`dictionary_encode`]; `packed_indices` is false when the field's codec
+/// stores the indices raw.
+pub(super) fn dictionary_encode_with_index_codec(
+    data_block: &DataBlock,
+    max_dict_entries: u32,
+    max_encoded_size: usize,
+    max_dict_bytes: usize,
+    packed_indices: bool,
 ) -> Option<(DataBlock, DataBlock)> {
     match data_block {
         DataBlock::FixedWidth(fixed_width_data_block) => {
@@ -332,9 +388,12 @@ pub fn dictionary_encode(
                         };
                         indices_buffer.push(idx);
                         let dict_bytes = dictionary_buffer.len().saturating_mul(bytes_per_value);
-                        let indices_bytes = indices_buffer
-                            .len()
-                            .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
+                        let indices_bytes = estimated_indices_bytes(
+                            indices_buffer.len(),
+                            curr_idx as usize,
+                            dict_bytes,
+                            packed_indices,
+                        );
                         let encoded_size = dict_bytes.saturating_add(indices_bytes);
                         if encoded_size > max_encoded_size {
                             return None;
@@ -388,9 +447,12 @@ pub fn dictionary_encode(
                         };
                         indices_buffer.push(idx);
                         let dict_bytes = dictionary_buffer.len().saturating_mul(bytes_per_value);
-                        let indices_bytes = indices_buffer
-                            .len()
-                            .saturating_mul(DICT_INDICES_BITS_PER_VALUE as usize / 8);
+                        let indices_bytes = estimated_indices_bytes(
+                            indices_buffer.len(),
+                            curr_idx as usize,
+                            dict_bytes,
+                            packed_indices,
+                        );
                         let encoded_size = dict_bytes.saturating_add(indices_bytes);
                         if encoded_size > max_encoded_size {
                             return None;
@@ -425,6 +487,7 @@ pub fn dictionary_encode(
                     max_dict_entries,
                     max_encoded_size,
                     max_dict_bytes,
+                    packed_indices,
                 ),
                 64 => dict_encode_variable_width::<u64>(
                     variable_width_data_block,
@@ -432,6 +495,7 @@ pub fn dictionary_encode(
                     max_dict_entries,
                     max_encoded_size,
                     max_dict_bytes,
+                    packed_indices,
                 ),
                 _ => None,
             }
@@ -712,7 +776,7 @@ mod tests {
         let data_block = DataBlock::from_array(Arc::new(array) as Arc<dyn Array>);
 
         let full_size = usize::try_from(data_block.data_size()).unwrap_or(usize::MAX);
-        let too_small_limit = full_size / 10;
+        let too_small_limit = full_size / 100;
         assert!(dictionary_encode(&data_block, 1000, too_small_limit, usize::MAX).is_none());
         assert!(dictionary_encode(&data_block, 1000, full_size, usize::MAX).is_some());
     }
@@ -747,5 +811,41 @@ mod tests {
         let (_, dictionary) =
             dictionary_encode(&data_block, 1000, max_encoded_size, 25_600).unwrap();
         assert_eq!(dictionary.num_values(), 100);
+    }
+
+    #[cfg(feature = "bitpacking")]
+    #[test]
+    fn test_dictionary_encode_budgets_bitpacked_indices() {
+        let block = |values: Vec<String>| {
+            let block =
+                DataBlock::from_array(Arc::new(StringArray::from(values)) as Arc<dyn Array>);
+            let budget = block.data_size() as usize * 4 / 5;
+            (block, budget)
+        };
+
+        // A one-byte value and its offset take five bytes. Four-byte indices alone
+        // use the whole 80% budget; bitpacked one-bit indices fit easily.
+        let (flags, budget) = block((0..4096).map(|i| ["Y", "N"][i % 2].to_string()).collect());
+        assert!(dictionary_encode(&flags, 1000, budget, usize::MAX).is_some());
+        assert!(
+            dictionary_encode_with_index_codec(&flags, 1000, budget, usize::MAX, false).is_none()
+        );
+
+        // 200 indices still fill a whole 1024-index block, which is not smaller than
+        // raw indices, so they are charged four bytes each.
+        let (codes, budget) = block((0..200).map(|i| format!("{:02}", i % 100)).collect());
+        assert!(dictionary_encode(&codes, 1000, budget, usize::MAX).is_none());
+
+        // Mostly empty strings with unique others: bitpacked indices would fit, but a
+        // dictionary over 64 KiB keeps the four-byte estimate and is still refused.
+        let (sparse, budget) = block(
+            (0..100_000)
+                .map(|i| match i % 33 {
+                    0 => format!("{i:020}"),
+                    _ => String::new(),
+                })
+                .collect(),
+        );
+        assert!(dictionary_encode(&sparse, 100_000, budget, usize::MAX).is_none());
     }
 }

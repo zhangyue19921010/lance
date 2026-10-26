@@ -1039,6 +1039,22 @@ fn test_should_dictionary_encode() {
         result.is_some(),
         "Should use dictionary encode based on size"
     );
+
+    assert!(result.unwrap().packed_indices);
+
+    // Uncompressed fields store indices raw, so they are not budgeted as bitpacked.
+    let arrow_field = arrow_field.with_metadata(HashMap::from([(
+        COMPRESSION_META_KEY.to_string(),
+        "none".to_string(),
+    )]));
+    let field = LanceField::try_from(&arrow_field).unwrap();
+    let budget = PrimitiveStructuralEncoder::should_dictionary_encode(
+        &block,
+        &field,
+        DictionaryEncodingPolicy::LegacyU16,
+    )
+    .unwrap();
+    assert!(!budget.packed_indices);
 }
 
 #[tokio::test]
