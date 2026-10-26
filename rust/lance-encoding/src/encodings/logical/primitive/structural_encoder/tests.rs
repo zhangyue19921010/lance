@@ -1661,7 +1661,9 @@ async fn test_constant_layout_nullable_item_v2_2() {
 
     let test_cases = TestCases::default()
         .with_encoding(TestEncoding::StructuralU32)
-        .with_page_sizes(vec![4096]);
+        .with_page_sizes(vec![4096])
+        .with_range(1..4)
+        .with_indices(vec![1, 4]);
     check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
 }
 
@@ -1706,7 +1708,9 @@ async fn test_constant_layout_list_repdef_v2_2() {
 
     let test_cases = TestCases::default()
         .with_encoding(TestEncoding::StructuralU32)
-        .with_page_sizes(vec![4096]);
+        .with_page_sizes(vec![4096])
+        .with_range(1..3)
+        .with_indices(vec![1, 3]);
     check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
 }
 
