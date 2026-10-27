@@ -2016,10 +2016,13 @@ async fn remap_deletes_all_indexed_rows(
     Ok(true)
 }
 
+/// Restrict rows to `owned_fragments` only for sources of a staging merge,
+/// before translating their addresses. Independent and deferred remaps pass None.
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
     row_id_map: &RowAddrTranslator,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<RemapResult> {
     // A remap is maintenance: a segment the tagged reader excludes from the
     // listing is still reachable here (its caller decided whether to touch
@@ -2163,6 +2166,7 @@ pub(crate) async fn remap_index(
                 &new_id,
                 matched,
                 row_id_map,
+                owned_fragments,
             )
             .await?;
 
@@ -8790,6 +8794,7 @@ mod tests {
             &dataset,
             &index_uuid,
             &RowAddrTranslator::sync(remap_to_empty.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -8827,6 +8832,7 @@ mod tests {
             &dataset,
             &index_meta.uuid,
             &RowAddrTranslator::sync(remap.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -8902,6 +8908,7 @@ mod tests {
             &dataset,
             &index_uuid,
             &RowAddrTranslator::sync(RowAddrRemap::empty()),
+            None,
         )
         .await
         .unwrap_err();
@@ -8979,6 +8986,7 @@ mod tests {
             &dataset,
             &index_uuid,
             &RowAddrTranslator::sync(RowAddrRemap::empty()),
+            None,
         )
         .await
         .expect_err("malformed covering metadata must not be silently accepted");
