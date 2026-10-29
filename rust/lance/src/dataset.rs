@@ -1583,6 +1583,8 @@ impl Dataset {
     /// Once a version is removed it can no longer be checked out or restored.  Any data unique
     /// to that version will be lost.
     ///
+    /// Returns an invalid-input error when this dataset is checked out at a detached version.
+    ///
     /// # Arguments
     ///
     /// * `older_than` - Versions older than this will be deleted.
@@ -1623,6 +1625,8 @@ impl Dataset {
     /// Once a version is removed it can no longer be checked out or restored.  Any data unique
     /// to that version will be lost.
     ///
+    /// Returns an invalid-input error when this dataset is checked out at a detached version.
+    ///
     /// # Arguments
     ///
     /// * `policy` - `CleanupPolicy` determines the behaviour of cleanup.
@@ -1642,6 +1646,8 @@ impl Dataset {
     ///
     /// The returned operation can be explained without deleting files, or
     /// executed to re-evaluate the current dataset state and remove files.
+    /// Both return an invalid-input error when this dataset is checked out at a
+    /// detached version.
     pub fn cleanup(&self, policy: CleanupPolicy) -> CleanupOperation<'_> {
         CleanupOperation::new(self, policy)
     }
