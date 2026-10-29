@@ -13,8 +13,9 @@
 use crate::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_MANAGED_BLOBS,
     FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    apply_index_object_metadata_flag, ensure_can_read_manifest, ensure_can_write_manifest,
-    inherit_sticky_feature_flags, managed_blobs_enabled, validate_non_reusable_field_id_flags,
+    apply_index_object_metadata_flag, apply_row_addr_index_feature_flag, ensure_can_read_manifest,
+    ensure_can_write_manifest, inherit_sticky_feature_flags, managed_blobs_enabled,
+    validate_non_reusable_field_id_flags,
 };
 use crate::format::clustering::{ChangedReferences, validate_clustering_of};
 
@@ -2022,6 +2023,7 @@ impl Transaction {
             manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
             manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
         }
+        apply_row_addr_index_feature_flag(&mut manifest, &final_indices);
 
         if let Some(current_manifest) = current_manifest {
             inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
@@ -3873,6 +3875,98 @@ mod tests {
             vec![1, 1],
             "append must cost one visit per appended fragment, regardless of table size"
         );
+    }
+
+    #[rstest]
+    #[case::btree("BTreeIndexDetails", 1, true, true)]
+    #[case::newer_btree("BTreeIndexDetails", 2, true, true)]
+    #[case::legacy_btree("BTreeIndexDetails", 0, true, false)]
+    #[case::without_stable_ids("BTreeIndexDetails", 1, false, false)]
+    #[case::bitmap("BitmapIndexDetails", 1, true, true)]
+    #[case::legacy_bitmap("BitmapIndexDetails", 0, true, false)]
+    #[case::label_list("LabelListIndexDetails", 2, true, true)]
+    #[case::legacy_label_list("LabelListIndexDetails", 1, true, false)]
+    #[case::row_id_index("InvertedIndexDetails", 0, true, false)]
+    fn row_addr_index_writer_fence_follows_final_indices(
+        #[case] details_type: &str,
+        #[case] index_version: i32,
+        #[case] stable_row_ids: bool,
+        #[case] needs_fence: bool,
+        #[values(false, true)] has_object_metadata: bool,
+    ) {
+        let mut manifest = sample_manifest_with_fragments(0..2);
+        if stable_row_ids {
+            for fragment in Arc::make_mut(&mut manifest.fragments) {
+                fragment.row_id_meta = Some(RowIdMeta::Inline(
+                    write_row_ids(&RowIdSequence::from(fragment.id..fragment.id + 1)).into(),
+                ));
+            }
+            apply_feature_flags(&mut manifest, true, false).unwrap();
+            manifest.next_row_id = 2;
+        }
+        let mut index = sample_index_metadata("id_idx");
+        index.index_version = index_version;
+        index.fragment_bitmap = Some(RoaringBitmap::from_iter([0, 1]));
+        index.index_details = Some(Arc::new(prost_types::Any {
+            type_url: format!("type.googleapis.com/lance.index.pb.{details_type}"),
+            value: vec![],
+        }));
+        if has_object_metadata {
+            index
+                .metadata
+                .insert("org.example.test".into(), "opaque".into());
+        }
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let (manifest, indices) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        let flag = crate::feature_flags::FLAG_ROW_ADDR_INDICES;
+        assert_eq!(manifest.reader_feature_flags & flag, 0);
+        assert_eq!(manifest.writer_feature_flags & flag != 0, needs_fence);
+        assert_eq!(manifest.reader_feature_flags & FLAG_OBJECT_METADATA, 0);
+        assert_eq!(
+            manifest.writer_feature_flags & FLAG_OBJECT_METADATA != 0,
+            has_object_metadata
+        );
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Append { fragments: vec![] },
+            None,
+        );
+        let (mut manifest, indices) = transaction
+            .build_manifest(Some(&manifest), indices, "txn", &default_build_config())
+            .unwrap();
+        // The final manifest write applies flags a second time.
+        apply_feature_flags(&mut manifest, stable_row_ids, false).unwrap();
+        assert_eq!(manifest.writer_feature_flags & flag != 0, needs_fence);
+        assert_eq!(manifest.reader_feature_flags & FLAG_OBJECT_METADATA, 0);
+        assert_eq!(
+            manifest.writer_feature_flags & FLAG_OBJECT_METADATA != 0,
+            has_object_metadata
+        );
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![index],
+            },
+            None,
+        );
+        let (manifest, indices) = transaction
+            .build_manifest(Some(&manifest), indices, "txn", &default_build_config())
+            .unwrap();
+        assert!(indices.is_empty());
+        assert_eq!(manifest.writer_feature_flags & flag, 0);
+        assert_eq!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
     }
 
     #[rstest]
