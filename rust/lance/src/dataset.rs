@@ -1980,6 +1980,34 @@ impl Dataset {
         blob::take_blobs_by_addresses(self, row_addrs, column.as_ref()).await
     }
 
+    /// Scan every row of this dataset with its blob v2 columns as values another
+    /// dataset can be written from: the payload bytes of every blob this dataset
+    /// stores, and an External blob's absolute URI and byte range, at any depth.
+    ///
+    /// Each batch holds the payloads of its blobs in memory.
+    pub async fn scan_blobs_as_logical(self: &Arc<Self>) -> Result<DatasetRecordBatchStream> {
+        let mut scan = self.scan();
+        scan.with_row_address();
+        let batches = scan.try_into_stream().await?;
+        let plan = Arc::new(optimize::BlobV2BatchRewritePlan::try_new(
+            self.schema(),
+            lance_io::stream::RecordBatchStream::schema(&batches).as_ref(),
+            false,
+            false,
+        )?);
+        let schema = plan.output_schema().clone();
+        let dataset = self.clone();
+        let batches = batches
+            .and_then(move |batch| {
+                let (plan, dataset) = (plan.clone(), dataset.clone());
+                async move { plan.transform_batch(&dataset, batch).await }
+            })
+            .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)));
+        Ok(DatasetRecordBatchStream::new(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batches),
+        )))
+    }
+
     /// Take [BlobFile] by row indices (offsets in the dataset).
     ///
     /// The result has the same null and empty blob representation as

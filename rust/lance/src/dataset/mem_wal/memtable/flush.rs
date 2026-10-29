@@ -27,6 +27,7 @@ use uuid::Uuid;
 use super::super::index::{FlushContext, FlushOutcome, GenerationWrite, IndexStore, MemIndexSpec};
 use super::super::memtable::MemTable;
 use crate::Dataset;
+use crate::dataset::blob::prepared_sidecar_bytes;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::SsTableWarmer;
@@ -100,16 +101,25 @@ impl FlushedSize {
     /// Zero reads as unmeasured. An empty memtable is refused before a flush
     /// gets here, so a flushed generation always holds rows and a zero can only
     /// mean the accounting failed.
-    fn of(memtable: &MemTable) -> Self {
-        Self {
+    fn of(memtable: &MemTable) -> Result<Self> {
+        // Blob payloads in packed and dedicated sidecars sit outside the
+        // batches, but a reader of this generation reads them back too.
+        let mut sidecar_bytes = 0u64;
+        for stored in memtable.batch_store().iter() {
+            sidecar_bytes = sidecar_bytes.saturating_add(prepared_sidecar_bytes(&stored.data)?);
+        }
+        Ok(Self {
             // `row_bytes`, not the store's retained heap: the window being
             // written is what a reader of this generation gets back.
-            in_memory_bytes: Some(memtable.batch_store().row_bytes() as u64).filter(|b| *b > 0),
+            in_memory_bytes: Some(
+                (memtable.batch_store().row_bytes() as u64).saturating_add(sidecar_bytes),
+            )
+            .filter(|b| *b > 0),
             physical_rows: Some(memtable.row_count() as u64).filter(|r| *r > 0),
             // Zero means the table has no primary key, which is not a
             // measurement of one.
             primary_key_bytes: Some(memtable.pk_bytes() as u64).filter(|b| *b > 0),
-        }
+        })
     }
 
     fn sstable(self, generation: u64, path: String) -> SsTable {
@@ -306,7 +316,7 @@ impl MemTableFlusher {
         }
 
         let generation = memtable.generation();
-        let size = FlushedSize::of(memtable);
+        let size = FlushedSize::of(memtable)?;
         let (gen_folder_name, gen_path, preassigned_data_file_name) =
             self.generation_target(memtable)?;
 
@@ -584,7 +594,7 @@ impl MemTableFlusher {
         }
 
         let generation = memtable.generation();
-        let size = FlushedSize::of(memtable);
+        let size = FlushedSize::of(memtable)?;
         let (gen_folder_name, gen_path, preassigned_data_file_name) =
             self.generation_target(memtable)?;
 
@@ -799,13 +809,14 @@ impl MemTableFlusher {
             std::cmp::Ordering::Greater => {
                 // A compactor may already have drained the SSTable from the
                 // manifest, leaving no path to report.
-                let sstable = manifest
+                let sstable = match manifest
                     .sstables
                     .into_iter()
                     .find(|sstable| sstable.generation == generation)
-                    .unwrap_or_else(|| {
-                        FlushedSize::of(memtable).sstable(generation, String::new())
-                    });
+                {
+                    Some(sstable) => sstable,
+                    None => FlushedSize::of(memtable)?.sstable(generation, String::new()),
+                };
                 Ok(Some(FlushResult {
                     sstable,
                     rows_flushed: memtable.row_count(),
@@ -1253,6 +1264,47 @@ mod tests {
         // No primary key here: absent, not zero, which a consumer would read as
         // costing nothing.
         assert_eq!(entry.primary_key_bytes, None);
+    }
+
+    /// Blob payloads in packed and dedicated sidecars count on top of the
+    /// MemTable's rows; an inline payload is already in them.
+    #[tokio::test]
+    async fn flushed_sstable_counts_blob_sidecar_payloads() {
+        use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder};
+
+        let fixture = FlushFixture::new().await;
+        let mut blobs = BlobDescriptorArrayBuilder::new("blob");
+        for blob in [
+            BlobDescriptor::Inline { data: "abc".into() },
+            BlobDescriptor::Packed {
+                blob_id: 1,
+                offset: 0,
+                size: 20,
+            },
+            BlobDescriptor::Dedicated {
+                blob_id: 2,
+                size: 1000,
+            },
+        ] {
+            blobs.push(blob).unwrap();
+        }
+        let (field, blobs) = blobs.finish().unwrap().into_parts();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            field,
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])), blobs],
+        )
+        .unwrap();
+        let mut memtable = MemTable::new(schema, 1, vec![]).unwrap();
+        let frag_id = memtable.insert(batch).await.unwrap();
+        let rows = memtable.batch_store().row_bytes() as u64;
+
+        let entry = fixture.flush_and_read_back(&memtable, frag_id + 1).await;
+
+        assert_eq!(entry.in_memory_bytes, Some(rows + 20 + 1000));
     }
 
     /// With a primary key, its size is recorded too -- the term neither of the

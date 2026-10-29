@@ -1649,6 +1649,21 @@ fn classify_rows(
     })
 }
 
+/// The URI of the object at `relative_path` under the base at `base_uri`, each
+/// path segment escaped so characters such as `#` and `?` stay in the name.
+fn external_blob_uri(base_uri: &str, relative_path: &str) -> Result<String> {
+    let mut url = lance_io::object_store::uri_to_url(base_uri)?;
+    url.path_segments_mut()
+        .map_err(|_| {
+            Error::invalid_input(format!(
+                "External blob base '{base_uri}' cannot hold an object path"
+            ))
+        })?
+        .pop_if_empty()
+        .extend(relative_path.split('/'));
+    Ok(url.to_string())
+}
+
 /// Convert a blob v2 descriptor into the logical writer representation.
 ///
 /// Reads blob data lazily using row addresses to avoid materializing all blob
@@ -1758,8 +1773,7 @@ async fn descriptor_to_logical_blob_array(
                             field_name, base_id
                         ))
                     })?;
-                    let absolute_uri = format!("{}/{}", base.path.trim_end_matches('/'), uri_val);
-                    uri_builder.append_value(&absolute_uri);
+                    uri_builder.append_value(external_blob_uri(&base.path, uri_val)?);
                 }
                 let position =
                     (!descriptor.position_col.is_null(i)).then(|| descriptor.position_col.value(i));
