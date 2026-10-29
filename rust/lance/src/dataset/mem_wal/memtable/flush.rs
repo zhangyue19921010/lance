@@ -71,6 +71,8 @@ pub struct MemTableFlusher {
     object_store: Arc<ObjectStore>,
     base_path: Path,
     base_uri: String,
+    /// The MemWAL's `dir_id`; generations are written under its directory.
+    dir_id: String,
     shard_id: Uuid,
     manifest_store: Arc<ShardManifestStore>,
     /// When present, each new generation is warmed before it is committed, so
@@ -137,10 +139,12 @@ impl FlushedSize {
 const TRAINING_BATCH_SIZE: usize = 8192;
 
 impl MemTableFlusher {
+    /// Create a flusher writing `shard_id`'s generations under the MemWAL `dir_id`.
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         base_uri: impl Into<String>,
+        dir_id: impl Into<String>,
         shard_id: Uuid,
         manifest_store: Arc<ShardManifestStore>,
     ) -> Self {
@@ -148,6 +152,7 @@ impl MemTableFlusher {
             object_store,
             base_path,
             base_uri: base_uri.into(),
+            dir_id: dir_id.into(),
             shard_id,
             manifest_store,
             warmer: None,
@@ -239,6 +244,8 @@ impl MemTableFlusher {
         }
     }
 
+    /// The generation's folder name, path, and reserved data file name (`None`
+    /// when no target was reserved). Errors if the target is for another generation.
     fn generation_target(&self, memtable: &MemTable) -> Result<(String, Path, Option<String>)> {
         let generation = memtable.generation();
         if let Some(target) = memtable.target() {
@@ -250,7 +257,7 @@ impl MemTableFlusher {
             }
             return Ok((
                 target.generation_dir.clone(),
-                target.generation_path(&self.base_path, &self.shard_id),
+                target.generation_path(&self.base_path, &self.dir_id, &self.shard_id),
                 Some(target.data_file_name.clone()),
             ));
         }
@@ -261,7 +268,13 @@ impl MemTableFlusher {
         let random_hash = generate_random_hash();
         Ok((
             format!("{}_gen_{}", random_hash, generation),
-            sstable_path(&self.base_path, &self.shard_id, &random_hash, generation),
+            sstable_path(
+                &self.base_path,
+                &self.dir_id,
+                &self.shard_id,
+                &random_hash,
+                generation,
+            ),
             None,
         ))
     }
@@ -965,12 +978,19 @@ mod tests {
             let manifest_store = Arc::new(ShardManifestStore::new(
                 store.clone(),
                 &base_path,
+                "",
                 shard_id,
                 2,
             ));
             let (epoch, _) = manifest_store.claim_epoch(0).await.unwrap();
-            let flusher =
-                MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store.clone());
+            let flusher = MemTableFlusher::new(
+                store,
+                base_path,
+                base_uri,
+                "",
+                shard_id,
+                manifest_store.clone(),
+            );
             Self {
                 manifest_store,
                 flusher,
@@ -1049,6 +1069,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1067,7 +1088,8 @@ mod tests {
         let durable = 0;
         assert!(!memtable.all_flushed_to_wal(durable));
 
-        let flusher = MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store);
+        let flusher =
+            MemTableFlusher::new(store, base_path, base_uri, "", shard_id, manifest_store);
         let result = flusher.flush(&memtable, epoch, 0, 0).await;
 
         assert!(result.is_err());
@@ -1086,6 +1108,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1096,7 +1119,8 @@ mod tests {
         let schema = create_test_schema();
         let memtable = MemTable::new(schema, 1, vec![]).unwrap();
 
-        let flusher = MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store);
+        let flusher =
+            MemTableFlusher::new(store, base_path, base_uri, "", shard_id, manifest_store);
         let result = flusher.flush(&memtable, epoch, 0, 0).await;
 
         assert!(result.is_err());
@@ -1110,6 +1134,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1132,6 +1157,7 @@ mod tests {
             store.clone(),
             base_path,
             base_uri,
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -1197,6 +1223,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1205,6 +1232,7 @@ mod tests {
             store.clone(),
             base_path,
             base_uri,
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -1366,6 +1394,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1389,6 +1418,7 @@ mod tests {
             store.clone(),
             base_path,
             base_uri,
+            "",
             shard_id,
             manifest_store.clone(),
         )
@@ -1421,6 +1451,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1444,6 +1475,7 @@ mod tests {
             store.clone(),
             base_path,
             base_uri.clone(),
+            "",
             shard_id,
             manifest_store,
         );
@@ -1519,6 +1551,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1547,6 +1580,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             _base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -1626,6 +1660,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1653,6 +1688,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             _base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -1720,6 +1756,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1750,6 +1787,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -1849,6 +1887,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1879,6 +1918,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -1947,6 +1987,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -2014,6 +2055,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -2112,6 +2154,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -2185,6 +2228,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -2238,6 +2282,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -2284,6 +2329,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -2390,6 +2436,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -2400,10 +2447,16 @@ mod tests {
         let mut memtable = MemTable::new(batch.schema(), 1, vec![]).unwrap();
         memtable.set_indexes(IndexStore::from_specs(&specs, &lance_schema, 1000, 16).unwrap());
         let durable = memtable.insert(batch).await.unwrap() + 1;
-        let result =
-            MemTableFlusher::new(store, base_path, base_uri.clone(), shard_id, manifest_store)
-                .flush_with_indexes(&memtable, epoch, &specs, 1, durable)
-                .await?;
+        let result = MemTableFlusher::new(
+            store,
+            base_path,
+            base_uri.clone(),
+            "",
+            shard_id,
+            manifest_store,
+        )
+        .flush_with_indexes(&memtable, epoch, &specs, 1, durable)
+        .await?;
         let generation = Dataset::open(&format!(
             "{}/_mem_wal/{}/{}",
             base_uri.trim_end_matches('/'),
