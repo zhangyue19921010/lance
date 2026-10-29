@@ -1179,6 +1179,8 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 (
                     TaskData {
                         fragments: bin.fragments,
+                        output_clustering_id: None,
+                        output_metadata: HashMap::new(),
                     },
                     live_rows,
                 )
@@ -1276,6 +1278,9 @@ pub async fn compact_files_with_planner(
     // If nothing to compact, don't make a commit.
     if compaction_plan.tasks().is_empty() {
         return Ok(CompactionMetrics::default());
+    }
+    for task in compaction_plan.tasks() {
+        refuse_stale_output_clustering(&dataset.manifest, task)?;
     }
 
     let dataset_ref = &dataset.clone();
@@ -2347,6 +2352,26 @@ async fn prepare_reader(
 pub struct TaskData {
     /// The fragments to compact.
     pub fragments: Vec<Fragment>,
+    /// `Fragment::clustering_id` of every output fragment, chosen by the
+    /// planner. `None`, the outputs carry no definition, whatever the inputs
+    /// carried: Lance does not infer it from the inputs, since a compaction
+    /// may span fragments of different clusterings. The commit refuses an id
+    /// whose definition the landing manifest does not hold. Independent of
+    /// `output_metadata`: metadata needs no definition.
+    ///
+    /// Serialized tasks stay readable in both directions, but the output
+    /// properties are honoured only by a worker that knows the fields: a
+    /// worker built before them rewrites unlabelled outputs with empty
+    /// metadata. A planner that hands such tasks to other processes must know
+    /// they run this version or newer; the Java binding refuses to export a
+    /// task carrying either property for that reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_clustering_id: Option<u32>,
+    /// `Fragment::metadata` of every output fragment, replacing whatever the
+    /// writer set; never copied from the inputs. Opaque to Lance. Empty, the
+    /// outputs carry no metadata.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub output_metadata: HashMap<String, String>,
 }
 
 /// A standalone task that can be serialized and sent to another machine for
@@ -2836,6 +2861,35 @@ async fn live_row_addrs(
     Ok(addrs)
 }
 
+/// Refuse a task whose output clustering id can never resolve, before the
+/// task rewrites anything: an id at or below the manifest's
+/// `max_clustering_id` that the manifest no longer holds, since definition ids
+/// are never reused. An id above the watermark may have been allocated after
+/// this snapshot was read and is left to the commit, which checks every id
+/// against the landing manifest; that check is the one that counts, this one
+/// only saves a planner that holds a stale id from rewriting every task's
+/// data to have the result refused.
+fn refuse_stale_output_clustering(
+    manifest: &lance_table::format::Manifest,
+    task: &TaskData,
+) -> Result<()> {
+    let Some(id) = task.output_clustering_id else {
+        return Ok(());
+    };
+    if id > manifest.max_clustering_id
+        || manifest
+            .clustering
+            .iter()
+            .any(|definition| definition.id == id)
+    {
+        return Ok(());
+    }
+    Err(Error::invalid_input(format!(
+        "compaction task outputs would carry clustering definition {id}, which the table \
+         no longer defines"
+    )))
+}
+
 /// Rewrite the files in a single task.
 ///
 /// This assumes that the dataset is the correct read version to be compacted.
@@ -2850,6 +2904,7 @@ async fn rewrite_files(
         dataset.manifest.data_storage_format.lance_file_format(),
         write_version,
     )?;
+    refuse_stale_output_clustering(&dataset.manifest, &task)?;
 
     if task.fragments.is_empty() {
         return Ok(RewriteResult {
@@ -3206,6 +3261,11 @@ async fn rewrite_files(
         .sum();
 
     log::info!("Compaction task {}: completed", task_id);
+
+    for fragment in &mut new_fragments {
+        fragment.clustering_id = task.output_clustering_id;
+        fragment.metadata = task.output_metadata.clone();
+    }
 
     Ok(RewriteResult {
         metrics,
@@ -4485,6 +4545,268 @@ mod tests {
         async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
             Ok(Some(Box::new(self.clone())))
         }
+    }
+
+    /// A task's output properties are independent: outputs carry exactly the
+    /// clustering id and the metadata the planner set, in any of the four
+    /// combinations, whatever the inputs carried; metadata needs no
+    /// definition; an id whose definition the manifest lacks is refused at
+    /// commit and no replacement is published.
+    #[tokio::test]
+    async fn compaction_outputs_carry_the_tasks_output_properties() {
+        use crate::dataset::CommitBuilder;
+        use crate::dataset::transaction::{Operation, Transaction};
+        use lance_table::format::ClusteringDefinition;
+
+        struct Stamping {
+            inner: DefaultCompactionPlanner,
+            clustering_id: Option<u32>,
+            metadata: HashMap<String, String>,
+        }
+
+        #[async_trait::async_trait]
+        impl CompactionPlanner for Stamping {
+            async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+                let mut plan = self.inner.plan(dataset).await?;
+                for task in &mut plan.tasks {
+                    task.output_clustering_id = self.clustering_id;
+                    task.output_metadata = self.metadata.clone();
+                }
+                Ok(plan)
+            }
+        }
+
+        fn stamping(clustering_id: Option<u32>, metadata: &[(&str, &str)]) -> Stamping {
+            Stamping {
+                inner: DefaultCompactionPlanner::new(CompactionOptions {
+                    target_rows_per_fragment: 1_000,
+                    ..Default::default()
+                })
+                .unwrap(),
+                clustering_id,
+                metadata: metadata
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }
+        }
+
+        async fn three_fragments(uri: &str) -> Dataset {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(0..300))],
+            )
+            .unwrap();
+            let dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                uri,
+                Some(WriteParams {
+                    max_rows_per_file: 100,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.fragments().len(), 3);
+            dataset
+        }
+
+        async fn with_definition(dataset: Dataset, id: u32) -> Dataset {
+            let definition = ClusteringDefinition {
+                id,
+                columns: vec![0],
+                provider: "org.example.cluster".into(),
+                version: 1,
+            };
+            CommitBuilder::new(Arc::new(dataset.clone()))
+                .with_clustering_definitions(vec![definition])
+                .execute(Transaction::new(
+                    dataset.manifest.version,
+                    Operation::UpdateConfig {
+                        config_updates: None,
+                        table_metadata_updates: None,
+                        schema_metadata_updates: None,
+                        field_metadata_updates: HashMap::new(),
+                    },
+                    None,
+                ))
+                .await
+                .unwrap()
+        }
+
+        async fn append_two_unstamped(dataset: &Dataset, uri: &str) -> Dataset {
+            let appended = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+                vec![Arc::new(Int64Array::from_iter_values(300..320))],
+            )
+            .unwrap();
+            let mut dataset = dataset.clone();
+            for _ in 0..2 {
+                dataset = Dataset::write(
+                    RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                    uri,
+                    Some(WriteParams {
+                        mode: WriteMode::Append,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            }
+            dataset
+        }
+
+        fn assert_outputs(dataset: &Dataset, id: Option<u32>, metadata: &[(&str, &str)]) {
+            let expected: HashMap<String, String> = metadata
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            for output in dataset.fragments().iter() {
+                assert_eq!(output.clustering_id, id, "{output:?}");
+                assert_eq!(output.metadata, expected, "{output:?}");
+            }
+        }
+
+        // Both: id under a defined definition plus opaque metadata.
+        let dir = TempStrDir::default();
+        let mut dataset = with_definition(three_fragments(&dir).await, 1).await;
+        compact_files_with_planner(&mut dataset, None, &stamping(Some(1), &[("bucket", "7")]))
+            .await
+            .unwrap();
+        assert!(dataset.fragments().len() < 3, "{:?}", dataset.fragments());
+        assert_outputs(&dataset, Some(1), &[("bucket", "7")]);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 300);
+
+        // Neither: stamped and unstamped inputs compact into outputs that carry
+        // no id and no metadata; nothing is inferred or copied from the inputs.
+        let mut dataset = append_two_unstamped(&dataset, &dir).await;
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .any(|f| f.clustering_id == Some(1))
+        );
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .any(|f| f.clustering_id.is_none())
+        );
+        compact_files_with_planner(&mut dataset, None, &stamping(None, &[]))
+            .await
+            .unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 340);
+        assert_outputs(&dataset, None, &[]);
+
+        // Metadata only: no definition exists on this table and none is needed.
+        let dir = TempStrDir::default();
+        let mut dataset = three_fragments(&dir).await;
+        assert!(dataset.manifest.clustering.is_empty());
+        compact_files_with_planner(
+            &mut dataset,
+            None,
+            &stamping(None, &[("owner", "x"), ("bucket", "3")]),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.fragments().len() < 3, "{:?}", dataset.fragments());
+        assert_outputs(&dataset, None, &[("owner", "x"), ("bucket", "3")]);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 300);
+
+        // Id only: outputs carry the definition and empty metadata, replacing
+        // the metadata the previous round stamped. Definition ids continue the
+        // manifest's maximum, so this table's first definition is 1.
+        let mut dataset = with_definition(append_two_unstamped(&dataset, &dir).await, 1).await;
+        compact_files_with_planner(&mut dataset, None, &stamping(Some(1), &[]))
+            .await
+            .unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 340);
+        assert_outputs(&dataset, Some(1), &[]);
+
+        // Serialized tasks carry both properties and omit them when unset.
+        let fragments = dataset.manifest.fragments.as_ref().clone();
+        let task = TaskData {
+            fragments: fragments.clone(),
+            output_clustering_id: Some(1),
+            output_metadata: [("k".to_string(), "v".to_string())].into(),
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains("\"output_clustering_id\":1"), "{json}");
+        assert!(json.contains("\"output_metadata\""), "{json}");
+        let back: TaskData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, task);
+        let plain = TaskData {
+            fragments,
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("output_"), "{json}");
+
+        // A stale id, one at or below the watermark that the table no longer
+        // defines, is refused before any task rewrites data: no file is staged
+        // and no version is added. Definition 1 is allocated, then cleared.
+        let dir = TempStrDir::default();
+        let dataset = with_definition(three_fragments(&dir).await, 1).await;
+        let mut dataset = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_clustering_definitions(Vec::new())
+            .execute(Transaction::new(
+                dataset.manifest.version,
+                Operation::UpdateConfig {
+                    config_updates: None,
+                    table_metadata_updates: None,
+                    schema_metadata_updates: None,
+                    field_metadata_updates: HashMap::new(),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+        assert!(dataset.manifest.clustering.is_empty());
+        assert_eq!(dataset.manifest.max_clustering_id, 1);
+        let version = dataset.manifest.version;
+        let error = compact_files_with_planner(&mut dataset, None, &stamping(Some(1), &[]))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("definition 1, which the table no longer defines"),
+            "{error}"
+        );
+        let reopened = Dataset::open(&dir).await.unwrap();
+        assert_eq!(reopened.manifest.version, version);
+        assert_eq!(reopened.fragments().len(), 3);
+        assert_outputs(&reopened, None, &[]);
+        // A worker given such a task refuses it the same way.
+        let error = rewrite_files(
+            Cow::Borrowed(&reopened),
+            TaskData {
+                fragments: reopened.manifest.fragments.as_ref().clone(),
+                output_clustering_id: Some(1),
+                output_metadata: HashMap::new(),
+            },
+            &CompactionOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("no longer defines"), "{error}");
+
+        // An id above the watermark may have been allocated after this
+        // snapshot was read, so it is left to the commit, which refuses it
+        // against the landing manifest: no replacement is published, though
+        // the id reservation may have advanced the version and output files
+        // may have been staged.
+        let error = compact_files_with_planner(&mut dataset, None, &stamping(Some(9), &[]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("clustering"), "{error}");
+        let reopened = Dataset::open(&dir).await.unwrap();
+        assert!(reopened.manifest.version <= version + 1);
+        assert_eq!(reopened.fragments().len(), 3);
+        assert_outputs(&reopened, None, &[]);
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 300);
     }
 
     #[rstest]
@@ -7678,6 +8000,8 @@ mod tests {
             Cow::Borrowed(&dataset),
             TaskData {
                 fragments: fragments.clone(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
             },
             &options,
         )
@@ -12739,6 +13063,8 @@ mod tests {
         for group in groups {
             let task = TaskData {
                 fragments: group.iter().map(|idx| fragments[*idx].clone()).collect(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
             };
             completed.push(
                 rewrite_files(Cow::Borrowed(&dataset), task, &options)
@@ -12984,6 +13310,8 @@ mod tests {
             Cow::Borrowed(&stale),
             TaskData {
                 fragments: vec![fragments[1].clone(), fragments[2].clone()],
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
             },
             &options,
         )
@@ -12993,6 +13321,8 @@ mod tests {
             Cow::Borrowed(&stale),
             TaskData {
                 fragments: vec![fragments[0].clone()],
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
             },
             &options,
         )
@@ -13312,6 +13642,8 @@ mod tests {
         let task = CompactionTask {
             task: TaskData {
                 fragments: dataset.fragments().as_ref().clone(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
             },
             read_version: dataset.manifest.version,
             options: deferred_options.clone(),

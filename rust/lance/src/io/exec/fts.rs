@@ -8287,6 +8287,8 @@ mod tests {
                     .filter(|f| f.id < 101 || f.id >= 259)
                     .cloned()
                     .collect(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
             },
             read_version: dataset.version().version,
             options: options.clone(),
