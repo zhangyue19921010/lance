@@ -9559,6 +9559,60 @@ mod tests {
         );
     }
 
+    /// The codebook length matches, but its values are f32 while the column is
+    /// f16. Every create path used to accept it and panic on the first batch
+    /// when quantization read the codebook as f16.
+    #[rstest]
+    #[case::v3(IndexFileVersion::V3)]
+    #[case::legacy(IndexFileVersion::Legacy)]
+    #[tokio::test]
+    async fn test_create_ivf_pq_rejects_codebook_of_another_value_type(
+        #[case] version: IndexFileVersion,
+    ) {
+        const DIM: usize = 32;
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let codebook = Arc::new(generate_random_array_with_seed::<Float32Type>(
+            256 * DIM,
+            [22; 32],
+        ));
+        let mut params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            fast_ivf_params(2),
+            PQBuildParams::with_codebook(4, 8, codebook),
+        );
+        params.version = version;
+        let error = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect_err("a codebook of another value type must be rejected");
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains(
+                "PQ codebook value type Float32 does not match the vector value type Float16"
+            ),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn test_create_ivf_flat_f16() {
         let test_dir = TempStrDir::default();
