@@ -9948,24 +9948,21 @@ mod tests {
 
         // Verify index is NOT being used in queries after delete (empty bitmap)
         if column_name == "text" {
-            // Inverted indexes will still appear to be used in FTS queries.
-            // TODO: once metrics are working on FTS queries, we can check the
-            // analyze plan output instead for index usage.
-            let _plan_after_delete = dataset
-                .scan()
-                .project(&[column_name])
+            // The retained index has no live fragments, so an empty snapshot
+            // needs no index scan to return an empty FTS result.
+            let mut scan = dataset.scan();
+            scan.project(&[column_name])
                 .unwrap()
                 .full_text_search(FullTextSearchQuery::new("test".to_string()))
-                .unwrap()
-                .explain_plan(false)
-                .await
                 .unwrap();
+            let plan_after_delete = scan.explain_plan(false).await.unwrap();
             assert_index_usage(
-                &_plan_after_delete,
+                &plan_after_delete,
                 column_name,
-                true,
+                false,
                 "after delete (empty bitmap)",
             );
+            assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
         } else {
             // Use equality filter for btree/bitmap indices
             let _plan_after_delete = dataset
