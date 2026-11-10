@@ -87,6 +87,9 @@ class LanceStats:
     def data_stats(self) -> DataStatistics:
         """
         Statistics about the data in the dataset.
+
+        Field bytes include all referenced base and overlay files, including
+        overlay values superseded by later updates.
         """
         return self._ds.data_stats()
 

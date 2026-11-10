@@ -40,7 +40,7 @@ from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.bitmap import Bitmap
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
 from lance.debug import format_fragment
-from lance.file import LanceFileWriter, stable_version
+from lance.file import LanceFileReader, LanceFileWriter, stable_version
 from lance.indices import IndexConfig
 from lance.schema import LanceSchema
 from lance.util import sanitize_ts, validate_vector_index
@@ -7701,6 +7701,51 @@ def test_stats(tmp_path: Path):
     assert data_stats.fields[1].bytes_on_disk > 0
     assert data_stats.fields[2].id == 2
     assert data_stats.fields[2].bytes_on_disk > 0
+
+
+def test_data_stats_include_overlays(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    table = pa.table(
+        {
+            "id": pa.array(range(8), pa.int32()),
+            "val": pa.array(range(8), pa.int32()),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=4)
+    expected = {s.id: s.bytes_on_disk for s in dataset.stats.data_stats().fields}
+
+    for generation in range(2):
+        groups = []
+        for fragment in dataset.get_fragments():
+            with fragment.write_overlay(["val"]) as writer:
+                writer.write_batch(
+                    pa.table(
+                        {
+                            "_rowaddr": _rowaddrs(fragment, [0, 1, 2]),
+                            "val": pa.array(
+                                [1000 + generation, None, -2000], pa.int32()
+                            ),
+                        }
+                    )
+                )
+                group = writer.finish()
+            groups.append(group)
+            file = tmp_path / "data" / group.overlays[0].data_file.path
+            overlay_bytes = (
+                LanceFileReader(str(file)).file_statistics().columns[0].size_bytes
+            )
+            assert overlay_bytes > 0
+            expected[1] += overlay_bytes
+
+        dataset = lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(groups),
+            read_version=dataset.version,
+        )
+        # Older overlays still occupy storage after their values are superseded.
+        actual = {s.id: s.bytes_on_disk for s in dataset.stats.data_stats().fields}
+        assert actual == expected
 
 
 def test_column_layout_stats(tmp_path: Path):

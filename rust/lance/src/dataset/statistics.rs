@@ -23,7 +23,8 @@ use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 pub struct FieldStatistics {
     /// Id of the field
     pub id: u32,
-    /// Amount of data in the field (after compression, if any)
+    /// Amount of data in the field (after compression, if any), across all
+    /// referenced base and overlay files, including superseded overlay values.
     ///
     /// This will be 0 if the data storage version is less than 2
     pub bytes_on_disk: u64,

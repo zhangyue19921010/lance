@@ -1301,14 +1301,15 @@ impl FileFragment {
         dataset_schema: &Schema,
         scan_scheduler: Arc<ScanScheduler>,
     ) -> Result<Vec<(u32, u64)>> {
+        let read_config = FragReadConfig::default().with_scan_scheduler(scan_scheduler);
+        // Storage includes every referenced file, even overlays whose values have
+        // been superseded. Open them independently of the base scan readers.
+        let readers = try_join_all(self.metadata.referenced_lance_files().map(|data_file| {
+            self.open_reader_with_full_metadata(data_file, Some(dataset_schema), &read_config)
+        }))
+        .await?;
         let mut stats = Vec::new();
-        for reader in self
-            .open_readers_with_full_metadata(
-                dataset_schema,
-                &FragReadConfig::default().with_scan_scheduler(scan_scheduler),
-            )
-            .await?
-        {
+        for reader in readers.into_iter().flatten() {
             stats.extend(reader.storage_stats()?);
         }
         Ok(stats)
@@ -1332,9 +1333,9 @@ impl FileFragment {
         self.metadata.id as usize
     }
 
-    /// The number of data files in this fragment.
+    /// The number of base and overlay data files referenced by this fragment.
     pub fn num_data_files(&self) -> usize {
-        self.metadata.files.len()
+        self.metadata.referenced_lance_files().count()
     }
 
     /// Gets the data file for a given field
@@ -1818,15 +1819,6 @@ impl FileFragment {
         ))))
     }
 
-    async fn open_readers(
-        &self,
-        projection: &Schema,
-        read_config: &FragReadConfig,
-    ) -> Result<Vec<Box<dyn GenericFileReader>>> {
-        self.open_readers_impl(projection, read_config, MetadataMode::LazyAllowed)
-            .await
-    }
-
     /// The id of `field` and of every field under it.
     fn collect_field_ids(field: &lance_core::datatypes::Field, out: &mut HashSet<i32>) {
         out.insert(field.id);
@@ -1835,20 +1827,10 @@ impl FileFragment {
         }
     }
 
-    async fn open_readers_with_full_metadata(
-        &self,
-        projection: &Schema,
-        read_config: &FragReadConfig,
-    ) -> Result<Vec<Box<dyn GenericFileReader>>> {
-        self.open_readers_impl(projection, read_config, MetadataMode::Full)
-            .await
-    }
-
-    fn open_readers_impl<'a>(
+    fn open_readers<'a>(
         &'a self,
         projection: &'a Schema,
         read_config: &'a FragReadConfig,
-        metadata_mode: MetadataMode,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn GenericFileReader>>>> {
         async move {
             // A fragment written through several `add_columns` holds one file
@@ -1876,22 +1858,7 @@ impl FileFragment {
                 .files
                 .iter()
                 .filter(|data_file| data_file.fields.iter().any(|id| wanted_ids.contains(id)))
-                .map(|data_file| async move {
-                    match metadata_mode {
-                        MetadataMode::LazyAllowed => {
-                            self.open_reader(data_file, Some(projection), read_config)
-                                .await
-                        }
-                        MetadataMode::Full => {
-                            self.open_reader_with_full_metadata(
-                                data_file,
-                                Some(projection),
-                                read_config,
-                            )
-                            .await
-                        }
-                    }
-                });
+                .map(|data_file| self.open_reader(data_file, Some(projection), read_config));
             let mut opened_files: Vec<Box<dyn GenericFileReader>> =
                 try_join_all(opens).await?.into_iter().flatten().collect();
 
@@ -4502,6 +4469,7 @@ mod tests {
         use lance_core::datatypes::Schema;
         use lance_file::version::LanceFileVersion;
         use lance_file::writer::FileWriterOptions;
+        use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
         use lance_io::utils::CachedFileSize;
         use lance_table::format::DataFile;
         use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
@@ -4509,6 +4477,7 @@ mod tests {
         use roaring::RoaringBitmap;
         use rstest::rstest;
 
+        use crate::dataset::statistics::DatasetStatisticsExt;
         use crate::dataset::transaction::{DataOverlayGroup, Operation};
         use crate::dataset::{Dataset, WriteDestination, WriteParams};
 
@@ -5010,6 +4979,9 @@ mod tests {
             #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
         ) {
             let dataset = create_base_dataset(version).await;
+            for fragment in dataset.get_fragments() {
+                assert_eq!(fragment.num_data_files(), 1);
+            }
             // Overlay fragment 0 at offset 0 and fragment 1 at offset 0 (global
             // row 6). Each fragment's coverage is independent.
             let dataset = commit_overlay(
@@ -5032,6 +5004,9 @@ mod tests {
                 version,
             )
             .await;
+            for fragment in dataset.get_fragments() {
+                assert_eq!(fragment.num_data_files(), 2);
+            }
 
             let batch = dataset
                 .scan()
@@ -5049,6 +5024,83 @@ mod tests {
                 })
                 .collect();
             assert_eq!(col(&batch, "val").values(), &expected);
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_data_stats_include_overlays(
+            #[values(
+                LanceFileVersion::V2_0,
+                LanceFileVersion::V2_1,
+                LanceFileVersion::V2_2,
+                LanceFileVersion::V2_3
+            )]
+            version: LanceFileVersion,
+        ) {
+            let mut dataset = create_base_dataset(version).await;
+            let baseline = Arc::new(dataset.clone())
+                .calculate_data_stats()
+                .await
+                .unwrap();
+            let scheduler = ScanScheduler::new(
+                dataset.object_store.clone(),
+                SchedulerConfig::max_bandwidth(dataset.object_store.as_ref()),
+            );
+            let mut overlay_bytes = 0;
+            for generation in 0..2 {
+                for fragment_id in 0..2 {
+                    dataset = commit_overlay(
+                        dataset,
+                        &format!("stats_{generation}_{fragment_id}"),
+                        fragment_id,
+                        &[1],
+                        OverlayCoverage::dense(bitmap([0, 2, 4])),
+                        vec![i32_array([Some(1000 + generation), None, Some(-2000)])],
+                        version,
+                    )
+                    .await;
+                    let fragment = dataset.get_fragment(fragment_id as usize).unwrap();
+                    let file = &fragment.metadata().overlays.last().unwrap().data_file;
+                    let file_scheduler = scheduler
+                        .open_file(
+                            &dataset.data_dir().join(file.path.as_str()),
+                            &file.file_size_bytes,
+                        )
+                        .await
+                        .unwrap();
+                    let metadata = fragment.get_file_metadata(&file_scheduler).await.unwrap();
+                    let bytes: u64 = metadata.column_metadatas[0]
+                        .pages
+                        .iter()
+                        .flat_map(|page| &page.buffer_sizes)
+                        .sum();
+                    assert!(bytes > 0);
+                    overlay_bytes += bytes;
+                }
+                // Superseded overlays remain referenced and still occupy storage.
+                let stats = Arc::new(dataset.clone())
+                    .calculate_data_stats()
+                    .await
+                    .unwrap();
+                assert_eq!(stats.fields.len(), 2);
+                assert_eq!(stats.fields[0].id, 0);
+                assert_eq!(
+                    stats.fields[0].bytes_on_disk,
+                    baseline.fields[0].bytes_on_disk
+                );
+                assert_eq!(stats.fields[1].id, 1);
+                assert_eq!(
+                    stats.fields[1].bytes_on_disk,
+                    baseline.fields[1].bytes_on_disk + overlay_bytes
+                );
+            }
+            dataset.drop_columns(&["val"]).await.unwrap();
+            let stats = Arc::new(dataset).calculate_data_stats().await.unwrap();
+            assert_eq!(stats.fields.len(), 1);
+            assert_eq!(
+                stats.fields[0].bytes_on_disk,
+                baseline.fields[0].bytes_on_disk
+            );
         }
 
         /// A `take` of a few rows must read only the overlay values those rows
