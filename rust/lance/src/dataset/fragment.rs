@@ -52,6 +52,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
+use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
@@ -558,6 +559,9 @@ mod v2_adapter {
         reader: Arc<ProjectedFileReader>,
         projection: Arc<Schema>,
         field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
+        /// The columns of the fields the manifest has tombstoned. They share one
+        /// field id, so `field_id_to_column_idx` holds at most one of them.
+        tombstoned_columns: Arc<HashSet<u32>>,
         /// The blob fields this file stores in the legacy layout.
         legacy_blobs: Arc<HashSet<i32>>,
         default_priority: u32,
@@ -569,6 +573,7 @@ mod v2_adapter {
             reader: Arc<ProjectedFileReader>,
             projection: Arc<Schema>,
             mut field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
+            tombstoned_columns: Arc<HashSet<u32>>,
             legacy_blobs: Arc<HashSet<i32>>,
             default_priority: u32,
             file_scheduler: FileScheduler,
@@ -603,6 +608,7 @@ mod v2_adapter {
                 reader,
                 projection,
                 field_id_to_column_idx,
+                tombstoned_columns,
                 legacy_blobs,
                 default_priority,
                 file_scheduler,
@@ -745,12 +751,18 @@ mod v2_adapter {
             let mut stats = Vec::new();
             // Some fields span more than one column.  We assume a column that doesn't have an
             // entry in the field_id_to_column_idx map is a continuation of the previous field.
-            let mut current_field_id = 0;
+            // A tombstoned column is not one: it starts a span no field owns.
+            let mut current_field_id = Some(0);
             for (column_idx, col_stats) in file_statistics.columns.iter().enumerate() {
-                if let Some(field_id) = column_idx_to_field_id.get(&(column_idx as u32)) {
-                    current_field_id = *field_id;
+                let column_idx = column_idx as u32;
+                if let Some(field_id) = column_idx_to_field_id.get(&column_idx) {
+                    current_field_id = Some(*field_id);
+                } else if self.tombstoned_columns.contains(&column_idx) {
+                    current_field_id = None;
                 }
-                stats.push((current_field_id, col_stats.size_bytes));
+                if let Some(field_id) = current_field_id {
+                    stats.push((field_id, col_stats.size_bytes));
+                }
             }
             Ok(stats)
         }
@@ -1714,6 +1726,17 @@ impl FileFragment {
                     (column_index >= 0).then_some((field_id as u32, column_index as u32))
                 }),
         ));
+        let tombstoned_columns = Arc::new(
+            data_file
+                .fields
+                .iter()
+                .zip(data_file.column_indices.iter())
+                .filter(|(field_id, column_index)| {
+                    **field_id == TOMBSTONE_FIELD_ID && **column_index >= 0
+                })
+                .map(|(_, column_index)| *column_index as u32)
+                .collect::<HashSet<_>>(),
+        );
         let file_version = data_file.file_version()?;
         // Blob projections always open the reader with the full footer. A 2.2 file reads
         // it first, to see which of its blob columns keep the legacy layout.
@@ -1812,6 +1835,7 @@ impl FileFragment {
             Arc::new(reader),
             schema_per_file,
             field_id_to_column_idx,
+            tombstoned_columns,
             Arc::new(legacy_blobs),
             reader_priority,
             file_scheduler,

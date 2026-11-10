@@ -306,14 +306,66 @@ impl<'a> DatasetStatistics<'a> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, record_batch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
 
-    use crate::dataset::WriteParams;
+    use crate::dataset::transaction::Operation;
+    use crate::dataset::{WriteDestination, WriteParams};
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_calculate_data_stats_skips_tombstoned_columns() {
+        let batch = record_batch!(
+            ("a", Int32, [0, 1, 2, 3]),
+            ("b", Int32, [0, 10, 20, 30]),
+            ("c", Int32, [0, 100, 200, 300])
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let dataset = Arc::new(Dataset::write(reader, "memory://", None).await.unwrap());
+        let before = dataset.calculate_data_stats().await.unwrap();
+
+        // Rewriting `b` and `c` leaves the original file holding `a` followed by
+        // two tombstoned columns.
+        let replacement = dataset
+            .get_fragment(0)
+            .unwrap()
+            .write_columns(
+                futures::stream::iter([Ok(batch.project(&[1, 2]).unwrap())]),
+                &dataset.schema().project_by_ids(&[1, 2], true),
+            )
+            .await
+            .unwrap();
+        let read_version = dataset.version().version;
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(dataset),
+            Operation::DataReplacement {
+                replacements: vec![replacement],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset.get_fragment(0).unwrap().metadata().files[0]
+                .fields
+                .as_ref(),
+            &[0, -2, -2]
+        );
+
+        let after = Arc::new(dataset).calculate_data_stats().await.unwrap();
+        assert_eq!(
+            after.fields[0].bytes_on_disk,
+            before.fields[0].bytes_on_disk
+        );
+    }
 
     #[tokio::test]
     async fn test_calculate_data_stats_after_dropping_wide_dataset_columns() {
