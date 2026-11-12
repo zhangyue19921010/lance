@@ -18,7 +18,7 @@ use lance_arrow::{DataTypeExt, r#struct::StructArrayExt};
 use lance_core::Result;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Field;
-use lance_core::error::{Error, LanceOptionExt};
+use lance_core::error::{CloneableError, Error, LanceOptionExt};
 use log::{debug, trace};
 
 use crate::EncodingsIo;
@@ -27,8 +27,9 @@ use crate::data::{concat_decoded_arrays, dictionary_batch_limit};
 use crate::decoder::{
     ColumnInfo, DecodePageTask, DecodedArray, DrainLimit, FilterExpression, IO_REQUEST_BATCH_BYTES,
     ListReadMode, LoadedPageShard, MessageType, PageEncoding, PageInfo, RequestBatch,
-    ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder,
-    StructuralFieldScheduler, StructuralPageDecoder, StructuralSchedulingJob, UnloadedPageShard,
+    ScheduledScanLine, SchedulerContext, SharedRead, StructuralDecodeArrayTask,
+    StructuralFieldDecoder, StructuralFieldScheduler, StructuralPageDecoder,
+    StructuralSchedulingJob, UnloadedPageShard,
 };
 use crate::encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler};
 use crate::format::metadata::PageLayout;
@@ -671,6 +672,8 @@ struct PageCacheMiss {
     page_idx: usize,
     cache_key: PageDataCacheKey,
     initialization: PageInitialization,
+    /// The cache holds an entry for this page that the scheduler rejected.
+    replace_cached: bool,
 }
 
 async fn read_page_initialization_buffers(
@@ -762,6 +765,7 @@ impl StructuralPrimitiveFieldScheduler {
                 view: page.scheduler.cache_view(),
                 target_data_type_tag: self.target_data_type_tag.clone(),
             };
+            let mut replace_cached = false;
             if let Some(cached_page) = cache.get_with_key(&cache_key).await {
                 match self.page_schedulers[page_idx]
                     .scheduler
@@ -770,6 +774,7 @@ impl StructuralPrimitiveFieldScheduler {
                     Ok(()) => continue,
                     Err(error) => {
                         debug!("Replacing invalid cached page data for {cache_key:?}: {error}");
+                        replace_cached = true;
                     }
                 }
             }
@@ -778,6 +783,7 @@ impl StructuralPrimitiveFieldScheduler {
                 page_idx,
                 cache_key,
                 initialization,
+                replace_cached,
             });
         }
         Ok(misses)
@@ -798,12 +804,10 @@ impl StructuralPrimitiveFieldScheduler {
     async fn initialize_cache_misses(
         &mut self,
         misses: Vec<PageCacheMiss>,
-        buffers: Vec<Bytes>,
+        buffers: SharedRead,
         cache: Arc<LanceCache>,
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<()> {
-        let mut buffers = buffers.into_iter();
-
         // Initialize each missing page from its slice of the buffers, in file
         // order. `init_from_buffers` can perform further I/O (e.g. loading blob
         // descriptions), so run pages concurrently; peel disjoint `&mut` page
@@ -811,12 +815,14 @@ impl StructuralPrimitiveFieldScheduler {
         // table.
         let mut tail = self.page_schedulers.as_mut_slice();
         let mut next_page = 0;
+        let mut next_buffer = 0;
         let mut page_inits = FuturesOrdered::new();
         for miss in misses {
             let PageCacheMiss {
                 page_idx,
                 cache_key,
                 initialization,
+                replace_cached,
             } = miss;
             let relative_idx = page_idx
                 .checked_sub(next_page)
@@ -835,32 +841,45 @@ impl StructuralPrimitiveFieldScheduler {
             tail = rest;
             next_page = page_idx + 1;
 
-            let count = initialization.num_required_ranges();
-            let page_buffers = buffers.by_ref().take(count).collect::<Vec<_>>();
-            if page_buffers.len() != count {
-                return Err(Error::invalid_input_source(
-                    format!(
-                        "Page {page_idx} received {} initialization buffers, expected {count}",
-                        page_buffers.len()
-                    )
-                    .into(),
-                ));
-            }
-            let page_buffers = initialization.with_buffers(page_buffers)?;
+            let page_buffers = next_buffer..next_buffer + initialization.num_required_ranges();
+            next_buffer = page_buffers.end;
+            let buffers = buffers.clone();
             let cache = cache.clone();
             let scheduler = &mut page.scheduler;
             page_inits.push_back(async move {
-                let cached = scheduler.init_from_buffers(page_buffers, io).await?;
-                scheduler.try_load(&cached)?;
-                cache_initialized_page(cache, cache_key, cached).await;
+                let init_scheduler = &mut *scheduler;
+                let init = async move {
+                    let buffers = buffers.await.map_err(CloneableError::into_inner)?;
+                    let page_buffers = buffers.get(page_buffers).ok_or_else(|| {
+                        Error::internal(format!(
+                            "Page {page_idx} initialization buffers are out of bounds"
+                        ))
+                    })?;
+                    let page_buffers = initialization.with_buffers(page_buffers.to_vec())?;
+                    init_scheduler.init_from_buffers(page_buffers, io).await
+                };
+                if replace_cached {
+                    // `get_or_insert_with_key` would return the rejected entry.
+                    let cached = init.await?;
+                    scheduler.try_load(&cached)?;
+                    cache_initialized_page(cache, cache_key, cached).await;
+                } else {
+                    // When several readers miss this page at once, one of them
+                    // initializes it and the others wait for that result
+                    // rather than reading the page metadata again.
+                    let cached = cache
+                        .get_or_insert_with_key(cache_key, || async move {
+                            Ok(CachedPage { data: init.await? })
+                        })
+                        .await?;
+                    scheduler.try_load(&cached.data)?;
+                }
                 Ok::<(), Error>(())
             });
         }
-        if buffers.next().is_some() {
-            return Err(Error::invalid_input_source(
-                "Page initialization returned unassigned buffers".into(),
-            ));
-        }
+        // Only the pages hold the read now, so a lone page's read error is
+        // returned unwrapped.
+        drop(buffers);
 
         page_inits.try_collect::<Vec<()>>().await?;
         Ok(())
@@ -887,8 +906,19 @@ impl StructuralPrimitiveFieldScheduler {
 
         // Concatenate the misses' metadata ranges into one request so adjacent
         // ranges coalesce into shared GETs instead of one request per page.
+        // The read starts only when a page this reader initializes awaits it,
+        // so a reader whose missed pages are all being initialized by other
+        // readers reads nothing.
         let all_ranges = Self::initialization_ranges(&misses);
-        let buffers = read_page_initialization_buffers(context.io(), all_ranges).await?;
+        let io = context.io().clone();
+        let buffers = async move {
+            read_page_initialization_buffers(&io, all_ranges)
+                .await
+                .map(Arc::new)
+                .map_err(CloneableError::new)
+        }
+        .boxed()
+        .shared();
         self.initialize_cache_misses(misses, buffers, cache, context.io())
             .await
     }
@@ -1506,9 +1536,10 @@ mod tests {
             .initialize(Some(&requested_ranges), &filter, &context)
             .await
             .unwrap();
+        // Each missed page counts twice: the cache check, then the load.
         assert_eq!(
             cache.stats().await.misses - cache_misses_before,
-            2,
+            2 * 2,
             "range-scoped initialization must only look up touched pages"
         );
 
@@ -1608,6 +1639,74 @@ mod tests {
             io.requests.lock().unwrap().as_slice(),
             &[vec![0..META_LEN, STRIDE..(STRIDE + META_LEN)]],
             "metadata reads must be sorted without changing page buffer assignment"
+        );
+
+        // Holds every read until the gate opens.
+        #[derive(Debug)]
+        struct GatedIo {
+            inner: RecordingScheduler,
+            gate: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
+        }
+        impl EncodingsIo for GatedIo {
+            fn submit_request(
+                &self,
+                ranges: Vec<Range<u64>>,
+                priority: u64,
+            ) -> BoxFuture<'static, crate::Result<Vec<Bytes>>> {
+                let read = self.inner.submit_request(ranges, priority);
+                let gate = self.gate.clone();
+                async move {
+                    let _ = gate.await;
+                    read.await
+                }
+                .boxed()
+            }
+        }
+        let (open_gate, gate) = futures::channel::oneshot::channel();
+        let io = Arc::new(GatedIo {
+            inner: RecordingScheduler::default(),
+            gate: gate.shared(),
+        });
+        // Sessions use the quick_cache backend.
+        let cache = Arc::new(lance_core::cache::LanceCache::with_backend(Arc::new(
+            lance_core::cache::QuickCacheBackend::with_capacity(4 * 1024),
+        )));
+        // Each reader has its own context, as concurrent reads do.
+        let (first_context, second_context) = (
+            SchedulerContext::new(io.clone(), cache.clone()),
+            SchedulerContext::new(io.clone(), cache.clone()),
+        );
+        let reader = || {
+            StructuralPrimitiveFieldScheduler::from_page_schedulers(
+                vec![PageInfoAndScheduler {
+                    page_index: 0,
+                    row_range: 0..100,
+                    scheduler: Box::new(FakePageScheduler {
+                        meta_range: 0..META_LEN,
+                    }),
+                }],
+                0,
+                Arc::from("test"),
+            )
+        };
+        let (mut first, mut second) = (reader(), reader());
+        let (first_init, second_init, ()) = futures::join!(
+            first.initialize(None, &filter, &first_context),
+            second.initialize(None, &filter, &second_context),
+            async {
+                // Open the gate once both readers have missed the page.
+                while cache.stats().await.misses < 2 {
+                    tokio::task::yield_now().await;
+                }
+                open_gate.send(()).unwrap();
+            },
+        );
+        first_init.unwrap();
+        second_init.unwrap();
+        assert_eq!(
+            io.inner.requests.lock().unwrap().len(),
+            1,
+            "readers missing the same page at once must read its metadata once"
         );
     }
 

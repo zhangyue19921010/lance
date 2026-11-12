@@ -3052,7 +3052,8 @@ impl PriorityRange for ListPriorityRange {
 /// I/O request per accumulated block.
 pub(crate) const IO_REQUEST_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
-type SharedRead = Shared<BoxFuture<'static, std::result::Result<Arc<Vec<Bytes>>, CloneableError>>>;
+pub(crate) type SharedRead =
+    Shared<BoxFuture<'static, std::result::Result<Arc<Vec<Bytes>>, CloneableError>>>;
 
 /// What a pending read receives once its batch is submitted, with its charge
 /// if the window sent the read ahead of the decoder.
